@@ -186,3 +186,225 @@ fn no_game_running_message() {
         stderr(&out)
     );
 }
+
+#[test]
+fn disasm_on_exec_page_is_blocked() {
+    let t = TestTarget::spawn();
+    let out = gt(&t, &["disasm", &format!("{:#x}", t.exec_page), "-n", "3"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("bloqueado pela regra do projeto"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(stdout(&out).is_empty(), "{}", stdout(&out));
+}
+
+#[test]
+fn disasm_on_data_is_allowed() {
+    let t = TestTarget::spawn();
+    let out = gt(&t, &["disasm", &format!("{:#x}", t.marker), "-n", "3"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out).lines().count(), 3, "{}", stdout(&out));
+}
+
+#[test]
+fn disasm_json_has_instruction_fields() {
+    let t = TestTarget::spawn();
+    let out = gt(
+        &t,
+        &["--json", "disasm", &format!("{:#x}", t.marker), "-n", "2"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let insns = v["instructions"].as_array().unwrap();
+    assert_eq!(insns.len(), 2);
+    assert_eq!(insns[0]["address"], format!("{:#x}", t.marker));
+    assert!(insns[0]["bytes_hex"].as_str().unwrap().starts_with("a5"));
+    assert!(insns[0]["text"].is_string());
+    assert!(insns[0]["label"].is_null());
+}
+
+#[test]
+fn disasm_rejects_huge_count() {
+    let t = TestTarget::spawn();
+    let out = gt(
+        &t,
+        &["disasm", &format!("{:#x}", t.marker), "-n", "4294967295"],
+    );
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("10000"), "{}", stderr(&out));
+}
+
+#[test]
+fn scan_on_elf_says_not_pe() {
+    let t = TestTarget::spawn();
+    let out = gt(&t, &["scan", "A5 A4"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("não é uma imagem PE"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn dump_on_exec_page_is_blocked() {
+    let t = TestTarget::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("x.bin");
+    let out = gt(
+        &t,
+        &[
+            "dump",
+            &format!("{:#x}", t.exec_page),
+            "4096",
+            "-o",
+            bin.to_str().unwrap(),
+        ],
+    );
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("bloqueado pela regra do projeto"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!bin.exists());
+    assert!(!dir.path().join("x.json").exists());
+}
+
+#[test]
+fn dump_range_writes_bin_and_json() {
+    let t = TestTarget::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("sub").join("m.bin");
+    let out = gt(
+        &t,
+        &[
+            "dump",
+            &format!("{:#x}", t.marker),
+            "32",
+            "-o",
+            bin.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(std::fs::read(&bin).unwrap(), marker_bytes());
+    let json = std::fs::read_to_string(dir.path().join("sub").join("m.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["size"], 32);
+    assert_eq!(v["start"], format!("{:#x}", t.marker));
+    assert_eq!(v["holes"], serde_json::json!([]));
+    assert!(v["version_key"].is_null());
+}
+
+#[test]
+fn dump_refuses_overwrite() {
+    let t = TestTarget::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("m.bin");
+    let args = [
+        "dump",
+        &format!("{:#x}", t.marker),
+        "32",
+        "-o",
+        bin.to_str().unwrap(),
+    ];
+    assert!(gt(&t, &args).status.success());
+    let second = gt(&t, &args);
+    assert!(!second.status.success());
+    assert!(stderr(&second).contains("já existe"), "{}", stderr(&second));
+    let mut forced = args.to_vec();
+    forced.push("--force");
+    let third = gt(&t, &forced);
+    assert!(third.status.success(), "{}", stderr(&third));
+}
+
+#[test]
+fn dump_refuses_overwrite_when_only_json_exists() {
+    let t = TestTarget::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("m.json"), "{}").unwrap();
+    let bin = dir.path().join("m.bin");
+    let out = gt(
+        &t,
+        &[
+            "dump",
+            &format!("{:#x}", t.marker),
+            "32",
+            "-o",
+            bin.to_str().unwrap(),
+        ],
+    );
+    assert!(!out.status.success());
+    assert!(!bin.exists());
+}
+
+#[test]
+fn dump_default_path_uses_pid_dir() {
+    let t = TestTarget::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_gt"))
+        .current_dir(dir.path())
+        .args(["--pid", &t.pid.to_string(), "--module", "gt-testtarget"])
+        .args(["dump", &format!("{:#x}", t.marker), "32"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let base = dir
+        .path()
+        .join("scratch/dumps")
+        .join(format!("pid{}", t.pid));
+    assert!(base.join(format!("{:x}.bin", t.marker)).exists());
+    assert!(base.join(format!("{:x}.json", t.marker)).exists());
+}
+
+#[test]
+fn dump_rejects_size_over_limit() {
+    let t = TestTarget::spawn();
+    let out = gt(&t, &["dump", &format!("{:#x}", t.marker), "0xFFFFFFFF"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("1 GiB"), "{}", stderr(&out));
+}
+
+#[test]
+fn dump_hole_writes_zeros_and_lists_hole() {
+    let t = TestTarget::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("h.bin");
+    let out = gt(
+        &t,
+        &[
+            "dump",
+            &format!("{:#x}", t.region_start),
+            "12288",
+            "-o",
+            bin.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let bytes = std::fs::read(&bin).unwrap();
+    assert_eq!(bytes.len(), 12288);
+    assert!(bytes[4096..8192].iter().all(|b| *b == 0));
+    let json = std::fs::read_to_string(dir.path().join("h.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        v["holes"],
+        serde_json::json!([{
+            "start": format!("{:#x}", t.region_start + 4096),
+            "end": format!("{:#x}", t.region_start + 8192),
+        }])
+    );
+}
+
+#[test]
+fn dump_section_on_elf_says_not_pe() {
+    let t = TestTarget::spawn();
+    let out = gt(&t, &["dump", ".text"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("não é uma imagem PE"),
+        "{}",
+        stderr(&out)
+    );
+}

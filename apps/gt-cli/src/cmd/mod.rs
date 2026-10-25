@@ -1,7 +1,10 @@
 //! Subcomandos do `gt`.
 
+pub mod disasm;
+pub mod dump;
 pub mod inspect;
 pub mod read;
+pub mod scan;
 
 /// Opções globais (`--pid`, `--module`, `--json`).
 #[derive(Debug, Clone)]

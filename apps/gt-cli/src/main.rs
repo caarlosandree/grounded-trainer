@@ -45,6 +45,44 @@ enum Command {
         /// Tamanho em bytes (decimal, ou hexadecimal com `0x`; padrão 64; máximo 1 MiB).
         size: Option<String>,
     },
+    /// Busca um padrão AOB (`48 8B ?? 05`) nas seções do módulo e diz se é único.
+    Scan {
+        /// Padrão: bytes em hexadecimal separados por espaço; `??` ou `?` é curinga.
+        pattern: String,
+        /// Só esta seção (ex.: `.text`); o padrão são as seções executáveis.
+        #[arg(long, value_name = "NOME", conflicts_with = "all")]
+        section: Option<String>,
+        /// Todas as seções do módulo.
+        #[arg(long)]
+        all: bool,
+        /// Busca no arquivo em disco (confere a versão), não na memória.
+        #[arg(long)]
+        disk: bool,
+        /// Máximo de ocorrências exibidas (o total é sempre contado por inteiro).
+        #[arg(long, value_name = "N", default_value = cmd::scan::default_limit())]
+        limit: String,
+    },
+    /// Desmonta instruções x86-64 (sintaxe Intel) a partir de um endereço.
+    Disasm {
+        /// Endereço: `0x1456FC11C`, `modulo+56FC11C` ou `+56FC11C` (hexadecimal).
+        address: String,
+        /// Quantidade de instruções (decimal, ou hexadecimal com `0x`; máximo 10000).
+        #[arg(short = 'n', long = "count", value_name = "N", default_value = cmd::disasm::default_count())]
+        count: String,
+    },
+    /// Salva memória em arquivo: uma seção, ou um endereço e um tamanho.
+    Dump {
+        /// Nome de uma seção (ex.: `.text`) ou, com TAMANHO, o endereço inicial.
+        target: String,
+        /// Tamanho em bytes (decimal, ou hexadecimal com `0x`; máximo 1 GiB).
+        size: Option<String>,
+        /// Arquivo `.bin` de saída; o `.json` fica ao lado, com o mesmo nome.
+        #[arg(short, long, value_name = "ARQUIVO")]
+        output: Option<std::path::PathBuf>,
+        /// Sobrescreve arquivos que já existem.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// Texto de ajuda para o erro de permissão (spec 6.10). Não sugere `sudo` como primeira opção.
@@ -115,6 +153,37 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Inspect => cmd::inspect::run(&global),
         Command::Read { address, size } => cmd::read::run(&global, &address, size.as_deref()),
+        Command::Scan {
+            pattern,
+            section,
+            all,
+            disk,
+            limit,
+        } => cmd::scan::run(
+            &global,
+            &cmd::scan::Options {
+                pattern: &pattern,
+                section: section.as_deref(),
+                all,
+                disk,
+                limit: Some(&limit),
+            },
+        ),
+        Command::Disasm { address, count } => cmd::disasm::run(&global, &address, Some(&count)),
+        Command::Dump {
+            target,
+            size,
+            output,
+            force,
+        } => cmd::dump::run(
+            &global,
+            &cmd::dump::Options {
+                target: &target,
+                size: size.as_deref(),
+                output: output.as_deref(),
+                force,
+            },
+        ),
     }
 }
 
