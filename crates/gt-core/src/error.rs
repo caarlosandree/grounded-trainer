@@ -59,6 +59,10 @@ pub enum Error {
     #[error("versão do módulo na memória ({memory}) difere da do disco ({disk})")]
     VersionMismatch { memory: String, disk: String },
 
+    /// Arquivo de `/proc` fora do formato esperado.
+    #[error("formato inesperado em {file}: {reason}")]
+    BadProc { file: String, reason: String },
+
     /// Erro de entrada e saída do sistema operacional.
     #[error("erro de E/S: {0}")]
     Io(#[from] io::Error),

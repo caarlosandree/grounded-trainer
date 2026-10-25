@@ -18,7 +18,7 @@ gt-testkit = { path = "crates/gt-testkit" }
 
 iced-x86 = "1.21.0"
 goblin = "0.10.7"
-nix = { version = "0.31.3", features = ["uio", "process", "fs", "feature"] }
+nix = { version = "0.31.3", features = ["uio", "process", "fs", "feature", "signal", "poll"] }
 ratatui = "0.30.2"
 crossterm = "0.29.0"
 clap = { version = "4.6.7", features = ["derive"] }

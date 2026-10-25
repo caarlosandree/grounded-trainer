@@ -171,3 +171,83 @@ fn scan_memory_skips_hole() {
     assert!(scans[0].hits.is_empty(), "{:?}", scans[0].hits);
     assert_eq!(scans[0].unreadable_bytes, t.page);
 }
+
+#[test]
+fn identity_and_pidfd_on_live_target() {
+    use gt_core::Error;
+    use gt_core::mem::Pidfd;
+    use gt_core::procinfo::{self, Identity};
+    use nix::sys::signal::Signal;
+    use std::time::{Duration, Instant};
+
+    // Espera (até 500 ms) todas as threads chegarem ao estado pedido.
+    fn all_threads(pid: i32, want_stopped: bool) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let tids = procinfo::list_tids(pid).unwrap();
+            let ok = !tids.is_empty()
+                && tids.iter().all(|&tid| {
+                    matches!(
+                        procinfo::read_task_stat(pid, tid).unwrap(),
+                        Some(s) if procinfo::is_stopped(s.state) == want_stopped
+                    )
+                });
+            if ok {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    let mut t = TestTarget::spawn();
+    let id = procinfo::identity(t.pid).unwrap();
+    assert_eq!(id.pid, t.pid);
+    assert_eq!(id.boot_id, procinfo::boot_id().unwrap());
+    procinfo::check_alive(&id).unwrap();
+    let reused = Identity {
+        start_time: id.start_time + 1,
+        ..id.clone()
+    };
+    assert!(matches!(
+        procinfo::check_alive(&reused),
+        Err(Error::ProcessGone { .. })
+    ));
+
+    let pidfd = Pidfd::open(t.pid).unwrap();
+    assert!(!pidfd.exited(Duration::ZERO).unwrap());
+    pidfd.send(Signal::SIGSTOP).unwrap();
+    assert!(all_threads(t.pid, true), "threads não pararam em 500 ms");
+    pidfd.send(Signal::SIGCONT).unwrap();
+    assert!(all_threads(t.pid, false), "threads não voltaram em 500 ms");
+
+    t.child.kill().unwrap();
+    t.child.wait().unwrap();
+    assert!(matches!(
+        procinfo::check_alive(&id),
+        Err(Error::ProcessGone { .. })
+    ));
+    assert!(pidfd.exited(Duration::ZERO).unwrap());
+    assert!(matches!(
+        pidfd.send(Signal::SIGCONT),
+        Err(Error::ProcessGone { .. })
+    ));
+}
+
+#[test]
+fn ignore_job_control_sets_sig_ign() {
+    gt_core::mem::ignore_job_control().unwrap();
+    // SigIgn em /proc/self/status: máscara com o bit (sinal - 1) ligado.
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let mask = status
+        .lines()
+        .find_map(|l| l.strip_prefix("SigIgn:"))
+        .map(|h| u64::from_str_radix(h.trim(), 16).unwrap())
+        .unwrap();
+    // Números no Linux: SIGTSTP 20, SIGTTIN 21, SIGTTOU 22.
+    for sig in [20u32, 21, 22] {
+        assert!(mask & (1 << (sig - 1)) != 0, "sinal {sig} não ignorado");
+    }
+}

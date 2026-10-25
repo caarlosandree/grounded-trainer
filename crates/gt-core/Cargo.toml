@@ -8,7 +8,7 @@ publish.workspace = true
 
 [features]
 # Escrita crua em /proc/<pid>/mem. O `gt` nunca ativa esta feature.
-write = []
+write = ["dep:libc"]
 # Apoio a testes (mmap/prctl) para o processo-alvo de teste.
 test-support = ["dep:libc"]
 

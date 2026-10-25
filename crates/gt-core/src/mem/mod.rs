@@ -1,10 +1,14 @@
 //! Leitura (e, com a feature `write`, escrita crua) da memória de outro processo.
 
+#[cfg(feature = "write")]
+mod sys;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 #[cfg(feature = "write")]
 mod writer;
 
+#[cfg(feature = "write")]
+pub use sys::{Pidfd, ignore_job_control};
 #[cfg(feature = "write")]
 pub use writer::MemWriter;
 
