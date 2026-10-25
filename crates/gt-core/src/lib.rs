@@ -3,5 +3,6 @@
 pub mod addr;
 pub mod error;
 pub mod maps;
+pub mod scan;
 
 pub use error::{Error, Result};
