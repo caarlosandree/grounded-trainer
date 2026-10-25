@@ -5,8 +5,23 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+default-run = "gt"
+
+[[bin]]
+name = "gt"
+path = "src/main.rs"
+
+[[bin]]
+name = "gt-testtarget"
+path = "src/bin/gt-testtarget.rs"
 
 [dependencies]
+gt-core = { workspace = true, features = ["test-support"] }
+
+[dev-dependencies]
+gt-core = { workspace = true, features = ["write", "test-support"] }
+serde_json.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

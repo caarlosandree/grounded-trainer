@@ -3,7 +3,9 @@
 pub mod addr;
 pub mod error;
 pub mod maps;
+pub mod mem;
 pub mod pe;
+pub mod process;
 pub mod scan;
 
 pub use error::{Error, Result};

@@ -1,0 +1,79 @@
+//! Apoio aos testes (feature `test-support`): `mmap`/`prctl` para o processo-alvo de teste.
+//!
+//! Nunca escreve em outro processo. As páginas criadas aqui vivem até o processo
+//! terminar (não há `munmap` final).
+
+use std::io;
+use std::ptr;
+
+use crate::Result;
+
+const PAGE: usize = 4096;
+
+/// Permite que qualquer processo do mesmo usuário nos inspecione
+/// (`prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY)`), mesmo com `ptrace_scope = 1`.
+pub fn allow_any_tracer() -> Result<()> {
+    // SAFETY: `prctl` com `PR_SET_PTRACER` só lê os argumentos inteiros (sem
+    // ponteiros) e altera um atributo do próprio processo.
+    let rc = unsafe { libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY, 0, 0, 0) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error().into())
+    }
+}
+
+/// Mapeia `len` bytes anônimos de leitura e escrita e devolve o início.
+fn map_anon(len: usize) -> Result<*mut libc::c_void> {
+    // SAFETY: mapeamento anônimo e privado com endereço nulo: o kernel escolhe uma
+    // região nova e livre; nenhuma memória existente é afetada.
+    let p = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if p == libc::MAP_FAILED {
+        Err(io::Error::last_os_error().into())
+    } else {
+        Ok(p)
+    }
+}
+
+/// Muda a proteção de `[p, p + len)`.
+fn protect(p: *mut libc::c_void, len: usize, prot: libc::c_int) -> Result<()> {
+    // SAFETY: `p` e `len` descrevem páginas alinhadas que este módulo acabou de
+    // mapear com `map_anon` e que ninguém mais referencia.
+    if unsafe { libc::mprotect(p, len, prot) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error().into())
+    }
+}
+
+/// Cria uma página anônima `PROT_READ | PROT_EXEC` de 4096 bytes preenchida com
+/// `fill` (via `PROT_WRITE` temporário) e devolve o endereço.
+pub fn exec_page(fill: u8) -> Result<u64> {
+    let p = map_anon(PAGE)?;
+    // SAFETY: `p` aponta para `PAGE` bytes graváveis recém-mapeados.
+    unsafe { ptr::write_bytes(p.cast::<u8>(), fill, PAGE) };
+    protect(p, PAGE, libc::PROT_READ | libc::PROT_EXEC)?;
+    Ok(p as u64)
+}
+
+/// Cria 3 páginas anônimas `rw` e troca a do meio para `PROT_NONE`; devolve o
+/// início das 3.
+///
+/// A página `PROT_NONE` é ilegível para `process_vm_readv` (`EFAULT`) e, ao contrário
+/// de um `munmap`, não é reaproveitada por `mmap`s posteriores.
+pub fn guarded_pages() -> Result<u64> {
+    let p = map_anon(3 * PAGE)?;
+    // SAFETY: a página do meio está dentro do mapeamento de 3 páginas acima.
+    let middle = unsafe { p.cast::<u8>().add(PAGE) }.cast::<libc::c_void>();
+    protect(middle, PAGE, libc::PROT_NONE)?;
+    Ok(p as u64)
+}

@@ -6,8 +6,15 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+# Escrita crua em /proc/<pid>/mem. O `gt` nunca ativa esta feature.
+write = []
+# Apoio a testes (mmap/prctl) para o processo-alvo de teste.
+test-support = ["dep:libc"]
+
 [dependencies]
 goblin.workspace = true
+libc = { workspace = true, optional = true }
 nix.workspace = true
 thiserror.workspace = true
 
