@@ -1,8 +1,27 @@
-#![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Apoio aos testes de integração: inicia e encerra o `gt-testtarget`.
 
 use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+
+/// Caminho de um binário deste crate (ex. `gt-testtarget`) em `target/<perfil>/`.
+///
+/// Sobe a partir do executável de teste até o diretório que contém `deps`. Entra em
+/// pânico se o binário não existir.
+pub fn bin_path(name: &str) -> PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    let found = exe
+        .ancestors()
+        .skip(1)
+        .find(|dir| dir.join("deps").is_dir())
+        .map(|dir| dir.join(name))
+        .filter(|path| path.is_file());
+    match found {
+        Some(path) => path,
+        None => panic!("binário {name} não encontrado; rode `cargo build --workspace` antes"),
+    }
+}
 
 /// Processo-alvo de teste em execução.
 pub struct TestTarget {
@@ -10,8 +29,13 @@ pub struct TestTarget {
     pub pid: i32,
     pub marker: u64,
     pub exec_page: u64,
-    /// Início de 3 páginas; a do meio (`region_start + 4096`) é ilegível.
+    /// Início de 3 páginas; a do meio (`region_start + page`) é ilegível.
     pub region_start: u64,
+    /// Início de uma região `rw` de `big_len` bytes (2 MiB + 1 página).
+    pub big_region: u64,
+    pub big_len: usize,
+    /// Tamanho da página do sistema, informado pelo alvo.
+    pub page: u64,
 }
 
 fn parse_hex(v: &serde_json::Value) -> u64 {
@@ -21,7 +45,7 @@ fn parse_hex(v: &serde_json::Value) -> u64 {
 
 impl TestTarget {
     pub fn spawn() -> TestTarget {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_gt-testtarget"))
+        let mut child = Command::new(bin_path("gt-testtarget"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -37,6 +61,9 @@ impl TestTarget {
             marker: parse_hex(&v["marker"]),
             exec_page: parse_hex(&v["exec_page"]),
             region_start: parse_hex(&v["region_start"]),
+            big_region: parse_hex(&v["big_region"]),
+            big_len: v["big_len"].as_u64().unwrap() as usize,
+            page: v["page"].as_u64().unwrap(),
             child,
         }
     }

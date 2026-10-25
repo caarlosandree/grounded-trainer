@@ -11,14 +11,10 @@ default-run = "gt"
 name = "gt"
 path = "src/main.rs"
 
-[[bin]]
-name = "gt-testtarget"
-path = "src/bin/gt-testtarget.rs"
-
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-gt-core = { workspace = true, features = ["test-support"] }
+gt-core.workspace = true
 gt-grounded2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -26,7 +22,7 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [dev-dependencies]
-gt-core = { workspace = true, features = ["write", "test-support"] }
+gt-testkit.workspace = true
 tempfile.workspace = true
 
 [lints]

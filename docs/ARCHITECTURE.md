@@ -48,12 +48,14 @@ grounded-trainer/
 │   │       └── suspend.rs        # pausar/retomar o processo durante escritas
 │   ├── gt-ue/                    # estruturas do Unreal Engine 5 (Fase 5)
 │   │   └── src/                  # FName/GNames, GObjects, GWorld, leitura de UObjects
-│   └── gt-grounded2/             # conhecimento específico do jogo
-│       ├── src/cheats/           # 1 módulo por cheat (sobrevivência, itens, progressão, movimento)
-│       └── signatures/           # *.toml por build do jogo
+│   ├── gt-grounded2/             # conhecimento específico do jogo
+│   │   ├── src/cheats/           # 1 módulo por cheat (sobrevivência, itens, progressão, movimento)
+│   │   └── signatures/           # *.toml por build do jogo
+│   └── gt-testkit/               # apoio a testes (publish = false): TestTarget, bin_path e binários de apoio
+│       ├── src/bin/gt-testtarget.rs  # processo-alvo de teste (não é o gt)
+│       └── tests/core_live.rs    # testes de API viva do gt-core contra o alvo
 ├── apps/
 │   ├── gt-cli/                   # ferramentas de pesquisa: inspect, read, scan, disasm, diff, dump, fling
-│   │   └── src/bin/gt-testtarget.rs  # processo-alvo de teste (binário de apoio, não é o gt)
 │   └── gt-tui/                   # interface do jogador
 └── docs/
 ```

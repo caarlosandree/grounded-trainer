@@ -1,11 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Integração do binário `gt` contra o processo-alvo de teste (nunca contra o jogo).
 
-mod support;
-
 use std::process::{Command, Output};
 
-use support::{TestTarget, marker_bytes};
+use gt_testkit::{TestTarget, marker_bytes};
 
 /// Roda `gt --pid <alvo> --module <module> <args...>`.
 fn gt_with(pid: i32, module: &str, args: &[&str]) -> Output {

@@ -10,6 +10,7 @@ pub use writer::MemWriter;
 
 use std::io::{self, IoSliceMut};
 use std::ops::Range;
+use std::sync::OnceLock;
 
 use nix::errno::Errno;
 use nix::sys::uio::{RemoteIoVec, process_vm_readv};
@@ -20,8 +21,19 @@ use crate::{Error, Result};
 /// Tamanho máximo de cada chamada a `process_vm_readv`.
 const CHUNK: usize = 1 << 20;
 
-/// Tamanho da página usada para localizar buracos na leitura tolerante.
-const PAGE: u64 = 4096;
+/// Tamanho de página assumido se `sysconf(_SC_PAGE_SIZE)` falhar.
+const DEFAULT_PAGE: u64 = 4096;
+
+/// Tamanho da página do sistema, em bytes (consultado uma vez; 4096 se a consulta falhar).
+pub fn page_size() -> u64 {
+    static PAGE_SIZE: OnceLock<u64> = OnceLock::new();
+    *PAGE_SIZE.get_or_init(
+        || match nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE) {
+            Ok(Some(n)) if n > 0 => n as u64,
+            _ => DEFAULT_PAGE,
+        },
+    )
+}
 
 /// Leitor da memória de um processo via `process_vm_readv`.
 #[derive(Debug, Clone, Copy)]
@@ -72,7 +84,7 @@ impl MemReader {
     /// Lê `len` bytes a partir de `addr`, tolerando páginas ilegíveis.
     ///
     /// Tenta o bloco inteiro; se falhar por memória não mapeada, repete página a
-    /// página (4096 bytes, alinhadas). As páginas ilegíveis ficam zeradas e entram
+    /// página (tamanho de [`page_size`], alinhadas). As páginas ilegíveis ficam zeradas e entram
     /// em `holes`. Se nenhuma página for legível, devolve [`Error::Unmapped`].
     pub fn read_lossy(&self, addr: u64, len: usize) -> Result<LossyRead> {
         let unmapped = Error::Unmapped { addr, len };
@@ -89,13 +101,14 @@ impl MemReader {
             Err(e) => return Err(e),
         }
 
+        let page = page_size();
         let mut holes: Vec<Range<u64>> = Vec::new();
         let mut readable = false;
         let mut at = addr;
         while at < end {
             // Próximo limite de página; se estourar o espaço de endereços, é o fim.
             let piece_end = at
-                .checked_add(PAGE - at % PAGE)
+                .checked_add(page - at % page)
                 .map_or(end, |next| next.min(end));
             let range = (at - addr) as usize..(piece_end - addr) as usize;
             match self.read_exact(at, &mut bytes[range.clone()]) {
@@ -135,5 +148,17 @@ impl MemReader {
             Err(Errno::EFAULT) => Ok(0),
             Err(e) => Err(Error::Io(io::Error::from(e))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_size_is_power_of_two_and_at_least_4096() {
+        let p = page_size();
+        assert!(p >= 4096, "{p}");
+        assert!(p.is_power_of_two(), "{p}");
     }
 }

@@ -41,6 +41,11 @@ impl MemWriter {
 
 /// Traduz um erro de E/S de `/proc/<pid>/mem` para o erro comum do núcleo.
 fn map_io(pid: i32, e: io::Error, addr: u64, len: usize) -> Error {
+    // Processo que terminou com o arquivo ainda aberto: o kernel devolve 0 bytes
+    // escritos, que `write_all_at` reporta como `WriteZero` (sem `errno`).
+    if e.kind() == io::ErrorKind::WriteZero && e.raw_os_error().is_none() {
+        return Error::ProcessGone { pid };
+    }
     match e.raw_os_error().map(Errno::from_raw) {
         Some(Errno::EACCES | Errno::EPERM) => Error::PermissionDenied {
             pid,

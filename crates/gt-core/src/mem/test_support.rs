@@ -8,7 +8,12 @@ use std::ptr;
 
 use crate::Result;
 
-const PAGE: usize = 4096;
+pub use super::page_size;
+
+/// Tamanho da página do sistema como `usize`.
+fn page() -> usize {
+    page_size() as usize
+}
 
 /// Permite que qualquer processo do mesmo usuário nos inspecione
 /// (`prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY)`), mesmo com `ptrace_scope = 1`.
@@ -60,13 +65,19 @@ fn protect(p: *mut libc::c_void, len: usize, prot: libc::c_int) -> Result<()> {
     }
 }
 
-/// Cria uma página anônima `PROT_READ | PROT_EXEC` de 4096 bytes preenchida com
+/// Cria um mapeamento anônimo `rw`, zerado, de `len` bytes e devolve o início.
+pub fn anon_rw(len: usize) -> Result<u64> {
+    Ok(map_anon(len)? as u64)
+}
+
+/// Cria uma página anônima `PROT_READ | PROT_EXEC` preenchida com
 /// `fill` (via `PROT_WRITE` temporário) e devolve o endereço.
 pub fn exec_page(fill: u8) -> Result<u64> {
-    let p = map_anon(PAGE)?;
-    // SAFETY: `p` aponta para `PAGE` bytes graváveis recém-mapeados.
-    unsafe { ptr::write_bytes(p.cast::<u8>(), fill, PAGE) };
-    protect(p, PAGE, libc::PROT_READ | libc::PROT_EXEC)?;
+    let page = page();
+    let p = map_anon(page)?;
+    // SAFETY: `p` aponta para `page` bytes graváveis recém-mapeados.
+    unsafe { ptr::write_bytes(p.cast::<u8>(), fill, page) };
+    protect(p, page, libc::PROT_READ | libc::PROT_EXEC)?;
     Ok(p as u64)
 }
 
@@ -76,9 +87,10 @@ pub fn exec_page(fill: u8) -> Result<u64> {
 /// A página `PROT_NONE` é ilegível para `process_vm_readv` (`EFAULT`) e, ao contrário
 /// de um `munmap`, não é reaproveitada por `mmap`s posteriores.
 pub fn guarded_pages() -> Result<u64> {
-    let p = map_anon(3 * PAGE)?;
+    let page = page();
+    let p = map_anon(3 * page)?;
     // SAFETY: a página do meio está dentro do mapeamento de 3 páginas acima.
-    let middle = unsafe { p.cast::<u8>().add(PAGE) }.cast::<libc::c_void>();
-    protect(middle, PAGE, libc::PROT_NONE)?;
+    let middle = unsafe { p.cast::<u8>().add(page) }.cast::<libc::c_void>();
+    protect(middle, page, libc::PROT_NONE)?;
     Ok(p as u64)
 }

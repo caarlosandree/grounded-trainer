@@ -1,0 +1,20 @@
+[package]
+name = "gt-testkit"
+description = "Apoio a testes: processo-alvo de teste e utilitários para os testes de integração."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# Os binários de `src/bin/` não enxergam dev-dependencies; por isso `write` e
+# `test-support` ficam nas dependências normais.
+gt-core = { workspace = true, features = ["write", "test-support"] }
+nix = { workspace = true, features = ["signal"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

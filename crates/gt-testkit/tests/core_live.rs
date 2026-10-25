@@ -1,25 +1,26 @@
-mod support;
+//! Testes de API viva do `gt-core` contra o processo-alvo de teste (nunca contra o jogo).
+
 use gt_core::mem::{MemReader, MemWriter};
+use gt_testkit::{TestTarget, hex_with_spaces, marker_bytes};
 
 #[test]
 fn reads_marker() {
-    let t = support::TestTarget::spawn();
+    let t = TestTarget::spawn();
     let mut buf = [0u8; 32];
     MemReader::new(t.pid)
         .read_exact(t.marker, &mut buf)
         .unwrap();
-    assert_eq!(buf, support::marker_bytes());
+    assert_eq!(buf, marker_bytes());
 }
 #[test]
 fn scan_finds_marker_once_in_its_region() {
-    let t = support::TestTarget::spawn();
+    let t = TestTarget::spawn();
     let maps = gt_core::maps::read_maps(t.pid).unwrap();
     let region = maps
         .iter()
         .find(|r| r.start <= t.marker && t.marker < r.end)
         .unwrap();
-    let pat =
-        gt_core::scan::Pattern::parse(&support::hex_with_spaces(&support::marker_bytes())).unwrap();
+    let pat = gt_core::scan::Pattern::parse(&hex_with_spaces(&marker_bytes())).unwrap();
     let reader = MemReader::new(t.pid);
     let hits = gt_core::scan::scan_chunked(region.end - region.start, 1 << 20, &pat, |off, buf| {
         reader.read_exact(region.start + off, buf)
@@ -29,7 +30,7 @@ fn scan_finds_marker_once_in_its_region() {
 }
 #[test]
 fn raw_writer_changes_marker() {
-    let t = support::TestTarget::spawn();
+    let t = TestTarget::spawn();
     MemWriter::open(t.pid)
         .unwrap()
         .write(t.marker, &[0x11; 4])
@@ -42,24 +43,27 @@ fn raw_writer_changes_marker() {
 }
 #[test]
 fn lossy_read_over_hole_marks_only_the_hole() {
-    let t = support::TestTarget::spawn();
+    let t = TestTarget::spawn();
     let r = MemReader::new(t.pid)
-        .read_lossy(t.region_start, 3 * 4096)
+        .read_lossy(t.region_start, 3 * t.page as usize)
         .unwrap();
-    assert_eq!(r.holes, vec![t.region_start + 4096..t.region_start + 8192]);
-    assert_eq!(r.bytes.len(), 3 * 4096);
+    assert_eq!(
+        r.holes,
+        vec![t.region_start + t.page..t.region_start + 2 * t.page]
+    );
+    assert_eq!(r.bytes.len(), 3 * t.page as usize);
 }
 #[test]
 fn fully_unmapped_is_error() {
-    let t = support::TestTarget::spawn();
+    let t = TestTarget::spawn();
     assert!(matches!(
-        MemReader::new(t.pid).read_lossy(t.region_start + 4096, 4096),
+        MemReader::new(t.pid).read_lossy(t.region_start + t.page, t.page as usize),
         Err(gt_core::Error::Unmapped { .. })
     ));
 }
 #[test]
 fn read_past_u64_max_is_unmapped() {
-    let t = support::TestTarget::spawn();
+    let t = TestTarget::spawn();
     assert!(matches!(
         MemReader::new(t.pid).read_lossy(u64::MAX - 15, 32),
         Err(gt_core::Error::Unmapped { .. })
@@ -67,7 +71,7 @@ fn read_past_u64_max_is_unmapped() {
 }
 #[test]
 fn dead_process_is_gone_for_lossy_too() {
-    let mut t = support::TestTarget::spawn();
+    let mut t = TestTarget::spawn();
     let pid = t.pid;
     t.child.kill().unwrap();
     t.child.wait().unwrap();
@@ -78,7 +82,7 @@ fn dead_process_is_gone_for_lossy_too() {
 }
 #[test]
 fn dead_process_is_gone() {
-    let mut t = support::TestTarget::spawn();
+    let mut t = TestTarget::spawn();
     let pid = t.pid;
     t.child.kill().unwrap();
     t.child.wait().unwrap();
@@ -90,9 +94,47 @@ fn dead_process_is_gone() {
 }
 #[test]
 fn lossy_read_on_last_page_is_unmapped_without_panic() {
-    let t = support::TestTarget::spawn();
+    let t = TestTarget::spawn();
     assert!(matches!(
         MemReader::new(t.pid).read_lossy(0xFFFF_FFFF_FFFF_F000, 16),
         Err(gt_core::Error::Unmapped { .. })
+    ));
+}
+#[test]
+fn writer_handles_more_than_one_mib() {
+    let t = TestTarget::spawn();
+    let data: Vec<u8> = (0..t.big_len).map(|i| (i % 251) as u8).collect();
+    MemWriter::open(t.pid)
+        .unwrap()
+        .write(t.big_region, &data)
+        .unwrap();
+    let mut back = vec![0u8; t.big_len];
+    MemReader::new(t.pid)
+        .read_exact(t.big_region, &mut back)
+        .unwrap();
+    assert_eq!(back, data);
+}
+
+#[test]
+fn writer_on_prot_none_page() {
+    // Kernel de referência (Fedora 44, kernel 7.2, proc_mem.force_override = always): a escrita
+    // forçada em página PROT_NONE privada é aceita (verificado em 2026-10-25).
+    let t = TestTarget::spawn();
+    let result = MemWriter::open(t.pid)
+        .unwrap()
+        .write(t.region_start + t.page, &[1, 2, 3]);
+    assert!(result.is_ok(), "{result:?}");
+}
+
+#[test]
+fn writer_to_dead_process_is_gone() {
+    let mut t = TestTarget::spawn();
+    let pid = t.pid;
+    let writer = MemWriter::open(pid).unwrap();
+    t.child.kill().unwrap();
+    t.child.wait().unwrap();
+    assert!(matches!(
+        writer.write(t.marker, &[1]),
+        Err(gt_core::Error::ProcessGone { .. })
     ));
 }

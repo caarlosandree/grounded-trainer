@@ -177,6 +177,7 @@ dependencies = [
  "clap",
  "gt-core",
  "gt-grounded2",
+ "gt-testkit",
  "serde",
  "serde_json",
  "tempfile",
@@ -204,6 +205,16 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "gt-testkit"
+version = "0.1.0"
+dependencies = [
+ "gt-core",
+ "nix",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
