@@ -108,6 +108,42 @@ mod live {
     /// Quantas vezes relê a lista de threads até ela ficar estável.
     const LIST_PASSES: usize = 10;
 
+    /// Quantas vezes relê a posição de uma thread que aparece como `Running` com o
+    /// processo parado.
+    const POS_ATTEMPTS: u32 = 50;
+
+    /// Espera entre as leituras da posição de uma thread.
+    const POS_WAIT: Duration = Duration::from_millis(2);
+
+    /// Lê a posição de uma thread já parada, relendo enquanto ela aparece como `Running`.
+    ///
+    /// Com o alvo sob `SIGSTOP`, o `wineserver` do Proton se anexa por ptrace às threads
+    /// por instantes; enquanto dura o anexo, `/proc/<pid>/task/<tid>/syscall` diz
+    /// `running`. Relê até `Stopped`, no máximo `attempts` vezes com `wait` entre elas;
+    /// se persistir, devolve `None` (ilegível). `None` da leitura (thread sumiu) encerra
+    /// na hora. Uma posição `Some(Running)` nunca é devolvida.
+    pub(super) fn settle_pos(
+        mut read: impl FnMut() -> Result<Option<ThreadPos>>,
+        attempts: u32,
+        wait: Duration,
+    ) -> Result<Option<ThreadPos>> {
+        for i in 0..attempts {
+            match read()? {
+                Some(ThreadPos::Running) => {
+                    if i + 1 < attempts && !wait.is_zero() {
+                        std::thread::sleep(wait);
+                    }
+                }
+                other => return Ok(other),
+            }
+        }
+        tracing::debug!(
+            attempts,
+            "posição da thread continua `running` com o alvo parado"
+        );
+        Ok(None)
+    }
+
     /// Uma thread viva do alvo no momento da pausa.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Thread {
@@ -219,7 +255,7 @@ mod live {
                     continue;
                 }
                 let pos = if need_positions {
-                    read_thread_pos(pid, tid)?
+                    settle_pos(|| read_thread_pos(pid, tid), POS_ATTEMPTS, POS_WAIT)?
                 } else {
                     None
                 };
@@ -242,6 +278,11 @@ mod live {
     /// Se já estavam todas paradas, não envia sinal (`sent_stop() == false`). Senão envia
     /// `SIGSTOP` e espera até `cfg.stop_timeout`; no estouro retoma o alvo e devolve
     /// [`Error::PauseTimeout`]. Com `need_positions`, lê a posição de cada thread.
+    ///
+    /// Uma posição nunca sai como `Some(ThreadPos::Running)`: o `wineserver` do Proton
+    /// se anexa por ptrace às threads por instantes, e nesse intervalo o `syscall` da
+    /// thread parada diz `running`. A leitura é repetida até 50 vezes (2 ms entre elas);
+    /// se persistir, a posição é `None` (ilegível).
     pub fn pause<'a>(
         pidfd: &'a Pidfd,
         pid: i32,
@@ -337,6 +378,95 @@ mod live {
             }
         }
         Ok(pcs)
+    }
+}
+
+#[cfg(all(test, feature = "write"))]
+mod settle_tests {
+    use std::time::Duration;
+
+    use super::live::settle_pos;
+    use crate::Error;
+    use crate::procinfo::ThreadPos;
+
+    const STOPPED: ThreadPos = ThreadPos::Stopped {
+        syscall: None,
+        pc: 0x1000,
+    };
+
+    #[test]
+    fn settle_pos_retries_until_stopped() {
+        let mut seq = vec![
+            Some(ThreadPos::Running),
+            Some(ThreadPos::Running),
+            Some(ThreadPos::Running),
+            Some(STOPPED),
+        ]
+        .into_iter();
+        let mut reads = 0;
+        let got = settle_pos(
+            || {
+                reads += 1;
+                Ok(seq.next().unwrap())
+            },
+            50,
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(got, Some(STOPPED));
+        assert_eq!(reads, 4);
+    }
+
+    #[test]
+    fn settle_pos_gives_up_as_unreadable() {
+        let mut reads = 0;
+        let got = settle_pos(
+            || {
+                reads += 1;
+                Ok(Some(ThreadPos::Running))
+            },
+            50,
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(got, None);
+        assert_eq!(reads, 50);
+    }
+
+    #[test]
+    fn settle_pos_vanished_thread_stops_at_once() {
+        let mut reads = 0;
+        let got = settle_pos(
+            || {
+                reads += 1;
+                Ok(None)
+            },
+            50,
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(got, None);
+        assert_eq!(reads, 1);
+    }
+
+    #[test]
+    fn settle_pos_propagates_error() {
+        let mut reads = 0;
+        let err = settle_pos(
+            || {
+                reads += 1;
+                if reads == 2 {
+                    Err(Error::ProcessGone { pid: 7 })
+                } else {
+                    Ok(Some(ThreadPos::Running))
+                }
+            },
+            50,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::ProcessGone { pid: 7 }));
+        assert_eq!(reads, 2);
     }
 }
 
