@@ -580,4 +580,21 @@ offset = 3
             Some("Augusta-CL-3207493")
         );
     }
+
+    #[test]
+    fn every_signature_file_is_embedded() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("signatures");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".toml"))
+            .collect();
+        on_disk.sort();
+        let mut embedded: Vec<String> = EMBEDDED.iter().map(|(n, _)| n.to_string()).collect();
+        embedded.sort();
+        assert_eq!(
+            on_disk, embedded,
+            "atualize EMBEDDED com os arquivos de signatures/"
+        );
+    }
 }
