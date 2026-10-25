@@ -221,6 +221,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "gt-patch"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "gt-core",
+ "gt-grounded2",
+ "gt-testkit",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "gt-testkit"
 version = "0.1.0"
 dependencies = [

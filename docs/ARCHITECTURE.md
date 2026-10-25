@@ -65,11 +65,12 @@ grounded-trainer/
 │       └── tests/harness.rs      # sinais, pânico, SIGKILL e recuperação pelo harness
 ├── apps/
 │   ├── gt-cli/                   # ferramentas de pesquisa: inspect, read, scan, disasm, diff, dump, fling
+│   ├── gt-patch/                 # aplica/desfaz patches (list, run, toggle, restore, profile); único aplicativo com `write`
 │   └── gt-tui/                   # interface do jogador
 └── docs/
 ```
 
-**Regra de dependência:** `gt-tui`/`gt-cli` → `gt-grounded2` → `gt-ue` → `gt-core`. Nunca o contrário. `gt-core` deve servir para outro jogo sem mudanças.
+**Regra de dependência:** `gt-tui`/`gt-cli`/`gt-patch` → `gt-grounded2` → `gt-ue` → `gt-core`. Nunca o contrário. `gt-core` deve servir para outro jogo sem mudanças.
 
 ## 4. Dependências principais
 

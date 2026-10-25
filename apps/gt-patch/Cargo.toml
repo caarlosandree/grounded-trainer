@@ -1,0 +1,27 @@
+[package]
+name = "gt-patch"
+description = "Aplica e desfaz patches de bytes no Grounded 2, com diário e restauração garantida."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "gt-patch"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+gt-core = { workspace = true, features = ["write"] }
+gt-grounded2 = { workspace = true, features = ["write"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[dev-dependencies]
+gt-testkit.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

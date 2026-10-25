@@ -170,9 +170,61 @@ fn game_exe_path(maps: &[MapRegion]) -> Option<&Path> {
     })
 }
 
+/// Texto de ajuda para o erro de permissão (spec 6.10). Não sugere `sudo` como primeira opção.
+///
+/// Serve ao `gt` e ao `gt-patch`; `ptrace_scope` é o valor de `kernel.yama.ptrace_scope`, se
+/// conhecido.
+pub fn permission_hint(ptrace_scope: Option<u8>) -> String {
+    match ptrace_scope {
+        Some(0) => "kernel.yama.ptrace_scope está em 0, que já permite a leitura; confira se o \
+                    processo é de outro usuário ou se o SELinux/um container bloqueia o acesso."
+            .to_string(),
+        Some(3) => {
+            "kernel.yama.ptrace_scope está em 3, que bloqueia qualquer leitura da memória de \
+                    outro processo e só pode ser baixado reiniciando o sistema (o programa não \
+                    altera nada)."
+                .to_string()
+        }
+        Some(value) => format!(
+            "kernel.yama.ptrace_scope está em {value}, o que restringe a leitura da memória de \
+             outro processo (com 1, só descendentes do processo que lê). Confira se o programa e o \
+             jogo são do mesmo usuário; se aceitar mudar a política, baixe o valor com `sudo sysctl \
+             kernel.yama.ptrace_scope=0` (afeta o sistema todo; o programa nunca altera isso \
+             sozinho)."
+        ),
+        None => "o arquivo kernel.yama.ptrace_scope não existe (Yama ausente); a recusa vem de \
+                 outra política, como SELinux, um container ou um processo de outro usuário."
+            .to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::permission_hint;
     use crate::Error;
+
+    #[test]
+    fn permission_hint_mentions_scope_and_value_without_sudo_first() {
+        let hint = permission_hint(Some(1));
+        assert!(hint.contains("ptrace_scope"));
+        assert!(hint.contains('1'));
+        assert!(!hint.trim_start().starts_with("sudo"));
+        let sudo = hint.find("sudo");
+        let scope = hint.find("ptrace_scope").unwrap();
+        assert!(sudo.is_none_or(|s| s > scope), "{hint}");
+    }
+
+    #[test]
+    fn permission_hint_for_scope_3_says_only_a_reboot_lowers_it() {
+        let hint = permission_hint(Some(3));
+        assert!(hint.contains("reiniciando"), "{hint}");
+        assert!(!hint.contains("sysctl"), "{hint}");
+    }
+
+    #[test]
+    fn permission_hint_without_yama_says_so() {
+        assert!(permission_hint(None).contains("Yama ausente"));
+    }
 
     #[test]
     fn many_candidates_lists_pids_and_mentions_pid_flag() {
