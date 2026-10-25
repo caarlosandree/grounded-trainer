@@ -138,3 +138,36 @@ fn writer_to_dead_process_is_gone() {
         Err(gt_core::Error::ProcessGone { .. })
     ));
 }
+
+#[test]
+fn scan_memory_finds_marker_once() {
+    use gt_core::memscan::{Verdict, scan_memory};
+    let t = TestTarget::spawn();
+    let maps = gt_core::maps::read_maps(t.pid).unwrap();
+    let region = maps
+        .iter()
+        .find(|r| r.start <= t.marker && t.marker < r.end)
+        .unwrap();
+    let pat = gt_core::scan::Pattern::parse(&hex_with_spaces(&marker_bytes())).unwrap();
+    let range = region.start..region.end;
+    let scans = scan_memory(&MemReader::new(t.pid), std::slice::from_ref(&range), &[pat]).unwrap();
+    assert_eq!(scans.len(), 1);
+    assert_eq!(scans[0].hits, vec![t.marker]);
+    assert_eq!(scans[0].verdict, Verdict::Unique);
+}
+
+#[test]
+fn scan_memory_skips_hole() {
+    use gt_core::memscan::scan_memory;
+    let t = TestTarget::spawn();
+    // As páginas 0 e 2 ficam sem zeros; só a lacuna (página 1, PROT_NONE) "tem" zeros.
+    let writer = MemWriter::open(t.pid).unwrap();
+    let fill = vec![0xAAu8; t.page as usize];
+    writer.write(t.region_start, &fill).unwrap();
+    writer.write(t.region_start + 2 * t.page, &fill).unwrap();
+    let pat = gt_core::scan::Pattern::parse("00 00 00 00").unwrap();
+    let range = t.region_start..t.region_start + 3 * t.page;
+    let scans = scan_memory(&MemReader::new(t.pid), std::slice::from_ref(&range), &[pat]).unwrap();
+    assert!(scans[0].hits.is_empty(), "{:?}", scans[0].hits);
+    assert_eq!(scans[0].unreadable_bytes, t.page);
+}

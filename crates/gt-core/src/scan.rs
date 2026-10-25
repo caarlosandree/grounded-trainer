@@ -78,25 +78,41 @@ pub fn find_all(haystack: &[u8], pattern: &Pattern) -> Vec<usize> {
 
 /// Busca `pattern` em `[0, total_len)` lendo a memória em blocos de até `chunk` bytes.
 ///
-/// Os blocos se sobrepõem em `pattern.len() - 1` bytes, então uma ocorrência que cruza a
-/// fronteira entre dois blocos é encontrada. Cada ocorrência é reportada uma única vez.
-/// Os offsets saem em ordem crescente e sem duplicatas. `chunk` menor ou igual ao tamanho do
-/// padrão é ajustado para `pattern.len() + 1`, para que cada bloco avance pelo menos um byte.
-///
-/// `read(offset, buf)` preenche `buf` com os bytes a partir de `offset`. Erros do `read`
-/// são devolvidos sem alteração.
+/// Invólucro de [`scan_chunked_many`] para um único padrão; veja lá a semântica dos blocos.
 pub fn scan_chunked(
     total_len: u64,
     chunk: usize,
     pattern: &Pattern,
-    mut read: impl FnMut(u64, &mut [u8]) -> Result<()>,
+    read: impl FnMut(u64, &mut [u8]) -> Result<()>,
 ) -> Result<Vec<u64>> {
-    let plen = pattern.len();
-    let chunk = chunk.max(plen + 1);
+    let mut all = scan_chunked_many(total_len, chunk, std::slice::from_ref(pattern), read)?;
+    Ok(all.pop().unwrap_or_default())
+}
+
+/// Busca vários padrões em `[0, total_len)` numa única passada, em blocos de até `chunk` bytes.
+///
+/// Devolve um vetor de ocorrências por padrão, na ordem de `patterns`. Os blocos se sobrepõem em
+/// `max_len - 1` bytes (`max_len` é o tamanho do maior padrão), então uma ocorrência que cruza a
+/// fronteira entre dois blocos é encontrada. Cada ocorrência é reportada uma única vez, em ordem
+/// crescente e sem duplicatas. `chunk` menor ou igual ao maior padrão é ajustado para
+/// `max_len + 1`, para que cada bloco avance pelo menos um byte. Sem padrões, nada é lido.
+///
+/// `read(offset, buf)` preenche `buf` com os bytes a partir de `offset`. Erros do `read`
+/// são devolvidos sem alteração.
+pub fn scan_chunked_many(
+    total_len: u64,
+    chunk: usize,
+    patterns: &[Pattern],
+    mut read: impl FnMut(u64, &mut [u8]) -> Result<()>,
+) -> Result<Vec<Vec<u64>>> {
+    let mut hits: Vec<Vec<u64>> = vec![Vec::new(); patterns.len()];
+    let Some(max_len) = patterns.iter().map(Pattern::len).max() else {
+        return Ok(hits);
+    };
+    let chunk = chunk.max(max_len + 1);
     // Cada bloco "é dono" dos offsets em [start, start + step). A sobreposição garante que
-    // qualquer ocorrência desse intervalo cabe inteira no bloco.
-    let step = (chunk - (plen - 1)) as u64;
-    let mut hits = Vec::new();
+    // qualquer ocorrência desse intervalo, de qualquer padrão, cabe inteira no bloco.
+    let step = (chunk - (max_len - 1)) as u64;
     let mut buf = vec![0u8; chunk.min(usize::try_from(total_len).unwrap_or(usize::MAX))];
     let mut start = 0u64;
     while start < total_len {
@@ -105,10 +121,12 @@ pub fn scan_chunked(
         read(start, window)?;
         let is_last = start + step >= total_len;
         let owned_end = if is_last { u64::MAX } else { start + step };
-        for at in find_all(window, pattern) {
-            let absolute = start + at as u64;
-            if absolute < owned_end {
-                hits.push(absolute);
+        for (pattern, found) in patterns.iter().zip(&mut hits) {
+            for at in find_all(window, pattern) {
+                let absolute = start + at as u64;
+                if absolute < owned_end {
+                    found.push(absolute);
+                }
             }
         }
         if is_last {
@@ -233,6 +251,42 @@ mod tests {
             .unwrap();
             assert_eq!(hits, whole, "chunk {chunk}");
         }
+    }
+
+    #[test]
+    fn many_patterns_share_one_pass() {
+        // Padrões de 3 e 7 bytes, com ocorrências em volta das fronteiras de blocos de 16 bytes.
+        let mut data = vec![0u8; 80];
+        for at in [0usize, 13, 14, 29, 40, 70] {
+            data[at..at + 3].copy_from_slice(&[0xAA, 0xBB, 0xCC]);
+        }
+        for at in [9usize, 25, 33, 60] {
+            data[at..at + 7].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7]);
+        }
+        let patterns = [
+            Pattern::parse("AA BB CC").unwrap(),
+            Pattern::parse("01 02 03 04 05 06 07").unwrap(),
+        ];
+        let many = scan_chunked_many(data.len() as u64, 16, &patterns, |off, buf| {
+            buf.copy_from_slice(&data[off as usize..off as usize + buf.len()]);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(many.len(), 2);
+        for (pattern, hits) in patterns.iter().zip(&many) {
+            let whole: Vec<u64> = find_all(&data, pattern)
+                .into_iter()
+                .map(|at| at as u64)
+                .collect();
+            assert!(!whole.is_empty());
+            assert_eq!(hits, &whole);
+        }
+    }
+
+    #[test]
+    fn many_without_patterns_reads_nothing() {
+        let result = scan_chunked_many(100, 16, &[], |_, _| panic!("não deveria ler"));
+        assert_eq!(result.unwrap(), Vec::<Vec<u64>>::new());
     }
 
     #[test]
