@@ -101,7 +101,7 @@ apps/gt-cli/
     - `pub fn parse_maps(text: &str) -> Result<Vec<MapRegion>>`
     - `pub fn read_maps(pid: i32) -> Result<Vec<MapRegion>>`
 
-- [ ] **Passo 1: Adicionar deps e fixtures**
+- [x] **Passo 1: Adicionar deps e fixtures**
 
 No `[workspace.dependencies]` da raiz: `serde_json = "1.0.154"`, `libc = "0.2.191"`, `tempfile = "3.27.0"`; trocar `nix = "0.31.3"` por `nix = { version = "0.31.3", features = ["uio", "process"] }`. Atualizar a tabela 4 do `ARCHITECTURE.md` com as três crates novas e o motivo de cada uma.
 
@@ -109,7 +109,7 @@ Criar `clippy.toml` na raiz com `allow-unwrap-in-tests = true`, `allow-expect-in
 
 As fixtures capturadas em 2026-10-24 (já com o usuário trocado por `user`) **já estão no repositório**, ainda não commitadas: `crates/gt-core/tests/fixtures/game-maps.txt`, `crates/gt-core/tests/fixtures/cmdline/{game,launcher,steam-exe,proton,reaper}.bin` e `crates/gt-grounded2/tests/fixtures/symbols.ini`. Esta tarefa as inclui no commit. Conferir com `command grep -rac caarlosandree crates/*/tests/fixtures` (esperado: 0 em todas; o `-a` é necessário para os `.bin`). Commits que mudam dependências incluem o `Cargo.lock`.
 
-- [ ] **Passo 2: Escrever os testes que falham** (em `maps.rs`, `#[cfg(test)]`)
+- [x] **Passo 2: Escrever os testes que falham** (em `maps.rs`, `#[cfg(test)]`)
 
 ```rust
 const REAL: &str = include_str!("../tests/fixtures/game-maps.txt");
@@ -155,15 +155,15 @@ fn rejects_garbage_line() {
 }
 ```
 
-- [ ] **Passo 3: Rodar e ver falhar** — `cargo test -p gt-core maps` → falha de compilação (`parse_maps` não existe).
+- [x] **Passo 3: Rodar e ver falhar** — `cargo test -p gt-core maps` → falha de compilação (`parse_maps` não existe).
 
-- [ ] **Passo 4: Implementar `error.rs` e `maps.rs`**
+- [x] **Passo 4: Implementar `error.rs` e `maps.rs`**
 
 O caminho é tudo o que vem depois da 5ª coluna, preservando espaços internos. O sufixo ` (deleted)` vira `deleted: true`. `read_maps` lê `/proc/<pid>/maps` como bytes e converte com `from_utf8_lossy`; `ENOENT`/`ESRCH` → `ProcessGone`; arquivo **vazio** também → `ProcessGone` (é o que um processo zumbi devolve, verificado); `EACCES`/`EPERM` → `PermissionDenied`.
 
-- [ ] **Passo 5: Rodar e ver passar** — `cargo test -p gt-core maps` → 4 testes ok; depois a validação global.
+- [x] **Passo 5: Rodar e ver passar** — `cargo test -p gt-core maps` → 4 testes ok; depois a validação global.
 
-- [ ] **Passo 6: Commit** — `feat(core): parse de /proc/<pid>/maps e erro comum`
+- [x] **Passo 6: Commit** — `feat(core): parse de /proc/<pid>/maps e erro comum`
 
 ---
 
@@ -178,7 +178,7 @@ O caminho é tudo o que vem depois da 5ª coluna, preservando espaços internos.
   - `pub fn parse_size(input: &str) -> Result<u64>` (decimal, ou hex com `0x`)
   - `impl AddrSpec { pub fn resolve(&self, base_of: impl Fn(Option<&str>) -> Result<u64>) -> Result<u64> }`. Soma com `checked_add`; overflow → `BadAddress`.
 
-- [ ] **Passo 1: Testes que falham**
+- [x] **Passo 1: Testes que falham**
 
 ```rust
 #[test] fn absolute_with_and_without_prefix() {
@@ -209,10 +209,10 @@ O caminho é tudo o que vem depois da 5ª coluna, preservando espaços internos.
 }
 ```
 
-- [ ] **Passo 2:** `cargo test -p gt-core addr` → falha.
-- [ ] **Passo 3: Implementar.** O separador `+` é o último `+` da string (nomes de módulo não têm `+`). `resolve` chama `base_of(module)` só para `ModuleOffset`.
-- [ ] **Passo 4:** `cargo test -p gt-core addr` → ok; validação global.
-- [ ] **Passo 5: Commit** — `feat(core): parse de endereços e tamanhos`
+- [x] **Passo 2:** `cargo test -p gt-core addr` → falha.
+- [x] **Passo 3: Implementar.** O separador `+` é o último `+` da string (nomes de módulo não têm `+`). `resolve` chama `base_of(module)` só para `ModuleOffset`.
+- [x] **Passo 4:** `cargo test -p gt-core addr` → ok; validação global.
+- [x] **Passo 5: Commit** — `feat(core): parse de endereços e tamanhos`
 
 ---
 
@@ -227,7 +227,7 @@ O caminho é tudo o que vem depois da 5ª coluna, preservando espaços internos.
   - `pub fn scan_chunked(total_len: u64, chunk: usize, pattern: &Pattern, read: impl FnMut(u64, &mut [u8]) -> Result<()>) -> Result<Vec<u64>>`. Lê `[0, total_len)` em blocos sobrepostos por `pattern.len() - 1` bytes e devolve offsets sem duplicatas.
   - `pub enum Uniqueness { None, Unique(u64), Many(usize) }` com `pub fn from_hits(hits: &[u64]) -> Uniqueness`.
 
-- [ ] **Passo 1: Testes que falham**
+- [x] **Passo 1: Testes que falham**
 
 ```rust
 #[test] fn parses_wildcards() {
@@ -262,10 +262,10 @@ O caminho é tudo o que vem depois da 5ª coluna, preservando espaços internos.
 }
 ```
 
-- [ ] **Passo 2:** `cargo test -p gt-core scan` → falha.
-- [ ] **Passo 3: Implementar.** Busca ingênua com máscara; se ficar lento, ancore no primeiro byte fixo com `iter().position`. Pré-condição documentada de `scan_chunked`: `chunk > pattern.len()`. O `Vec` de ocorrências não tem limite (padrões curtos como `00` podem gerar milhões); a exibição é que é limitada no `gt scan`. Desempenho-alvo: a `.text` (128 MB) em menos de 5 s em release.
-- [ ] **Passo 4:** `cargo test -p gt-core scan` → ok; validação global.
-- [ ] **Passo 5: Commit** — `feat(core): padrões AOB com curingas e busca em blocos`
+- [x] **Passo 2:** `cargo test -p gt-core scan` → falha.
+- [x] **Passo 3: Implementar.** Busca ingênua com máscara; se ficar lento, ancore no primeiro byte fixo com `iter().position`. Pré-condição documentada de `scan_chunked`: `chunk > pattern.len()`. O `Vec` de ocorrências não tem limite (padrões curtos como `00` podem gerar milhões); a exibição é que é limitada no `gt scan`. Desempenho-alvo: a `.text` (128 MB) em menos de 5 s em release.
+- [x] **Passo 4:** `cargo test -p gt-core scan` → ok; validação global.
+- [x] **Passo 5: Commit** — `feat(core): padrões AOB com curingas e busca em blocos`
 
 ---
 
@@ -288,7 +288,7 @@ O caminho é tudo o que vem depois da 5ª coluna, preservando espaços internos.
     - `pub fn product_version(&self) -> Option<String>`: `goblin::pe::PE::parse_with_opts` **sobre a imagem em layout de RVA**, com `let mut o = ParseOptions::default(); o.resolve_rva = false; o.parse_imports = false; o.parse_attribute_certificates = false;` (`ParseOptions` é `#[non_exhaustive]`; com `resolve_rva = true` o parse falha em "cannot map tls callback", verificado no exe real) → `resource_data.version_info` → string `ProductVersion`.
   - `pub fn check_same_version(memory: &PeHeaders, disk: &PeHeaders) -> Result<()>`: compara `time_date_stamp` e `size_of_image`; diferente → `VersionMismatch` com as duas chaves.
 
-- [ ] **Passo 1: Testes que falham** (bytes sintéticos montados por um helper de teste `fake_pe(sections: &[FakeSection], image_base: u64, time_date_stamp: u32, size_of_image: u32, reloc_dir: Option<(u32, u32)>) -> Vec<u8>` que escreve um **arquivo** PE32+ mínimo: DOS header, `PE\0\0`, COFF, optional header com 16 data directories (o índice 5, base relocation, recebe `reloc_dir` = `(rva, tamanho)`), tabela de seções e o conteúdo bruto de cada seção. `struct FakeSection { name: &'static str, rva: u32, vsize: u32, characteristics: u32, data: Vec<u8> }`; `raw_size = data.len()`. Helpers de teste também a escrever: `sec(name, rva, vsize, characteristics, data_len) -> FakeSection` (dados zerados), `text_with_ptr() -> FakeSection` (`.text` em `0x1000`, `u64` `0x140002000` no offset `0x10`), `reloc_block() -> FakeSection` (`.reloc` em `0x2000` com o bloco descrito no teste) e `u64_at(&DiskImage, rva) -> u64`)
+- [x] **Passo 1: Testes que falham** (bytes sintéticos montados por um helper de teste `fake_pe(sections: &[FakeSection], image_base: u64, time_date_stamp: u32, size_of_image: u32, reloc_dir: Option<(u32, u32)>) -> Vec<u8>` que escreve um **arquivo** PE32+ mínimo: DOS header, `PE\0\0`, COFF, optional header com 16 data directories (o índice 5, base relocation, recebe `reloc_dir` = `(rva, tamanho)`), tabela de seções e o conteúdo bruto de cada seção. `struct FakeSection { name: &'static str, rva: u32, vsize: u32, characteristics: u32, data: Vec<u8> }`; `raw_size = data.len()`. Helpers de teste também a escrever: `sec(name, rva, vsize, characteristics, data_len) -> FakeSection` (dados zerados), `text_with_ptr() -> FakeSection` (`.text` em `0x1000`, `u64` `0x140002000` no offset `0x10`), `reloc_block() -> FakeSection` (`.reloc` em `0x2000` com o bloco descrito no teste) e `u64_at(&DiskImage, rva) -> u64`)
 
 ```rust
 #[test] fn parses_headers_and_sections() {
@@ -331,10 +331,10 @@ fn real_exe_on_disk() {
 ```
 (`dirs_home()` = `PathBuf::from(std::env::var_os("HOME").unwrap())` no próprio teste.)
 
-- [ ] **Passo 2:** `cargo test -p gt-core pe` → falha.
-- [ ] **Passo 3: Implementar** com as assinaturas acima. `DiskImage::load` lê o arquivo inteiro (≈180 MB) uma vez; alocação aceitável para o `diff`.
-- [ ] **Passo 4:** `cargo test -p gt-core pe` → ok; `cargo test -p gt-core pe -- --ignored` → `real_exe_on_disk` ok (não precisa do jogo aberto). Se o build mudou, registre a nova chave em `RESEARCH.md` e ajuste o teste.
-- [ ] **Passo 5: Commit** — `feat(core): cabeçalho PE, imagem em disco, realocações e versão`
+- [x] **Passo 2:** `cargo test -p gt-core pe` → falha.
+- [x] **Passo 3: Implementar** com as assinaturas acima. `DiskImage::load` lê o arquivo inteiro (≈180 MB) uma vez; alocação aceitável para o `diff`.
+- [x] **Passo 4:** `cargo test -p gt-core pe` → ok; `cargo test -p gt-core pe -- --ignored` → `real_exe_on_disk` ok (não precisa do jogo aberto). Se o build mudou, registre a nova chave em `RESEARCH.md` e ajuste o teste.
+- [x] **Passo 5: Commit** — `feat(core): cabeçalho PE, imagem em disco, realocações e versão`
 
 ---
 
@@ -356,7 +356,7 @@ fn real_exe_on_disk() {
   - Alvo `gt-testtarget`: chama `allow_any_tracer()`, monta em tempo de execução um marcador de 32 bytes num `Box<[u8]>` (bytes `0xA5 ^ i` para i em 0..32, para o literal não existir em `.rodata`), cria `exec_page(0xCC)` e `guarded_pages()`, passa o marcador por `std::hint::black_box`, imprime com `writeln!` **uma** linha JSON em stdout (`{"pid":..,"marker":"0x..","marker_len":32,"exec_page":"0x..","region_start":"0x.."}`), dá flush e espera até o stdin fechar.
   - `tests/support/mod.rs`: `pub struct TestTarget { pub child: Child, pub pid: i32, pub marker: u64, pub exec_page: u64, pub region_start: u64 }` (a página ilegível é `region_start + 4096`) com `pub fn spawn() -> TestTarget` (usa `env!("CARGO_BIN_EXE_gt-testtarget")` com `stdin` e `stdout` em `Stdio::piped()`, lê a linha JSON e guarda o `stdin` aberto) e `Drop` que mata e aguarda o filho; `pub fn marker_bytes() -> [u8; 32]`; `pub fn hex_with_spaces(bytes: &[u8]) -> String` (ex. `"A5 A4 ..."`). O nome evita confusão com `context::Target` do binário. O arquivo começa com `#![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]`, porque cada teste compila o `support` separado e nem todos usam tudo.
 
-- [ ] **Passo 1: Testes que falham** (`apps/gt-cli/tests/core_live.rs`)
+- [x] **Passo 1: Testes que falham** (`apps/gt-cli/tests/core_live.rs`)
 
 ```rust
 mod support;
@@ -411,10 +411,10 @@ use gt_core::mem::{MemReader, MemWriter};
 }
 ```
 
-- [ ] **Passo 2:** `cargo test -p gt-cli --test core_live` → falha de compilação.
-- [ ] **Passo 3: Implementar** `mem/`, `gt-testtarget` e `tests/support`. Crie `crates/gt-core/src/process.rs` com o stub `pub fn ptrace_scope() -> Option<u8> { None }` (a Tarefa 6 o completa). Deixe `main.rs` do `gt` ainda vazio (`fn main() {}`).
-- [ ] **Passo 4:** `cargo test -p gt-cli --test core_live` → 6 ok. `cargo build -p gt-cli` isolado → compila. Validação global.
-- [ ] **Passo 5: Commit** — `feat(core): leitura de memória, escrita crua e processo-alvo de teste`
+- [x] **Passo 2:** `cargo test -p gt-cli --test core_live` → falha de compilação.
+- [x] **Passo 3: Implementar** `mem/`, `gt-testtarget` e `tests/support`. Crie `crates/gt-core/src/process.rs` com o stub `pub fn ptrace_scope() -> Option<u8> { None }` (a Tarefa 6 o completa). Deixe `main.rs` do `gt` ainda vazio (`fn main() {}`).
+- [x] **Passo 4:** `cargo test -p gt-cli --test core_live` → 6 ok. `cargo build -p gt-cli` isolado → compila. Validação global.
+- [x] **Passo 5: Commit** — `feat(core): leitura de memória, escrita crua e processo-alvo de teste`
 
 ---
 
@@ -432,7 +432,7 @@ use gt_core::mem::{MemReader, MemWriter};
     - `pub enum Pick { One(i32), None, Many(Vec<i32>) }`
     - `pub fn pick(procs: &[(i32, Vec<String>)]) -> (Pick, Vec<(i32, String)>)`: devolve a escolha (entre os que passam em `is_game`) e os descartados, que são **só** os processos com `mentions_game` e sem `is_game`, cada um com o `args[0]` como motivo.
 
-- [ ] **Passo 1: Testes que falham** (`target.rs`, com as fixtures de `crates/gt-core/tests/fixtures/cmdline/` via `include_bytes!("../../gt-core/tests/fixtures/cmdline/game.bin")`)
+- [x] **Passo 1: Testes que falham** (`target.rs`, com as fixtures de `crates/gt-core/tests/fixtures/cmdline/` via `include_bytes!("../../gt-core/tests/fixtures/cmdline/game.bin")`)
 
 ```rust
 #[test] fn real_cmdlines() {
@@ -457,10 +457,10 @@ use gt_core::mem::{MemReader, MemWriter};
 ```
 E em `gt_core::process`: `parse_cmdline(b"a\0b\0\0\0") == ["a", "b"]`.
 
-- [ ] **Passo 2:** `cargo test -p gt-core -p gt-grounded2` → falha de compilação.
-- [ ] **Passo 3: Implementar.**
-- [ ] **Passo 4:** testes ok; validação global.
-- [ ] **Passo 5: Commit** — `feat: localizar o processo do jogo pelo cmdline`
+- [x] **Passo 2:** `cargo test -p gt-core -p gt-grounded2` → falha de compilação.
+- [x] **Passo 3: Implementar.**
+- [x] **Passo 4:** testes ok; validação global.
+- [x] **Passo 5: Commit** — `feat: localizar o processo do jogo pelo cmdline`
 
 ---
 
@@ -481,7 +481,7 @@ E em `gt_core::process`: `parse_cmdline(b"a\0b\0\0\0") == ["a", "b"]`.
   - `gt_core::guard`: `pub fn check(maps: &[MapRegion], modules: &[Module], addr: u64, len: u64) -> Result<()>`. Para cada byte do intervalo em região `exec`: se cair num módulo com `trusted == false`, ou se a região for anônima e o byte não cair em nenhum módulo `trusted`, devolve `ThirdPartyCode { addr: <primeiro byte bloqueado> }`. Região não executável, `[vdso]`/`[vsyscall]` e arquivo não PE passam. O cálculo é por intervalos (sem iterar byte a byte). Um intervalo que toca região não mapeada não é problema da guarda (a leitura trata).
   - `gt_grounded2::trust::policy(game_exe: &Path, home: &Path) -> TrustPolicy`: lista da spec 6.1. A biblioteca do jogo é o prefixo de `game_exe` até o componente `steamapps` inclusive, mais `home/.local/share/Steam/steamapps`. Em cada biblioteca, `common/Grounded2`, e cada entrada de `common/` que comece com `Proton` ou `SteamLinuxRuntime`, via `read_dir`, ignorando erros. Também `home/.local/share/Steam/compatibilitytools.d`. No prefixo `<biblioteca do jogo>/compatdata/2661300/pfx/drive_c/`: `windows`, `Program Files (x86)/Steam` e `Program Files/Steam`.
 
-- [ ] **Passo 1: Testes que falham** (`guard.rs`, com mapas e módulos sintéticos montados à mão)
+- [x] **Passo 1: Testes que falham** (`guard.rs`, com mapas e módulos sintéticos montados à mão)
 
 ```rust
 // módulo confiável M: [0x140000000, 0x14b27c000); módulo de terceiros T: [0x180000000, 0x180100000)
@@ -508,10 +508,10 @@ E em `modules.rs` / `trust.rs`:
 #[test] fn require_trusted_rejects_third_party() { /* Module{trusted:false} → Err(ThirdPartyCode{addr: base}); trusted → Ok */ }
 ```
 
-- [ ] **Passo 2:** `cargo test -p gt-core -p gt-grounded2` → falha de compilação.
-- [ ] **Passo 3: Implementar.**
-- [ ] **Passo 4:** testes ok; validação global.
-- [ ] **Passo 5: Commit** — `feat: módulos, política de confiança e guarda contra código de terceiros`
+- [x] **Passo 2:** `cargo test -p gt-core -p gt-grounded2` → falha de compilação.
+- [x] **Passo 3: Implementar.**
+- [x] **Passo 4:** testes ok; validação global.
+- [x] **Passo 5: Commit** — `feat: módulos, política de confiança e guarda contra código de terceiros`
 
 ---
 
@@ -529,7 +529,7 @@ E em `modules.rs` / `trust.rs`:
     - `pub fn disassemble_around(bytes: &[u8], base: u64, start: u64, end: u64, context: usize) -> Vec<Insn>`: tenta começar em `start - 64 + k` (limitado ao início de `bytes`), com `k` de 0 a 15, e usa o primeiro `k` cuja decodificação chegue **exatamente** em `start` sem instrução inválida (se nenhum servir, começa em `start`) e devolve até `context` instruções antes, o trecho e `context` depois.
   - `gt_core::diff::group(a: &[u8], b: &[u8], gap: usize) -> Vec<std::ops::Range<usize>>`: trechos onde `a != b`; duas diferenças nos índices `i < j` ficam no mesmo trecho se `j - i < gap` (spec: "a menos de 16 bytes"); `a.len() == b.len()` é pré-condição (assert documentado).
 
-- [ ] **Passo 1: Testes que falham**
+- [x] **Passo 1: Testes que falham**
 
 ```rust
 // bytes de RESEARCH.md, +57BD6D0 (FLiNG): e9 4b 29 ac 86 0f 1f 00 em ip 0x1457BD6D0
@@ -563,10 +563,10 @@ E em `modules.rs` / `trust.rs`:
 #[test] fn around_aligns_to_start() { /* sequência de 10 `nop` de 1 byte + alvo: disassemble_around(..., context=3) começa 3 instruções antes de start */ }
 ```
 
-- [ ] **Passo 2:** `cargo test -p gt-core` → falha de compilação.
-- [ ] **Passo 3: Implementar.**
-- [ ] **Passo 4:** testes ok; validação global.
-- [ ] **Passo 5: Commit** — `feat(core): desmontagem, destino de desvios e agrupamento de diferenças`
+- [x] **Passo 2:** `cargo test -p gt-core` → falha de compilação.
+- [x] **Passo 3: Implementar.**
+- [x] **Passo 4:** testes ok; validação global.
+- [x] **Passo 5: Commit** — `feat(core): desmontagem, destino de desvios e agrupamento de diferenças`
 
 ---
 
@@ -584,7 +584,7 @@ E em `modules.rs` / `trust.rs`:
   - `pub const CHANGE_WINDOW: usize = 16;` e `pub fn is_changed(memory: &[u8], disk: &[u8]) -> bool` (compara os primeiros `CHANGE_WINDOW` bytes).
   - `pub enum FlingError` (thiserror, pt-BR): `NotUtf16`, `BadLine { line: usize, text: String }`, `NoMatchingVersion { .. }`, `Io(std::io::Error)`.
 
-- [ ] **Passo 1: Testes que falham**
+- [x] **Passo 1: Testes que falham**
 
 ```rust
 const REAL: &[u8] = include_bytes!("../tests/fixtures/symbols.ini");
@@ -611,10 +611,10 @@ const REAL: &[u8] = include_bytes!("../tests/fixtures/symbols.ini");
 ```
 (`tempfile` como dev-dependency do `gt-grounded2`.)
 
-- [ ] **Passo 2:** `cargo test -p gt-grounded2 fling` → falha.
-- [ ] **Passo 3: Implementar.** Registrar o formato em `RESEARCH.md`, se ainda faltar algum detalhe (já há uma entrada de 2026-10-24).
-- [ ] **Passo 4:** testes ok; validação global.
-- [ ] **Passo 5: Commit** — `feat(grounded2): leitura do symbols.ini do FLiNG`
+- [x] **Passo 2:** `cargo test -p gt-grounded2 fling` → falha.
+- [x] **Passo 3: Implementar.** Registrar o formato em `RESEARCH.md`, se ainda faltar algum detalhe (já há uma entrada de 2026-10-24).
+- [x] **Passo 4:** testes ok; validação global.
+- [x] **Passo 5: Commit** — `feat(grounded2): leitura do symbols.ini do FLiNG`
 
 ---
 
@@ -638,7 +638,7 @@ const REAL: &[u8] = include_bytes!("../tests/fixtures/symbols.ini");
   - `inspect`: campos da spec 6.3. JSON: `{pid, discarded:[{pid,reason}], module:{name,path,base,image_base,size_of_image}, version_key, product_version, sections:[{name,address,virtual_size,raw_size,perms}], ptrace_scope, memory_readable}`. O `product_version` vem de `ctx.open_disk(..)?.product_version()`; se qualquer passo falhar, `null`/"indisponível" (o `inspect` não falha por isso).
   - `read`: limite de 1 MiB; `guard::check` antes de ler; `read_lossy`. JSON: `{address, label, size, bytes_hex, holes:[{start,end}]}`.
 
-- [ ] **Passo 1: Testes que falham** (`tests/cli.rs`, rodando `env!("CARGO_BIN_EXE_gt")` com `--pid <alvo> --module gt-testtarget`)
+- [x] **Passo 1: Testes que falham** (`tests/cli.rs`, rodando `env!("CARGO_BIN_EXE_gt")` com `--pid <alvo> --module gt-testtarget`)
 
 ```rust
 #[test] fn read_shows_marker()                    { /* gt --json read <marker> 32 → bytes_hex == marker */ }
@@ -657,10 +657,10 @@ E unitários das mensagens (funções puras de formatação em `main.rs`/`output
 
 E unitários em `output.rs`: `hexdump(0x1000, &[0x41; 20], &[])` tem 2 linhas, a primeira `0x0000000000001000  41 41 ... |AAAAAAAAAAAAAAAA|`, e as lacunas aparecem como `??`.
 
-- [ ] **Passo 2:** `cargo test -p gt-cli --test cli` → falha.
-- [ ] **Passo 3: Implementar.** Logs: `tracing_subscriber` em stderr com `EnvFilter` de `RUST_LOG` (padrão `warn`).
-- [ ] **Passo 4:** `cargo test -p gt-cli` (inclui os unitários do binário) ok; `cargo build -p gt-cli` isolado; validação global.
-- [ ] **Passo 5: Commit** — `feat(cli): gt inspect e gt read`
+- [x] **Passo 2:** `cargo test -p gt-cli --test cli` → falha.
+- [x] **Passo 3: Implementar.** Logs: `tracing_subscriber` em stderr com `EnvFilter` de `RUST_LOG` (padrão `warn`).
+- [x] **Passo 4:** `cargo test -p gt-cli` (inclui os unitários do binário) ok; `cargo build -p gt-cli` isolado; validação global.
+- [x] **Passo 5: Commit** — `feat(cli): gt inspect e gt read`
 
 ---
 
@@ -675,7 +675,7 @@ E unitários em `output.rs`: `hexdump(0x1000, &[0x41; 20], &[])` tem 2 linhas, a
   - `disasm <ENDERECO> [-n N=20]`: `N` até 10000 (acima → erro "contagem acima do limite de 10000"); lê `N*15` bytes (com `checked_mul`) com `read_lossy` (após `guard::check` do intervalo) e desmonta; cada linha `label  bytes  texto`, mais `→ label(target)` quando `target` cair num módulo conhecido. JSON: `{instructions:[{address,label,bytes_hex,text,target,target_label}]}`.
   - `dump (<SECAO> | <ENDERECO> <TAMANHO>) [-o ARQUIVO] [--force]`: com dois argumentos posicionais é intervalo; com um, é nome de seção. Os diretórios de destino são criados (`create_dir_all`). Seção → `[base+rva, +virtual_size)`; intervalo limitado a 1 GiB. `guard::check` antes; lê com `read_lossy`. Destino padrão `scratch/dumps/<version_key | pid<PID>>/<nome>.bin` (relativo ao diretório atual; `<nome>` = seção sem ponto, ou o endereço inicial como `{:x}`, minúsculo, sem `0x` e sem zeros à esquerda), com o `.json` ao lado (`{base, start, size, version_key, holes}`). Com `-o X.bin`, o `.json` é `X.json` (troca a extensão). Arquivo existente (`.bin` ou `.json`) sem `--force` → erro. A seção executável de módulo não confiável é recusada por `require_trusted`.
 
-- [ ] **Passo 1: Testes que falham** (`tests/cli.rs`)
+- [x] **Passo 1: Testes que falham** (`tests/cli.rs`)
 
 ```rust
 #[test] fn disasm_on_exec_page_is_blocked() { /* != 0, "bloqueado pela regra do projeto" */ }
@@ -689,10 +689,10 @@ E unitários em `output.rs`: `hexdump(0x1000, &[0x41; 20], &[])` tem 2 linhas, a
 #[test] fn dump_hole_writes_zeros_and_lists_hole() { /* dump <region_start> 12288 -o <tmp>/h.bin → bytes 4096..8192 zerados; h.json "holes" == [{"start": "0x<region_start+4096>", "end": "0x<region_start+8192>"}] */ }
 ```
 
-- [ ] **Passo 2:** `cargo test -p gt-cli --test cli` → os novos falham.
-- [ ] **Passo 3: Implementar.**
-- [ ] **Passo 4:** testes ok; validação global.
-- [ ] **Passo 5: Commit** — `feat(cli): gt scan, gt disasm e gt dump`
+- [x] **Passo 2:** `cargo test -p gt-cli --test cli` → os novos falham.
+- [x] **Passo 3: Implementar.**
+- [x] **Passo 4:** testes ok; validação global.
+- [x] **Passo 5: Commit** — `feat(cli): gt scan, gt disasm e gt dump`
 
 ---
 
@@ -709,7 +709,7 @@ E unitários em `output.rs`: `hexdump(0x1000, &[0x41; 20], &[])` tem 2 linhas, a
   - `diff [--section NOME]`: padrão = seções executáveis do módulo (`--module`); `require_trusted` antes. Fora das seções executáveis, imprime primeiro o aviso da spec 6.7. Lê a seção da memória (`read_lossy`; lacunas entram como diferença marcada "ilegível") e compara com `DiskImage::bytes`, usando `group(.., 16)`. Para cada trecho: `label`, tamanho, bytes originais × atuais, `disassemble_around` dos dois lados (`context = 3`) e, se `branch_at` no início do trecho atual, o destino classificado. No fim, o total, ou "nenhuma alteração". JSON: `{section, chunks:[{address,label,len,original_hex,current_hex,original_asm:[..],current_asm:[..],branch:{target,destination}}], total}`.
   - `fling [--steam-library DIR] [--ini ARQUIVO]`: o padrão da biblioteca é `$HOME/.local/share/Steam/steamapps`. `locate_ini` pelo `time_date_stamp` da memória, ou `--ini` com aviso se `ini_version_mismatch`. Para cada símbolo: resolve `módulo+offset` pelo nome de módulo que vem do próprio `.ini` (não pelo `--module`), compara `CHANGE_WINDOW` bytes memória × disco (`is_changed`), desmonta 3 instruções do código atual (se o endereço passar no `guard::check`) e, se alterado, mostra o destino via `classify_branch`. O texto termina com a nota: "original = sem alteração nos 16 bytes a partir do endereço". JSON: `{ini, symbols:[{name,address,label,state,asm:[..],branch}]}`.
 
-- [ ] **Passo 1: Testes que falham.** De CLI, sem o jogo:
+- [x] **Passo 1: Testes que falham.** De CLI, sem o jogo:
 
 ```rust
 #[test] fn diff_on_elf_says_not_pe()  { /* != 0, "não é uma imagem PE" */ }
@@ -734,10 +734,10 @@ Unitários das funções puras de `compare.rs`:
 ```
 (`Module` deriva `Default`; `game_module()` = `Module { name: "Grounded2Steam-Win64-Shipping.exe".into(), base: 0x140000000, size: 0xb27c000, trusted: true, ..Default::default() }`; `hex()` helper local.)
 
-- [ ] **Passo 2:** os testes falham.
-- [ ] **Passo 3: Implementar.**
-- [ ] **Passo 4:** testes ok; validação global.
-- [ ] **Passo 5: Commit** — `feat(cli): gt diff e gt fling`
+- [x] **Passo 2:** os testes falham.
+- [x] **Passo 3: Implementar.**
+- [x] **Passo 4:** testes ok; validação global.
+- [x] **Passo 5: Commit** — `feat(cli): gt diff e gt fling`
 
 ---
 
@@ -745,7 +745,7 @@ Unitários das funções puras de `compare.rs`:
 
 **Arquivos:** Criar `apps/gt-cli/tests/game.rs`; modificar `docs/RESEARCH.md`, `docs/ROADMAP.md` (marcar a Fase 1) e `docs/plans/001-nucleo-memoria-gt.md` (checkboxes).
 
-- [ ] **Passo 1: Escrever os testes `#[ignore = "exige o jogo aberto"]`** (arquivo começa com `#![allow(clippy::unwrap_used, clippy::expect_used)]`)
+- [x] **Passo 1: Escrever os testes `#[ignore = "exige o jogo aberto"]`** (arquivo começa com `#![allow(clippy::unwrap_used, clippy::expect_used)]`)
 
 ```rust
 #[test] #[ignore = "exige o jogo aberto"] fn inspect_finds_game()   { /* gt --json inspect → module.base presente, sections ≥ 6, version_key casa ^[0-9a-f]{8}-[0-9a-f]{8}$ */ }
@@ -754,9 +754,9 @@ Unitários das funções puras de `compare.rs`:
 #[test] #[ignore = "exige o jogo aberto"] fn fling_lists_symbols()   { /* gt --json fling → 11 símbolos (build c935e799) */ }
 ```
 
-- [ ] **Passo 2: Pedir ao dono:** "abra o Grounded 2 num save de teste (faça backup do save antes) e me avise". Rodar `cargo test --workspace -- --ignored` → todos ok.
+- [x] **Passo 2: Pedir ao dono:** "abra o Grounded 2 num save de teste (faça backup do save antes) e me avise". Rodar `cargo test --workspace -- --ignored` → todos ok.
 
-- [ ] **Passo 3: Critério de pronto (spec 8).** Pedir ao dono: "abra o FLiNG e ligue **usos/cargas infinitas** e **quantidade ao arrastar**". Rodar e guardar as saídas em texto:
+- [x] **Passo 3: Critério de pronto (spec 8).** Pedir ao dono: "abra o FLiNG e ligue **usos/cargas infinitas** e **quantidade ao arrastar**". Rodar e guardar as saídas em texto:
   1. `cargo run --release -p gt-cli --bin gt -- inspect` → base, seções, chave de versão.
   2. `cargo run --release -p gt-cli --bin gt -- disasm Grounded2Steam-Win64-Shipping.exe+56FC11C` → bate com `RESEARCH.md` (`call 0x1439e6d10`, `cmp qword ptr [rsi+0xb0], 0`...).
   3. `cargo run --release -p gt-cli --bin gt -- diff` → 2 trechos, em `+57BD6D0` e `+5BBFE8C`, com o destino "fora dos módulos".
@@ -764,8 +764,8 @@ Unitários das funções puras de `compare.rs`:
 
   Se o build mudou, os offsets serão outros: o critério é achar os mesmos dois patches onde estiverem.
 
-- [ ] **Passo 4: Mostrar ao dono** as saídas lado a lado com `RESEARCH.md` e pedir a confirmação.
+- [x] **Passo 4: Mostrar ao dono** as saídas lado a lado com `RESEARCH.md` e pedir a confirmação.
 
-- [ ] **Passo 5: Registrar** em `RESEARCH.md` (data, build, o que o `gt` confirmou, hipóteses descartadas da sessão) e marcar a Fase 1 como concluída no `ROADMAP.md`.
+- [x] **Passo 5: Registrar** em `RESEARCH.md` (data, build, o que o `gt` confirmou, hipóteses descartadas da sessão) e marcar a Fase 1 como concluída no `ROADMAP.md`.
 
-- [ ] **Passo 6: Commit** — `test: testes com o jogo e fechamento da fase 1` (inclui o próprio plano com as caixas marcadas).
+- [x] **Passo 6: Commit** — `test: testes com o jogo e fechamento da fase 1` (inclui o próprio plano com as caixas marcadas).

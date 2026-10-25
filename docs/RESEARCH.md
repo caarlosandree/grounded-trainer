@@ -40,13 +40,15 @@ os padrões que encontrou. Só **11 de ~38** opções acharam o padrão na vers�
 | `aobdefmultiplier` | `+5943EC8` | Encontrado |
 | `aobcharges` | `+57BD6D0` | Encontrado e **patch aplicado** |
 | `aobdragitemamount` | `+5BBFE8C` | Encontrado e **patch aplicado** |
-| `aobgamemodesettings` | `+593AF1C` | Encontrado |
-| `aobbuildingreg` | `+57689DB` | Encontrado |
+| `aobgamemodesettings` | `+593AF1C` | Encontrado (em 2026-10-25: **patch aplicado**) |
+| `aobbuildingreg` | `+57689DB` | Encontrado (em 2026-10-25: **patch aplicado**) |
 | `aobspeed` | `+37EEE9B` | Encontrado |
 | `aobplayerspeed` | `+3785DF2` | Encontrado |
 | `aobinfinitejumps` | `+378553E` | Encontrado |
-| `aobdaytime` | `+58C8A2A` | Encontrado |
+| `aobdaytime` | `+58C8A2A` | Encontrado (em 2026-10-25: **patch aplicado**) |
 | `aoblocation` | `+35FB632` | Encontrado |
+
+Correção em 2026-10-25: "patch aplicado" **não** significa "opção ligada". Ver a sessão de 2026-10-25 abaixo.
 
 O trainer contém uma DLL embutida, `TrSpeedHack_x64.dll` (injetada para velocidade do jogo, hooks em `WINMM`/`KERNEL32`).
 
@@ -97,6 +99,35 @@ e8 ef ab 2e fe           call 0x1439e6d10
 - (2026-10-24) Com o FLiNG sem patch ativo, a `.text` na memória é idêntica ao arquivo em disco.
 - (2026-10-24) `symbols.ini` do FLiNG: UTF-16LE com BOM, CRLF, seção `[default]`, linhas `nome=Grounded2Steam-Win64-Shipping.exe+OFFSET`. A pasta `version/<id>` é o `TimeDateStamp` do PE em decimal (`0xc935e799` = `3375753113`).
 
+## Sessão de 2026-10-25: confirmação com o `gt` (fim da Fase 1)
+
+Mesmo build (`c935e799-0b27c000`, `Augusta-CL-3207493`). Jogo aberto num save, FLiNG aberto e conectado,
+**nenhuma opção ligada** (relato do dono). Comandos: `gt inspect`, `disasm`, `diff`, `fling`, `scan`, `read`, `dump`.
+
+- `gt inspect`: base, `SizeOfImage`, `ProductVersion` e as 8 seções iguais às tabelas acima.
+- `gt disasm +56FC11C`: mesmas instruções registradas acima, sem patch.
+- `gt diff` (`.text` na memória × disco) achou **5** trechos alterados, todos `jmp rel32` (+ `nop`) para
+  uma região executável fora de qualquer módulo (código do FLiNG, que o `gt` se recusa a ler):
+
+  | Endereço | Símbolo FLiNG | Bytes | Original | Desvio |
+  |---|---|---|---|---|
+  | `+57689DB` | `aobbuildingreg` | 6 | `88 9f d1 05 00 00` (`mov [rdi+0x5d1], bl`) | `0xDCB10050` |
+  | `+57BD6D0` | `aobcharges` | 7 | `f3 0f 10 89 74 09 00` | `0xDCB10020` |
+  | `+58C8A2A` | `aobdaytime` | 7 | `f2 0f 58 83 70 01 00` (`addsd xmm0, [rbx+0x170]`) | `0xDCB10090` |
+  | `+593AF1C` | `aobgamemodesettings` | 7 | `48 8b 88 48 01 00 00` (`mov rcx, [rax+0x148]`) | `0xDCB10040` |
+  | `+5BBFE8C` | `aobdragitemamount` | 6 | `48 8b f9 48 85 c9` | `0xDCB10030` |
+
+- **O FLiNG instala os desvios ao se conectar, mesmo sem nenhuma opção ligada.** Hipótese: cada opção só
+  liga uma chave dentro do código do FLiNG. Então os patches vistos em 2026-10-22 não provam que as opções
+  estavam ligadas. Por que só 2 desvios apareceram em 2026-10-22: não verificado.
+- O destino do `jmp` muda a cada sessão (`0xCC28xxxx` em 2026-10-22/24, `0xDCB1xxxx` agora). O FLiNG aloca
+  a área do código dele em lugar novo a cada vez, então só o **local** do patch é estável, não os bytes.
+- O padrão original das cargas (`f3 0f 10 89 74 09 00 00 f3 0f 58 c9`) aparece **2 vezes** no executável
+  em disco (`+57BD6D0` e `+57C2C10`). A assinatura do nosso patch (Fase 3) precisa de mais contexto para
+  ser única.
+- O padrão do god mode (`e8 ?? ?? ?? ?? 48 83 be b0 00 00 00 00 48 8b d8`) é único em memória e em disco.
+
 ## Hipóteses descartadas
 
-- (nenhuma ainda)
+- (2026-10-25) "Os patches em `+57BD6D0`/`+5BBFE8C` indicam que as opções de cargas e arrastar item estavam
+  ligadas no FLiNG": os desvios aparecem com todas as opções desligadas.

@@ -20,6 +20,7 @@ Cada fase só começa quando a anterior cumpre seu critério de pronto. Cada fun
 
 **Pronto quando:** `cargo build`, `cargo clippy -- -D warnings` e `cargo test` passam no workspace vazio.
 **Você faz:** revisar e aprovar os documentos.
+**Status:** ✅ concluída.
 
 ---
 
@@ -41,6 +42,7 @@ Cada fase só começa quando a anterior cumpre seu critério de pronto. Cada fun
 
 **Pronto quando:** `gt inspect` e `gt disasm Grounded2Steam-Win64-Shipping.exe+56FC11C` funcionam com o jogo aberto, e `gt diff` reproduz os achados de `RESEARCH.md`.
 **Você faz:** deixar o jogo aberto num save de teste quando eu pedir.
+**Status:** ✅ concluída em 2026-10-25 (spec e plano `001-nucleo-memoria-gt`).
 
 ---
 
