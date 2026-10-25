@@ -265,6 +265,15 @@ pub fn destination_for(modules: &[Module], target: u64) -> Destination {
     }
 }
 
+/// O slot de 8 bytes em `slot` cabe inteiro (primeiro e último byte) em módulo `trusted`.
+pub fn slot_is_trusted(modules: &[Module], slot: u64) -> bool {
+    matches!(destination_for(modules, slot), Destination::Trusted(_))
+        && matches!(
+            destination_for(modules, slot.saturating_add(7)),
+            Destination::Trusted(_)
+        )
+}
+
 /// Resolve o destino de `branch` e o classifica. Nunca lê bytes no destino.
 ///
 /// `RipIndirect` lê o ponteiro (8 bytes) só se o slot estiver inteiro num módulo `trusted` e a
@@ -273,13 +282,8 @@ pub fn classify_branch(ctx: &Target, branch: Branch) -> (Option<u64>, Destinatio
     match branch {
         Branch::Direct(target) => (Some(target), destination_for(&ctx.modules, target)),
         Branch::RipIndirect { slot } => {
-            let slot_trusted =
-                matches!(destination_for(&ctx.modules, slot), Destination::Trusted(_))
-                    && matches!(
-                        destination_for(&ctx.modules, slot.saturating_add(7)),
-                        Destination::Trusted(_)
-                    );
-            if !slot_trusted || guard::check(&ctx.maps, &ctx.modules, &ctx.non_pe, slot, 8).is_err()
+            if !slot_is_trusted(&ctx.modules, slot)
+                || guard::check(&ctx.maps, &ctx.modules, &ctx.non_pe, slot, 8).is_err()
             {
                 return (None, Destination::Unresolved);
             }
@@ -384,6 +388,60 @@ mod tests {
             trusted: true,
             ..Default::default()
         }
+    }
+
+    fn third_party_module() -> Module {
+        Module {
+            name: "TrSpeedHack_x64.dll".into(),
+            base: 0x7ff0_0000_0000,
+            size: 0x1000,
+            trusted: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn slot_inside_trusted_module_is_trusted() {
+        let modules = [game_module(), third_party_module()];
+        assert!(slot_is_trusted(&modules, 0x140000000 + 0x1000));
+        // Último slot que ainda cabe inteiro.
+        assert!(slot_is_trusted(&modules, 0x140000000 + 0xb27c000 - 8));
+    }
+
+    #[test]
+    fn slot_in_third_party_module_is_not_trusted() {
+        let modules = [game_module(), third_party_module()];
+        assert!(!slot_is_trusted(&modules, 0x7ff0_0000_0100));
+    }
+
+    #[test]
+    fn slot_outside_modules_is_not_trusted() {
+        let modules = [game_module(), third_party_module()];
+        assert!(!slot_is_trusted(&modules, 0x1000));
+        assert!(!slot_is_trusted(&[], 0x140000000));
+    }
+
+    #[test]
+    fn slot_crossing_the_end_of_trusted_module_is_not_trusted() {
+        let modules = [game_module()];
+        let end = 0x140000000 + 0xb27c000;
+        // O primeiro byte está dentro; o oitavo (slot + 7) já está fora.
+        assert!(!slot_is_trusted(&modules, end - 7));
+        assert!(!slot_is_trusted(&modules, end - 1));
+    }
+
+    #[test]
+    fn slot_next_to_third_party_module_is_not_trusted() {
+        // Módulos vizinhos: o slot começa no confiável e termina no de terceiros.
+        let trusted = game_module();
+        let neighbour = Module {
+            base: trusted.end(),
+            ..third_party_module()
+        };
+        assert!(!slot_is_trusted(
+            &[trusted.clone(), neighbour],
+            trusted.end() - 4
+        ));
     }
 
     fn hex_in(text: &str) -> Vec<u8> {

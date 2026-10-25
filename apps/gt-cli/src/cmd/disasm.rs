@@ -75,7 +75,12 @@ pub fn run(global: &Global, address: &str, count: Option<&str>) -> anyhow::Resul
             .iter()
             .map(|insn| insn_output(&target, insn))
             .collect(),
-        stopped_at_hole: read.holes.first().map(|hole| format!("{:#x}", hole.start)),
+        // Só interrompeu de fato se a lacuna impediu de chegar às N instruções pedidas.
+        stopped_at_hole: read
+            .holes
+            .first()
+            .filter(|_| insns.len() < count as usize)
+            .map(|hole| format!("{:#x}", hole.start)),
     };
     emit(
         global.json,

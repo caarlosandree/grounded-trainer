@@ -106,6 +106,12 @@ fn permission_hint(ptrace_scope: Option<u8>) -> String {
         Some(0) => "kernel.yama.ptrace_scope está em 0, que já permite a leitura; confira se o \
                     processo é de outro usuário ou se o SELinux/um container bloqueia o acesso."
             .to_string(),
+        Some(3) => {
+            "kernel.yama.ptrace_scope está em 3, que bloqueia qualquer leitura da memória de \
+                    outro processo e só pode ser baixado reiniciando o sistema (o gt não altera \
+                    nada)."
+                .to_string()
+        }
         Some(value) => format!(
             "kernel.yama.ptrace_scope está em {value}, o que restringe a leitura da memória de \
              outro processo (com 1, só descendentes do processo que lê). Confira se o gt e o jogo \
@@ -256,6 +262,13 @@ mod tests {
         let sudo = hint.find("sudo");
         let scope = hint.find("ptrace_scope").unwrap();
         assert!(sudo.is_none_or(|s| s > scope), "{hint}");
+    }
+
+    #[test]
+    fn permission_hint_for_scope_3_says_only_a_reboot_lowers_it() {
+        let hint = permission_hint(Some(3));
+        assert!(hint.contains("reiniciando"), "{hint}");
+        assert!(!hint.contains("sysctl"), "{hint}");
     }
 
     #[test]

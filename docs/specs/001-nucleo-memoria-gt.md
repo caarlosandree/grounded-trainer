@@ -155,6 +155,14 @@ intervalo estiver mapeado, é erro (6.10). Sujeito à guarda da 6.12
 - Lista **todas** as ocorrências (com limite de exibição, padrão 50, e o total real), cada uma com
   endereço e `módulo+offset`. O resumo diz explicitamente "único", "nenhum" ou "N ocorrências"
   (regra do `AGENTS.md` 4: só "único" serve como assinatura).
+- **Bytes ilegíveis:** na busca em memória, se alguma parte da área não pôde ser lida, uma ocorrência pode estar
+  na lacuna. Então 0 ou 1 ocorrência não é "nenhum"/"único": o texto diz "nenhum nas partes legíveis" ou
+  "único nas partes legíveis", seguido de "inconclusivo (N bytes ilegíveis; confirme com --disk)", e o JSON traz
+  `uniqueness: "inconclusive"`. Com 2 ou mais ocorrências o resultado continua "não único" (`many`). Os valores de
+  `uniqueness` no JSON são `none`, `unique`, `many` e `inconclusive`; só `unique` serve como assinatura. Com
+  `--disk` o arquivo é lido por inteiro e o veredito nunca é `inconclusive`.
+- Na busca em memória cada seção passa pela guarda da 6.12 antes de ser lida (as seções vêm do cabeçalho em
+  memória e não são confiáveis até a guarda conferir).
 - A busca deve encontrar ocorrências que atravessem a fronteira entre blocos de leitura.
 - Por padrão a busca é na **memória**. Com `--disk`, busca nas mesmas seções do arquivo em disco (mesmo
   acesso e mesma checagem de versão da 6.7). Use `--disk` para validar assinaturas, porque um patch de outro
@@ -291,6 +299,19 @@ de conduta.
     (`/tmp/steamapps/common/Proton x/`) é de terceiros;
   - **integração (CLI)**: o processo-alvo de teste cria uma página executável anônima com `mmap`, e
     `gt read`/`disasm`/`dump` nela são recusados.
+
+#### Limitações conhecidas e decisões da implementação
+
+- **Região executável com arquivo:** passa pela guarda só se o arquivo for verificado como **não PE**, lendo-o
+  por `/proc/<pid>/root`. Arquivo marcado `(deleted)` e arquivo que não pôde ser verificado são bloqueados (lado
+  restritivo). Entre os pseudo-caminhos, só `[vdso]` e `[vsyscall]` passam.
+- **Extensão do módulo confiável:** vem do `SizeOfImage` do cabeçalho **na memória**, que um trainer poderia
+  aumentar para "cobrir" código dele. Limitação conhecida, **pendente de decisão do dono**; alternativa: limitar
+  a extensão com o `SizeOfImage` da imagem em disco (`min(memória, disco)`).
+- **Snapshot do `maps`:** a guarda usa o `maps` lido na abertura do alvo (`Target::open`). Uma região executável
+  criada pelo trainer entre a abertura e a leitura (milissegundos) não seria vista.
+- **Erros com `--json`:** o erro vai para stderr, em texto, com código de saída diferente de 0, e **nenhum objeto
+  JSON** é escrito em stdout. Scripts devem checar o código de saída antes de ler o stdout.
 
 ### 6.13 Processo-alvo de teste e `unsafe`
 

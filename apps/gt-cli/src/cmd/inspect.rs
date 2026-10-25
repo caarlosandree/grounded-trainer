@@ -49,13 +49,18 @@ pub fn run(global: &Global) -> anyhow::Result<()> {
     let target = Target::open(global.pid)?;
     let (module, headers) = target.module(&global.module)?;
 
-    // Sem a imagem em disco só falta o `ProductVersion`; o `inspect` não falha por isso.
-    let product_version = match target.open_disk(module, &headers) {
-        Ok(disk) => disk.product_version(),
-        Err(err) => {
-            tracing::debug!(error = %err, "ProductVersion indisponível");
-            None
+    // Sem a imagem em disco só falta o `ProductVersion`; o `inspect` não falha por isso. Módulo de
+    // terceiros só tem o cabeçalho lido (spec 6.12): a imagem dele não é aberta nem realocada.
+    let product_version = if module.trusted {
+        match target.open_disk(module, &headers) {
+            Ok(disk) => disk.product_version(),
+            Err(err) => {
+                tracing::debug!(error = %err, "ProductVersion indisponível");
+                None
+            }
         }
+    } else {
+        None
     };
     let memory_readable = target.reader.read_exact(module.base, &mut [0u8; 1]).is_ok();
 
