@@ -33,7 +33,13 @@ grounded-trainer/
 ├── crates/
 │   ├── gt-core/                  # genérico, não sabe nada do Grounded 2
 │   │   └── src/
-│   │       ├── process.rs        # achar processo, ler /proc/<pid>/maps, módulos
+│   │       ├── error.rs          # Error (thiserror) e Result comuns
+│   │       ├── process.rs        # achar processo, cmdline, ptrace_scope
+│   │       ├── maps.rs           # parse de /proc/<pid>/maps (regiões, permissões, caminhos)
+│   │       ├── addr.rs           # parse de endereços e tamanhos (hex e decimal)
+│   │       ├── modules.rs        # Module, TrustPolicy, descoberta de imagens PE
+│   │       ├── guard.rs          # guarda: recusa código fora dos módulos do jogo/Wine
+│   │       ├── diff.rs           # agrupamento de diferenças entre leituras
 │   │       ├── mem/              # ÚNICO lugar com unsafe: leitura/escrita
 │   │       ├── pe.rs             # cabeçalhos PE lidos da memória (seções)
 │   │       ├── scan.rs           # padrões AOB com curingas
@@ -47,6 +53,7 @@ grounded-trainer/
 │       └── signatures/           # *.toml por build do jogo
 ├── apps/
 │   ├── gt-cli/                   # ferramentas de pesquisa: inspect, read, scan, disasm, diff, dump, fling
+│   │   └── src/bin/gt-testtarget.rs  # processo-alvo de teste (binário de apoio, não é o gt)
 │   └── gt-tui/                   # interface do jogador
 └── docs/
 ```
@@ -64,6 +71,9 @@ grounded-trainer/
 | `clap` | CLI |
 | `serde` + `toml` | Arquivos de assinatura e configuração |
 | `thiserror` / `anyhow` | Erros (libs / binários) |
+| `serde_json` | Saída em JSON das ferramentas do `gt` |
+| `libc` | Chamadas de sistema sem wrapper no `nix` (ex.: `mmap`/`prctl` do alvo de teste) |
+| `tempfile` | Diretórios e arquivos temporários nos testes (só `dev-dependencies`) |
 | `tracing` + `tracing-subscriber` | Logs (em arquivo enquanto a TUI estiver aberta) |
 | `signal-hook` | Restauração ao receber SIGINT/SIGTERM |
 
