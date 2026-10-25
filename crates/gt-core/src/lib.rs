@@ -5,6 +5,7 @@ pub mod asm;
 pub mod diff;
 pub mod error;
 pub mod guard;
+pub mod journal;
 pub mod maps;
 pub mod mem;
 pub mod memscan;

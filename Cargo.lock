@@ -194,6 +194,8 @@ dependencies = [
  "iced-x86",
  "libc",
  "nix",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tracing",

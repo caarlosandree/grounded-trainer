@@ -71,6 +71,14 @@ pub enum Error {
     #[error("patch {id} inválido: {reason}")]
     BadPatch { id: String, reason: String },
 
+    /// Outro `gt-patch` já segura a trava do diário.
+    #[error("outro gt-patch já está em execução")]
+    AlreadyRunning,
+
+    /// Falha do diário que não é de E/S comum (serialização, trava).
+    #[error("diário: {0}")]
+    Journal(String),
+
     /// Erro de entrada e saída do sistema operacional.
     #[error("erro de E/S: {0}")]
     Io(#[from] io::Error),

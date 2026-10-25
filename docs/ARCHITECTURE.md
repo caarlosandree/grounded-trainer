@@ -73,7 +73,7 @@ grounded-trainer/
 | `clap` | CLI |
 | `serde` + `toml` | Arquivos de assinatura e configuração |
 | `thiserror` / `anyhow` | Erros (libs / binários) |
-| `serde_json` | Saída em JSON das ferramentas do `gt` |
+| `serde_json` | Saída em JSON das ferramentas do `gt` e diário de patches (`journal.json`) |
 | `libc` | Chamadas de sistema sem wrapper no `nix` (ex.: `mmap`/`prctl` do alvo de teste) |
 | `tempfile` | Diretórios e arquivos temporários nos testes (só `dev-dependencies`) |
 | `tracing` + `tracing-subscriber` | Logs (em arquivo enquanto a TUI estiver aberta); o `gt-core` usa só `tracing` (avisos de extensão de módulo) |
