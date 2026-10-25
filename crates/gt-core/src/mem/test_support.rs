@@ -17,9 +17,14 @@ pub fn allow_any_tracer() -> Result<()> {
     // ponteiros) e altera um atributo do próprio processo.
     let rc = unsafe { libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY, 0, 0, 0) };
     if rc == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    // EINVAL: kernel sem Yama; não há restrição a relaxar.
+    if err.raw_os_error() == Some(libc::EINVAL) {
         Ok(())
     } else {
-        Err(io::Error::last_os_error().into())
+        Err(err.into())
     }
 }
 

@@ -29,6 +29,10 @@ impl MemWriter {
 
     /// Escreve `data` em `addr`.
     pub fn write(&self, addr: u64, data: &[u8]) -> Result<()> {
+        let len = data.len();
+        if addr.checked_add(len as u64).is_none() {
+            return Err(Error::Unmapped { addr, len });
+        }
         self.file
             .write_all_at(data, addr)
             .map_err(|e| map_io(self.pid, e, addr, data.len()))

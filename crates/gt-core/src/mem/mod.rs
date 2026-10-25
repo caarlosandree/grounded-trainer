@@ -93,8 +93,10 @@ impl MemReader {
         let mut readable = false;
         let mut at = addr;
         while at < end {
-            let next = (at / PAGE + 1) * PAGE;
-            let piece_end = next.min(end);
+            // Próximo limite de página; se estourar o espaço de endereços, é o fim.
+            let piece_end = at
+                .checked_add(PAGE - at % PAGE)
+                .map_or(end, |next| next.min(end));
             let range = (at - addr) as usize..(piece_end - addr) as usize;
             match self.read_exact(at, &mut bytes[range.clone()]) {
                 Ok(()) => readable = true,

@@ -88,3 +88,11 @@ fn dead_process_is_gone() {
         Err(gt_core::Error::ProcessGone { .. })
     ));
 }
+#[test]
+fn lossy_read_on_last_page_is_unmapped_without_panic() {
+    let t = support::TestTarget::spawn();
+    assert!(matches!(
+        MemReader::new(t.pid).read_lossy(0xFFFF_FFFF_FFFF_F000, 16),
+        Err(gt_core::Error::Unmapped { .. })
+    ));
+}
