@@ -2,8 +2,10 @@
 
 pub mod addr;
 pub mod error;
+pub mod guard;
 pub mod maps;
 pub mod mem;
+pub mod modules;
 pub mod pe;
 pub mod process;
 pub mod scan;
