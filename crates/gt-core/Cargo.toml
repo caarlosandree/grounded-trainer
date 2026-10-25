@@ -14,6 +14,7 @@ test-support = ["dep:libc"]
 
 [dependencies]
 goblin.workspace = true
+iced-x86.workspace = true
 libc = { workspace = true, optional = true }
 nix.workspace = true
 thiserror.workspace = true

@@ -1,6 +1,8 @@
 //! Núcleo genérico: processos, memória, PE, busca AOB, assembly e patches.
 
 pub mod addr;
+pub mod asm;
+pub mod diff;
 pub mod error;
 pub mod guard;
 pub mod maps;
