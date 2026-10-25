@@ -4,6 +4,8 @@ use std::ffi::OsStr;
 use std::io;
 use std::path::PathBuf;
 
+use nix::errno::Errno;
+
 use crate::error::{Error, Result};
 
 /// Permissões de uma região, como em `rwxp`.
@@ -78,6 +80,9 @@ pub fn read_maps(pid: i32) -> Result<Vec<MapRegion>> {
 }
 
 fn proc_error(pid: i32, err: io::Error) -> Error {
+    if err.raw_os_error() == Some(Errno::ESRCH as i32) {
+        return Error::ProcessGone { pid };
+    }
     match err.kind() {
         io::ErrorKind::NotFound => Error::ProcessGone { pid },
         // `ptrace_scope` é preenchido pelo módulo de processos, quando necessário.
@@ -230,6 +235,24 @@ mod tests {
                 .iter()
                 .any(|r| r.perms.exec && r.file_name().is_some())
         );
+    }
+
+    #[test]
+    fn maps_errno_to_error_kinds() {
+        let esrch = io::Error::from_raw_os_error(Errno::ESRCH as i32);
+        assert!(matches!(
+            proc_error(7, esrch),
+            Error::ProcessGone { pid: 7 }
+        ));
+        for errno in [Errno::EACCES, Errno::EPERM] {
+            let err = io::Error::from_raw_os_error(errno as i32);
+            assert!(matches!(
+                proc_error(7, err),
+                Error::PermissionDenied { pid: 7, .. }
+            ));
+        }
+        let other = io::Error::from_raw_os_error(Errno::EIO as i32);
+        assert!(matches!(proc_error(7, other), Error::Io(_)));
     }
 
     #[test]
