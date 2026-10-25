@@ -71,11 +71,37 @@ pub enum Error {
     #[error("patch {id} inválido: {reason}")]
     BadPatch { id: String, reason: String },
 
+    /// O patch cai fora dos intervalos em que a política permite escrever.
+    #[error("patch {id} fora da área permitida para escrita ({addr:#x})")]
+    OutsidePolicy { id: String, addr: u64 },
+
+    /// O patch toca um intervalo já ativo (ou outro patch do mesmo lote).
+    #[error("patch {id} se sobrepõe a um patch ativo")]
+    Overlap { id: String },
+
+    /// Os bytes na memória não são os esperados (hex com espaços).
+    #[error(
+        "bytes diferentes do esperado no patch {id}: esperados {expected}, encontrados {found}"
+    )]
+    BytesMismatch {
+        id: String,
+        expected: String,
+        found: String,
+    },
+
+    /// Alguma thread continua parada num ponto perigoso do patch.
+    #[error("threads do jogo não saem do trecho do patch {id} depois de {attempts} tentativas")]
+    ThreadsInPatch { id: String, attempts: u32 },
+
+    /// O kernel recusou a escrita num intervalo permitido pela política.
+    #[error("o kernel recusou a escrita em {addr:#x}; confira proc_mem.force_override")]
+    WriteRefused { addr: u64 },
+
     /// Outro `gt-patch` já segura a trava do diário.
     #[error("outro gt-patch já está em execução")]
     AlreadyRunning,
 
-    /// Falha do diário que não é de E/S comum (serialização, trava).
+    /// Falha do diário: gravação (com o caminho), serialização ou trava.
     #[error("diário: {0}")]
     Journal(String),
 

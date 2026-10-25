@@ -144,3 +144,53 @@ pub fn pipe_never_written() -> Result<i32> {
     }
     Ok(fds[0])
 }
+
+/// Cria uma página `MAP_SHARED` somente leitura de um arquivo temporário preenchido
+/// com `fill` e devolve o endereço.
+///
+/// O arquivo é aberto com `O_RDONLY`: o mapeamento fica sem `VM_MAYWRITE`, então a
+/// leitura por outro processo funciona, mas a escrita forçada por `/proc/<pid>/mem`
+/// falha (com `O_RDWR` ela passaria e alteraria o arquivo). O arquivo é apagado logo
+/// depois de aberto; a página continua válida.
+pub fn readonly_shared_page(fill: u8) -> Result<u64> {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let page = page();
+    let path = std::env::temp_dir().join(format!(
+        "gt-ro-shared-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        file.write_all(&vec![fill; page])?;
+    }
+    let opened = std::fs::File::open(&path);
+    let removed = std::fs::remove_file(&path);
+    let file = opened?;
+    removed?;
+    // SAFETY: mapeamento novo (endereço nulo: o kernel escolhe uma região livre) de
+    // `page` bytes de um arquivo que tem exatamente `page` bytes; nenhuma memória
+    // existente é afetada. O mapeamento sobrevive ao fechamento do `fd`.
+    let p = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            page,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if p == libc::MAP_FAILED {
+        Err(io::Error::last_os_error().into())
+    } else {
+        Ok(p as u64)
+    }
+}

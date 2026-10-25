@@ -40,6 +40,9 @@ pub struct TestTarget {
     /// Início de uma região `rw` de `big_len` bytes (2 MiB + 1 página).
     pub big_region: u64,
     pub big_len: usize,
+    /// Página `MAP_SHARED` somente leitura (de arquivo) preenchida com `0x90`: legível,
+    /// mas a escrita por `/proc/<pid>/mem` é recusada.
+    pub ro_shared: u64,
     /// Tamanho da página do sistema, informado pelo alvo.
     pub page: u64,
 }
@@ -89,6 +92,7 @@ impl TestTarget {
             region_start: parse_hex(&v["region_start"]),
             big_region: parse_hex(&v["big_region"]),
             big_len: v["big_len"].as_u64().unwrap() as usize,
+            ro_shared: parse_hex(&v["ro_shared"]),
             page: v["page"].as_u64().unwrap(),
             child,
         }

@@ -16,7 +16,7 @@ use crate::procinfo::{ThreadPos, is_dead, is_stopped};
 pub enum HookPoint {
     /// Dentro da pausa, com o alvo parado e antes de qualquer escrita.
     InPause,
-    /// Logo depois de aplicar o lote, ainda com o alvo parado.
+    /// Logo depois de aplicar o lote, já com o alvo retomado (disparado pelo motor).
     AfterApply,
 }
 

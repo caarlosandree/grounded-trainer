@@ -164,32 +164,42 @@ impl JournalStore {
     }
 
     /// Grava o diário de forma atômica: temporário, `fsync`, `rename`, `fsync` do diretório.
+    ///
+    /// Erros de E/S viram [`Error::Journal`] com o caminho do diário.
     pub fn save(&self, j: &Journal) -> Result<()> {
-        fs::create_dir_all(&self.dir)?;
         let text = serde_json::to_string_pretty(j)
             .map_err(|e| Error::Journal(format!("serialização: {e}")))?;
         let tmp = self.dir.join(TMP_FILE);
-        let mut file = File::create(&tmp)?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&tmp, self.journal_path())?;
-        sync_dir(&self.dir)
+        let write = || -> io::Result<()> {
+            fs::create_dir_all(&self.dir)?;
+            let mut file = File::create(&tmp)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&tmp, self.journal_path())?;
+            sync_dir(&self.dir)
+        };
+        write().map_err(|e| self.io_error("gravação", e))
     }
 
     /// Apaga o diário. Sem arquivo, não faz nada.
+    ///
+    /// Erros de E/S viram [`Error::Journal`] com o caminho do diário.
     pub fn clear(&self) -> Result<()> {
         match fs::remove_file(self.journal_path()) {
-            Ok(()) => sync_dir(&self.dir),
+            Ok(()) => sync_dir(&self.dir).map_err(|e| self.io_error("remoção", e)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(self.io_error("remoção", e)),
         }
+    }
+
+    fn io_error(&self, what: &str, e: io::Error) -> Error {
+        Error::Journal(format!("{what} de {}: {e}", self.journal_path().display()))
     }
 }
 
-fn sync_dir(dir: &Path) -> Result<()> {
-    File::open(dir)?.sync_all()?;
-    Ok(())
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    File::open(dir)?.sync_all()
 }
 
 /// Trava exclusiva do diário; solta ao cair.

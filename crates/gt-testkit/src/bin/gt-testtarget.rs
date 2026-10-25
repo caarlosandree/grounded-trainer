@@ -1,5 +1,6 @@
 //! Processo-alvo de teste: expõe um marcador, páginas executáveis, uma região
-//! com página ilegível e uma região `rw` grande, e espera o `stdin` fechar. Nunca é o jogo.
+//! com página ilegível, uma região `rw` grande e uma página compartilhada somente
+//! leitura, e espera o `stdin` fechar. Nunca é o jogo.
 //!
 //! Argumento opcional `--spin`: cria uma thread que gira para sempre em `spin_page`.
 
@@ -8,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use gt_core::mem::test_support::{
     allow_any_tracer, anon_rw, exec_code, exec_page, guarded_pages, page_size, pipe_never_written,
-    spawn_thread_at,
+    readonly_shared_page, spawn_thread_at,
 };
 use gt_core::procinfo::{ThreadPos, list_tids, read_task_stat, read_thread_pos};
 
@@ -65,6 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2 MiB + 1 página: passa de 1 MiB e termina fora de um limite de bloco.
     let big_len = (2usize << 20) + page as usize;
     let big_region = anon_rw(big_len)?;
+    let ro_shared = readonly_shared_page(0x90)?;
 
     // Thread bloqueada para sempre num `read` de um pipe que ninguém escreve.
     let syscall_page = exec_code(&syscall_code(pipe_never_written()?), 1)?;
@@ -87,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut out = std::io::stdout().lock();
     writeln!(
         out,
-        "{{\"pid\":{},\"marker\":\"{:#x}\",\"marker_len\":{},\"exec_page\":\"{:#x}\",\"exec2\":\"{:#x}\",\"spin_page\":\"{:#x}\",\"syscall_page\":\"{:#x}\",\"region_start\":\"{:#x}\",\"big_region\":\"{:#x}\",\"big_len\":{},\"page\":{}}}",
+        "{{\"pid\":{},\"marker\":\"{:#x}\",\"marker_len\":{},\"exec_page\":\"{:#x}\",\"exec2\":\"{:#x}\",\"spin_page\":\"{:#x}\",\"syscall_page\":\"{:#x}\",\"region_start\":\"{:#x}\",\"big_region\":\"{:#x}\",\"big_len\":{},\"ro_shared\":\"{:#x}\",\"page\":{}}}",
         std::process::id(),
         marker.as_ptr() as u64,
         marker.len(),
@@ -98,6 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         region,
         big_region,
         big_len,
+        ro_shared,
         page,
     )?;
     out.flush()?;
