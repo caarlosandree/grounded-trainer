@@ -210,21 +210,24 @@ where
         );
         let mut next = pos + len_now;
         if next < total {
-            let open = part.last().is_some_and(|last| {
-                let end_rel = (last.end() - (start + pos as u64)) as usize;
-                !last.is_pure_hole() && end_rel + GROUP_GAP > len_now
+            // O trecho "aberto" é o último que não é lacuna pura: uma lacuna no fim do bloco não
+            // o fecha, porque uma diferença do bloco seguinte ainda pode se fundir a ele através
+            // dela. Tudo a partir dele (inclusive as lacunas depois) é relido no próximo bloco.
+            let base = start + pos as u64;
+            let open = part.iter().rposition(|chunk| !chunk.is_pure_hole());
+            let open = open.filter(|&index| {
+                let end_rel = (part[index].end() - base) as usize;
+                end_rel + GROUP_GAP > len_now
             });
-            if open {
-                let last_rel = part
-                    .last()
-                    .map_or(0, |last| (last.addr - start) as usize - pos);
-                if last_rel == 0 {
+            if let Some(index) = open {
+                let open_rel = (part[index].addr - base) as usize;
+                if open_rel == 0 {
                     // O trecho ocupa o bloco todo: sem progresso possível, aumenta o bloco.
                     len = len_now.saturating_mul(2);
                     continue;
                 }
-                part.pop();
-                next = pos + last_rel;
+                part.truncate(index);
+                next = pos + open_rel;
             }
         }
         len = block;
@@ -633,6 +636,26 @@ mod tests {
         let chunks = compare_section(start, &disk, 64, fake_reader(start, &mem, &[])).unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].len(), 0x1f9);
+    }
+
+    #[test]
+    fn hole_at_block_end_defers_previous_difference() {
+        let start = 0x4000u64;
+        let disk = vec![0u8; 192];
+        let mut mem = disk.clone();
+        // Diferenças em 58 e 72 (distância 14 < GROUP_GAP) com a lacuna [60, 70) no meio: na seção
+        // inteira viram um trecho só, `unreadable`. O bloco de 64 bytes termina dentro da lacuna.
+        mem[58] = 1;
+        mem[72] = 1;
+        let holes = [start + 60..start + 70];
+        let whole = {
+            let mut read = fake_reader(start, &mem, &holes);
+            let r = read(start, mem.len()).unwrap();
+            build_chunks(&r.bytes, &r.holes, &disk, start)
+        };
+        assert_eq!(whole.len(), 1);
+        let blocks = compare_section(start, &disk, 64, fake_reader(start, &mem, &holes)).unwrap();
+        assert_eq!(blocks, whole);
     }
 
     #[test]

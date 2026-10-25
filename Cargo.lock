@@ -178,6 +178,7 @@ dependencies = [
  "gt-core",
  "gt-grounded2",
  "gt-testkit",
+ "nix",
  "serde",
  "serde_json",
  "tempfile",

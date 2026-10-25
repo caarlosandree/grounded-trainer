@@ -343,6 +343,34 @@ fn dump_refuses_overwrite() {
 }
 
 #[test]
+fn dump_force_refuses_directory_and_keeps_previous_pair() {
+    let t = TestTarget::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("x.bin");
+    std::fs::write(&bin, b"OLD").unwrap();
+    std::fs::create_dir(dir.path().join("x.json")).unwrap();
+    let out = gt(
+        &t,
+        &[
+            "dump",
+            &format!("{:#x}", t.marker),
+            "32",
+            "-o",
+            bin.to_str().unwrap(),
+            "--force",
+        ],
+    );
+    assert!(!out.status.success());
+    assert_eq!(std::fs::read(&bin).unwrap(), b"OLD");
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".x.") && name.contains("tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+#[test]
 fn dump_refuses_overwrite_when_only_json_exists() {
     let t = TestTarget::spawn();
     let dir = tempfile::tempdir().unwrap();
