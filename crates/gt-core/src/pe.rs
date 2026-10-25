@@ -5,6 +5,7 @@
 
 use std::fs::{self, File};
 use std::io::Read;
+use std::ops::Range;
 use std::path::Path;
 
 use goblin::pe::PE;
@@ -78,7 +79,7 @@ impl PeHeaders {
     ///
     /// Qualquer coisa que não seja um PE com optional header devolve `BadPe`.
     pub fn parse(header_bytes: &[u8]) -> Result<PeHeaders> {
-        parse_headers(header_bytes).map(|(headers, _)| headers)
+        parse_headers(header_bytes).map(|parsed| parsed.headers)
     }
 
     /// Chave de versão do build, `{time_date_stamp:08x}-{size_of_image:08x}`.
@@ -102,8 +103,14 @@ pub fn read_file_headers(path: &Path) -> Result<PeHeaders> {
     PeHeaders::parse(&header)
 }
 
-/// Cabeçalhos mais o diretório de realocação `(rva, tamanho)`, quando existe.
-type ParsedHeaders = (PeHeaders, Option<(u32, u32)>);
+/// Cabeçalhos mais os diretórios de dados `(rva, tamanho)` que a imagem em disco usa.
+struct ParsedHeaders {
+    headers: PeHeaders,
+    /// Diretório de realocação, quando existe.
+    reloc_dir: Option<(u32, u32)>,
+    /// Diretório de exceção (`.pdata`), quando existe.
+    exception_dir: Option<(u32, u32)>,
+}
 
 fn bad_pe(err: impl std::fmt::Display) -> Error {
     Error::BadPe(err.to_string())
@@ -146,6 +153,10 @@ fn parse_headers(header_bytes: &[u8]) -> Result<ParsedHeaders> {
         .data_directories
         .get_base_relocation_table()
         .map(|dd| (dd.virtual_address, dd.size));
+    let exception_dir = optional
+        .data_directories
+        .get_exception_table()
+        .map(|dd| (dd.virtual_address, dd.size));
     let headers = PeHeaders {
         image_base: windows.image_base,
         size_of_image: windows.size_of_image,
@@ -153,7 +164,11 @@ fn parse_headers(header_bytes: &[u8]) -> Result<ParsedHeaders> {
         size_of_headers: windows.size_of_headers,
         sections,
     };
-    Ok((headers, reloc_dir))
+    Ok(ParsedHeaders {
+        headers,
+        reloc_dir,
+        exception_dir,
+    })
 }
 
 /// Imagem do arquivo `.exe` montada no layout de RVA, como o loader do Windows faria.
@@ -164,6 +179,7 @@ pub struct DiskImage {
     pub headers: PeHeaders,
     image: Vec<u8>,
     reloc_dir: Option<(u32, u32)>,
+    exception_dir: Option<(u32, u32)>,
     /// Base para a qual as realocações já foram aplicadas; começa em `image_base`.
     current_base: u64,
 }
@@ -180,7 +196,11 @@ impl DiskImage {
     /// Os `size_of_headers` primeiros bytes vão para o RVA 0 e cada seção copia
     /// `min(raw_size, virtual_size)` bytes de `raw_offset` para `rva`; o resto fica zerado.
     pub fn from_file_bytes(file: &[u8]) -> Result<DiskImage> {
-        let (headers, reloc_dir) = parse_headers(file)?;
+        let ParsedHeaders {
+            headers,
+            reloc_dir,
+            exception_dir,
+        } = parse_headers(file)?;
         let mut image = vec![0u8; headers.size_of_image as usize];
 
         let headers_len = headers.size_of_headers as usize;
@@ -210,6 +230,7 @@ impl DiskImage {
             headers,
             image,
             reloc_dir,
+            exception_dir,
             current_base,
         })
     }
@@ -296,6 +317,27 @@ impl DiskImage {
             pos += block_size;
         }
         Ok(targets)
+    }
+
+    /// Limites das funções (RVA inicial e final) segundo o diretório de exceção (`.pdata`),
+    /// em ordem crescente. Cada entrada `RUNTIME_FUNCTION` tem 12 bytes; entradas vazias ou
+    /// com fim antes do início são ignoradas. Sem diretório de exceção, a lista é vazia.
+    pub fn functions(&self) -> Result<Vec<Range<u32>>> {
+        let Some((dir_rva, dir_size)) = self.exception_dir else {
+            return Ok(Vec::new());
+        };
+        let dir = self
+            .bytes(dir_rva, dir_size as usize)
+            .ok_or_else(|| Error::BadPe("diretório de exceção fora da imagem".to_string()))?;
+        // Sobra menor que uma entrada é preenchimento.
+        let (entries, _) = dir.as_chunks::<12>();
+        let mut functions: Vec<Range<u32>> = entries
+            .iter()
+            .map(|entry| read_u32(&entry[0..4])..read_u32(&entry[4..8]))
+            .filter(|f| f.start < f.end)
+            .collect();
+        functions.sort_by_key(|f| f.start);
+        Ok(functions)
     }
 
     /// `ProductVersion` do recurso de versão (ex. `Augusta-CL-3207493`), se existir.
@@ -505,6 +547,54 @@ pub(crate) mod tests {
         assert_eq!(read_file_headers(&small).unwrap(), from_file);
         // Inexistente: erro de E/S, sem pânico.
         assert!(read_file_headers(&tmp.path().join("ausente.exe")).is_err());
+    }
+
+    #[test]
+    fn functions_from_synthetic_pdata() {
+        // Três entradas fora de ordem, uma vazia e uma com fim antes do início; sobra de 4 bytes.
+        let mut pdata = Vec::new();
+        for (begin, end) in [
+            (0x1100u32, 0x1180u32),
+            (0x1000, 0x1040),
+            (0, 0),
+            (0x1200, 0x1100),
+            (0x1040, 0x1100),
+        ] {
+            pdata.extend_from_slice(&begin.to_le_bytes());
+            pdata.extend_from_slice(&end.to_le_bytes());
+            pdata.extend_from_slice(&0x5000u32.to_le_bytes());
+        }
+        let size = pdata.len() as u32;
+        pdata.extend_from_slice(&[0xAA; 4]);
+        let mut section = sec(".pdata", 0x2000, 0x100, 0x4000_0040, 0);
+        section.data = pdata;
+        let mut file = fake_pe(&[text_with_ptr(), section], 0x1_4000_0000, 1, 0x3000, None);
+        // Diretório de exceção: índice 3 das data directories (optional header em 0x58).
+        let dir = 0x58 + 112 + 3 * 8;
+        file[dir..dir + 4].copy_from_slice(&0x2000u32.to_le_bytes());
+        file[dir + 4..dir + 8].copy_from_slice(&(size + 4).to_le_bytes());
+        let img = DiskImage::from_file_bytes(&file).unwrap();
+        assert_eq!(
+            img.functions().unwrap(),
+            vec![0x1000..0x1040, 0x1040..0x1100, 0x1100..0x1180]
+        );
+
+        // Sem diretório de exceção: lista vazia.
+        let none = DiskImage::from_file_bytes(&fake_pe(
+            &[text_with_ptr()],
+            0x1_4000_0000,
+            1,
+            0x2000,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(none.functions().unwrap(), Vec::<Range<u32>>::new());
+
+        // Diretório fora da imagem: erro.
+        let mut bad = file.clone();
+        bad[dir..dir + 4].copy_from_slice(&0x2ff8u32.to_le_bytes());
+        let img = DiskImage::from_file_bytes(&bad).unwrap();
+        assert!(matches!(img.functions(), Err(Error::BadPe(_))));
     }
 
     #[test]

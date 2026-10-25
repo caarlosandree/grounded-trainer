@@ -32,6 +32,14 @@ pub enum Error {
         reason: String,
     },
 
+    /// `id` pedido que não existe no catálogo.
+    #[error("patch desconhecido: {id}")]
+    UnknownPatch { id: String },
+
+    /// `id` pedido cujo estado não permite aplicar.
+    #[error("patch {id} indisponível: {state}")]
+    Unavailable { id: String, state: String },
+
     /// Erro do núcleo; a mensagem é a do próprio erro.
     #[error(transparent)]
     Core(#[from] gt_core::Error),

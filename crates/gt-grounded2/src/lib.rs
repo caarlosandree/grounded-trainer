@@ -1,7 +1,12 @@
 //! Conhecimento específico do Grounded 2: constantes do jogo e regra de casamento do processo.
 
+pub mod catalog;
 pub mod error;
 pub mod fling;
+#[cfg(feature = "write")]
+pub mod patching;
+pub mod policy;
+pub mod profile;
 pub mod resolve;
 pub mod signatures;
 pub mod state;

@@ -14,7 +14,7 @@ toml.workspace = true
 tracing.workspace = true
 
 [features]
-# Habilita o motor de escrita do `gt-core` (ainda sem código próprio aqui).
+# Habilita o motor de escrita do `gt-core` e o `patching` (abertura do motor para o jogo).
 write = ["gt-core/write"]
 
 [dev-dependencies]
