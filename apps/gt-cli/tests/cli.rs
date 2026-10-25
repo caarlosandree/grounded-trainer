@@ -249,6 +249,30 @@ fn scan_on_elf_says_not_pe() {
 }
 
 #[test]
+fn diff_on_elf_says_not_pe() {
+    let t = TestTarget::spawn();
+    let out = gt(&t, &["diff"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("não é uma imagem PE"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn fling_on_elf_says_not_pe() {
+    let t = TestTarget::spawn();
+    let out = gt(&t, &["fling"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("não é uma imagem PE"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
 fn dump_on_exec_page_is_blocked() {
     let t = TestTarget::spawn();
     let dir = tempfile::tempdir().unwrap();

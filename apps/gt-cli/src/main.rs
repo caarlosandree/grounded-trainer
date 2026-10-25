@@ -70,6 +70,21 @@ enum Command {
         #[arg(short = 'n', long = "count", value_name = "N", default_value = cmd::disasm::default_count())]
         count: String,
     },
+    /// Compara o código na memória com o executável em disco (acha patches de outros trainers).
+    Diff {
+        /// Só esta seção (ex.: `.rdata`); o padrão são as seções executáveis.
+        #[arg(long, value_name = "NOME")]
+        section: Option<String>,
+    },
+    /// Lê os pontos do `symbols.ini` do FLiNG e mostra o estado de cada um.
+    Fling {
+        /// Biblioteca da Steam (`steamapps`); padrão `$HOME/.local/share/Steam/steamapps`.
+        #[arg(long, value_name = "DIR")]
+        steam_library: Option<std::path::PathBuf>,
+        /// Usa este `symbols.ini` em vez de procurar pela versão do jogo (ignora --steam-library).
+        #[arg(long, value_name = "ARQUIVO")]
+        ini: Option<std::path::PathBuf>,
+    },
     /// Salva memória em arquivo: uma seção, ou um endereço e um tamanho.
     Dump {
         /// Nome de uma seção (ex.: `.text`) ou, com TAMANHO, o endereço inicial.
@@ -170,6 +185,19 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             },
         ),
         Command::Disasm { address, count } => cmd::disasm::run(&global, &address, Some(&count)),
+        Command::Diff { section } => cmd::diff::run(
+            &global,
+            &cmd::diff::Options {
+                section: section.as_deref(),
+            },
+        ),
+        Command::Fling { steam_library, ini } => cmd::fling::run(
+            &global,
+            &cmd::fling::Options {
+                steam_library: steam_library.as_deref(),
+                ini: ini.as_deref(),
+            },
+        ),
         Command::Dump {
             target,
             size,
