@@ -1,0 +1,12 @@
+[package]
+name = "gt-ue"
+description = "Estruturas do Unreal Engine 5 (GNames, GObjects, GWorld)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

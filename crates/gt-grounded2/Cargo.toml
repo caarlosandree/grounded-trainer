@@ -1,0 +1,12 @@
+[package]
+name = "gt-grounded2"
+description = "Conhecimento específico do Grounded 2: cheats e assinaturas."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

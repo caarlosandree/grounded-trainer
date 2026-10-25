@@ -1,0 +1,12 @@
+[package]
+name = "gt-tui"
+description = "Interface do jogador no terminal."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
