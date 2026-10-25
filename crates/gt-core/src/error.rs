@@ -67,6 +67,10 @@ pub enum Error {
     #[error("o jogo não pausou no prazo depois de {attempts} tentativas")]
     PauseTimeout { attempts: u32 },
 
+    /// O patch não passou na validação (tamanho, instruções ou regra do `call`).
+    #[error("patch {id} inválido: {reason}")]
+    BadPatch { id: String, reason: String },
+
     /// Erro de entrada e saída do sistema operacional.
     #[error("erro de E/S: {0}")]
     Io(#[from] io::Error),

@@ -9,6 +9,7 @@ pub mod maps;
 pub mod mem;
 pub mod memscan;
 pub mod modules;
+pub mod patch;
 pub mod pe;
 pub mod process;
 pub mod procinfo;
