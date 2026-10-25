@@ -1,6 +1,8 @@
 //! Módulos (imagens PE) carregados no processo e política de módulos confiáveis.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -23,9 +25,17 @@ pub struct TrustPolicy {
 
 impl TrustPolicy {
     /// Cria a política a partir dos diretórios confiáveis.
+    ///
+    /// Diretórios vazios, relativos ou iguais a `/` (depois de normalizados) são descartados:
+    /// confiariam em tudo. Fica do lado restritivo.
     pub fn new(dirs: Vec<PathBuf>) -> TrustPolicy {
         TrustPolicy {
-            dirs: dirs.iter().map(|d| normalize(d)).collect(),
+            dirs: dirs
+                .iter()
+                .filter(|d| d.is_absolute())
+                .map(|d| normalize(d))
+                .filter(|d| d.components().count() > 1)
+                .collect(),
         }
     }
 
@@ -145,6 +155,44 @@ pub fn discover(
     Ok(modules)
 }
 
+/// Caminhos de regiões executáveis com arquivo que foram verificados como **não** PE.
+///
+/// Para cada caminho único de região executável com arquivo (`File`, não `deleted`), lê os dois
+/// primeiros bytes de `root` + caminho e o inclui só se a leitura der certo e os bytes forem
+/// diferentes de `MZ`. Qualquer erro de leitura deixa o caminho fora do conjunto (não verificado).
+/// No uso real, `root` é `/proc/<pid>/root`, que enxerga o mesmo sistema de arquivos do processo.
+pub fn verified_non_pe(maps: &[MapRegion], root: &Path) -> HashSet<PathBuf> {
+    let paths: HashSet<&Path> = maps
+        .iter()
+        .filter(|region| region.perms.exec)
+        .filter_map(|region| match &region.path {
+            MapPath::File {
+                path,
+                deleted: false,
+            } => Some(path.as_path()),
+            _ => None,
+        })
+        .collect();
+    paths
+        .into_iter()
+        .filter(|path| starts_without_mz(root, path))
+        .map(Path::to_path_buf)
+        .collect()
+}
+
+/// `true` se o arquivo é regular, legível e seus dois primeiros bytes não são `MZ`.
+fn starts_without_mz(root: &Path, path: &Path) -> bool {
+    // `join` com caminho absoluto descartaria `root`.
+    let real = root.join(path.strip_prefix("/").unwrap_or(path));
+    // Só arquivos regulares: abrir um FIFO ou dispositivo poderia bloquear.
+    if !std::fs::metadata(&real).is_ok_and(|m| m.is_file()) {
+        return false;
+    }
+    let mut magic = [0u8; 2];
+    let read = File::open(&real).and_then(|mut f| f.read_exact(&mut magic));
+    read.is_ok() && &magic != b"MZ"
+}
+
 /// Recusa módulos de terceiros (usada por `scan`, `diff` e `dump` de seção executável).
 pub fn require_trusted(module: &Module) -> Result<()> {
     if module.trusted {
@@ -204,6 +252,48 @@ mod tests {
         assert!(p.is_trusted(Path::new("/opt/trusted/./a/../b.dll")));
         assert!(!p.is_trusted(Path::new("/opt/trusted/../evil/b.dll")));
         assert!(!p.is_trusted(Path::new("/opt/trusted/a/../../evil/b.dll")));
+    }
+
+    #[test]
+    fn policy_drops_empty_relative_and_root_dirs() {
+        let p = TrustPolicy::new(vec![
+            PathBuf::new(),
+            ".".into(),
+            "relativo/dir".into(),
+            "/".into(),
+            "/..".into(),
+            "/a/../..".into(),
+        ]);
+        assert!(!p.is_trusted(Path::new("/qualquer/coisa.dll")));
+        assert!(!p.is_trusted(Path::new("relativo/dir/a.dll")));
+        assert!(!p.is_trusted(Path::new("a.dll")));
+        // Diretórios válidos na mesma lista continuam valendo.
+        let p = TrustPolicy::new(vec!["".into(), "/opt/ok".into()]);
+        assert!(p.is_trusted(Path::new("/opt/ok/a.dll")));
+    }
+
+    #[test]
+    fn verified_non_pe_keeps_only_readable_non_mz_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        std::fs::write(root.join("lib/libx.so"), b"\x7fELF....").unwrap();
+        std::fs::write(root.join("lib/a.dll"), b"MZ\x90\x00").unwrap();
+        std::fs::write(root.join("lib/short.bin"), b"M").unwrap();
+        std::fs::write(root.join("lib/gone.so"), b"\x7fELF").unwrap();
+        let maps = parse_maps(
+            "1000-2000 r-xp 00000000 00:00 1 /lib/libx.so\n\
+             2000-3000 r-xp 00000000 00:00 1 /lib/libx.so\n\
+             3000-4000 r-xp 00000000 00:00 1 /lib/a.dll\n\
+             4000-5000 r-xp 00000000 00:00 1 /lib/short.bin\n\
+             5000-6000 r-xp 00000000 00:00 1 /lib/ausente.so\n\
+             6000-7000 r-xp 00000000 00:00 1 /lib/gone.so (deleted)\n\
+             7000-8000 r--p 00000000 00:00 1 /lib/gone.so\n\
+             8000-9000 r-xp 00000000 00:00 0\n",
+        )
+        .unwrap();
+        let set = verified_non_pe(&maps, root);
+        assert_eq!(set, HashSet::from([PathBuf::from("/lib/libx.so")]));
     }
 
     #[test]

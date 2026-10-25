@@ -14,6 +14,12 @@ use crate::APP_ID;
 pub fn policy(game_exe: &Path, home: &Path) -> TrustPolicy {
     let steam = home.join(".local/share/Steam");
     let game_library = steamapps_prefix(game_exe);
+    if game_library.is_none() {
+        tracing::warn!(
+            exe = %game_exe.display(),
+            "o caminho do jogo não tem o componente steamapps: só a biblioteca Steam padrão é confiável"
+        );
+    }
 
     let mut libraries: Vec<PathBuf> = Vec::new();
     if let Some(library) = &game_library {

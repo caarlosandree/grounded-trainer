@@ -18,5 +18,8 @@ libc = { workspace = true, optional = true }
 nix.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true
