@@ -47,8 +47,9 @@ impl Target {
             }
             None => TrustPolicy::default(),
         };
-        let modules = modules::discover(&maps, &reader, &policy)?;
-        let non_pe = modules::verified_non_pe(&maps, Path::new(&format!("/proc/{pid}/root")));
+        let root = PathBuf::from(format!("/proc/{pid}/root"));
+        let modules = modules::discover(&maps, &reader, &policy, &root)?;
+        let non_pe = modules::verified_non_pe(&maps, &root);
         Ok(Target {
             pid,
             discarded,

@@ -305,9 +305,9 @@ de conduta.
 - **Região executável com arquivo:** passa pela guarda só se o arquivo for verificado como **não PE**, lendo-o
   por `/proc/<pid>/root`. Arquivo marcado `(deleted)` e arquivo que não pôde ser verificado são bloqueados (lado
   restritivo). Entre os pseudo-caminhos, só `[vdso]` e `[vsyscall]` passam.
-- **Extensão do módulo confiável:** vem do `SizeOfImage` do cabeçalho **na memória**, que um trainer poderia
-  aumentar para "cobrir" código dele. Limitação conhecida, **pendente de decisão do dono**; alternativa: limitar
-  a extensão com o `SizeOfImage` da imagem em disco (`min(memória, disco)`).
+- **Extensão do módulo confiável:** vinha do `SizeOfImage` do cabeçalho **na memória**, que um trainer poderia
+  aumentar para "cobrir" código dele. Decidido na Fase 2: a extensão passa a ser `min(memória, disco)`; ver a
+  spec 002, 6.12 (módulos de terceiros e arquivo ilegível continuam com o valor da memória).
 - **Snapshot do `maps`:** a guarda usa o `maps` lido na abertura do alvo (`Target::open`). Uma região executável
   criada pelo trainer entre a abertura e a leitura (milissegundos) não seria vista.
 - **Erros com `--json`:** o erro vai para stderr, em texto, com código de saída diferente de 0, e **nenhum objeto

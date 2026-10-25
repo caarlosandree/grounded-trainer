@@ -195,6 +195,7 @@ dependencies = [
  "nix",
  "tempfile",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

@@ -3,7 +3,8 @@
 //! O cabeçalho vem de uma leitura de memória do processo ou do arquivo `.exe`; a imagem em
 //! disco é montada no layout de RVA para comparar bytes e interpretar recursos.
 
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::Path;
 
 use goblin::pe::PE;
@@ -89,6 +90,16 @@ impl PeHeaders {
     pub fn section(&self, name: &str) -> Option<&Section> {
         self.sections.iter().find(|s| s.name == name)
     }
+}
+
+/// Lê só o início do arquivo (até `0x1000` bytes, ou menos se ele for menor) e interpreta os
+/// cabeçalhos PE. Não lê nem aloca a imagem inteira, ao contrário de [`DiskImage::load`].
+pub fn read_file_headers(path: &Path) -> Result<PeHeaders> {
+    let mut header = Vec::with_capacity(HEADER_WINDOW);
+    File::open(path)?
+        .take(HEADER_WINDOW as u64)
+        .read_to_end(&mut header)?;
+    PeHeaders::parse(&header)
 }
 
 /// Cabeçalhos mais o diretório de realocação `(rva, tamanho)`, quando existe.
@@ -322,12 +333,12 @@ pub fn check_same_version(memory: &PeHeaders, disk: &PeHeaders) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::path::PathBuf;
 
     /// Seção de um PE de teste: `raw_size` é o tamanho de `data`.
-    struct FakeSection {
+    pub(crate) struct FakeSection {
         name: &'static str,
         rva: u32,
         vsize: u32,
@@ -381,7 +392,7 @@ mod tests {
 
     /// Monta um arquivo PE32+ mínimo: DOS header, `PE\0\0`, COFF, optional header com
     /// 16 data directories, tabela de seções e o conteúdo bruto de cada seção.
-    fn fake_pe(
+    pub(crate) fn fake_pe(
         sections: &[FakeSection],
         image_base: u64,
         time_date_stamp: u32,
@@ -466,6 +477,34 @@ mod tests {
         assert_eq!(h.section(".data").unwrap().raw_size, 0x400);
         assert_eq!(h.section(".data").unwrap().perms_string(), "rw-");
         assert!(h.section(".nada").is_none());
+    }
+
+    #[test]
+    fn read_file_headers_reads_only_the_header() {
+        let mut file = fake_pe(
+            &[sec(".text", 0x1000, 0x1000, 0x6000_0020, 0x200)],
+            0x1_4000_0000,
+            0xc935e799,
+            0x3000,
+            None,
+        );
+        // O arquivo passa bastante do que o leitor de cabeçalho precisa.
+        file.resize(64 * 1024, 0xcc);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("big.exe");
+        fs::write(&path, &file).unwrap();
+        let from_file = read_file_headers(&path).unwrap();
+        assert_eq!(
+            from_file,
+            DiskImage::from_file_bytes(&file).unwrap().headers
+        );
+        assert_eq!(from_file.size_of_image, 0x3000);
+        // Arquivo menor que a janela: lê o que houver.
+        let small = tmp.path().join("small.exe");
+        fs::write(&small, &file[..0x600]).unwrap();
+        assert_eq!(read_file_headers(&small).unwrap(), from_file);
+        // Inexistente: erro de E/S, sem pânico.
+        assert!(read_file_headers(&tmp.path().join("ausente.exe")).is_err());
     }
 
     #[test]

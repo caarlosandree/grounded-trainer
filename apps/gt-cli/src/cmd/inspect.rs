@@ -18,7 +18,12 @@ struct InspectOutput {
     product_version: Option<String>,
     sections: Vec<SectionOutput>,
     ptrace_scope: Option<u8>,
-    memory_readable: bool,
+    /// `SizeOfImage` do arquivo em disco; só existe para módulo confiável com o disco lido.
+    disk_size_of_image: Option<u32>,
+    /// `true` se a extensão do módulo foi conferida com o disco (spec 002, 6.12).
+    extent_checked: bool,
+    /// `false` para módulo de terceiros, cujo disco não é aberto.
+    trusted: bool,
 }
 
 #[derive(Serialize)]
@@ -62,8 +67,6 @@ pub fn run(global: &Global) -> anyhow::Result<()> {
     } else {
         None
     };
-    let memory_readable = target.reader.read_exact(module.base, &mut [0u8; 1]).is_ok();
-
     let output = InspectOutput {
         pid: target.pid,
         discarded: target
@@ -95,7 +98,9 @@ pub fn run(global: &Global) -> anyhow::Result<()> {
             })
             .collect(),
         ptrace_scope: ptrace_scope(),
-        memory_readable,
+        disk_size_of_image: module.disk_size.and_then(|size| u32::try_from(size).ok()),
+        extent_checked: module.extent_checked(),
+        trusted: module.trusted,
     };
     emit(global.json, |out| write_text(out, &output), &output)
 }
@@ -119,6 +124,11 @@ fn write_text(out: &mut dyn Write, o: &InspectOutput) -> std::io::Result<()> {
         "SizeOfImage: {:#x} ({} bytes)",
         o.module.size_of_image, o.module.size_of_image
     )?;
+    if let Some(disk) = o.disk_size_of_image
+        && disk != o.module.size_of_image
+    {
+        writeln!(out, "SizeOfImage (disco): {disk:#x}")?;
+    }
     writeln!(out, "Chave de versão: {}", o.version_key)?;
     writeln!(
         out,
@@ -146,9 +156,83 @@ fn write_text(out: &mut dyn Write, o: &InspectOutput) -> std::io::Result<()> {
         Some(scope) => writeln!(out, "ptrace_scope: {scope}")?,
         None => writeln!(out, "ptrace_scope: Yama ausente")?,
     }
-    writeln!(
-        out,
-        "Leitura de memória: {}",
-        if o.memory_readable { "ok" } else { "falhou" }
-    )
+    let extent = if o.extent_checked {
+        "conferida com o disco"
+    } else if o.trusted {
+        "não conferida (disco ilegível)"
+    } else {
+        "não conferida (módulo de terceiros)"
+    };
+    writeln!(out, "Extensão do módulo: {extent}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn output() -> InspectOutput {
+        InspectOutput {
+            pid: 42,
+            discarded: Vec::new(),
+            module: ModuleOutput {
+                name: "a.dll".into(),
+                path: "/opt/a.dll".into(),
+                base: "0x1000".into(),
+                image_base: "0x1000".into(),
+                size_of_image: 0x3000,
+            },
+            version_key: "00000000-00003000".into(),
+            product_version: None,
+            sections: Vec::new(),
+            ptrace_scope: Some(0),
+            disk_size_of_image: None,
+            extent_checked: false,
+            trusted: true,
+        }
+    }
+
+    fn text(o: &InspectOutput) -> String {
+        let mut buf = Vec::new();
+        write_text(&mut buf, o).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn text_shows_extent_status_and_disk_size() {
+        // Disco ilegível: sem linha do disco.
+        let t = text(&output());
+        assert!(t.contains("Extensão do módulo: não conferida (disco ilegível)"));
+        assert!(!t.contains("SizeOfImage (disco)"));
+        assert!(!t.contains("Leitura de memória"));
+
+        // Conferida e diferente: a linha do disco vem logo após a do SizeOfImage.
+        let t = text(&InspectOutput {
+            disk_size_of_image: Some(0x2000),
+            extent_checked: true,
+            ..output()
+        });
+        assert!(t.contains("Extensão do módulo: conferida com o disco"));
+        assert!(t.contains("SizeOfImage (disco): 0x2000"));
+        let lines: Vec<_> = t.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.starts_with("SizeOfImage:"))
+            .unwrap();
+        assert!(lines[at + 1].starts_with("SizeOfImage (disco): 0x2000"));
+
+        // Conferida e igual: a linha do disco não aparece.
+        let t = text(&InspectOutput {
+            disk_size_of_image: Some(0x3000),
+            extent_checked: true,
+            ..output()
+        });
+        assert!(!t.contains("SizeOfImage (disco)"));
+
+        // Terceiros: o disco não é aberto.
+        let t = text(&InspectOutput {
+            trusted: false,
+            ..output()
+        });
+        assert!(t.contains("Extensão do módulo: não conferida (módulo de terceiros)"));
+    }
 }

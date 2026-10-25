@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use crate::error::{Error, Result};
 use crate::maps::{MapPath, MapRegion};
 use crate::mem::MemReader;
-use crate::pe::PeHeaders;
+use crate::pe::{PeHeaders, read_file_headers};
 
 /// Quantos bytes do início da imagem são lidos para interpretar o cabeçalho PE.
 const HEADER_LEN: usize = 0x1000;
@@ -73,13 +73,24 @@ pub struct Module {
     pub path: PathBuf,
     /// Endereço onde a imagem foi carregada.
     pub base: u64,
-    /// `SizeOfImage` do cabeçalho PE na memória.
+    /// Extensão usada pela guarda e pelas saídas: `min(memory_size, disk_size)` para módulo
+    /// confiável com o disco lido, senão `memory_size` (spec 002, 6.12).
     pub size: u64,
+    /// `SizeOfImage` do cabeçalho PE na memória.
+    pub memory_size: u64,
+    /// `SizeOfImage` do arquivo em disco; `None` em módulo de terceiros (o disco não é aberto) ou
+    /// quando o arquivo não pôde ser lido.
+    pub disk_size: Option<u64>,
     /// `true` se o caminho está dentro de um diretório da [`TrustPolicy`].
     pub trusted: bool,
 }
 
 impl Module {
+    /// `true` se o módulo é confiável e a extensão foi conferida com o `SizeOfImage` do disco.
+    pub fn extent_checked(&self) -> bool {
+        self.trusted && self.disk_size.is_some()
+    }
+
     /// Primeiro endereço fora do módulo (exclusivo).
     pub fn end(&self) -> u64 {
         self.base.saturating_add(self.size)
@@ -119,14 +130,54 @@ pub fn candidate_bases(maps: &[MapRegion]) -> Vec<(u64, PathBuf)> {
     bases
 }
 
+/// Lê só o cabeçalho PE do arquivo de um módulo.
+///
+/// Tenta `root` + caminho (no uso real, `/proc/<pid>/root`, que enxerga o sistema de arquivos do
+/// container da Steam) e, se falhar, o caminho direto do host.
+pub fn open_in_root(root: &Path, path: &Path) -> Result<PeHeaders> {
+    // `join` com caminho absoluto descartaria `root`.
+    let in_root = root.join(path.strip_prefix("/").unwrap_or(path));
+    read_file_headers(&in_root).or_else(|first| {
+        tracing::debug!(path = %in_root.display(), error = %first, "imagem não encontrada no root do processo");
+        read_file_headers(path)
+    })
+}
+
+/// Extensão de um módulo confiável: `(size, disk_size)` a partir do `SizeOfImage` da memória e do
+/// que o disco informa. Diferença entre os dois sai como aviso (spec 002, 6.12).
+fn trusted_extent(name: &str, path: &Path, memory: u64, root: &Path) -> (u64, Option<u64>) {
+    match open_in_root(root, path) {
+        Ok(disk) => {
+            let disk = u64::from(disk.size_of_image);
+            if disk != memory {
+                tracing::warn!(
+                    module = name,
+                    memory,
+                    disk,
+                    "SizeOfImage difere entre a memória e o disco"
+                );
+            }
+            (memory.min(disk), Some(disk))
+        }
+        Err(err) => {
+            tracing::warn!(module = name, error = %err, "extensão do módulo não conferida com o disco");
+            (memory, None)
+        }
+    }
+}
+
 /// Descobre as imagens PE carregadas: lê o cabeçalho em cada base candidata.
 ///
 /// Só entram as que passam em [`PeHeaders::parse`]. Uma candidata não mapeada é ignorada;
 /// `PermissionDenied` e `ProcessGone` são propagados.
+///
+/// Para módulo **confiável**, a extensão é limitada pelo `SizeOfImage` do arquivo em disco, lido
+/// por `root` (ver [`open_in_root`]); módulo de terceiros nunca abre o disco.
 pub fn discover(
     maps: &[MapRegion],
     reader: &MemReader,
     policy: &TrustPolicy,
+    root: &Path,
 ) -> Result<Vec<Module>> {
     let mut modules = Vec::new();
     for (base, path) in candidate_bases(maps) {
@@ -144,11 +195,19 @@ pub fn discover(
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         let trusted = policy.is_trusted(&path);
+        let memory_size = u64::from(pe.size_of_image);
+        let (size, disk_size) = if trusted {
+            trusted_extent(&name, &path, memory_size, root)
+        } else {
+            (memory_size, None)
+        };
         modules.push(Module {
             name,
             path,
             base,
-            size: u64::from(pe.size_of_image),
+            size,
+            memory_size,
+            disk_size,
             trusted,
         });
     }
@@ -219,6 +278,7 @@ pub fn describe(modules: &[Module], addr: u64) -> Option<(String, u64)> {
 mod tests {
     use super::*;
     use crate::maps::parse_maps;
+    use crate::pe::tests::fake_pe;
 
     const GAME_MAPS: &str = include_str!("../tests/fixtures/game-maps.txt");
 
@@ -338,23 +398,11 @@ mod tests {
         );
     }
 
-    /// Cabeçalho PE32+ mínimo (sem seções) com o `SizeOfImage` dado.
+    /// Imagem PE mínima (sem seções) com o `SizeOfImage` dado, completada até `0x1000` bytes
+    /// (o `discover` lê essa janela da memória).
     fn tiny_pe(size_of_image: u32) -> Vec<u8> {
-        let mut f = vec![0u8; 0x1000];
-        f[0..2].copy_from_slice(b"MZ");
-        f[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
-        f[0x40..0x44].copy_from_slice(b"PE\0\0");
-        f[0x44..0x46].copy_from_slice(&0x8664u16.to_le_bytes());
-        let opt_size = 112 + 16 * 8;
-        f[0x54..0x56].copy_from_slice(&(opt_size as u16).to_le_bytes());
-        let o = 0x58;
-        f[o..o + 2].copy_from_slice(&0x20bu16.to_le_bytes());
-        f[o + 24..o + 32].copy_from_slice(&0x1_4000_0000u64.to_le_bytes());
-        f[o + 32..o + 36].copy_from_slice(&0x1000u32.to_le_bytes());
-        f[o + 36..o + 40].copy_from_slice(&0x200u32.to_le_bytes());
-        f[o + 56..o + 60].copy_from_slice(&size_of_image.to_le_bytes());
-        f[o + 60..o + 64].copy_from_slice(&0x400u32.to_le_bytes());
-        f[o + 108..o + 112].copy_from_slice(&16u32.to_le_bytes());
+        let mut f = fake_pe(&[], 0x1_4000_0000, 0, size_of_image, None);
+        f.resize(HEADER_LEN, 0);
         f
     }
 
@@ -381,15 +429,92 @@ mod tests {
         ];
         let reader = MemReader::new(std::process::id() as i32);
         let policy = TrustPolicy::new(vec!["/opt/trusted".into()]);
-        let mut modules = discover(&maps, &reader, &policy).unwrap();
+        // Nenhum dos arquivos existe em disco: o raiz vazio não muda o resultado.
+        let root = tempfile::tempdir().unwrap();
+        let mut modules = discover(&maps, &reader, &policy, root.path()).unwrap();
         modules.sort_by(|a, b| a.name.cmp(&b.name));
         assert_eq!(modules.len(), 2);
         assert_eq!(modules[0].name, "Game.EXE");
         assert_eq!(modules[0].size, 0x20_0000);
+        assert_eq!(modules[0].memory_size, 0x20_0000);
+        assert_eq!(modules[0].disk_size, None);
         assert_eq!(modules[0].base, pe_trusted.as_ptr() as u64);
         assert!(modules[0].trusted);
         assert_eq!(modules[1].name, "inject.dll");
         assert!(!modules[1].trusted);
+    }
+
+    /// Descobre um único módulo em `path`, com `memory` de `SizeOfImage` na memória e, se houver,
+    /// `disk` no arquivo correspondente sob um raiz temporário. Só `/opt/trusted` é confiável.
+    fn discover_one(path: &str, memory: u32, disk: Option<u32>) -> Module {
+        let root = tempfile::tempdir().unwrap();
+        if let Some(disk) = disk {
+            let file = root.path().join(path.trim_start_matches('/'));
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, fake_pe(&[], 0x1_4000_0000, 0, disk, None)).unwrap();
+        }
+        let image = tiny_pe(memory);
+        let maps = vec![file_region(image.as_ptr() as u64, path)];
+        let reader = MemReader::new(std::process::id() as i32);
+        let policy = TrustPolicy::new(vec!["/opt/trusted".into()]);
+        let mut modules = discover(&maps, &reader, &policy, root.path()).unwrap();
+        assert_eq!(modules.len(), 1);
+        modules.remove(0)
+    }
+
+    #[test]
+    fn trusted_extent_is_min_of_memory_and_disk() {
+        let m = discover_one("/opt/trusted/a.dll", 0x3000, Some(0x2000));
+        assert_eq!((m.memory_size, m.disk_size), (0x3000, Some(0x2000)));
+        assert_eq!(m.size, 0x2000);
+        assert!(m.extent_checked());
+        // Disco maior que a memória: a memória continua limitando.
+        let m = discover_one("/opt/trusted/b.dll", 0x2000, Some(0x3000));
+        assert_eq!(m.size, 0x2000);
+        // Iguais: sem diferença.
+        let m = discover_one("/opt/trusted/c.dll", 0x2000, Some(0x2000));
+        assert_eq!(m.size, 0x2000);
+        assert!(m.extent_checked());
+    }
+
+    #[test]
+    fn trusted_extent_without_disk_keeps_memory() {
+        let m = discover_one("/opt/trusted/a.dll", 0x3000, None);
+        assert_eq!(m.size, 0x3000);
+        assert_eq!((m.memory_size, m.disk_size), (0x3000, None));
+        assert!(!m.extent_checked());
+    }
+
+    #[test]
+    fn third_party_extent_ignores_disk() {
+        let m = discover_one("/home/u/evil/x.dll", 0x3000, Some(0x1000));
+        assert!(!m.trusted);
+        assert_eq!(m.size, 0x3000);
+        assert_eq!(m.disk_size, None);
+        assert!(!m.extent_checked());
+    }
+
+    #[test]
+    fn open_in_root_prefers_root_and_falls_back_to_direct_path() {
+        let root = tempfile::tempdir().unwrap();
+        let direct = tempfile::tempdir().unwrap();
+        let direct_file = direct.path().join("d.dll");
+        std::fs::write(&direct_file, fake_pe(&[], 0x1_4000_0000, 0, 0x5000, None)).unwrap();
+        // Só o caminho direto existe.
+        let pe = open_in_root(root.path(), &direct_file).unwrap();
+        assert_eq!(pe.size_of_image, 0x5000);
+        // Com a cópia no raiz, ela vence.
+        let in_root = root.path().join(direct_file.strip_prefix("/").unwrap());
+        std::fs::create_dir_all(in_root.parent().unwrap()).unwrap();
+        std::fs::write(&in_root, fake_pe(&[], 0x1_4000_0000, 0, 0x6000, None)).unwrap();
+        assert_eq!(
+            open_in_root(root.path(), &direct_file)
+                .unwrap()
+                .size_of_image,
+            0x6000
+        );
+        // Nenhum dos dois: erro.
+        assert!(open_in_root(root.path(), Path::new("/nao/existe.dll")).is_err());
     }
 
     #[test]

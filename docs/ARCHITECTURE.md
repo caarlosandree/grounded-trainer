@@ -76,7 +76,7 @@ grounded-trainer/
 | `serde_json` | Saída em JSON das ferramentas do `gt` |
 | `libc` | Chamadas de sistema sem wrapper no `nix` (ex.: `mmap`/`prctl` do alvo de teste) |
 | `tempfile` | Diretórios e arquivos temporários nos testes (só `dev-dependencies`) |
-| `tracing` + `tracing-subscriber` | Logs (em arquivo enquanto a TUI estiver aberta) |
+| `tracing` + `tracing-subscriber` | Logs (em arquivo enquanto a TUI estiver aberta); o `gt-core` usa só `tracing` (avisos de extensão de módulo) |
 | `signal-hook` | Restauração ao receber SIGINT/SIGTERM |
 
 As versões são fixadas no `Cargo.toml` na Fase 0, usando a estável mais recente.
