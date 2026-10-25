@@ -13,7 +13,7 @@ use gt_core::engine::{Engine, EngineOptions, PolicyFn};
 use gt_core::journal::{JournalEntry, JournalLock, JournalStore, Loaded};
 use gt_core::mem::{MemReader, MemWriter};
 use gt_core::patch::{PatchSpec, Validated, WritePolicy, validate};
-use gt_core::procinfo::{ThreadPos, list_tids, read_stat, read_task_stat};
+use gt_core::procinfo::{Identity, ThreadPos, identity, list_tids, read_stat, read_task_stat};
 use gt_core::suspend::{
     HookPoint, PauseConfig, is_stopped_now, open_checked, pause, sample_pcs, wait_until,
 };
@@ -184,7 +184,7 @@ fn open_engine(
             ..PauseConfig::default()
         },
     };
-    Engine::open(pid, env.store.clone(), &env.lock, policy, opts).unwrap()
+    Engine::open(pid, None, env.store.clone(), &env.lock, policy, opts).unwrap()
 }
 
 fn patch(id: &str, addr: u64, expected: &[u8], replacement: &[u8]) -> Validated {
@@ -217,6 +217,51 @@ fn missing(env: &Env) -> bool {
 
 const NOP3: [u8; 3] = [0x90, 0x90, 0x90];
 const NOP2_NOP: [u8; 3] = [0x66, 0x90, 0x90];
+
+fn open_expecting(t: &TestTarget, env: &Env, expected: &Identity) -> gt_core::Result<Engine> {
+    let range = exec2_range(t);
+    let policy: PolicyFn = Box::new(move |_maps| WritePolicy::new(vec![range.clone()]));
+    let opts = EngineOptions {
+        version_key: "teste".into(),
+        pause: PauseConfig::default(),
+    };
+    Engine::open(
+        t.pid,
+        Some(expected),
+        env.store.clone(),
+        &env.lock,
+        policy,
+        opts,
+    )
+}
+
+#[test]
+fn open_refuses_other_identity() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let real = identity(t.pid).unwrap();
+    for wrong in [
+        Identity {
+            start_time: real.start_time + 1,
+            ..real.clone()
+        },
+        Identity {
+            boot_id: "outro-boot".into(),
+            ..real.clone()
+        },
+    ] {
+        let r = open_expecting(&t, &env, &wrong);
+        assert!(matches!(r, Err(Error::ProcessGone { .. })), "{wrong:?}");
+    }
+    assert!(missing(&env));
+    assert_eq!(bytes_at(t.pid, t.exec2, 3), NOP3);
+    // Com a identidade certa, abre e escreve normalmente.
+    let mut engine = open_expecting(&t, &env, &real).unwrap();
+    engine
+        .apply(vec![patch("p", t.exec2, &NOP3, &NOP2_NOP)])
+        .unwrap();
+    assert_eq!(bytes_at(t.pid, t.exec2, 3), NOP2_NOP);
+}
 
 #[test]
 fn apply_and_undo_on_exec_page() {
@@ -362,7 +407,7 @@ fn drop_keeps_journal_when_policy_refuses_undo() {
         version_key: "teste".into(),
         pause: PauseConfig::default(),
     };
-    let mut engine = Engine::open(t.pid, env.store.clone(), &env.lock, policy, opts).unwrap();
+    let mut engine = Engine::open(t.pid, None, env.store.clone(), &env.lock, policy, opts).unwrap();
     engine
         .apply(vec![patch("p", t.exec2, &NOP3, &NOP2_NOP)])
         .unwrap();

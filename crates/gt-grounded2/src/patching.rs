@@ -13,8 +13,9 @@ use crate::resolve::Target;
 /// Abre o motor de patches no processo `target`.
 ///
 /// A política de escrita é recalculada a cada lote com o `maps` novo ([`write_policy`]), a
-/// partir do `module` e do cabeçalho do disco `disk` (calculados uma vez, spec 6.6). Quem chama
-/// guarda o `lock` do diário até depois do `drop` do [`Engine`].
+/// partir do `module` e do cabeçalho do disco `disk` (calculados uma vez, spec 6.6). O motor só
+/// abre se o processo ainda tiver a identidade lida no [`Target::open`]. Quem chama guarda o
+/// `lock` do diário até depois do `drop` do [`Engine`].
 pub fn open_engine(
     target: &Target,
     store: JournalStore,
@@ -29,5 +30,12 @@ pub fn open_engine(
         version_key,
         pause: PauseConfig::default(),
     };
-    Ok(Engine::open(target.pid, store, lock, policy, options)?)
+    Ok(Engine::open(
+        target.pid,
+        Some(&target.identity),
+        store,
+        lock,
+        policy,
+        options,
+    )?)
 }

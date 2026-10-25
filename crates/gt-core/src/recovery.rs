@@ -19,7 +19,7 @@ use crate::journal::{
 };
 use crate::maps::{MapRegion, read_maps};
 use crate::patch::{MAX_PATCH_LEN, WritePolicy};
-use crate::procinfo::{ProcStat, boot_id, read_stat};
+use crate::procinfo::{Identity, ProcStat, boot_id, read_stat};
 use crate::suspend::{PauseConfig, open_checked};
 use crate::{Error, Result};
 
@@ -165,7 +165,22 @@ pub fn recover(
         version_key: journal.version_key.clone(),
         pause: cfg.clone(),
     };
-    let mut engine = match Engine::open(journal.pid, store.clone(), lock, policy, opts) {
+    // A identidade do diário: se o processo mudou desde a conferência acima, o motor
+    // recusa a abertura e nada é escrito.
+    let expected = Identity {
+        pid: journal.pid,
+        start_time: journal.start_time,
+        boot_id: journal.boot_id.clone(),
+    };
+    let opened = Engine::open(
+        journal.pid,
+        Some(&expected),
+        store.clone(),
+        lock,
+        policy,
+        opts,
+    );
+    let mut engine = match opened {
         Ok(engine) => engine,
         Err(Error::ProcessGone { .. }) => return finish_gone(store, report),
         Err(e) => return Err(e),

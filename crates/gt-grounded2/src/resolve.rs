@@ -9,6 +9,7 @@ use gt_core::mem::MemReader;
 use gt_core::modules::{self, Module, TrustPolicy};
 use gt_core::pe::{DiskImage, PeHeaders, check_same_version};
 use gt_core::process::list_processes;
+use gt_core::procinfo::{Identity, identity};
 
 use crate::target::{Pick, pick};
 use crate::{Error, GAME_EXE, Result};
@@ -19,6 +20,8 @@ const HEADER_LEN: usize = 0x1000;
 /// Processo alvo já resolvido.
 pub struct Target {
     pub pid: i32,
+    /// Identidade do processo lida na abertura; o motor confere que ainda é a mesma.
+    pub identity: Identity,
     /// Processos que mencionam o jogo mas foram descartados, com o motivo.
     pub discarded: Vec<(i32, String)>,
     pub maps: Vec<MapRegion>,
@@ -36,6 +39,7 @@ impl Target {
             Some(pid) => (pid, Vec::new()),
             None => find_game()?,
         };
+        let identity = identity(pid)?;
         let maps = read_maps(pid)?;
         let reader = MemReader::new(pid);
         let policy = match game_exe_path(&maps) {
@@ -52,6 +56,7 @@ impl Target {
         let non_pe = modules::verified_non_pe(&maps, &root);
         Ok(Target {
             pid,
+            identity,
             discarded,
             maps,
             reader,

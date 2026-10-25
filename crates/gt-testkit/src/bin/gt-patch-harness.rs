@@ -21,6 +21,7 @@ use anyhow::{Context, Result, bail};
 use gt_core::engine::{Engine, EngineOptions, PolicyFn};
 use gt_core::journal::{DiscardReason, JournalStore};
 use gt_core::patch::{PatchSpec, WritePolicy, validate};
+use gt_core::procinfo::identity;
 use gt_core::recovery::{RecoveryReport, recover};
 use gt_core::session::{RunEnd, Shutdown, run_until_shutdown};
 use gt_core::suspend::{HookPoint, PauseConfig};
@@ -235,6 +236,9 @@ fn run(args: Args, addr: u64, expected: Vec<u8>, replacement: Vec<u8>) -> Result
     if !report.is_empty() {
         print_recovery(&mut std::io::stdout().lock(), &report)?;
     }
+    // Identidade do alvo lida depois da recuperação, como o `Target::open` do `gt-patch`: o
+    // motor só abre se o processo ainda for o mesmo.
+    let target_id = identity(pid)?;
     let patch = validate(PatchSpec {
         id: PATCH_ID.into(),
         addr,
@@ -249,7 +253,7 @@ fn run(args: Args, addr: u64, expected: Vec<u8>, replacement: Vec<u8>) -> Result
             ..PauseConfig::default()
         },
     };
-    let mut engine = Engine::open(pid, store.clone(), &lock, policy, opts)?;
+    let mut engine = Engine::open(pid, Some(&target_id), store.clone(), &lock, policy, opts)?;
     engine.apply(vec![patch])?;
     {
         let mut out = std::io::stdout().lock();

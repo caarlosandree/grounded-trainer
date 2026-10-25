@@ -160,15 +160,23 @@ impl Engine {
     /// Abre o motor: horário de início → `pidfd` → `/proc/<pid>/mem` → horário de novo
     /// (spec 6.7). Se o horário mudou, o PID foi reaproveitado: [`Error::ProcessGone`].
     ///
+    /// `expected` é a identidade que quem chama já conhece (a do diário, na recuperação,
+    /// ou a lida ao resolver o alvo): se a lida agora for outra, o processo não é mais o
+    /// mesmo e a abertura devolve [`Error::ProcessGone`] sem escrever nada.
+    ///
     /// `_lock` é a testemunha de que quem chama segura a trava do diário.
     pub fn open(
         pid: i32,
+        expected: Option<&Identity>,
         store: JournalStore,
         _lock: &JournalLock,
         policy: PolicyFn,
         opts: EngineOptions,
     ) -> Result<Engine> {
         let before = identity(pid)?;
+        if expected.is_some_and(|e| *e != before) {
+            return Err(Error::ProcessGone { pid });
+        }
         let pidfd = Pidfd::open(pid)?;
         let writer = MemWriter::open(pid)?;
         let after = identity(pid)?;
