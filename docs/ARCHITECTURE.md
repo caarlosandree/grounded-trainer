@@ -104,7 +104,11 @@ As versões são fixadas no `Cargo.toml` na Fase 0, usando a estável mais recen
 
 ### 5.3 Versão do jogo e assinaturas
 - Chave de versão: campo `TimeDateStamp` do PE (hash de build reprodutível, ex. `c935e799`) + `SizeOfImage`.
-- `signatures/<chave>.toml` guarda padrões, offsets e bytes esperados por versão. Uma versão desconhecida usa os padrões genéricos (só AOB) e marca como "não verificado".
+- Assinaturas em `crates/gt-grounded2/signatures/*.toml`, embutidas no binário (`include_str!`); atualizar exige recompilar. Detalhes do comportamento na spec `002-motor-patches.md` (6.3 e 6.4).
+  - `generic.toml` (obrigatório): um bloco `[[patch]]` por patch, válido para qualquer versão: `id`, `description` (pt-BR), `module` (opcional; só o exe do jogo nesta fase), `pattern` (AOB com os bytes originais, mesma sintaxe do `gt scan`), `offset` (do início da ocorrência ao início do patch), `expected` e `replacement` (bytes em hex separados por espaço, mesmo tamanho).
+  - `<chave>.toml` (ex.: `c935e799-0b27c000.toml`): `version` (igual ao nome do arquivo), `product_version` (opcional, informativo) e, por patch verificado naquela build, `[[patch]]` com `id` (já definido no genérico) e `rva` (início do patch relativo à base do módulo, aceita hexadecimal `0x...`); opcionalmente sobrescreve `pattern`, `offset`, `expected` e `replacement` quando a build mudou o código.
+  - Regra de carga (erro claro com arquivo e campo, também depois das sobrescritas): `id` único; `module` igual ao exe do jogo; hex válido; `expected` e `replacement` do mesmo tamanho; o trecho `[offset, offset + tamanho)` cabe no `pattern`; cada byte fixo do `pattern` nesse trecho é igual ao de `expected` (curingas no trecho são permitidos).
+- Versão com arquivo e `rva` conferido: patch "disponível (verificado)". Versão sem arquivo (ou sem entrada para o `id`) usa a definição genérica e, se o padrão for único na memória e no disco no mesmo lugar, fica "disponível (não verificado)".
 - Cada cheat informa o próprio estado: disponível, padrão não encontrado ou padrão ambíguo.
 
 ### 5.4 Escrita segura de patches

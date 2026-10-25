@@ -1,0 +1,7 @@
+# Definições genéricas dos patches, válidas para qualquer versão do jogo (spec 002, 6.3).
+#
+# Cada patch é um bloco [[patch]] com:
+#   id, description (pt-BR), module (opcional; padrão: o exe do jogo),
+#   pattern (AOB com os bytes ORIGINAIS), offset, expected e replacement (bytes em hex).
+#
+# Sem patches nesta fase: o `teste-codificacao` entra na Tarefa 15, depois da pesquisa no jogo.

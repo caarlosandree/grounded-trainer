@@ -48,6 +48,12 @@ impl Pattern {
         self.bytes.len()
     }
 
+    /// A posição `i` do padrão: `None` fora do padrão, `Some(None)` para curinga e `Some(Some(b))`
+    /// para um byte fixo.
+    pub fn token(&self, i: usize) -> Option<Option<u8>> {
+        self.bytes.get(i).copied()
+    }
+
     /// Sempre `false` para um padrão criado por `parse`. Existe por causa do `len`.
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
@@ -167,6 +173,15 @@ mod tests {
     fn parses_wildcards() {
         let p = Pattern::parse("48 8B ?? ? 05").unwrap();
         assert_eq!(p.len(), 5);
+    }
+
+    #[test]
+    fn token_accessor() {
+        let p = Pattern::parse("48 ?? 05").unwrap();
+        assert_eq!(p.token(0), Some(Some(0x48)));
+        assert_eq!(p.token(1), Some(None));
+        assert_eq!(p.token(2), Some(Some(0x05)));
+        assert_eq!(p.token(3), None);
     }
 
     #[test]

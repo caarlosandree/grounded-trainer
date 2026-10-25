@@ -8,7 +8,9 @@ publish.workspace = true
 
 [dependencies]
 gt-core.workspace = true
+serde.workspace = true
 thiserror.workspace = true
+toml.workspace = true
 tracing.workspace = true
 
 [features]

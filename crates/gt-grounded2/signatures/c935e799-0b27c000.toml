@@ -1,0 +1,5 @@
+# Build verificada do Grounded 2 (TimeDateStamp c935e799, SizeOfImage 0b27c000).
+# Por patch: `rva` (início do patch, relativo à base do módulo) e, se a build mudou o código,
+# `pattern`, `offset`, `expected` e `replacement`. Sem patches nesta fase.
+version = "c935e799-0b27c000"
+product_version = "Augusta-CL-3207493"

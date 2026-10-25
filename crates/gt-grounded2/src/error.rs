@@ -24,6 +24,14 @@ pub enum Error {
         source: gt_core::Error,
     },
 
+    /// Arquivo de assinaturas inválido (`signatures/*.toml`).
+    #[error("assinatura inválida em {file}, campo {field}: {reason}")]
+    Signature {
+        file: String,
+        field: String,
+        reason: String,
+    },
+
     /// Erro do núcleo; a mensagem é a do próprio erro.
     #[error(transparent)]
     Core(#[from] gt_core::Error),
