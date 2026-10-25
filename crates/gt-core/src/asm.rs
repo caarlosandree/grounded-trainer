@@ -1,7 +1,8 @@
 //! Desmontagem x86-64 e destino de desvios.
 
 use iced_x86::{
-    Decoder, DecoderOptions, FlowControl, Formatter, Instruction, IntelFormatter, Mnemonic, OpKind,
+    Decoder, DecoderOptions, FlowControl, Formatter, Instruction, IntelFormatter, MemorySize,
+    Mnemonic, OpKind,
 };
 
 /// Texto de uma instrução que o decodificador não reconheceu.
@@ -9,6 +10,9 @@ const INVALID_TEXT: &str = "(inválida)";
 
 /// Tamanho máximo de uma instrução x86 em bytes.
 const MAX_INSN_LEN: usize = 15;
+
+/// Tamanho de `jmp rel32` e `call rel32` em bytes.
+const REL32_BRANCH_LEN: usize = 5;
 
 /// Quantos bytes antes do trecho `disassemble_around` tenta alinhar.
 const AROUND_LOOKBACK: usize = 64;
@@ -128,12 +132,27 @@ pub fn branch_at(bytes: &[u8], ip: u64) -> Option<Branch> {
         return None;
     }
     match insn.mnemonic() {
-        Mnemonic::Jmp | Mnemonic::Call if is_near_branch(&insn) => {
+        // Só `jmp rel32` / `call rel32` (5 bytes): `jmp rel8` e `rel16` não servem de desvio de
+        // patch e o destino delas não é o que um `e9`/`e8` mostraria.
+        Mnemonic::Jmp | Mnemonic::Call
+            if insn.op0_kind() == OpKind::NearBranch64 && insn.len() == REL32_BRANCH_LEN =>
+        {
             Some(Branch::Direct(insn.near_branch_target()))
         }
-        Mnemonic::Jmp if insn.is_ip_rel_memory_operand() => Some(Branch::RipIndirect {
-            slot: insn.ip_rel_memory_address(),
-        }),
+        // Só `jmp qword ptr [rip+x]`: o slot lido tem 8 bytes (nada de `jmp far`). O iced
+        // reporta o operando de memória desse `jmp` como `QwordOffset`.
+        Mnemonic::Jmp
+            if insn.op0_kind() == OpKind::Memory
+                && matches!(
+                    insn.memory_size(),
+                    MemorySize::QwordOffset | MemorySize::UInt64
+                )
+                && insn.is_ip_rel_memory_operand() =>
+        {
+            Some(Branch::RipIndirect {
+                slot: insn.ip_rel_memory_address(),
+            })
+        }
         _ => None,
     }
 }
@@ -151,6 +170,8 @@ pub fn disassemble_around(
     end: u64,
     context: usize,
 ) -> Vec<Insn> {
+    // Um fim antes do início vira um trecho vazio no início.
+    let end = end.max(start);
     let Some(start_off) = start
         .checked_sub(base)
         .and_then(|o| usize::try_from(o).ok())
@@ -224,6 +245,53 @@ mod tests {
             branch_at(&b, 0x1000),
             Some(Branch::RipIndirect { slot: 0x1016 })
         ));
+    }
+
+    #[test]
+    fn short_and_word_branches_are_not_direct() {
+        // jmp rel8, jmp rel16 (prefixo 66) e call rel16: o destino não é o de um rel32.
+        assert_eq!(branch_at(&[0xeb, 0x05], 0x1000), None);
+        assert_eq!(branch_at(&[0x66, 0xe9, 0x10, 0x00], 0x1000), None);
+        assert_eq!(branch_at(&[0x66, 0xe8, 0x10, 0x00], 0x1000), None);
+    }
+
+    #[test]
+    fn far_rip_jumps_are_not_rip_indirect() {
+        // jmp far [rip+0x10] (ff /5) e jmp far m16:64 (48 ff /5): o slot não é um ponteiro de 8 bytes.
+        assert_eq!(
+            branch_at(&[0xff, 0x2d, 0x10, 0x00, 0x00, 0x00], 0x1000),
+            None
+        );
+        assert_eq!(
+            branch_at(&[0x48, 0xff, 0x2d, 0x10, 0x00, 0x00, 0x00], 0x1000),
+            None
+        );
+    }
+
+    #[test]
+    fn call_rel32_is_direct() {
+        let b = [0xe8, 0xef, 0xab, 0x2e, 0xfe];
+        assert!(matches!(
+            branch_at(&b, 0x1456FC11C),
+            Some(Branch::Direct(0x1439E6D10))
+        ));
+    }
+
+    #[test]
+    fn around_with_end_before_start_does_not_panic() {
+        let mut b = vec![0x90u8; 10];
+        b.push(0xc3);
+        let base = 0x1000;
+        let start = base + 10;
+        let inverted = disassemble_around(&b, base, start, start - 4, 3);
+        let empty = disassemble_around(&b, base, start, start, 3);
+        assert_eq!(inverted, empty);
+        // Com `context = 0` o intervalo invertido dava `lo > hi` e derrubava o processo.
+        assert_eq!(
+            disassemble_around(&b, base, start, start - 4, 0),
+            disassemble_around(&b, base, start, start, 0)
+        );
+        assert_eq!(inverted.last().map(|i| i.addr), Some(start));
     }
 
     #[test]
