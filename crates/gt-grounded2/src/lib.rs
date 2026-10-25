@@ -1,1 +1,12 @@
-//! Conhecimento específico do Grounded 2: cheats e assinaturas.
+//! Conhecimento específico do Grounded 2: constantes do jogo e regra de casamento do processo.
+
+pub mod target;
+
+/// Nome do executável do jogo, como aparece no `cmdline` (formato Windows).
+pub const GAME_EXE: &str = "Grounded2Steam-Win64-Shipping.exe";
+
+/// AppID da Steam do Grounded 2.
+pub const APP_ID: u32 = 2661300;
+
+/// Pasta do trainer FLiNG usada para localizar o `symbols.ini` (Tarefa 9).
+pub const FLING_GAME_DIR: &str = "grounded-2-trainer";

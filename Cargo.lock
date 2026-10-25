@@ -80,6 +80,11 @@ dependencies = [
 [[package]]
 name = "gt-grounded2"
 version = "0.1.0"
+dependencies = [
+ "gt-core",
+ "tempfile",
+ "thiserror",
+]
 
 [[package]]
 name = "gt-tui"
