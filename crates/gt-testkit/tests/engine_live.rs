@@ -752,3 +752,27 @@ fn stress_1000_toggles_on_spinning_loop() {
         "nenhum pc em spin_page: {pcs:x?}"
     );
 }
+
+#[test]
+fn toggle_cycles_and_ends_off() {
+    use gt_core::session::{Shutdown, toggle};
+
+    let t = TestTarget::spawn();
+    let env = env();
+    let mut engine = open_engine(t.pid, &env, vec![exec2_range(&t)], None);
+    let p = patch("t", t.exec2, &NOP3, &NOP2_NOP);
+    let shutdown = Shutdown::manual();
+    let report = toggle(&mut engine, p.clone(), 20, Duration::ZERO, &shutdown).unwrap();
+    assert_eq!(report.cycles, 20);
+    assert!(report.pause_max >= report.pause_avg, "{report:?}");
+    assert!(report.pause_max > Duration::ZERO, "{report:?}");
+    assert_eq!(bytes_at(t.pid, t.exec2, 3), NOP3);
+    assert!(engine.active().is_empty());
+    assert!(missing(&env));
+
+    shutdown.request();
+    let report = toggle(&mut engine, p, 20, Duration::ZERO, &shutdown).unwrap();
+    assert_eq!(report.cycles, 0);
+    assert_eq!(bytes_at(t.pid, t.exec2, 3), NOP3);
+    assert!(missing(&env));
+}

@@ -8,7 +8,7 @@ publish.workspace = true
 
 [features]
 # Escrita crua em /proc/<pid>/mem. O `gt` nunca ativa esta feature.
-write = ["dep:libc"]
+write = ["dep:libc", "dep:signal-hook"]
 # Apoio a testes (mmap/prctl) para o processo-alvo de teste.
 test-support = ["dep:libc"]
 
@@ -19,6 +19,7 @@ libc = { workspace = true, optional = true }
 nix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+signal-hook = { workspace = true, optional = true }
 thiserror.workspace = true
 tracing.workspace = true
 

@@ -44,16 +44,25 @@ grounded-trainer/
 │   │       ├── pe.rs             # cabeçalhos PE lidos da memória (seções)
 │   │       ├── scan.rs           # padrões AOB com curingas
 │   │       ├── asm.rs            # wrappers iced-x86: disasm, montagem, relocação RIP-relative
-│   │       ├── patch.rs          # Patch, CodeCave, Freeze + guarda de restauração
-│   │       └── suspend.rs        # pausar/retomar o processo durante escritas
+│   │       ├── memscan.rs        # busca AOB na memória do processo e veredito
+│   │       ├── procinfo.rs       # /proc/<pid>/stat, threads, posição das threads, boot_id, identidade
+│   │       ├── patch.rs          # validação de patch, fronteiras de instrução, regra de perigo, política
+│   │       ├── journal.rs        # diário em disco, trava OFD e decisão de recuperação (pura)
+│   │       ├── suspend.rs        # pausar/retomar o processo com conferência das threads
+│   │       ├── engine.rs         # motor: aplica/desfaz lotes com diário e pausa (feature write)
+│   │       ├── recovery.rs       # recuperação do diário no início de cada comando (feature write)
+│   │       └── session.rs        # sinais de encerramento, laço do run e toggle (feature write)
 │   ├── gt-ue/                    # estruturas do Unreal Engine 5 (Fase 5)
 │   │   └── src/                  # FName/GNames, GObjects, GWorld, leitura de UObjects
 │   ├── gt-grounded2/             # conhecimento específico do jogo
 │   │   ├── src/cheats/           # 1 módulo por cheat (sobrevivência, itens, progressão, movimento)
 │   │   └── signatures/           # *.toml por build do jogo
 │   └── gt-testkit/               # apoio a testes (publish = false): TestTarget, bin_path e binários de apoio
-│       ├── src/bin/gt-testtarget.rs  # processo-alvo de teste (não é o gt)
-│       └── tests/core_live.rs    # testes de API viva do gt-core contra o alvo
+│       ├── src/bin/gt-testtarget.rs      # processo-alvo de teste (não é o gt)
+│       ├── src/bin/gt-patch-harness.rs   # mesma biblioteca do gt-patch com patch cru (testes)
+│       ├── tests/core_live.rs    # testes de API viva do gt-core contra o alvo
+│       ├── tests/engine_live.rs  # testes do motor, da pausa e do toggle contra o alvo
+│       └── tests/harness.rs      # sinais, pânico, SIGKILL e recuperação pelo harness
 ├── apps/
 │   ├── gt-cli/                   # ferramentas de pesquisa: inspect, read, scan, disasm, diff, dump, fling
 │   └── gt-tui/                   # interface do jogador
@@ -99,10 +108,13 @@ As versões são fixadas no `Cargo.toml` na Fase 0, usando a estável mais recen
 - Cada cheat informa o próprio estado: disponível, padrão não encontrado ou padrão ambíguo.
 
 ### 5.4 Escrita segura de patches
-1. Verificar que os bytes atuais são os esperados (se não, recusar).
-2. **Pausar o processo** (`SIGSTOP`), escrever e retomar (`SIGCONT`). Isso evita que uma thread do jogo execute uma instrução escrita pela metade. A pausa dura poucos milissegundos.
-3. Registrar o patch no `PatchRegistry`, que desfaz tudo em `Drop`, em pânico (`panic hook`) e em SIGINT/SIGTERM.
-4. Se o jogo fechar, o registro é descartado sem tentar escrever.
+Detalhes na spec `docs/specs/002-motor-patches.md` (6.2 a 6.8).
+1. **Validação:** mesmo tamanho, instruções completas, no máximo 64 bytes, dentro da política de escrita (intervalos permitidos, recalculados do `maps` a cada lote). Bytes atuais diferentes dos esperados recusam o lote.
+2. **Diário antes de escrever:** a intenção (e o marcador "pausado por nós") vai para `$XDG_STATE_HOME/grounded-trainer/journal.json` por escrita atômica antes da pausa; o diário é atualizado depois de cada lote. Uma trava OFD em `journal.lock` garante uma instância por vez; ordem de todo comando que escreve: trava → recuperação → escritas.
+3. **Pausa conferida:** `SIGSTOP` pelo `pidfd` e conferência, thread por thread, de que todas pararam (prazo de 500 ms). Se alguma thread está parada num ponto em que a troca de bytes muda a fronteira de instrução (regra de perigo, incluindo `pc - 2` em syscall), retoma e tenta de novo (até 10 tentativas, 20 ms entre elas). Releitura dos bytes e conferência de que tudo continua parado imediatamente antes de escrever; escrita por `/proc/<pid>/mem`, releitura e `SIGCONT`.
+4. **Identidade:** PID **e** horário de início (`/proc/<pid>/stat`), conferidos antes de cada escrita; `pidfd` e descritor do `mem` abertos com a identidade conferida, de modo que um PID reaproveitado nunca recebe sinal nem escrita. Processo sumido, horário diferente ou zumbi: o jogo fechou e o registro é descartado sem escrever.
+5. **Restauração:** o motor desfaz tudo no `undo_all` e no `Drop` (inclusive no desenrolar de um pânico). SIGINT/SIGTERM/SIGHUP/SIGQUIT só marcam o pedido (`signal-hook`); o laço do `run` desfaz e sai. SIGTSTP/SIGTTIN/SIGTTOU são ignorados.
+6. **Recuperação** (SIGKILL, travamento, queda de energia): no início de cada comando, o diário é conferido contra o `/proc` (`boot_id`, PID, horário de início). Outro boot ou processo: descarta. Mesmo processo: `SIGCONT` se estava pausado por nós e, para cada entrada em memória executável, reescreve os originais onde cada byte é o original ou o nosso; byte de outro → não escreve. O diário só é limpo quando tudo foi resolvido.
 
 ### 5.5 Code caves (Fase 6)
 Sem `VirtualAllocEx` de fora do processo, existem duas estratégias:

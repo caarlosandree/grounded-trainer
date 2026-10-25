@@ -16,7 +16,11 @@ pub mod patch;
 pub mod pe;
 pub mod process;
 pub mod procinfo;
+#[cfg(feature = "write")]
+pub mod recovery;
 pub mod scan;
+#[cfg(feature = "write")]
+pub mod session;
 pub mod suspend;
 
 pub use error::{Error, Result};
