@@ -58,8 +58,10 @@ pub struct RestoreReport {
     pub restored: Vec<String>,
     /// Entradas que já tinham os bytes originais (só esquecidas).
     pub dropped: Vec<String>,
-    /// Entradas com bytes de outro (ou inválidas, ou fora da política): não tocadas.
+    /// Entradas com bytes de outro (ou inválidas): não tocadas e tiradas do diário.
     pub foreign: Vec<String>,
+    /// Entradas fora da política de escrita: não tocadas e mantidas no diário.
+    pub outside_policy: Vec<String>,
 }
 
 /// Quais fronteiras perdidas valem na regra de perigo de uma escrita.
@@ -395,9 +397,14 @@ impl Engine {
         let mut ops = Vec::new();
         for e in entries {
             if !policy.allows(&entry_range(&e)) {
-                tracing::warn!(id = %e.id, addr = e.addr, "entrada fora da política; não tocada");
-                report.foreign.push(e.id.clone());
-                resolved.push(e);
+                // Não conta como resolvida: os bytes podem ser nossos, então a entrada
+                // fica no diário para a próxima execução (spec 6.7).
+                tracing::warn!(
+                    id = %e.id,
+                    addr = e.addr,
+                    "entrada fora da política; não tocada e mantida no diário"
+                );
+                report.outside_policy.push(e.id.clone());
                 continue;
             }
             let spec = PatchSpec {

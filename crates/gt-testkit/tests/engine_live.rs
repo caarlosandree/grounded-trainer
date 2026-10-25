@@ -5,7 +5,7 @@ use std::cell::Cell;
 use std::ops::Range;
 use std::os::unix::fs::PermissionsExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use gt_core::Error;
@@ -341,6 +341,44 @@ fn drop_restores() {
     drop(engine);
     assert_eq!(bytes_at(t.pid, t.exec2, 3), NOP3);
     assert!(missing(&env));
+    assert!(wait_all_running(t.pid), "{:?}", states(t.pid));
+}
+
+static DENY_POLICY: AtomicBool = AtomicBool::new(false);
+
+#[test]
+fn drop_keeps_journal_when_policy_refuses_undo() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let range = exec2_range(&t);
+    let policy: PolicyFn = Box::new(move |_maps| {
+        if DENY_POLICY.load(Ordering::SeqCst) {
+            WritePolicy::new(Vec::new())
+        } else {
+            WritePolicy::new(vec![range.clone()])
+        }
+    });
+    let opts = EngineOptions {
+        version_key: "teste".into(),
+        pause: PauseConfig::default(),
+    };
+    let mut engine = Engine::open(t.pid, env.store.clone(), &env.lock, policy, opts).unwrap();
+    engine
+        .apply(vec![patch("p", t.exec2, &NOP3, &NOP2_NOP)])
+        .unwrap();
+    DENY_POLICY.store(true, Ordering::SeqCst);
+    drop(engine);
+    // Nada foi escrito e a entrada continua no diário para a próxima execução.
+    assert_eq!(bytes_at(t.pid, t.exec2, 3), NOP2_NOP);
+    match env.store.peek().unwrap() {
+        Loaded::Ok(j) => {
+            assert!(!j.paused_by_us);
+            assert_eq!(j.entries.len(), 1);
+            assert_eq!(j.entries[0].id, "p");
+            assert_eq!(j.entries[0].replacement, NOP2_NOP.to_vec());
+        }
+        other => panic!("diário inesperado: {other:?}"),
+    }
     assert!(wait_all_running(t.pid), "{:?}", states(t.pid));
 }
 
