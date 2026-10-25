@@ -4,4 +4,14 @@
 #   id, description (pt-BR), module (opcional; padrão: o exe do jogo),
 #   pattern (AOB com os bytes ORIGINAIS), offset, expected e replacement (bytes em hex).
 #
-# Sem patches nesta fase: o `teste-codificacao` entra na Tarefa 15, depois da pesquisa no jogo.
+
+# Patch de teste da Fase 2 (spec 002, 6.9): troca sem efeito na partida. `or rax, rdx` (48 0B C2) vira a
+# outra codificação da mesma instrução (48 09 D0), dentro de uma espera ativa que as threads do jogo
+# executam o tempo todo. Achado em 2026-10-25 (RESEARCH.md, sessão B).
+[[patch]]
+id = "teste-codificacao"
+description = "Troca sem efeito (codificação equivalente de or rax, rdx), para testar o motor"
+pattern = "f3 90 0f 31 48 c1 e2 20 48 0b c2 48 2b c7 48 3b c3 72 ed"
+offset = 8
+expected = "48 0b c2"
+replacement = "48 09 d0"

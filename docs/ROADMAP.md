@@ -56,8 +56,9 @@ Cada fase só começa quando a anterior cumpre seu critério de pronto. Cada fun
 - Restauração garantida: ao sair, com Ctrl+C, em pânico do trainer ou se o jogo fechar.
 - Detecção de versão do jogo e arquivo de assinaturas por versão (`signatures/*.toml`).
 
-**Pronto quando:** um patch de teste liga e desliga 100 vezes seguidas sem crash, e matar o trainer restaura os bytes.
+**Pronto quando:** um patch de teste liga e desliga 100 vezes seguidas sem crash; Ctrl+C, SIGTERM e pânico restauram os bytes na hora; SIGKILL restaura na próxima execução, pelo diário (`gt-patch restore`).
 **Você faz:** confirmar que o jogo continua estável.
+**Status:** ✅ concluída em 2026-10-25 (spec e plano `002-motor-patches`; binário `gt-patch`).
 
 ---
 

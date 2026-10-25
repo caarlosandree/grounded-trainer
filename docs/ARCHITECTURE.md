@@ -110,7 +110,7 @@ As versões são fixadas no `Cargo.toml` na Fase 0, usando a estável mais recen
   - `<chave>.toml` (ex.: `c935e799-0b27c000.toml`): `version` (igual ao nome do arquivo), `product_version` (opcional, informativo) e, por patch verificado naquela build, `[[patch]]` com `id` (já definido no genérico) e `rva` (início do patch relativo à base do módulo, aceita hexadecimal `0x...`); opcionalmente sobrescreve `pattern`, `offset`, `expected` e `replacement` quando a build mudou o código.
   - Regra de carga (erro claro com arquivo e campo, também depois das sobrescritas): `id` único; `module` igual ao exe do jogo; hex válido; `expected` e `replacement` do mesmo tamanho; o trecho `[offset, offset + tamanho)` cabe no `pattern`; cada byte fixo do `pattern` nesse trecho é igual ao de `expected` (curingas no trecho são permitidos).
 - Versão com arquivo e `rva` conferido: patch "disponível (verificado)". Versão sem arquivo (ou sem entrada para o `id`) usa a definição genérica e, se o padrão for único na memória e no disco no mesmo lugar, fica "disponível (não verificado)".
-- Cada cheat informa o próprio estado: disponível, padrão não encontrado ou padrão ambíguo.
+- Cada patch informa o próprio estado (tabela da spec 002, 6.4): disponível (verificado ou não verificado), ativo, pendente, bytes diferentes, fora do lugar, não encontrado, ambíguo, inconclusivo ou disco ilegível.
 
 ### 5.4 Escrita segura de patches
 Detalhes na spec `docs/specs/002-motor-patches.md` (6.2 a 6.8).
@@ -161,3 +161,10 @@ As instruções originais copiadas para a cave passam por relocação (endereço
 | 2026-10-22 | Trainer externo primeiro | Mais simples e seguro; nada é injetado no jogo |
 | 2026-10-22 | TUI em vez de GUI | Simples, funciona bem no Wayland |
 | 2026-10-22 | Assinaturas em TOML por versão | O jogo atualiza com frequência (Early Access) |
+| 2026-10-25 | Extensão de módulo confiável = `min(SizeOfImage memória, disco)` | Um trainer poderia aumentar o `SizeOfImage` na memória para "cobrir" código dele (decisão do dono, spec 002) |
+| 2026-10-25 | Binário separado `gt-patch`; o `gt` continua somente leitura | Escrita isolada atrás da feature `write`, que o `gt-cli` não ativa (dono) |
+| 2026-10-25 | Pausa por SIGSTOP com conferência da posição das threads via `/proc/<tid>/syscall`, sem ptrace | Evita thread retomando no meio de instrução trocada (dono); posição transitória por anexo do `wineserver` é relida |
+| 2026-10-25 | Diário em disco + recuperação automática na próxima execução | Cobre SIGKILL, travamento e queda de energia sem processo guardião (dono) |
+| 2026-10-25 | Versão sem assinaturas: patch "não verificado" se o AOB for único em memória e disco e os bytes baterem | Não parar o trainer a cada atualização, sem abrir mão da conferência de bytes (dono) |
+| 2026-10-25 | Identidade do processo por PID + horário de início + `boot_id`; sinais por `pidfd`; escrita pelo descritor do `mem` | Nunca escrever nem sinalizar um PID reaproveitado |
+| 2026-10-25 | Escrita só nas seções executáveis (do disco) do módulo declarado pelo patch | Escrever é mais rígido que ler; o cabeçalho em memória poderia ser alterado |

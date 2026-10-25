@@ -166,6 +166,54 @@ nenhuma opção ligada (relato do dono).
 - Extensão dos módulos (spec 002 6.12): 131 módulos confiáveis, **0** com `SizeOfImage` diferente entre memória e
   disco; `gt inspect` mostra "Extensão do módulo: conferida com o disco".
 
+## Sessão de 2026-10-25 (Fase 2, sessão B): patch de teste e critério de pronto
+
+Mesmo build (`c935e799-0b27c000`). Jogo reiniciado, FLiNG **fechado** (`gt diff`: nenhuma alteração na `.text`
+antes de começar), dono andando pelo mapa, backup do save feito.
+
+### Perfil por amostragem (`gt-patch profile`, 200 pausas a cada 300 ms)
+
+| Função (`.pdata`) | Amostras | `pc` mais frequente |
+|---|---|---|
+| `+112c3f3`–`+112c4f6` | 44 | `+112c464` (43×) |
+| `+2610831`–`+2610df0` | 41 | `+26109c5` (16×) |
+| `+4a85057`–`+4a86953` | 21 | espalhados |
+| `+4a8e611`–`+4a8e9c0` | 17 | `+4a8e78a` (3×) |
+
+A função `+112c3f3` é uma espera ativa de um pool de threads (`pause; rdtsc; shl rdx,0x20; or rax,rdx;
+sub rax,rdi; cmp rax,rbx; jb` de volta a `+112c460`), executada o tempo todo por várias threads.
+
+### Patch de teste `teste-codificacao`
+
+- Local: `Grounded2Steam-Win64-Shipping.exe+112c468`, dentro do laço acima, no mesmo bloco básico da amostra
+  `+112c464` (o bloco vai de `+112c460`, alvo do `jb`, até o `jb` em `+112c471`; nenhum desvio ou alvo entre
+  `+112c464` e `+112c468`). Fora dos 5 locais do FLiNG.
+- Troca: `or rax, rdx` `48 0B C2` → `48 09 D0` (a mesma instrução na outra codificação; mesmo tamanho, mesmo
+  efeito e mesmas flags). Mesmas fronteiras de instrução (nenhuma fronteira perdida).
+- Assinatura: `f3 90 0f 31 48 c1 e2 20 48 0b c2 48 2b c7 48 3b c3 72 ed`, `offset = 8`; **única** na memória e no
+  disco (`gt scan` e `gt scan --disk`, ocorrência em `+112c460`). Registrada em `signatures/generic.toml` e
+  `signatures/c935e799-0b27c000.toml` (`rva = 0x112c468`).
+
+### Critério de pronto (spec 002, seção 9)
+
+1. `gt-patch list`: `teste-codificacao  disponível (verificado)  …+112c468`.
+2. `gt-patch toggle teste-codificacao --times 100`: 100 ciclos, **0 novas tentativas** (perigo e prazo), pausa
+   média **14,1 ms**, máxima **16,3 ms**; ~35 s no total. O dono confirmou que o jogo não engasgou. `gt diff`
+   depois: nenhuma alteração.
+3. `gt-patch run` + SIGINT e + SIGTERM: com o patch ativo o `gt diff` mostra 1 trecho; depois de cada sinal,
+   `restaurado: teste-codificacao`, código 0, e `gt diff` sem alteração.
+4. `gt-patch run` + SIGKILL: o patch continua no jogo, o `list` mostra `pendente` e "Diário pendente: sim";
+   `gt-patch restore` imprime `restaurado: teste-codificacao` e o `gt diff` volta a "nenhuma alteração".
+   (Na primeira tentativa o `kill -9` atingiu o subshell que lançou o `gt-patch`, não ele; o `restore` então
+   recusou corretamente com "outro gt-patch já está em execução".)
+5. `gt-patch run` e o dono fecha o jogo: "o jogo fechou; nada a restaurar", código 0, diário limpo.
+
+Observação: um `gt-patch list` rodado no instante em que o `run` aplicava mostrou `bytes diferentes` uma vez
+(a busca viu os bytes originais e a releitura já viu os novos); na consulta seguinte, `ativo`. Transitório.
+
+Os testes `#[ignore]` de `apps/gt-patch/tests/game.rs` não foram rodados nesta sessão (o jogo foi fechado no
+item 5); os passos manuais acima cobrem o mesmo comportamento.
+
 ## Hipóteses descartadas
 
 - (2026-10-25) "Os patches em `+57BD6D0`/`+5BBFE8C` indicam que as opções de cargas e arrastar item estavam
