@@ -52,13 +52,27 @@ pub fn begin() -> anyhow::Result<(Session, RecoveryReport)> {
     ))
 }
 
-/// Como [`begin`], imprimindo o relatório da recuperação se ela fez alguma coisa.
+/// Como [`begin`], imprimindo o relatório da recuperação se ela fez alguma coisa, para os
+/// comandos que seguem para o jogo (`run`, `toggle`, `profile`): recusa se a recuperação deixou
+/// entradas no diário ([`ensure_recovered`]).
 pub fn begin_and_show() -> anyhow::Result<Session> {
     let (session, report) = begin()?;
     if !report.is_empty() {
         print_recovery(&mut io::stdout().lock(), &report)?;
     }
+    ensure_recovered(&report)?;
     Ok(session)
+}
+
+/// Entradas que a recuperação não resolveu continuam no diário; o comando não segue (um motor
+/// novo regravaria o diário só com os patches dele e as apagaria). O erro traz a mensagem da
+/// spec 6.7 para cada uma.
+pub fn ensure_recovered(report: &RecoveryReport) -> anyhow::Result<()> {
+    if report.kept.is_empty() {
+        return Ok(());
+    }
+    let lines: Vec<String> = report.kept.iter().map(|id| unrestored_text(id)).collect();
+    anyhow::bail!("{}", lines.join("\n"))
 }
 
 /// Por que o diário foi descartado.
@@ -70,7 +84,8 @@ fn discard_text(reason: DiscardReason) -> &'static str {
     }
 }
 
-/// Linhas do relatório de recuperação.
+/// Linhas do relatório de recuperação. As entradas mantidas no diário (`kept`) não entram: vão
+/// no erro de [`ensure_recovered`].
 pub fn print_recovery(out: &mut impl Write, report: &RecoveryReport) -> io::Result<()> {
     if let Some(path) = &report.corrupt {
         writeln!(out, "diário corrompido movido para {}", path.display())?;
@@ -95,9 +110,6 @@ pub fn print_recovery(out: &mut impl Write, report: &RecoveryReport) -> io::Resu
     }
     for id in &report.foreign {
         writeln!(out, "não restaurado: {id} (bytes alterados por outro)")?;
-    }
-    for id in &report.kept {
-        writeln!(out, "{}", unrestored_text(id))?;
     }
     out.flush()
 }
@@ -182,4 +194,45 @@ pub fn location(target: &Target, addr: u64) -> String {
     target
         .module_label(addr)
         .unwrap_or_else(|| format!("{addr:#x}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_without_kept_entries_lets_the_command_go_on() {
+        ensure_recovered(&RecoveryReport::default()).unwrap();
+        let report = RecoveryReport {
+            restored: vec!["a".into()],
+            foreign: vec!["b".into()],
+            ..RecoveryReport::default()
+        };
+        ensure_recovered(&report).unwrap();
+    }
+
+    #[test]
+    fn kept_entries_stop_the_command_with_the_spec_message() {
+        let report = RecoveryReport {
+            kept: vec!["a".into(), "b".into()],
+            ..RecoveryReport::default()
+        };
+        let err = ensure_recovered(&report).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            format!("{}\n{}", unrestored_text("a"), unrestored_text("b"))
+        );
+    }
+
+    #[test]
+    fn print_recovery_leaves_kept_entries_to_the_error() {
+        let report = RecoveryReport {
+            restored: vec!["a".into()],
+            kept: vec!["b".into()],
+            ..RecoveryReport::default()
+        };
+        let mut out = Vec::new();
+        print_recovery(&mut out, &report).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "restaurado: a\n");
+    }
 }

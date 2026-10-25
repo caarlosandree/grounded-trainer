@@ -203,10 +203,25 @@ fn print_recovery(out: &mut impl Write, r: &RecoveryReport) -> std::io::Result<(
     for id in &r.foreign {
         writeln!(out, "bytes de outro, não tocado: {id}")?;
     }
-    for id in &r.kept {
-        writeln!(out, "pendente (a próxima execução vai restaurar): {id}")?;
-    }
     Ok(())
+}
+
+/// Como no `gt-patch`: entradas que a recuperação não resolveu continuam no diário e o comando
+/// não segue (`restore` sai com erro).
+fn ensure_recovered(r: &RecoveryReport) -> Result<()> {
+    if r.kept.is_empty() {
+        return Ok(());
+    }
+    let lines: Vec<String> = r
+        .kept
+        .iter()
+        .map(|id| {
+            format!(
+                "não foi possível restaurar {id} agora; a próxima execução do gt-patch vai restaurar"
+            )
+        })
+        .collect();
+    bail!("{}", lines.join("\n"))
 }
 
 fn restore(args: Args) -> Result<()> {
@@ -222,7 +237,8 @@ fn restore(args: Args) -> Result<()> {
     } else {
         print_recovery(&mut out, &report)?;
     }
-    Ok(())
+    out.flush()?;
+    ensure_recovered(&report)
 }
 
 fn run(args: Args, addr: u64, expected: Vec<u8>, replacement: Vec<u8>) -> Result<()> {
@@ -236,6 +252,7 @@ fn run(args: Args, addr: u64, expected: Vec<u8>, replacement: Vec<u8>) -> Result
     if !report.is_empty() {
         print_recovery(&mut std::io::stdout().lock(), &report)?;
     }
+    ensure_recovered(&report)?;
     // Identidade do alvo lida depois da recuperação, como o `Target::open` do `gt-patch`: o
     // motor só abre se o processo ainda for o mesmo.
     let target_id = identity(pid)?;
@@ -286,5 +303,24 @@ fn main() -> Result<()> {
             expected,
             replacement,
         } => run(args, addr, expected, replacement),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kept_entries_stop_the_command() {
+        ensure_recovered(&RecoveryReport::default()).unwrap();
+        let report = RecoveryReport {
+            kept: vec!["harness".into()],
+            ..RecoveryReport::default()
+        };
+        let err = ensure_recovered(&report).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "não foi possível restaurar harness agora; a próxima execução do gt-patch vai restaurar"
+        );
     }
 }
