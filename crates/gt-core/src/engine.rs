@@ -21,7 +21,9 @@ use crate::patch::{
     Direction, PatchSpec, Validated, WritePolicy, is_dangerous, overlaps, validate,
 };
 use crate::procinfo::{Identity, ThreadPos, check_alive, identity};
-use crate::suspend::{HookPoint, PauseConfig, Thread, is_stopped_now, pause, resume_points};
+use crate::suspend::{
+    HookPoint, PauseConfig, PauseGuard, Thread, is_stopped_now, pause, resume_points,
+};
 use crate::{Error, Result};
 
 /// Política de escrita calculada a partir do `maps` atual (relido antes de cada lote).
@@ -120,10 +122,12 @@ struct Pass {
 }
 
 /// Falha da passagem. `dirty` diz que pode ter sobrado byte escrito (o desfazer
-/// ainda pausado também falhou).
+/// ainda pausado também falhou, ou o SIGCONT falhou depois da escrita). `stuck` diz que
+/// o SIGCONT falhou e o alvo pode ter ficado parado por nós: o diário mantém o marcador.
 struct Failure {
     error: Error,
     dirty: bool,
+    stuck: bool,
 }
 
 impl Failure {
@@ -131,8 +135,61 @@ impl Failure {
         Failure {
             error,
             dirty: false,
+            stuck: false,
         }
     }
+}
+
+/// O que aconteceu numa tentativa com o alvo parado.
+#[derive(Debug)]
+enum Step {
+    /// Thread em ponto perigoso para a escrita deste `id`: nova tentativa.
+    Danger(String),
+    /// O alvo foi retomado por outro durante a conferência: nova tentativa.
+    Resumed,
+    /// Lote escrito e conferido (resultado de cada escrita, na ordem do lote).
+    Wrote(Vec<Option<Skip>>),
+}
+
+/// O `SIGSTOP` da pausa foi nosso, mas o diário foi gravado sem o marcador (o alvo
+/// estava parado na conferência e alguém o retomou antes da pausa).
+fn needs_marker(sent_stop: bool, marked: bool) -> bool {
+    sent_stop && !marked
+}
+
+/// Junta o resultado da tentativa pausada com o do SIGCONT que a encerra.
+///
+/// SIGCONT que falha nunca some: a falha volta com `stuck` (o diário fica com o
+/// marcador) e, se o lote já tinha sido escrito, com `dirty`. Falha dentro da pausa
+/// mantém o erro original. Alvo que terminou não fica parado: sem `stuck`.
+fn settle_resume(
+    step: std::result::Result<Step, Failure>,
+    cont: Result<()>,
+) -> std::result::Result<Step, Failure> {
+    let error = match cont {
+        Ok(()) => return step,
+        Err(error) => error,
+    };
+    if matches!(error, Error::ProcessGone { .. }) {
+        return Err(match step {
+            Err(f) => f,
+            Ok(_) => Failure::clean(error),
+        });
+    }
+    tracing::error!(erro = %error, "falha ao enviar SIGCONT; o diário mantém o marcador");
+    Err(match step {
+        Err(f) => Failure { stuck: true, ..f },
+        Ok(Step::Wrote(_)) => Failure {
+            error,
+            dirty: true,
+            stuck: true,
+        },
+        Ok(Step::Danger(_) | Step::Resumed) => Failure {
+            error,
+            dirty: false,
+            stuck: true,
+        },
+    })
 }
 
 /// Motor de patches de um processo.
@@ -306,7 +363,7 @@ impl Engine {
             return Err(e);
         }
 
-        match self.locked_write(&ops) {
+        match self.locked_write(&ops, will_stop) {
             Ok(pass) => {
                 self.forget_pending(&entries);
                 let restored = ops.iter().map(|o| o.v.spec.id.clone()).collect();
@@ -330,7 +387,7 @@ impl Engine {
                 if !f.dirty {
                     self.forget_pending(&entries);
                 }
-                self.save_final();
+                self.save_logged(f.stuck);
                 Err(f.error)
             }
         }
@@ -460,12 +517,12 @@ impl Engine {
 
     /// Intenção no diário, passagem pausada e tratamento da falha (desfazer e restaurar).
     ///
-    /// Na falha, as entradas continuam no diário (sem o marcador); se sobrou byte
-    /// escrito, os patches ativos envolvidos viram pendentes.
+    /// Na falha, as entradas continuam no diário (sem o marcador, salvo se o SIGCONT
+    /// falhou); se sobrou byte escrito, os patches ativos envolvidos viram pendentes.
     fn run_pass(&mut self, ops: &[Op]) -> Result<Pass> {
         let will_stop = !is_stopped_now(self.pid)?;
         self.save_journal(will_stop)?;
-        match self.locked_write(ops) {
+        match self.locked_write(ops, will_stop) {
             Ok(pass) => Ok(pass),
             Err(f) => {
                 if matches!(f.error, Error::ProcessGone { .. }) {
@@ -480,7 +537,7 @@ impl Engine {
                         }
                     }
                 }
-                self.save_final();
+                self.save_logged(f.stuck);
                 Err(f.error)
             }
         }
@@ -539,7 +596,11 @@ impl Engine {
     }
 
     /// Pausa uma vez para o lote todo, com novas tentativas (spec 6.5), e escreve.
-    fn locked_write(&mut self, ops: &[Op]) -> std::result::Result<Pass, Failure> {
+    ///
+    /// `marked` diz se o diário em disco já tem o marcador "pausado por nós". Se a pausa
+    /// enviou o `SIGSTOP` sem ele, o alvo é retomado, o marcador é gravado fora da pausa
+    /// e a tentativa conta como nova (por prazo).
+    fn locked_write(&mut self, ops: &[Op], mut marked: bool) -> std::result::Result<Pass, Failure> {
         let need_positions = ops.iter().any(|o| has_lost(&o.v, o.danger));
         let max = self.pause_cfg.max_attempts.max(1);
         let (mut danger_retries, mut timeout_retries) = (0u32, 0u32);
@@ -568,58 +629,85 @@ impl Engine {
                     }
                 }
             };
-            let threads = guard.threads();
-            if let Some(op) = ops.iter().find(|op| {
-                threads
-                    .iter()
-                    .any(|t| thread_dangerous(&op.v, op.danger, t))
-            }) {
-                tracing::debug!(id = %op.v.spec.id, attempt, "thread em ponto perigoso; nova tentativa");
-                danger_retries += 1;
-                last_danger = Some(op.v.spec.id.clone());
-                guard.resume().map_err(Failure::clean)?;
-                continue;
-            }
-            // Releitura sob pausa (passo 5), com a identidade conferida antes.
-            check_alive(&self.identity).map_err(Failure::clean)?;
-            let mut plan = Vec::with_capacity(ops.len());
-            for op in ops {
-                plan.push(self.decide_now(op).map_err(Failure::clean)?);
-            }
-            // Imediatamente antes de escrever: ninguém retomou o alvo durante a conferência.
-            if !guard.still_stopped().map_err(Failure::clean)? {
+            if needs_marker(guard.sent_stop(), marked) {
                 tracing::debug!(
                     attempt,
-                    "alvo retomado por outro durante a pausa; nova tentativa"
+                    "alvo retomado antes da pausa e diário sem marcador; nova tentativa"
                 );
+                settle_resume(Ok(Step::Resumed), guard.resume())?;
+                self.save_journal(true).map_err(Failure::clean)?;
+                marked = true;
                 timeout_retries += 1;
                 last_danger = None;
-                guard.resume().map_err(Failure::clean)?;
                 continue;
             }
-            let outcomes = self.write_plan(ops, plan)?;
+            let step = self.paused_step(&guard, ops, attempt);
             let pause_len = started.elapsed();
-            // Escrito e conferido: falha do SIGCONT agora não desfaz, mas sinaliza sobra.
-            guard
-                .resume()
-                .map_err(|error| Failure { error, dirty: true })?;
-            tracing::debug!(
-                pausa_us = pause_len.as_micros() as u64,
-                danger_retries,
-                timeout_retries,
-                "lote escrito"
-            );
-            return Ok(Pass {
-                pause: pause_len,
-                danger_retries,
-                timeout_retries,
-                outcomes,
-            });
+            // O SIGCONT sai sempre por aqui (nunca pelo `Drop` do guarda), para que a falha
+            // dele chegue a quem grava o diário.
+            match settle_resume(step, guard.resume())? {
+                Step::Danger(id) => {
+                    danger_retries += 1;
+                    last_danger = Some(id);
+                }
+                Step::Resumed => {
+                    timeout_retries += 1;
+                    last_danger = None;
+                }
+                Step::Wrote(outcomes) => {
+                    tracing::debug!(
+                        pausa_us = pause_len.as_micros() as u64,
+                        danger_retries,
+                        timeout_retries,
+                        "lote escrito"
+                    );
+                    return Ok(Pass {
+                        pause: pause_len,
+                        danger_retries,
+                        timeout_retries,
+                        outcomes,
+                    });
+                }
+            }
         }
         Err(Failure::clean(match last_danger {
             Some(id) => Error::ThreadsInPatch { id, attempts: max },
             None => Error::PauseTimeout { attempts: max },
         }))
+    }
+
+    /// Uma tentativa com o alvo parado: regra de perigo → identidade → releitura sob
+    /// pausa → conferência de que tudo continua parado → escrita e releitura.
+    fn paused_step(
+        &self,
+        guard: &PauseGuard<'_>,
+        ops: &[Op],
+        attempt: u32,
+    ) -> std::result::Result<Step, Failure> {
+        let threads = guard.threads();
+        if let Some(op) = ops.iter().find(|op| {
+            threads
+                .iter()
+                .any(|t| thread_dangerous(&op.v, op.danger, t))
+        }) {
+            tracing::debug!(id = %op.v.spec.id, attempt, "thread em ponto perigoso; nova tentativa");
+            return Ok(Step::Danger(op.v.spec.id.clone()));
+        }
+        // Releitura sob pausa (passo 5), com a identidade conferida antes.
+        check_alive(&self.identity).map_err(Failure::clean)?;
+        let mut plan = Vec::with_capacity(ops.len());
+        for op in ops {
+            plan.push(self.decide_now(op).map_err(Failure::clean)?);
+        }
+        // Imediatamente antes de escrever: ninguém retomou o alvo durante a conferência.
+        if !guard.still_stopped().map_err(Failure::clean)? {
+            tracing::debug!(
+                attempt,
+                "alvo retomado por outro durante a pausa; nova tentativa"
+            );
+            return Ok(Step::Resumed);
+        }
+        self.write_plan(ops, plan).map(Step::Wrote)
     }
 
     /// Escreve e relê cada escrita do plano; na primeira falha desfaz as já escritas.
@@ -648,6 +736,7 @@ impl Engine {
                 return Err(Failure {
                     error,
                     dirty: !clean,
+                    stuck: false,
                 });
             }
             done.push((addr, before));
@@ -756,7 +845,13 @@ impl Engine {
     /// Diário final, sem marcador. A falha só vai para o log: o que está em disco
     /// continua cobrindo o que foi escrito.
     fn save_final(&self) {
-        if let Err(e) = self.save_journal(false) {
+        self.save_logged(false);
+    }
+
+    /// Grava o diário com o estado em memória e o marcador pedido (mantido quando o
+    /// SIGCONT falhou). A falha só vai para o log.
+    fn save_logged(&self, paused_by_us: bool) {
+        if let Err(e) = self.save_journal(paused_by_us) {
             tracing::error!(erro = %e, "falha ao atualizar o diário");
         }
     }
@@ -866,6 +961,61 @@ mod tests {
 
     fn thread(pos: Option<ThreadPos>) -> Thread {
         Thread { tid: 1, pos }
+    }
+
+    fn io_error() -> Error {
+        Error::Io(std::io::Error::other("sigcont"))
+    }
+
+    #[test]
+    fn marker_is_needed_only_for_our_stop_without_marker() {
+        assert!(needs_marker(true, false));
+        assert!(!needs_marker(true, true));
+        assert!(!needs_marker(false, false));
+        assert!(!needs_marker(false, true));
+    }
+
+    #[test]
+    fn resumed_target_keeps_the_step() {
+        assert!(matches!(
+            settle_resume(Ok(Step::Wrote(vec![None])), Ok(())),
+            Ok(Step::Wrote(_))
+        ));
+        let f = settle_resume(Err(Failure::clean(io_error())), Ok(()))
+            .err()
+            .unwrap();
+        assert!(!f.stuck && !f.dirty);
+    }
+
+    #[test]
+    fn failed_sigcont_keeps_the_marker() {
+        // Escrito e conferido, mas o SIGCONT falhou: sobra possível e alvo parado por nós.
+        let f = settle_resume(Ok(Step::Wrote(vec![None])), Err(io_error()))
+            .err()
+            .unwrap();
+        assert!(f.stuck && f.dirty);
+        // Nova tentativa (perigo ou retomado por outro) sem escrita: só parado por nós.
+        for step in [Step::Danger("p".into()), Step::Resumed] {
+            let f = settle_resume(Ok(step), Err(io_error())).err().unwrap();
+            assert!(f.stuck && !f.dirty);
+        }
+        // Falha dentro da pausa: o erro original vale, e o marcador fica.
+        let inner = Failure::clean(Error::WriteRefused { addr: 1 });
+        let f = settle_resume(Err(inner), Err(io_error())).err().unwrap();
+        assert!(f.stuck);
+        assert!(matches!(f.error, Error::WriteRefused { addr: 1 }));
+    }
+
+    #[test]
+    fn sigcont_to_gone_process_is_process_gone() {
+        let gone = || Error::ProcessGone { pid: 7 };
+        let f = settle_resume(Ok(Step::Wrote(vec![None])), Err(gone()))
+            .err()
+            .unwrap();
+        assert!(matches!(f.error, Error::ProcessGone { pid: 7 }) && !f.stuck);
+        let inner = Failure::clean(Error::WriteRefused { addr: 1 });
+        let f = settle_resume(Err(inner), Err(gone())).err().unwrap();
+        assert!(!f.stuck);
     }
 
     #[test]
