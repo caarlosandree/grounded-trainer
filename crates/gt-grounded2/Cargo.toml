@@ -16,6 +16,8 @@ tracing.workspace = true
 write = ["gt-core/write"]
 
 [dev-dependencies]
+# O portão da pausa (testes ignorados) precisa de `pause`; fica só nos testes para o `gt-cli` não ganhar `write`.
+gt-core = { workspace = true, features = ["write"] }
 tempfile.workspace = true
 
 [lints]
