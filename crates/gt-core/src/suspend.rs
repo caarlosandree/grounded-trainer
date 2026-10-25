@@ -91,7 +91,7 @@ pub fn wait_until(
 
 #[cfg(feature = "write")]
 mod live {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use nix::sys::signal::Signal;
 
@@ -115,22 +115,65 @@ mod live {
     /// Espera entre as leituras da posição de uma thread.
     const POS_WAIT: Duration = Duration::from_millis(2);
 
+    /// Orçamento total das releituras de posição numa pausa (todas as threads somadas).
+    const POS_BUDGET: Duration = Duration::from_millis(200);
+
+    /// Orçamento de tempo das releituras de posição de uma pausa.
+    pub(super) struct PosBudget {
+        limit: Duration,
+        /// Tempo decorrido desde o início do orçamento.
+        clock: Box<dyn FnMut() -> Duration>,
+    }
+
+    impl PosBudget {
+        /// Orçamento de `limit` contado a partir de agora.
+        pub(super) fn new(limit: Duration) -> PosBudget {
+            let start = Instant::now();
+            PosBudget::with_clock(limit, move || start.elapsed())
+        }
+
+        /// Orçamento com relógio injetado (`clock` devolve o tempo decorrido).
+        pub(super) fn with_clock(
+            limit: Duration,
+            clock: impl FnMut() -> Duration + 'static,
+        ) -> PosBudget {
+            PosBudget {
+                limit,
+                clock: Box::new(clock),
+            }
+        }
+
+        /// O orçamento acabou.
+        pub(super) fn exhausted(&mut self) -> bool {
+            (self.clock)() >= self.limit
+        }
+    }
+
     /// Lê a posição de uma thread já parada, relendo enquanto ela aparece como `Running`.
     ///
     /// Com o alvo sob `SIGSTOP`, o `wineserver` do Proton se anexa por ptrace às threads
     /// por instantes; enquanto dura o anexo, `/proc/<pid>/task/<tid>/syscall` diz
-    /// `running`. Relê até `Stopped`, no máximo `attempts` vezes com `wait` entre elas;
-    /// se persistir, devolve `None` (ilegível). `None` da leitura (thread sumiu) encerra
-    /// na hora. Uma posição `Some(Running)` nunca é devolvida.
+    /// `running`. Relê até `Stopped`, no máximo `attempts` vezes com `wait` entre elas,
+    /// e só enquanto `exhausted()` (o orçamento da pausa toda) for `false`; se persistir,
+    /// devolve `None` (ilegível). `None` da leitura (thread sumiu) encerra na hora. Uma
+    /// posição `Some(Running)` nunca é devolvida.
     pub(super) fn settle_pos(
         mut read: impl FnMut() -> Result<Option<ThreadPos>>,
         attempts: u32,
         wait: Duration,
+        mut exhausted: impl FnMut() -> bool,
     ) -> Result<Option<ThreadPos>> {
         for i in 0..attempts {
             match read()? {
                 Some(ThreadPos::Running) => {
-                    if i + 1 < attempts && !wait.is_zero() {
+                    if i + 1 >= attempts {
+                        break;
+                    }
+                    if exhausted() {
+                        tracing::debug!("orçamento de releitura da pausa esgotado");
+                        return Ok(None);
+                    }
+                    if !wait.is_zero() {
                         std::thread::sleep(wait);
                     }
                 }
@@ -242,9 +285,11 @@ mod live {
         Ok((pidfd, before))
     }
 
-    /// Lê as threads vivas, relendo a lista de TIDs até ela ficar estável.
+    /// Lê as threads vivas, relendo a lista de TIDs até ela ficar estável. As releituras
+    /// de posição de todas as threads dividem um orçamento de [`POS_BUDGET`].
     fn collect_threads(pid: i32, need_positions: bool) -> Result<Vec<Thread>> {
         let mut tids = list_tids(pid)?;
+        let mut budget = PosBudget::new(POS_BUDGET);
         for _ in 0..LIST_PASSES {
             let mut threads = Vec::with_capacity(tids.len());
             for &tid in &tids {
@@ -255,7 +300,12 @@ mod live {
                     continue;
                 }
                 let pos = if need_positions {
-                    settle_pos(|| read_thread_pos(pid, tid), POS_ATTEMPTS, POS_WAIT)?
+                    settle_pos(
+                        || read_thread_pos(pid, tid),
+                        POS_ATTEMPTS,
+                        POS_WAIT,
+                        || budget.exhausted(),
+                    )?
                 } else {
                     None
                 };
@@ -281,8 +331,9 @@ mod live {
     ///
     /// Uma posição nunca sai como `Some(ThreadPos::Running)`: o `wineserver` do Proton
     /// se anexa por ptrace às threads por instantes, e nesse intervalo o `syscall` da
-    /// thread parada diz `running`. A leitura é repetida até 50 vezes (2 ms entre elas);
-    /// se persistir, a posição é `None` (ilegível).
+    /// thread parada diz `running`. A leitura é repetida até 50 vezes (2 ms entre elas),
+    /// com um orçamento de 200 ms para a pausa toda; se persistir (ou o orçamento acabar),
+    /// a posição é `None` (ilegível).
     pub fn pause<'a>(
         pidfd: &'a Pidfd,
         pid: i32,
@@ -385,7 +436,7 @@ mod live {
 mod settle_tests {
     use std::time::Duration;
 
-    use super::live::settle_pos;
+    use super::live::{PosBudget, settle_pos};
     use crate::Error;
     use crate::procinfo::ThreadPos;
 
@@ -411,6 +462,7 @@ mod settle_tests {
             },
             50,
             Duration::ZERO,
+            || false,
         )
         .unwrap();
         assert_eq!(got, Some(STOPPED));
@@ -427,6 +479,7 @@ mod settle_tests {
             },
             50,
             Duration::ZERO,
+            || false,
         )
         .unwrap();
         assert_eq!(got, None);
@@ -443,6 +496,7 @@ mod settle_tests {
             },
             50,
             Duration::ZERO,
+            || false,
         )
         .unwrap();
         assert_eq!(got, None);
@@ -463,10 +517,61 @@ mod settle_tests {
             },
             50,
             Duration::ZERO,
+            || false,
         )
         .unwrap_err();
         assert!(matches!(err, Error::ProcessGone { pid: 7 }));
         assert_eq!(reads, 2);
+    }
+
+    #[test]
+    fn settle_pos_exhausted_budget_reads_once() {
+        let mut reads = 0;
+        let running = settle_pos(
+            || {
+                reads += 1;
+                Ok(Some(ThreadPos::Running))
+            },
+            50,
+            Duration::ZERO,
+            || true,
+        )
+        .unwrap();
+        assert_eq!(running, None);
+        assert_eq!(reads, 1);
+        // Posição já parada na primeira leitura continua valendo.
+        let stopped = settle_pos(|| Ok(Some(STOPPED)), 50, Duration::ZERO, || true).unwrap();
+        assert_eq!(stopped, Some(STOPPED));
+    }
+
+    #[test]
+    fn pos_budget_is_shared_by_all_threads() {
+        // Orçamento de 5 releituras para a pausa toda: a 1ª thread gasta tudo, as
+        // seguintes leem uma vez só e viram `None`.
+        let mut budget = PosBudget::with_clock(Duration::from_millis(10), {
+            let mut t = 0u64;
+            move || {
+                t += 2;
+                Duration::from_millis(t)
+            }
+        });
+        let mut reads = Vec::new();
+        for _ in 0..3 {
+            let mut n = 0;
+            let pos = settle_pos(
+                || {
+                    n += 1;
+                    Ok(Some(ThreadPos::Running))
+                },
+                50,
+                Duration::ZERO,
+                || budget.exhausted(),
+            )
+            .unwrap();
+            assert_eq!(pos, None);
+            reads.push(n);
+        }
+        assert_eq!(reads, vec![5, 1, 1]);
     }
 }
 
