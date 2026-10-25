@@ -11,6 +11,10 @@ gt-core.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+[features]
+# Habilita o motor de escrita do `gt-core` (ainda sem código próprio aqui).
+write = ["gt-core/write"]
+
 [dev-dependencies]
 tempfile.workspace = true
 

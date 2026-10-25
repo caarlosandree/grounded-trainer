@@ -124,19 +124,23 @@ fn permission_hint(ptrace_scope: Option<u8>) -> String {
     }
 }
 
-/// Erro de vários candidatos ao processo do jogo.
-fn many_candidates_message(pids: &[i32]) -> String {
-    let list: Vec<String> = pids.iter().map(i32::to_string).collect();
-    format!(
-        "mais de um processo do jogo encontrado (PIDs: {}); escolha um com --pid <PID>",
-        list.join(", ")
-    )
+/// Erro do núcleo dentro de `err`, direto ou embrulhado em `gt_grounded2::Error`.
+fn core_error(err: &anyhow::Error) -> Option<&gt_core::Error> {
+    if let Some(core) = err.downcast_ref::<gt_core::Error>() {
+        return Some(core);
+    }
+    match err.downcast_ref::<gt_grounded2::Error>()? {
+        gt_grounded2::Error::Core(core) | gt_grounded2::Error::DiskOpen { source: core, .. } => {
+            Some(core)
+        }
+        _ => None,
+    }
 }
 
 /// Sugestão de ação para o erro, quando há uma.
 fn hint(err: &anyhow::Error) -> Option<String> {
     use gt_core::Error;
-    match err.downcast_ref::<Error>()? {
+    match core_error(err)? {
         Error::PermissionDenied { ptrace_scope, .. } => Some(permission_hint(
             gt_core::process::ptrace_scope().or(*ptrace_scope),
         )),
@@ -277,10 +281,25 @@ mod tests {
     }
 
     #[test]
-    fn many_candidates_lists_pids_and_mentions_pid_flag() {
-        let msg = many_candidates_message(&[10, 20]);
-        assert!(msg.contains("10"));
-        assert!(msg.contains("20"));
-        assert!(msg.contains("--pid"));
+    fn hint_finds_core_error_inside_grounded2_error() {
+        let err = anyhow::Error::from(gt_grounded2::Error::from(gt_core::Error::ProcessGone {
+            pid: 1,
+        }));
+        let hint = hint(&err).expect("deveria haver dica");
+        assert!(hint.contains("o processo terminou"), "{hint}");
+    }
+
+    #[test]
+    fn hint_finds_core_error_inside_disk_open() {
+        let err = anyhow::Error::from(gt_grounded2::Error::DiskOpen {
+            path: "/x".into(),
+            source: gt_core::Error::ProcessGone { pid: 1 },
+        });
+        assert!(hint(&err).is_some());
+    }
+
+    #[test]
+    fn hint_is_none_for_errors_without_a_suggestion() {
+        assert!(hint(&anyhow::Error::from(gt_grounded2::Error::GameNotFound)).is_none());
     }
 }

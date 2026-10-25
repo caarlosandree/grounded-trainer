@@ -1,8 +1,12 @@
 //! Conhecimento específico do Grounded 2: constantes do jogo e regra de casamento do processo.
 
+pub mod error;
 pub mod fling;
+pub mod resolve;
 pub mod target;
 pub mod trust;
+
+pub use error::{Error, Result};
 
 /// Nome do executável do jogo, como aparece no `cmdline` (formato Windows).
 pub const GAME_EXE: &str = "Grounded2Steam-Win64-Shipping.exe";

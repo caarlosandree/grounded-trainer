@@ -82,7 +82,7 @@ pub fn run(global: &Global, opts: &Options<'_>) -> anyhow::Result<()> {
             tracing::debug!(error = %err, "dump por intervalo sem módulo PE");
             None
         }
-        Err(err) => return Err(err),
+        Err(err) => return Err(err.into()),
     };
     let base = module.as_ref().map(|(m, _)| m.base);
     let version_key = module.as_ref().map(|(_, headers)| headers.version_key());

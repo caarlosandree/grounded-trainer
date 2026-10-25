@@ -211,10 +211,10 @@ fn resolve<'a>(
                     disk,
                 })
             }
-            Err(err) => match err.downcast_ref::<Error>() {
-                Some(Error::ModuleNotFound { .. } | Error::NotPe { .. }) => None,
-                _ => return Err(err),
-            },
+            Err(gt_grounded2::Error::Core(Error::ModuleNotFound { .. } | Error::NotPe { .. })) => {
+                None
+            }
+            Err(err) => return Err(err.into()),
         };
         cache.insert(key.clone(), entry);
     }
