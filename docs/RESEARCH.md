@@ -127,6 +127,45 @@ Mesmo build (`c935e799-0b27c000`, `Augusta-CL-3207493`). Jogo aberto num save, F
   ser única.
 - O padrão do god mode (`e8 ?? ?? ?? ?? 48 83 be b0 00 00 00 00 48 8b d8`) é único em memória e em disco.
 
+## Sessão de 2026-10-25 (Fase 2, sessão A): portão da pausa e reconferência do `gt scan`
+
+Mesmo build (`c935e799-0b27c000`, `Augusta-CL-3207493`), Proton 11.0. Jogo num save, FLiNG aberto e conectado,
+nenhuma opção ligada (relato do dono).
+
+### Pausa por SIGSTOP/SIGCONT (portão da spec 002 6.5)
+
+- Teste `pause_gate` (`crates/gt-grounded2/tests/game_pause.rs`): **100 pausas** a cada 300 ms, sem escrita.
+  Nenhuma nova tentativa por prazo; **148 threads** por pausa em média; tempo até o processo inteiro parar:
+  mín 10,1 ms, médio 15,4 ms, máx 24,2 ms. Todas as posições legíveis em `/proc/<tid>/syscall`; depois de cada
+  SIGCONT, nenhuma thread ficou parada. O dono confirmou que o jogo não engasgou.
+- Uma thread (`tid 150444`) foi vista uma vez em estado `D` antes de uma pausa (não atrasou a parada).
+- O processo pai do jogo é o `pv-adverb` do pressure-vessel. O efeito do `SIGCHLD` das pausas nele não foi
+  medido; o jogo seguiu normal.
+- **Achado:** o `wineserver` do Proton se anexa por ptrace à thread principal (`GameThread`, tid = pid) por
+  instantes (`TracerPid` = pid do `wineserver`), provavelmente para atender às leituras de memória que o FLiNG faz
+  pela API do Windows. Enquanto anexada, a thread aparece como `running` no `syscall` e até `R` no `stat`, mesmo com
+  o processo pausado (56 de 300 leituras seguidas). O motor relê essa posição (até 50×2 ms) em vez de tratá-la como
+  thread rodando. Com o FLiNG fechado o efeito não foi medido.
+- `pc` mais frequentes com o jogo pausado: três endereços fora do executável (`0x7f25ff6ca2fd` 9544×,
+  `0x7f25ff6cc3bd` 2436×, `0x7f25ff653352` 2263×; bibliotecas do Wine/sistema, threads esperando em syscall).
+  No executável, os mais vistos foram `+112c464` (17×), `+26109c5` (10×), `+2cb577b` e `+4a59225` (6× cada).
+
+### `gt scan` com o FLiNG conectado (spec 002 7.1, commit `85bfa2f`)
+
+| Padrão | Memória | Disco |
+|---|---|---|
+| God mode `e8 ?? ?? ?? ?? 48 83 be b0 00 00 00 00 48 8b d8` | único (`+56fc11c`) | único (`+56fc11c`) |
+| Cargas `f3 0f 10 89 74 09 00 00 f3 0f 58 c9` | 1 (`+57c2c10`) | 2 (`+57bd6d0`, `+57c2c10`) |
+
+- O FLiNG alterou a ocorrência de `+57bd6d0` na memória, e a outra passou a parecer "única": é o caso que o
+  `--disk` (e a exigência de unicidade em disco da spec 002 6.4) evita.
+- `gt scan --all` com o padrão do god mode: "único", sem bloqueio da guarda e sem veredito `inconclusive` (nenhuma
+  página ilegível nas seções).
+- A DLL do FLiNG (`TrSpeedHack_x64.dll`) **aparece no `maps`** com o FLiNG conectado e nenhuma opção ligada;
+  `gt scan --module TrSpeedHack_x64.dll` é recusado pela guarda (código de terceiros).
+- Extensão dos módulos (spec 002 6.12): 131 módulos confiáveis, **0** com `SizeOfImage` diferente entre memória e
+  disco; `gt inspect` mostra "Extensão do módulo: conferida com o disco".
+
 ## Hipóteses descartadas
 
 - (2026-10-25) "Os patches em `+57BD6D0`/`+5BBFE8C` indicam que as opções de cargas e arrastar item estavam
