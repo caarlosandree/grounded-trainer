@@ -33,10 +33,11 @@ Cada fase só começa quando a anterior cumpre seu critério de pronto. Cada fun
 - Busca AOB com curingas (`??`).
 - Desmontagem x86-64 de qualquer endereço.
 - CLI de pesquisa `gt`:
-  - `gt inspect`: processo, base, seções, versão do jogo detectada.
+  - `gt inspect`: processo, base, seções, chave de versão do jogo.
   - `gt scan "<padrão>"`: onde o padrão aparece.
   - `gt disasm <endereço|módulo+offset>`: código desmontado.
   - `gt diff`: compara o código na memória com o executável em disco (revela patches de outros trainers).
+  - `gt read`, `gt dump` e `gt fling`: hexdump, salvar memória em arquivo e estado dos pontos do FLiNG (spec 001).
 
 **Pronto quando:** `gt inspect` e `gt disasm Grounded2Steam-Win64-Shipping.exe+56FC11C` funcionam com o jogo aberto, e `gt diff` reproduz os achados de `RESEARCH.md`.
 **Você faz:** deixar o jogo aberto num save de teste quando eu pedir.

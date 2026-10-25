@@ -1,3 +1,3 @@
-//! Ferramentas de pesquisa: inspect, scan, disasm, diff.
+//! Ferramentas de pesquisa: inspect, read, scan, disasm, diff, dump, fling.
 
 fn main() {}

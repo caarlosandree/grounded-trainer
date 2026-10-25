@@ -20,10 +20,13 @@ Achados sobre o jogo, sempre com a versão em que foram observados. Hipóteses d
 |---|---|---|
 | `.text` | `0x140001000` | `0x07A8E4F1` |
 | `.rdata` | `0x147A90000` | `0x026F326C` |
-| `.data` | `0x14A184000` | `0x00298400` |
+| `.data` | `0x14A184000` | `0x00298400` (*) |
 | `.pdata` | `0x14A840000` | `0x0069E790` |
 | `.rsrc` | `0x14AF3E000` | `0x00011B40` |
 | `.reloc` | `0x14AF50000` | `0x0032B428` |
+
+(*) Correção em 2026-10-24: o valor da `.data` é o `SizeOfRawData`; o `VirtualSize` é `0x006BBECC`. As
+demais são `VirtualSize`. O PE tem 8 seções; esta tabela omitiu `.msvcjmc` e `_RDATA`.
 
 ## Trainer FLiNG "Early Access Plus 38" (2026-08-17) na versão atual
 
@@ -89,6 +92,10 @@ e8 ef ab 2e fe           call 0x1439e6d10
 - `kernel.yama.ptrace_scope = 0`: leitura de `/proc/<pid>/mem` funciona como usuário comum.
 - O FLiNG roda com `protontricks-launch --appid 2661300` e enxerga o jogo (PID do Wine: `364`).
 - Os avisos `Fontconfig ... out of memory` do container são inofensivos.
+- (2026-10-24) `cmdline` do jogo: `S:\steamapps\common\Grounded2\Augusta\Binaries\Win64\Grounded2Steam-Win64-Shipping.exe`, `Augusta` (separados por NUL). O launcher aparece como `S:\steamapps\common\Grounded2\Grounded2.exe`.
+- (2026-10-24) No `maps`, `.text` (`140001000-147a90000 r-xp`) e `.rdata` são anônimas; só cabeçalho, `.data` e `.reloc` aparecem com o nome do exe. 129 imagens PE carregadas. Com o FLiNG fechado, há 6 regiões executáveis anônimas fora de qualquer imagem PE (`0x7700000` 64 KB `rwxp` e cinco páginas `r-xp` isoladas perto de `0x7f43ec98d000`).
+- (2026-10-24) Com o FLiNG sem patch ativo, a `.text` na memória é idêntica ao arquivo em disco.
+- (2026-10-24) `symbols.ini` do FLiNG: UTF-16LE com BOM, CRLF, seção `[default]`, linhas `nome=Grounded2Steam-Win64-Shipping.exe+OFFSET`. A pasta `version/<id>` é o `TimeDateStamp` do PE em decimal (`0xc935e799` = `3375753113`).
 
 ## Hipóteses descartadas
 

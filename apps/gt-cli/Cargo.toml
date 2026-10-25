@@ -1,6 +1,6 @@
 [package]
 name = "gt-cli"
-description = "Ferramentas de pesquisa: inspect, scan, disasm, diff."
+description = "Ferramentas de pesquisa: inspect, read, scan, disasm, diff, dump, fling."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

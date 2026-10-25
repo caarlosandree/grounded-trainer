@@ -46,7 +46,7 @@ grounded-trainer/
 │       ├── src/cheats/           # 1 módulo por cheat (sobrevivência, itens, progressão, movimento)
 │       └── signatures/           # *.toml por build do jogo
 ├── apps/
-│   ├── gt-cli/                   # ferramentas de pesquisa: inspect, scan, disasm, diff, dump
+│   ├── gt-cli/                   # ferramentas de pesquisa: inspect, read, scan, disasm, diff, dump, fling
 │   └── gt-tui/                   # interface do jogador
 └── docs/
 ```
@@ -72,7 +72,7 @@ As versões são fixadas no `Cargo.toml` na Fase 0, usando a estável mais recen
 ## 5. Decisões técnicas
 
 ### 5.1 Acesso à memória
-- **Leitura em massa** (varrer os ~128 MB da `.text`): `process_vm_readv`, que é rápido e não exige ptrace attach.
+- **Leitura em massa** (varrer os ~128 MB da `.text`): `process_vm_readv`, que é rápido e não exige anexar ao processo (`PTRACE_ATTACH`), mas passa pela mesma checagem de permissão de ptrace (afetada pelo Yama).
 - **Escrita**: `pwrite` em `/proc/<pid>/mem`. O kernel permite escrever em páginas somente leitura (código) quando o processo tem permissão de ptrace. `process_vm_writev` falharia nelas.
 - **Permissão**: exige `kernel.yama.ptrace_scope = 0` (estado atual) ou `CAP_SYS_PTRACE`. O trainer detecta e explica o erro em vez de falhar silenciosamente.
 
