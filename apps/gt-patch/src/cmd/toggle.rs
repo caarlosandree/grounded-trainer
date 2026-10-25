@@ -39,18 +39,20 @@ pub fn run(pid: Option<i32>, id: &str, times: u32, interval_ms: u64) -> anyhow::
     let mut selected = select_patches(&scan, &[id.to_string()])?;
     // Declarado depois da `session`: o motor cai antes de a trava ser solta.
     let mut engine = open_engine(&target, &scan, &session)?;
-    warn_unverified(&selected);
     // `select_patches` devolve exatamente o patch pedido.
     let Some(chosen) = selected.pop() else {
         anyhow::bail!("patch {id} não selecionado");
     };
+    let patch = chosen.patch.clone();
     let interval = Duration::from_millis(interval_ms);
+    // O aviso de não verificado só sai depois do primeiro `apply` que deu certo.
     match toggle(
         &mut engine,
-        chosen.patch,
+        patch,
         times,
         interval,
         &session.shutdown,
+        || warn_unverified(std::slice::from_ref(&chosen)),
     ) {
         Ok(report) => {
             let mut out = io::stdout().lock();

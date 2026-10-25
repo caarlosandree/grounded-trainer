@@ -807,7 +807,18 @@ fn toggle_cycles_and_ends_off() {
     let mut engine = open_engine(t.pid, &env, vec![exec2_range(&t)], None);
     let p = patch("t", t.exec2, &NOP3, &NOP2_NOP);
     let shutdown = Shutdown::manual();
-    let report = toggle(&mut engine, p.clone(), 20, Duration::ZERO, &shutdown).unwrap();
+    // O aviso roda uma vez só, logo depois do primeiro `apply` (bytes já trocados).
+    let seen = Cell::new(Vec::new());
+    let report = toggle(
+        &mut engine,
+        p.clone(),
+        20,
+        Duration::ZERO,
+        &shutdown,
+        || seen.set(vec![bytes_at(t.pid, t.exec2, 3)]),
+    )
+    .unwrap();
+    assert_eq!(seen.take(), vec![NOP2_NOP.to_vec()]);
     assert_eq!(report.cycles, 20);
     assert!(report.pause_max >= report.pause_avg, "{report:?}");
     assert!(report.pause_max > Duration::ZERO, "{report:?}");
@@ -815,8 +826,22 @@ fn toggle_cycles_and_ends_off() {
     assert!(engine.active().is_empty());
     assert!(missing(&env));
 
+    // `apply` recusado (bytes esperados errados): nada aplicado, nenhum aviso.
+    let wrong = patch("t", t.exec2, &NOP2_NOP, &NOP3);
+    let called = Cell::new(false);
+    assert!(
+        toggle(&mut engine, wrong, 20, Duration::ZERO, &shutdown, || called
+            .set(true))
+        .is_err()
+    );
+    assert!(!called.get());
+
     shutdown.request();
-    let report = toggle(&mut engine, p, 20, Duration::ZERO, &shutdown).unwrap();
+    let report = toggle(&mut engine, p, 20, Duration::ZERO, &shutdown, || {
+        called.set(true)
+    })
+    .unwrap();
+    assert!(!called.get());
     assert_eq!(report.cycles, 0);
     assert_eq!(bytes_at(t.pid, t.exec2, 3), NOP3);
     assert!(missing(&env));

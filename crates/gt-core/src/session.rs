@@ -99,6 +99,9 @@ pub struct ToggleReport {
 
 /// Liga e desliga `patch` `times` vezes, dormindo `interval` entre as trocas.
 ///
+/// `after_first_apply` roda uma vez, logo depois do primeiro `apply` bem-sucedido (ex.: o
+/// aviso de patch não verificado, que só vale quando o patch foi de fato aplicado).
+///
 /// Termina com o patch desligado. Para no primeiro erro (devolvido; um patch que não
 /// pôde ser desligado continua ativo no motor, cujo `Drop` tenta de novo) ou num pedido
 /// de encerramento, sempre antes de ligar.
@@ -108,7 +111,9 @@ pub fn toggle(
     times: u32,
     interval: Duration,
     shutdown: &Shutdown,
+    after_first_apply: impl FnOnce(),
 ) -> Result<ToggleReport> {
+    let mut after_first_apply = Some(after_first_apply);
     let mut report = ToggleReport::default();
     let mut total = Duration::ZERO;
     let mut switches = 0u32;
@@ -128,6 +133,9 @@ pub fn toggle(
             std::thread::sleep(interval);
         }
         let on = engine.apply(vec![patch.clone()])?;
+        if let Some(f) = after_first_apply.take() {
+            f();
+        }
         record(&on, &mut report);
         std::thread::sleep(interval);
         let off = engine.undo_all()?;
