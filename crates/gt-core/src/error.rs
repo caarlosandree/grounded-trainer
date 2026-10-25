@@ -63,6 +63,10 @@ pub enum Error {
     #[error("formato inesperado em {file}: {reason}")]
     BadProc { file: String, reason: String },
 
+    /// O alvo não parou no prazo (SIGSTOP não chegou a todas as threads).
+    #[error("o jogo não pausou no prazo depois de {attempts} tentativas")]
+    PauseTimeout { attempts: u32 },
+
     /// Erro de entrada e saída do sistema operacional.
     #[error("erro de E/S: {0}")]
     Io(#[from] io::Error),

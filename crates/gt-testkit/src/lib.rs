@@ -29,6 +29,12 @@ pub struct TestTarget {
     pub pid: i32,
     pub marker: u64,
     pub exec_page: u64,
+    /// Início de 2 páginas `r-x` preenchidas com `0x90`, sem thread.
+    pub exec2: u64,
+    /// Página com `48 8B F9 EB FB` (laço de 5 bytes); só há thread nela com `spin`.
+    pub spin_page: u64,
+    /// Página de uma thread bloqueada num `read`; o `pc` parado é `syscall_page + 22`.
+    pub syscall_page: u64,
     /// Início de 3 páginas; a do meio (`region_start + page`) é ilegível.
     pub region_start: u64,
     /// Início de uma região `rw` de `big_len` bytes (2 MiB + 1 página).
@@ -38,14 +44,31 @@ pub struct TestTarget {
     pub page: u64,
 }
 
+/// Opções de [`TestTarget::spawn_with`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TargetOpts {
+    /// Cria uma thread que gira em `spin_page` (consome uma CPU).
+    pub spin: bool,
+}
+
 fn parse_hex(v: &serde_json::Value) -> u64 {
     let s = v.as_str().unwrap();
     u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap()
 }
 
 impl TestTarget {
+    /// Inicia o alvo sem a thread que gira.
     pub fn spawn() -> TestTarget {
-        let mut child = Command::new(bin_path("gt-testtarget"))
+        TestTarget::spawn_with(TargetOpts::default())
+    }
+
+    /// Inicia o alvo com as opções dadas e espera ele ficar pronto.
+    pub fn spawn_with(opts: TargetOpts) -> TestTarget {
+        let mut cmd = Command::new(bin_path("gt-testtarget"));
+        if opts.spin {
+            cmd.arg("--spin");
+        }
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -60,6 +83,9 @@ impl TestTarget {
             pid: v["pid"].as_i64().unwrap() as i32,
             marker: parse_hex(&v["marker"]),
             exec_page: parse_hex(&v["exec_page"]),
+            exec2: parse_hex(&v["exec2"]),
+            spin_page: parse_hex(&v["spin_page"]),
+            syscall_page: parse_hex(&v["syscall_page"]),
             region_start: parse_hex(&v["region_start"]),
             big_region: parse_hex(&v["big_region"]),
             big_len: v["big_len"].as_u64().unwrap() as usize,

@@ -94,3 +94,53 @@ pub fn guarded_pages() -> Result<u64> {
     protect(middle, page, libc::PROT_NONE)?;
     Ok(p as u64)
 }
+
+/// Cria `pages` páginas anônimas preenchidas com `0x90` (`nop`), copia `code` no
+/// início e as deixa `PROT_READ | PROT_EXEC`; devolve o endereço.
+///
+/// [`io::ErrorKind::InvalidInput`] se `code` não couber nas páginas.
+pub fn exec_code(code: &[u8], pages: usize) -> Result<u64> {
+    let len = pages * page();
+    if code.len() > len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "código maior que as páginas pedidas",
+        )
+        .into());
+    }
+    let p = map_anon(len)?;
+    // SAFETY: `p` aponta para `len` bytes graváveis recém-mapeados e `code.len() <= len`;
+    // origem e destino não se sobrepõem (o destino acabou de ser criado).
+    unsafe {
+        ptr::write_bytes(p.cast::<u8>(), 0x90, len);
+        ptr::copy_nonoverlapping(code.as_ptr(), p.cast::<u8>(), code.len());
+    }
+    protect(p, len, libc::PROT_READ | libc::PROT_EXEC)?;
+    Ok(p as u64)
+}
+
+/// Cria uma thread que salta para `addr` e nunca volta.
+///
+/// Só para testes: `addr` deve ser código do próprio teste (ex. de [`exec_code`]) que
+/// nunca retorna e só usa a zona vermelha da pilha (sem `push`/`call`).
+pub fn spawn_thread_at(addr: u64) -> Result<()> {
+    // SAFETY: o contrato acima (código do próprio teste, executável, que nunca retorna
+    // e só usa a zona vermelha da pilha) é o que `extern "C" fn()` exige; a thread
+    // nunca chega ao fim da função.
+    let entry: extern "C" fn() =
+        unsafe { std::mem::transmute::<usize, extern "C" fn()>(addr as usize) };
+    // A thread fica solta: o processo-alvo de teste termina com ela ainda rodando.
+    std::thread::Builder::new().spawn(move || entry())?;
+    Ok(())
+}
+
+/// Cria um pipe e devolve o fd de **leitura**; a ponta de escrita fica aberta e
+/// vazada, então ler dele bloqueia para sempre sem gastar CPU.
+pub fn pipe_never_written() -> Result<i32> {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` tem espaço para os 2 descritores que `pipe` escreve.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(fds[0])
+}

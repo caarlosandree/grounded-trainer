@@ -13,5 +13,6 @@ pub mod pe;
 pub mod process;
 pub mod procinfo;
 pub mod scan;
+pub mod suspend;
 
 pub use error::{Error, Result};
