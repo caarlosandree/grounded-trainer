@@ -202,7 +202,7 @@ pub fn recover(
     if !report.kept.is_empty() {
         tracing::warn!(
             ids = ?report.kept,
-            "entradas não restauradas; a próxima execução do gt-patch vai tentar de novo"
+            "entradas não restauradas; a próxima execução do trainer vai tentar de novo"
         );
     }
     Ok(report)

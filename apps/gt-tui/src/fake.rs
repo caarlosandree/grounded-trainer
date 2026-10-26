@@ -541,7 +541,7 @@ impl Session<()> for FakeSession {
 
     fn restore_pending(&mut self) -> OpOutcome {
         let out = self.op(|busy| Call::RestorePending { busy });
-        if matches!(out, OpOutcome::Done(_)) {
+        if matches!(out, OpOutcome::Done(_) | OpOutcome::Foreign) {
             self.ctl.state().pending.clear();
         }
         out

@@ -856,6 +856,13 @@ impl<B: Backend> Controller<B> {
     /// Pede ao motor para restaurar os restos (`r` ou espaço num cheat em `erro`). Resolvidos,
     /// o cheat volta a `[OFF]` (quem acerta as linhas é o `sync_pending`).
     fn restore_residue(&mut self, now: Instant, draw: &mut dyn FnMut(&Model)) -> bool {
+        let residue: Vec<String> = self
+            .model
+            .cheats
+            .iter()
+            .filter(|r| r.residue)
+            .map(|r| r.id.clone())
+            .collect();
         let Some(outcome) = self.run_op(RESTORING.to_string(), draw, |s| s.restore_pending())
         else {
             return false;
@@ -871,7 +878,8 @@ impl<B: Backend> Controller<B> {
             OpOutcome::Residue(cause) => {
                 self.event(format!("restos continuam no jogo ({cause})"));
             }
-            OpOutcome::Foreign => self.event("restos: alterados por outro; saíram do registro"),
+            // Bytes de outro: o motor não escreveu nada e as entradas saíram do registro.
+            OpOutcome::Foreign => self.mark_residue_foreign(&residue),
         }
         true
     }
@@ -1158,7 +1166,9 @@ impl<B: Backend> Controller<B> {
                 self.model.merge_value_event(
                     &hhmm,
                     id,
-                    format!("{}: {} → {}", row.name, spec.format(before), spec.format(k)),
+                    &row.name,
+                    &spec.format(before),
+                    &spec.format(k),
                 );
             }
             // Recusa limpa: o jogo continua com o valor de antes e a tela volta a mostrá-lo.
@@ -1209,6 +1219,31 @@ impl<B: Backend> Controller<B> {
         self.set_desired(id, None);
         self.event(format!(
             "{name}: alterado por outro; o patch saiu do registro, nada foi escrito"
+        ));
+    }
+
+    /// Os restos eram de bytes alterados por outro: nada foi restaurado e as entradas saíram do
+    /// registro. As linhas deixam de estar em `erro` e ficam indisponíveis, como em
+    /// [`Self::mark_foreign`].
+    fn mark_residue_foreign(&mut self, ids: &[String]) {
+        let mut names = Vec::new();
+        for id in ids {
+            if let Some(row) = self.model.cheats.iter_mut().find(|r| &r.id == id) {
+                row.on = false;
+                row.applied_k = None;
+                row.residue = false;
+                row.avail = Avail::Unavailable("alterado por outro".to_string());
+                names.push(row.name.clone());
+            }
+            self.set_desired(id, None);
+        }
+        let who = if names.is_empty() {
+            "restos".to_string()
+        } else {
+            names.join(", ")
+        };
+        self.event(format!(
+            "{who}: restos não restaurados (bytes alterados por outro)"
         ));
     }
 
@@ -3121,6 +3156,37 @@ mod tests {
     }
 
     #[test]
+    fn restore_pending_foreign_is_not_reported_as_restored() {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![cheat("a", available())]);
+        h.connect(0);
+        h.ctl.push_residue("escrita", &["a"]);
+        assert!(h.toggle("a", 100));
+        assert!(h.row("a").residue);
+
+        // Bytes de outro: o motor não escreveu nada e tirou a entrada do diário.
+        h.ctl.push_outcome(OpOutcome::Foreign);
+        assert!(h.key(Action::Retry, 200));
+        let last = h.events().last().copied().unwrap_or_default();
+        assert!(
+            last.contains("a: restos não restaurados (bytes alterados por outro)"),
+            "{last}"
+        );
+        assert!(
+            !h.events().iter().any(|e| e.contains("restos restaurados")),
+            "{:?}",
+            h.events()
+        );
+        let a = h.row("a");
+        assert!(!a.residue && !a.on && !a.desired);
+        assert_eq!(
+            a.avail,
+            Avail::Unavailable("alterado por outro".to_string())
+        );
+        assert_eq!(h.c.model.banners.residue, None);
+    }
+
+    #[test]
     fn stuck_banner_appears_and_clears() {
         let mut h = H::new();
         h.ctl.set_catalog(vec![cheat("a", available())]);
@@ -3270,7 +3336,8 @@ mod tests {
         assert_eq!(h.c.model.busy, None);
         // Trocas seguidas somam uma linha só.
         let arrows: Vec<&str> = h.events().into_iter().filter(|e| e.contains('→')).collect();
-        assert_eq!(arrows, ["12:00 v: 3 → 5"]);
+        // A linha mostra o valor de antes da primeira troca (2), não só do último par.
+        assert_eq!(arrows, ["12:00 v: 2 → 5"]);
 
         // Nada mais a mandar.
         assert!(!h.tick(2_400));

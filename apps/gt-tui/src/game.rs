@@ -435,8 +435,13 @@ impl Session<GamePayload> for GameSession {
         match engine.undo_all() {
             Ok(report) => (report.restored, report.foreign),
             Err(e) => {
-                // O resultado final da saída é decidido relendo o diário (spec 6.8).
-                tracing::error!(erro = %e, "undo_all falhou");
+                // O resultado final da saída é decidido relendo o diário (spec 6.8). O jogo já
+                // fechado é esperado: não é erro.
+                if matches!(e, gt_core::Error::ProcessGone { .. }) {
+                    tracing::warn!(erro = %e, "undo_all: o jogo já tinha fechado");
+                } else {
+                    tracing::error!(erro = %e, "undo_all falhou");
+                }
                 (Vec::new(), Vec::new())
             }
         }

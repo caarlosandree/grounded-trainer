@@ -1181,7 +1181,7 @@ impl Drop for Engine {
         }
         if !self.journal_entries().is_empty() {
             tracing::error!(
-                "alguns patches não puderam ser restaurados; a próxima execução do gt-patch vai restaurar"
+                "alguns patches não puderam ser restaurados; a próxima execução do trainer vai restaurar"
             );
         }
     }

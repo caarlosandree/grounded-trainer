@@ -206,6 +206,9 @@ pub fn outcome_of(res: gt_core::Result<BatchReport>, id: &str, pending: &[String
 /// depois da operação: entradas fora da política continuam lá mesmo com `Ok`.
 pub fn restore_outcome(res: gt_core::Result<RestoreReport>, pending: &[String]) -> OpOutcome {
     match res {
+        // Bytes de outro: o motor não escreveu nada e tirou a entrada do diário. Não é
+        // "restaurado" (AGENTS.md 3; spec 6.11).
+        Ok(report) if !report.foreign.is_empty() => OpOutcome::Foreign,
         Ok(_) if pending.is_empty() => OpOutcome::Done(Duration::ZERO),
         Ok(_) => OpOutcome::Residue(format!(
             "não foi possível restaurar {} agora",
@@ -469,6 +472,14 @@ mod tests {
             restore_outcome(ok(), &pending(&["a"])),
             OpOutcome::Residue(_)
         ));
+        // Bytes de outro: nada foi escrito, então não é `Done`.
+        let foreign = || {
+            Ok(RestoreReport {
+                foreign: vec!["a".to_string()],
+                ..RestoreReport::default()
+            })
+        };
+        assert_eq!(restore_outcome(foreign(), &[]), OpOutcome::Foreign);
         assert_eq!(
             restore_outcome(Err(Error::ProcessGone { pid: 1 }), &pending(&["a"])),
             OpOutcome::Gone

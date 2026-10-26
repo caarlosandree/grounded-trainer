@@ -161,8 +161,9 @@ pub struct Model {
     pub diagnostic: bool,
     /// O terminal está menor que o mínimo.
     pub too_small: bool,
-    /// `id` do cheat da última linha, se ela veio de [`Model::merge_value_event`].
-    last_value_event: Option<String>,
+    /// `id` do cheat da última linha e o valor de antes da primeira troca da sequência, se ela
+    /// veio de [`Model::merge_value_event`].
+    last_value_event: Option<(String, String)>,
 }
 
 impl Model {
@@ -228,18 +229,25 @@ impl Model {
     }
 
     /// Como [`Model::push_event`] para trocas de valor: se a última linha veio de uma troca do
-    /// mesmo `id`, ela é substituída em vez de somar uma linha por tecla.
-    pub fn merge_value_event(&mut self, hhmm: &str, id: &str, text: String) {
+    /// mesmo `id`, ela é substituída em vez de somar uma linha por tecla, e mostra o valor de
+    /// antes da primeira troca da sequência (`from`) até o atual (`to`).
+    pub fn merge_value_event(&mut self, hhmm: &str, id: &str, name: &str, from: &str, to: &str) {
+        let first = match &self.last_value_event {
+            Some((last_id, first)) if last_id == id && !self.events.is_empty() => {
+                Some(first.clone())
+            }
+            _ => None,
+        };
+        let merging = first.is_some();
+        let first = first.unwrap_or_else(|| from.to_string());
+        let text = format!("{name}: {first} → {to}");
         tracing::debug!("{text}");
         let line = format!("{hhmm} {text}");
-        if self.last_value_event.as_deref() == Some(id)
-            && let Some(last) = self.events.back_mut()
-        {
-            *last = line;
-            return;
+        self.last_value_event = Some((id.to_string(), first));
+        match self.events.back_mut() {
+            Some(last) if merging => *last = line,
+            _ => self.append(line),
         }
-        self.last_value_event = Some(id.to_string());
-        self.append(line);
     }
 
     fn append(&mut self, line: String) {
@@ -403,18 +411,21 @@ mod tests {
     #[test]
     fn value_events_merge() {
         let mut m = Model::new(false);
-        m.merge_value_event("12:00", "speed", "valor 1.5".into());
-        m.merge_value_event("12:01", "speed", "valor 2.0".into());
+        m.merge_value_event("12:00", "speed", "v", "1.0", "1.5");
+        m.merge_value_event("12:01", "speed", "v", "1.5", "2.0");
         assert_eq!(m.events.len(), 1);
-        assert_eq!(m.events[0], "12:01 valor 2.0");
+        // A linha fundida mostra o valor de antes da primeira troca.
+        assert_eq!(m.events[0], "12:01 v: 1.0 → 2.0");
         // Uma troca de outro id no meio separa.
-        m.merge_value_event("12:02", "other", "valor 3".into());
-        m.merge_value_event("12:03", "speed", "valor 2.5".into());
+        m.merge_value_event("12:02", "other", "o", "2", "3");
+        m.merge_value_event("12:03", "speed", "v", "2.0", "2.5");
         assert_eq!(m.events.len(), 3);
+        assert_eq!(m.events[2], "12:03 v: 2.0 → 2.5");
         // Um evento comum também separa.
         m.push_event("12:04", "ligado".into());
-        m.merge_value_event("12:05", "speed", "valor 3.0".into());
+        m.merge_value_event("12:05", "speed", "v", "2.5", "3.0");
         assert_eq!(m.events.len(), 5);
+        assert_eq!(m.events[4], "12:05 v: 2.5 → 3.0");
     }
 
     #[test]
@@ -427,7 +438,7 @@ mod tests {
         assert_eq!(m.events.front().map(String::as_str), Some("00:00 e50"));
         assert_eq!(m.events.back().map(String::as_str), Some("00:00 e249"));
         for i in 0..250 {
-            m.merge_value_event("00:00", &format!("id{i}"), format!("v{i}"));
+            m.merge_value_event("00:00", &format!("id{i}"), "n", "a", &format!("v{i}"));
         }
         assert_eq!(m.events.len(), 200);
     }

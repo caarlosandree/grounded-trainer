@@ -171,10 +171,11 @@ pub fn finish<T: Term, B: Backend>(
     restore: &RestoreOnce,
     store: &JournalStore,
     end: RunEnd,
+    logged: bool,
 ) -> Summary {
     drop(controller);
     let _ = restore.run(|| term.restore());
-    summarize(store, &end.restored, &end.foreign, end.panicked)
+    summarize(store, &end.restored, &end.foreign, end.panicked, logged)
 }
 
 #[cfg(test)]
@@ -353,7 +354,7 @@ mod tests {
         // A saída mostrou `restaurando…` antes de desfazer.
         assert!(events(&log).contains(&"draw:restaurando…".to_string()));
 
-        let summary = finish(&mut term, c, &restore, &store, end);
+        let summary = finish(&mut term, c, &restore, &store, end, true);
         let ev = events(&log);
         // Uma restauração só, depois do `drop` do controlador (a sessão já tinha caído), e
         // nenhum desenho depois dela.
@@ -378,7 +379,7 @@ mod tests {
 
         let end = run(&mut term, &mut c, &Shutdown::manual(), &restore, &elsewhere);
         assert!(end.panicked);
-        let summary = finish(&mut term, c, &restore, &store, end);
+        let summary = finish(&mut term, c, &restore, &store, end, true);
         assert_eq!(summary.code, 101);
         assert_eq!(events(&log).last().unwrap(), "restore:dropped=0");
     }
@@ -401,7 +402,7 @@ mod tests {
         // O `shutdown` rodou depois do pânico.
         assert_eq!(end.restored, ["x"]);
         assert_eq!(ctl.count(|c| matches!(c, Call::UndoAll { .. })), 1);
-        let summary = finish(&mut term, c, &restore, &store, end);
+        let summary = finish(&mut term, c, &restore, &store, end, true);
         assert_eq!(summary.code, 101);
         assert_eq!(events(&log).last().unwrap(), "restore:dropped=1");
     }
@@ -424,7 +425,7 @@ mod tests {
             .filter(|e| e.starts_with("draw"))
             .count();
         assert_eq!(draws, 1, "{:?}", events(&log));
-        let summary = finish(&mut term, c, &restore, &store, end);
+        let summary = finish(&mut term, c, &restore, &store, end, true);
         assert_eq!(summary.code, 0);
     }
 
@@ -441,7 +442,7 @@ mod tests {
             foreign: Vec::new(),
             panicked: false,
         };
-        assert_eq!(finish(&mut term, c, &restore, &store, end).code, 0);
+        assert_eq!(finish(&mut term, c, &restore, &store, end, true).code, 0);
 
         // Com uma entrada no diário: 1.
         let (c, ctl) = connected();
@@ -470,7 +471,7 @@ mod tests {
             foreign: Vec::new(),
             panicked: false,
         };
-        assert_eq!(finish(&mut term, c, &restore, &store, end).code, 1);
+        assert_eq!(finish(&mut term, c, &restore, &store, end, true).code, 1);
     }
 
     #[test]

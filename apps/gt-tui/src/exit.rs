@@ -15,12 +15,14 @@ pub struct Summary {
 }
 
 /// Monta o resumo. `restored` e `foreign` vêm do `undo_all`; o que ficou no jogo sai de uma
-/// leitura nova do diário (`peek`), depois do `drop` do motor.
+/// leitura nova do diário (`peek`), depois do `drop` do motor. `logged` diz se o log em arquivo
+/// foi aberto (só então a mensagem de pânico manda olhar o log).
 pub fn summarize(
     store: &JournalStore,
     restored: &[String],
     foreign: &[String],
     panicked: bool,
+    logged: bool,
 ) -> Summary {
     let mut lines: Vec<String> = restored
         .iter()
@@ -63,9 +65,14 @@ pub fn summarize(
         }
     }
     if panicked {
-        lines.push(
-            "o gt-tui terminou por um erro interno (pânico); veja o log em arquivo".to_string(),
-        );
+        let hint = if logged {
+            "veja o log em arquivo"
+        } else {
+            "veja a mensagem acima"
+        };
+        lines.push(format!(
+            "o gt-tui terminou por um erro interno (pânico); {hint}"
+        ));
     }
     let code = if panicked {
         PANIC_CODE
@@ -115,7 +122,7 @@ mod tests {
     fn summary_codes() {
         // Diário vazio: tudo restaurado, código 0.
         let (_d, store) = store_with(None);
-        let s = summarize(&store, &["a".to_string()], &[], false);
+        let s = summarize(&store, &["a".to_string()], &[], false, true);
         assert_eq!(s.code, 0);
         assert!(
             s.lines.iter().any(|l| l == "restaurado: a"),
@@ -126,7 +133,7 @@ mod tests {
 
         // Entrada que ficou: a linha da spec 002 6.7 e código 1.
         let (_d, store) = store_with(Some(journal(vec![entry("god")], false)));
-        let s = summarize(&store, &[], &[], false);
+        let s = summarize(&store, &[], &[], false, true);
         assert_eq!(s.code, 1);
         assert!(
             s.lines.iter().any(|l| l
@@ -137,7 +144,7 @@ mod tests {
 
         // Marcador "pausado por nós": kill -CONT com o pid do diário relido.
         let (_d, store) = store_with(Some(journal(vec![], true)));
-        let s = summarize(&store, &[], &[], false);
+        let s = summarize(&store, &[], &[], false, true);
         assert_eq!(s.code, 1);
         assert!(
             s.lines
@@ -149,7 +156,7 @@ mod tests {
 
         // Pânico: 101, mesmo com o diário limpo, e o resumo diz isso.
         let (_d, store) = store_with(None);
-        let s = summarize(&store, &[], &[], true);
+        let s = summarize(&store, &[], &[], true, true);
         assert_eq!(s.code, 101);
         assert!(
             s.lines.iter().any(|l| l.contains("pânico")),
@@ -159,16 +166,40 @@ mod tests {
 
         // Pânico com restos: continua 101, e os restos também aparecem.
         let (_d, store) = store_with(Some(journal(vec![entry("god")], true)));
-        let s = summarize(&store, &[], &[], true);
+        let s = summarize(&store, &[], &[], true, true);
         assert_eq!(s.code, 101);
         assert!(s.lines.iter().any(|l| l.contains("restaurar god")));
         assert!(s.lines.iter().any(|l| l.contains("kill -CONT 4242")));
     }
 
     #[test]
+    fn panic_hint_depends_on_log() {
+        let (_d, store) = store_with(None);
+        let with_log = summarize(&store, &[], &[], true, true);
+        assert!(
+            with_log
+                .lines
+                .iter()
+                .any(|l| l.contains("veja o log em arquivo")),
+            "{:?}",
+            with_log.lines
+        );
+        let without = summarize(&store, &[], &[], true, false);
+        assert!(
+            without
+                .lines
+                .iter()
+                .any(|l| l.contains("veja a mensagem acima")),
+            "{:?}",
+            without.lines
+        );
+        assert!(!without.lines.iter().any(|l| l.contains("log em arquivo")));
+    }
+
+    #[test]
     fn foreign_entries_are_listed_without_changing_code() {
         let (_d, store) = store_with(None);
-        let s = summarize(&store, &[], &["x".to_string()], false);
+        let s = summarize(&store, &[], &["x".to_string()], false, true);
         assert_eq!(s.code, 0);
         assert!(
             s.lines
@@ -184,7 +215,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = JournalStore::new(dir.path().to_path_buf());
         std::fs::write(dir.path().join("journal.json"), b"{ isto nao e json").unwrap();
-        let s = summarize(&store, &[], &[], false);
+        let s = summarize(&store, &[], &[], false, true);
         assert_eq!(s.code, 1);
         assert!(
             s.lines.iter().any(|l| l.contains("diário")),

@@ -129,7 +129,7 @@ fn real_main(cli: &Cli) -> anyhow::Result<i32> {
             panicked: true,
         }
     };
-    let summary = app::finish(&mut term, controller, &RESTORE, &store, end);
+    let summary = app::finish(&mut term, controller, &RESTORE, &store, end, logged);
 
     let mut out = io::stdout().lock();
     for line in &summary.lines {
