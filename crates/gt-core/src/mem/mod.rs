@@ -25,6 +25,10 @@ use crate::{Error, Result};
 /// Tamanho máximo de cada chamada a `process_vm_readv`.
 const CHUNK: usize = 1 << 20;
 
+/// Máximo de `iovec` remotos por chamada de `process_vm_readv` em [`ReadMem::read_many`]
+/// (o kernel aceita até `UIO_MAXIOV` = 1024).
+const IOV_MAX: usize = 1024;
+
 /// Tamanho de página assumido se `sysconf(_SC_PAGE_SIZE)` falhar.
 const DEFAULT_PAGE: u64 = 4096;
 
@@ -37,6 +41,106 @@ pub fn page_size() -> u64 {
             _ => DEFAULT_PAGE,
         },
     )
+}
+
+/// Interface de leitura da memória de um processo.
+///
+/// Existe para que as camadas acima (ex. o leitor de reflexão do Unreal) leiam sem
+/// depender de [`MemReader`] e possam ser testadas com uma memória sintética.
+pub trait ReadMem {
+    /// Lê exatamente `buf.len()` bytes a partir de `addr`.
+    ///
+    /// Memória não mapeada vira [`Error::Unmapped`]; processo morto, [`Error::ProcessGone`];
+    /// falta de permissão, [`Error::PermissionDenied`].
+    fn read_exact(&self, addr: u64, buf: &mut [u8]) -> Result<()>;
+
+    /// Lê vários trechos `(endereço, tamanho)`; o resultado tem a ordem dos pedidos.
+    ///
+    /// Um trecho em memória não mapeada ([`Error::Unmapped`]) vira `None`; qualquer outro erro
+    /// (`ProcessGone`, `PermissionDenied`, ...) interrompe a leitura e volta como `Err`.
+    /// A implementação padrão faz um [`ReadMem::read_exact`] por pedido.
+    fn read_many(&self, reqs: &[(u64, usize)]) -> Result<Vec<Option<Vec<u8>>>> {
+        reqs.iter()
+            .map(|&(addr, len)| {
+                let mut buf = vec![0u8; len];
+                match self.read_exact(addr, &mut buf) {
+                    Ok(()) => Ok(Some(buf)),
+                    Err(Error::Unmapped { .. }) => Ok(None),
+                    Err(e) => Err(e),
+                }
+            })
+            .collect()
+    }
+}
+
+impl ReadMem for MemReader {
+    fn read_exact(&self, addr: u64, buf: &mut [u8]) -> Result<()> {
+        MemReader::read_exact(self, addr, buf)
+    }
+
+    /// Agrupa os pedidos em chamadas de `process_vm_readv` com até 1024 `iovec` remotos.
+    ///
+    /// Numa leitura curta, o pedido em que ela parou é relido sozinho com
+    /// [`MemReader::read_exact`] (que decide entre `None` e o erro) e o lote segue do pedido
+    /// seguinte.
+    fn read_many(&self, reqs: &[(u64, usize)]) -> Result<Vec<Option<Vec<u8>>>> {
+        let mut out: Vec<Option<Vec<u8>>> = vec![None; reqs.len()];
+        let mut next = 0usize;
+        while next < reqs.len() {
+            // Pedidos vazios não viram `iovec`; endereço que estoura o espaço é `None`.
+            let mut batch: Vec<usize> = Vec::with_capacity(IOV_MAX.min(reqs.len() - next));
+            while next < reqs.len() && batch.len() < IOV_MAX {
+                let (addr, len) = reqs[next];
+                if len == 0 {
+                    out[next] = Some(Vec::new());
+                } else if addr.checked_add(len as u64).is_some() {
+                    batch.push(next);
+                }
+                next += 1;
+            }
+            if batch.is_empty() {
+                continue;
+            }
+            let mut bufs: Vec<Vec<u8>> = batch.iter().map(|&i| vec![0u8; reqs[i].1]).collect();
+            let remote: Vec<RemoteIoVec> = batch
+                .iter()
+                .map(|&i| RemoteIoVec {
+                    base: reqs[i].0 as usize,
+                    len: reqs[i].1,
+                })
+                .collect();
+            let mut local: Vec<IoSliceMut<'_>> =
+                bufs.iter_mut().map(|b| IoSliceMut::new(b)).collect();
+            let got = self.readv_many(&mut local, &remote)?;
+            drop(local);
+
+            // Pedidos inteiros lidos antes do ponto em que a chamada parou.
+            let mut consumed = 0usize;
+            let mut stopped = None;
+            for (k, &i) in batch.iter().enumerate() {
+                let len = reqs[i].1;
+                if consumed + len <= got {
+                    consumed += len;
+                    out[i] = Some(std::mem::take(&mut bufs[k]));
+                } else {
+                    stopped = Some(i);
+                    // Os pedidos depois do que parou não foram lidos: voltam à fila.
+                    next = i + 1;
+                    break;
+                }
+            }
+            if let Some(i) = stopped {
+                let (addr, len) = reqs[i];
+                let mut buf = vec![0u8; len];
+                match MemReader::read_exact(self, addr, &mut buf) {
+                    Ok(()) => out[i] = Some(buf),
+                    Err(Error::Unmapped { .. }) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Leitor da memória de um processo via `process_vm_readv`.
@@ -141,7 +245,13 @@ impl MemReader {
             len: buf.len(),
         }];
         let mut local = [IoSliceMut::new(buf)];
-        match process_vm_readv(Pid::from_raw(self.pid), &mut local, &remote) {
+        self.readv_many(&mut local, &remote)
+    }
+
+    /// Uma única chamada a `process_vm_readv` com vários `iovec`; devolve quantos bytes
+    /// foram lidos (a chamada para no primeiro trecho ilegível).
+    fn readv_many(&self, local: &mut [IoSliceMut<'_>], remote: &[RemoteIoVec]) -> Result<usize> {
+        match process_vm_readv(Pid::from_raw(self.pid), local, remote) {
             Ok(n) => Ok(n),
             Err(Errno::ESRCH) => Err(Error::ProcessGone { pid: self.pid }),
             Err(Errno::EPERM) => Err(Error::PermissionDenied {
@@ -157,7 +267,42 @@ impl MemReader {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
+
+    /// Memória sintética: só `0x1000..0x1008` é legível; `0x2000` simula processo morto.
+    struct Fake;
+
+    impl ReadMem for Fake {
+        fn read_exact(&self, addr: u64, buf: &mut [u8]) -> Result<()> {
+            match addr {
+                0x1000 if buf.len() <= 8 => {
+                    buf.fill(0x42);
+                    Ok(())
+                }
+                0x2000 => Err(Error::ProcessGone { pid: 1 }),
+                _ => Err(Error::Unmapped {
+                    addr,
+                    len: buf.len(),
+                }),
+            }
+        }
+    }
+
+    #[test]
+    fn default_read_many_maps_unmapped_to_none() {
+        let got = Fake
+            .read_many(&[(0x1000, 2), (0x3000, 4), (0x1000, 0)])
+            .unwrap();
+        assert_eq!(got, vec![Some(vec![0x42; 2]), None, Some(vec![])]);
+    }
+
+    #[test]
+    fn default_read_many_stops_on_other_errors() {
+        let r = Fake.read_many(&[(0x1000, 2), (0x2000, 4), (0x1000, 2)]);
+        assert!(matches!(r, Err(Error::ProcessGone { .. })), "{r:?}");
+    }
 
     #[test]
     fn page_size_is_power_of_two_and_at_least_4096() {

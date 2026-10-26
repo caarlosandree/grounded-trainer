@@ -70,6 +70,18 @@ pub fn anon_rw(len: usize) -> Result<u64> {
     Ok(map_anon(len)? as u64)
 }
 
+/// Copia `bytes` para `addr` na memória do **próprio** processo.
+///
+/// Só para testes: `addr` deve estar numa região `rw` alocada pelo próprio teste (ex. de
+/// [`anon_rw`]) com pelo menos `bytes.len()` bytes a partir de `addr`.
+pub fn write_local(addr: u64, bytes: &[u8]) -> Result<()> {
+    // SAFETY: pelo contrato acima, `addr` aponta para uma região `rw` do próprio processo com
+    // espaço para `bytes.len()` bytes; origem (slice do chamador) e destino (região do mapeamento
+    // do teste) não se sobrepõem.
+    unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len()) };
+    Ok(())
+}
+
 /// Cria uma página anônima `PROT_READ | PROT_EXEC` preenchida com
 /// `fill` (via `PROT_WRITE` temporário) e devolve o endereço.
 pub fn exec_page(fill: u8) -> Result<u64> {
@@ -211,5 +223,60 @@ pub fn readonly_shared_page(fill: u8) -> Result<u64> {
         Err(io::Error::last_os_error().into())
     } else {
         Ok(p as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::mem::{MemReader, ReadMem};
+
+    #[test]
+    fn write_local_roundtrips_through_read_many_on_self() {
+        let page = page();
+        let base = anon_rw(2 * page).unwrap();
+        write_local(base, &[1, 2, 3, 4]).unwrap();
+        write_local(base + page as u64, &[9, 8]).unwrap();
+        let reader = MemReader::new(std::process::id() as i32);
+        let got = reader
+            .read_many(&[(base, 4), (base + page as u64, 2), (base + 2, 0)])
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![Some(vec![1, 2, 3, 4]), Some(vec![9, 8]), Some(vec![])]
+        );
+    }
+
+    #[test]
+    fn read_many_guard_page_is_none_and_batch_continues() {
+        let page = page();
+        let base = guarded_pages().unwrap();
+        write_local(base, &[7; 4]).unwrap();
+        write_local(base + 2 * page as u64, &[5; 4]).unwrap();
+        let reader = MemReader::new(std::process::id() as i32);
+        let got = reader
+            .read_many(&[
+                (base, 4),
+                (base + page as u64, 4),
+                (base + 2 * page as u64, 4),
+                // Atravessa a guarda: curto, vira None.
+                (base + page as u64 - 2, 4),
+                (u64::MAX - 1, 4),
+                (base, 4),
+            ])
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![
+                Some(vec![7; 4]),
+                None,
+                Some(vec![5; 4]),
+                None,
+                None,
+                Some(vec![7; 4]),
+            ]
+        );
     }
 }
