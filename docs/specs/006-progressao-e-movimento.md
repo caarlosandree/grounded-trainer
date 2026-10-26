@@ -346,10 +346,11 @@ diminui a carga enquanto ligado.
 ### 6.8 Diário: entradas de dados de N bytes
 
 A entrada de dados da spec 005 guarda um byte (original, escrito, máscara). Ela passa a guardar **N bytes**
-contíguos (o formato aceita de 1 a 8; esta spec só usa 1, nos bits, e 4, nos `set`), em dois modos:
+contíguos, em dois modos:
 
-- **bits** (os da 005): por byte, só os bits da máscara voltam ao original, e só se esses bits forem os nossos;
-- **inteiro** (os `set`): o campo é uma unidade. Restaurar exige que **todos** os bytes atuais sejam iguais ao
+- **bits** (os da 005): continuam com **1 byte** e uma máscara; só os bits da máscara voltam ao original, e só se
+  esses bits forem os nossos;
+- **inteiro** (os `set`): de 1 a 8 bytes (esta spec só usa 4); o campo é uma unidade. Restaurar exige que **todos** os bytes atuais sejam iguais ao
   `written` (ou ao `next`, abaixo); então escreve o `original` inteiro numa escrita só. Qualquer byte diferente: não
   escreve nada e só esquece a entrada. Nunca sobra um valor misturado. A máscara não se aplica a esse modo.
 
@@ -424,7 +425,7 @@ Nada fora das assinaturas é lido por nome fixo no código. Continua só leitura
 | Plano do `set` com dois campos: um escrito e outro recusado, ao ligar e numa troca de valor, fica `[ON ]` e a manutenção leva os dois ao valor desejado | Não |
 | Motor: entrada atualizada (original novo ou `next`) seguida de falha na restauração não deixa cópia velha no pendente nem no diário; no máximo uma entrada viva por (`id`, endereço) | Não |
 | Plano do `add` (função pura): soma, recusa com atual fora da faixa, recusa quando passaria do máximo, releitura diferente registrada sem repetir | Não |
-| Diário: entradas de 1, 4 e 8 bytes nos dois modos; diário da spec 005 legível; restauração inteira com valor parcialmente igual (ex.: 3 dos 4 bytes nossos) não escreve nada; restauração com o valor igual ao `next` | Não |
+| Diário: entradas de bits (1 byte) e inteiras de 1, 4 e 8 bytes; diário da spec 005 legível; restauração inteira com valor parcialmente igual (ex.: 3 dos 4 bytes nossos) não escreve nada; restauração com o valor igual ao `next` | Não |
 | Recuperação e `gt-patch restore` com uma entrada `set` de 4 bytes: restaura quando a identidade bate e o valor é o nosso (`written` ou `next`); descarta quando não bate; só esquece quando o valor é do jogo | Não |
 | **Reflexão sintética** (`gt-testtarget`): `Outer`, `Level`, `World`, `GameState`, `PartyComponent`, `HaulingComponent`, um componente de movimento e os campos novos, com offsets diferentes dos do jogo; o trainer acha tudo por nome, aplica os `set`, executa o `add` e restaura | Não |
 | Na reflexão sintética: `Outer` que não é `Level`, `OwningWorld` nulo, `World` de classe errada, `GameState` de classe errada e `PartyComponent` nulo nunca são escritos; a ação relê o `maps` quando o `PartyComponent` muda de endereço; pawn nulo com controller válido mantém a ação disponível; `InGameGameState` ausente deixa só a ação indisponível, com os cheats do pawn funcionando; classe do caminho do pawn ausente deixa a ação funcionando; `HaulingComponent` nulo deixa só `carga` em `aguardando o personagem`, com `vida-infinita` funcionando, e o pet ausente continua com `aguardando o pet` | Não |
