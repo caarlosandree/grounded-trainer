@@ -32,6 +32,9 @@ const AUTO_MIN_INTERVAL: Duration = Duration::from_secs(5);
 /// Por quanto tempo, depois de cada conexão, as buscas automáticas continuam.
 const AUTO_WINDOW: Duration = Duration::from_secs(120);
 
+/// Menor intervalo entre o início de duas trocas de valor (cada troca pausa o jogo).
+const SWAP_INTERVAL: Duration = Duration::from_millis(150);
+
 /// Mensagem do topo durante a recuperação do diário.
 const RECOVERING: &str = "recuperando o diário…";
 /// Mensagem do topo durante a restauração dos restos e o novo SIGCONT.
@@ -130,6 +133,8 @@ pub struct Controller<B: Backend> {
     desired: HashMap<String, Desired>,
     /// Há religação a fazer no próximo `tick` (o `tick` recebe o `draw`; o `wait_search`, não).
     reapply_pending: bool,
+    /// Quando a última troca de valor começou (limite de ritmo; zerado quando o jogo fecha).
+    last_swap: Option<Instant>,
     /// Avisos de religação já dados nesta conexão.
     notes: HashSet<(String, Note)>,
     /// Cheats não verificados já avisados nesta conexão.
@@ -163,6 +168,7 @@ impl<B: Backend> Controller<B> {
             op_counts: HashMap::new(),
             desired: HashMap::new(),
             reapply_pending: false,
+            last_swap: None,
             notes: HashSet::new(),
             warned_unverified: HashSet::new(),
             quit: false,
@@ -181,17 +187,48 @@ impl<B: Backend> Controller<B> {
         self.recover_diary(draw);
     }
 
-    /// Uma volta do laço: colhe a busca, percebe o fechamento do jogo, procura o jogo e
-    /// dispara as novas buscas automáticas.
-    pub fn tick(&mut self, now: Instant, draw: &mut dyn FnMut(&Model)) {
+    /// Uma volta do laço: colhe a busca, percebe o fechamento do jogo, procura o jogo, religa os
+    /// desejados, dispara as novas buscas automáticas e manda a troca de valor que esperava o
+    /// intervalo. Devolve `true` se chamou a sessão numa operação (religar ou trocar o valor): o
+    /// laço então descarta as teclas que chegaram durante a chamada, como depois do `handle`.
+    pub fn tick(&mut self, now: Instant, draw: &mut dyn FnMut(&Model)) -> bool {
         self.poll_search(now);
         self.check_exit(now);
         if self.session.is_none() {
             self.poll_find(now, draw);
-        } else {
-            self.run_reapply(now, draw);
-            self.maybe_auto_search(now);
+            return false;
         }
+        let mut called = self.run_reapply(now, draw);
+        self.maybe_auto_search(now);
+        // Só uma operação por volta: a troca que sobrou espera a próxima.
+        if !called {
+            called = self.run_pending_swap(now, draw);
+        }
+        called
+    }
+
+    /// Das teclas lidas logo depois de uma operação do motor (spec 6.6), as que ainda valem:
+    /// sair e as setas de valor (que seguem a regra da 6.7). O resto (espaço, `Enter`, `r` e
+    /// movimento) é descartado, para que toques repetidos com o jogo pausado não virem uma
+    /// sequência de liga-desliga depois.
+    pub fn after_op_keys(&mut self, keys: Vec<Action>) -> Vec<Action> {
+        keys.into_iter()
+            .filter(|k| matches!(k, Action::Quit | Action::Dec | Action::Inc))
+            .collect()
+    }
+
+    /// Saída (spec 6.8, passo 1): desenha `restaurando…`, abandona a busca em andamento sem
+    /// esperá-la (solta só o `Receiver`; a thread termina sozinha e o resultado dela se perde) e
+    /// desfaz todos os patches. Devolve (restaurados, alterados por outro). A sessão continua
+    /// aberta: quem chama faz `drop` do controlador depois, e o `Drop` do motor restaura o que
+    /// sobrar.
+    pub fn shutdown(&mut self, draw: &mut dyn FnMut(&Model)) -> (Vec<String>, Vec<String>) {
+        self.search = None;
+        self.model.busy = Some(RESTORING.to_string());
+        draw(&self.model);
+        let out = self.session_call(|s| s.undo_all());
+        self.model.busy = None;
+        out.unwrap_or_default()
     }
 
     /// O dono pediu para sair (`q`, `Esc` ou Ctrl+C): o laço encerra.
@@ -482,21 +519,39 @@ impl<B: Backend> Controller<B> {
     }
 
     /// Junta o catálogo da busca de conexão na lista: as linhas que já existiam (de uma conexão
-    /// anterior) guardam o `k` mostrado; a disponibilidade é a da busca nova.
+    /// anterior) guardam o valor mostrado; a disponibilidade é a da busca nova. Se o bloco
+    /// `value` do cheat mudou (jogo atualizado), o valor mostrado, que é também o guardado, vai
+    /// ao ponto mais próximo da grade nova (spec 6.2) e o registro de eventos diz o valor usado.
     fn merge_connect(&mut self, cheats: Vec<CheatInfo>) {
         for c in cheats {
-            match self.model.cheats.iter_mut().find(|r| r.id == c.id) {
-                Some(row) => {
-                    row.name = c.name;
-                    row.category = c.category;
-                    row.avail = c.avail;
-                    row.k = match &c.value {
-                        Some(v) => row.k.min(v.steps()),
-                        None => 0,
-                    };
-                    row.value = c.value;
+            let Some(row) = self.model.cheats.iter_mut().find(|r| r.id == c.id) else {
+                self.model.cheats.push(row_of(c));
+                continue;
+            };
+            let old_spec = row.value.take();
+            let (k, regridded) = match (&old_spec, &c.value) {
+                (Some(old), Some(new)) if old != new => {
+                    let k = new.nearest_k(old.value(row.k));
+                    (k, Some(new.format(k)))
                 }
-                None => self.model.cheats.push(row_of(c)),
+                (Some(_), Some(new)) => (row.k.min(new.steps()), None),
+                (None, Some(new)) => (new.default_k.min(new.steps()), None),
+                (_, None) => (0, None),
+            };
+            row.name = c.name;
+            row.category = c.category;
+            row.avail = c.avail;
+            row.value = c.value;
+            row.k = k;
+            let (id, name) = (row.id.clone(), row.name.clone());
+            // O desejado guarda sempre o valor mostrado.
+            if let Some(d) = self.desired.get_mut(&id) {
+                d.k = k;
+            }
+            if let Some(used) = regridded {
+                self.event(format!(
+                    "{name}: a grade do valor mudou na versão nova; usando {used}"
+                ));
             }
         }
         self.clamp_selected();
@@ -622,6 +677,7 @@ impl<B: Backend> Controller<B> {
         self.auto_until = None;
         self.next_auto = None;
         self.reapply_pending = false;
+        self.last_swap = None;
         self.notes.clear();
         self.warned_unverified.clear();
         self.last_find = Some(now);
@@ -737,8 +793,8 @@ impl<B: Backend> Controller<B> {
                 false
             }
             Action::Toggle => self.toggle(now, draw),
-            // Troca de valor: Tarefa 14.
-            Action::Dec | Action::Inc => false,
+            Action::Dec => self.change_value(-1, now, draw),
+            Action::Inc => self.change_value(1, now, draw),
             Action::Retry => self.retry(now, draw),
             Action::Quit => false,
         }
@@ -1010,6 +1066,120 @@ impl<B: Backend> Controller<B> {
         true
     }
 
+    // ---- troca de valor (spec 6.2 e 6.7) ----
+
+    /// Muda o valor mostrado do `id` e o guardado no desejado (o valor guardado é sempre o
+    /// mostrado).
+    fn set_shown_k(&mut self, id: &str, k: u64) {
+        if let Some(row) = self.model.cheats.iter_mut().find(|r| r.id == id) {
+            row.k = k;
+        }
+        if let Some(d) = self.desired.get_mut(id) {
+            d.k = k;
+        }
+    }
+
+    /// `←`/`→` no cheat selecionado: muda o valor mostrado em um passo, dentro da grade, também
+    /// com o cheat desligado, indisponível ou com a marca de religar pendente. Com o cheat
+    /// ligado, a troca vai para o jogo se o intervalo de 150 ms desde o início da anterior já
+    /// passou; senão o valor fica como alvo e o `tick` o manda depois. Devolve `true` se chamou
+    /// a sessão.
+    fn change_value(&mut self, delta: i64, now: Instant, draw: &mut dyn FnMut(&Model)) -> bool {
+        let Some(id) = self.model.selected_id().map(str::to_string) else {
+            return false;
+        };
+        let Some(row) = self.model.cheats.iter().find(|r| r.id == id) else {
+            return false;
+        };
+        let Some(spec) = &row.value else {
+            return false;
+        };
+        let last = i64::try_from(spec.steps()).unwrap_or(i64::MAX);
+        let current = i64::try_from(row.k).unwrap_or(i64::MAX);
+        let k = u64::try_from(current.saturating_add(delta).clamp(0, last)).unwrap_or(0);
+        if k == row.k {
+            return false;
+        }
+        let in_game = row.on && row.applied_k.is_some();
+        self.set_shown_k(&id, k);
+        in_game && self.swap_due(now) && self.do_swap(&id, now, draw)
+    }
+
+    /// Já passaram 150 ms do início da última troca.
+    fn swap_due(&self, now: Instant) -> bool {
+        self.last_swap
+            .is_none_or(|t| now.saturating_duration_since(t) >= SWAP_INTERVAL)
+    }
+
+    /// Manda ao jogo a troca que esperava o intervalo: o primeiro cheat ligado cujo valor
+    /// mostrado difere do que está no jogo. Devolve `true` se chamou a sessão.
+    fn run_pending_swap(&mut self, now: Instant, draw: &mut dyn FnMut(&Model)) -> bool {
+        if !self.swap_due(now) {
+            return false;
+        }
+        let pending = self
+            .model
+            .cheats
+            .iter()
+            .find(|r| r.on && r.applied_k.is_some_and(|a| a != r.k))
+            .map(|r| r.id.clone());
+        match pending {
+            Some(id) => self.do_swap(&id, now, draw),
+            None => false,
+        }
+    }
+
+    /// Troca o valor do `id` no jogo para o valor mostrado (spec 6.7). Devolve `true` se chamou
+    /// a sessão.
+    fn do_swap(&mut self, id: &str, now: Instant, draw: &mut dyn FnMut(&Model)) -> bool {
+        let Some(row) = self.model.cheats.iter().find(|r| r.id == id).cloned() else {
+            return false;
+        };
+        let (Some(spec), Some(before)) = (row.value.clone(), row.applied_k) else {
+            return false;
+        };
+        let k = Self::shown_k(&row);
+        if k == before {
+            return false;
+        }
+        self.last_swap = Some(now);
+        self.note_op(id);
+        let busy = format!("trocando o valor de {}…", row.name);
+        let target = id.to_string();
+        let Some(outcome) = self.run_op(busy, draw, |s| s.set_value(&target, k)) else {
+            return false;
+        };
+        match outcome {
+            OpOutcome::Done(_) => {
+                if let Some(r) = self.model.cheats.iter_mut().find(|r| r.id == id) {
+                    r.applied_k = Some(k);
+                }
+                let hhmm = (self.clock)();
+                self.model.merge_value_event(
+                    &hhmm,
+                    id,
+                    format!("{}: {} → {}", row.name, spec.format(before), spec.format(k)),
+                );
+            }
+            // Recusa limpa: o jogo continua com o valor de antes e a tela volta a mostrá-lo.
+            OpOutcome::Refused(reason) => {
+                self.set_shown_k(id, before);
+                self.event(format!("{}: {reason}", row.name));
+            }
+            OpOutcome::Foreign => self.mark_foreign(id),
+            OpOutcome::Residue(cause) => {
+                self.mark_residue(&[id.to_string()]);
+                self.event(format!(
+                    "{}: falhou deixando restos no jogo ({cause})",
+                    row.name
+                ));
+            }
+            // O desejado já guarda o valor novo (é o mostrado).
+            OpOutcome::Gone => self.on_game_closed(now),
+        }
+        true
+    }
+
     // ---- efeitos dos desfechos na linha ----
 
     fn mark_on(&mut self, id: &str, k: u64) {
@@ -1096,12 +1266,13 @@ impl<B: Backend> Controller<B> {
     /// Religa os desejados disponíveis da mesma versão (spec 6.2). Roda no `tick` seguinte ao
     /// fim de uma busca, porque só o `tick` recebe o `draw` que mostra `religando…` antes da
     /// chamada à sessão.
-    fn run_reapply(&mut self, now: Instant, draw: &mut dyn FnMut(&Model)) {
+    /// Devolve `true` se chamou a sessão.
+    fn run_reapply(&mut self, now: Instant, draw: &mut dyn FnMut(&Model)) -> bool {
         if !std::mem::take(&mut self.reapply_pending) || self.desired.is_empty() {
-            return;
+            return false;
         }
         let Conn::Connected { version_key, .. } = &self.model.conn else {
-            return;
+            return false;
         };
         let version_key = version_key.clone();
         let blocked = self.write_block();
@@ -1143,7 +1314,7 @@ impl<B: Backend> Controller<B> {
             }
         }
         if batch.is_empty() {
-            return;
+            return false;
         }
         for (id, _) in &batch {
             self.note_op(id);
@@ -1151,7 +1322,7 @@ impl<B: Backend> Controller<B> {
         let items = batch.clone();
         let Some(outcome) = self.run_op("religando…".to_string(), draw, |s| s.apply(&items))
         else {
-            return;
+            return false;
         };
         match outcome {
             OpOutcome::Done(pause) => {
@@ -1178,6 +1349,7 @@ impl<B: Backend> Controller<B> {
                 }
             }
         }
+        true
     }
 
     /// O lote foi recusado: cada desejado é tentado sozinho, para que um patch com problema
@@ -1299,9 +1471,10 @@ mod tests {
             self.t0 + Duration::from_millis(ms)
         }
 
-        fn tick(&mut self, ms: u64) {
+        /// Uma volta do laço em `ms`; devolve se o `tick` chamou a sessão.
+        fn tick(&mut self, ms: u64) -> bool {
             let now = self.at(ms);
-            self.c.tick(now, &mut *self.draw);
+            self.c.tick(now, &mut *self.draw)
         }
 
         fn wait(&mut self, ms: u64) -> bool {
@@ -3040,5 +3213,442 @@ mod tests {
         assert_eq!(h.row("a").avail, available());
         // O disco novo ficou na sessão (o `merge_search` do alvo falso o guarda).
         assert_eq!(h.ctl.merge_ids().len(), 1);
+    }
+
+    // ---- Tarefa 14: valores, teclas depois de uma operação e saída ----
+
+    /// Cheat com valor na grade `grid()` (`0..=10`, padrão 2).
+    fn valued(id: &str) -> CheatInfo {
+        let mut c = cheat(id, available());
+        c.value = Some(grid());
+        c
+    }
+
+    fn set_call(id: &str, k: u64) -> Call {
+        Call::SetValue {
+            id: id.to_string(),
+            k,
+            busy: Some(format!("trocando o valor de {id}…")),
+        }
+    }
+
+    fn swaps(h: &H) -> Vec<Call> {
+        h.ctl
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, Call::SetValue { .. }))
+            .collect()
+    }
+
+    #[test]
+    fn value_queue_rate_limited_and_ends_on_last() {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![valued("v")]);
+        h.connect(0);
+        assert!(h.toggle("v", 1_000));
+        assert_eq!(h.row("v").applied_k, Some(2));
+
+        // Uma tecla isolada vai na hora.
+        assert!(h.key(Action::Inc, 2_000));
+        assert_eq!(swaps(&h), [set_call("v", 3)]);
+        assert_eq!(h.row("v").applied_k, Some(3));
+
+        // Duas teclas dentro dos 150 ms só mudam o valor mostrado.
+        assert!(!h.key(Action::Inc, 2_025));
+        assert!(!h.key(Action::Inc, 2_050));
+        assert_eq!(h.row("v").k, 5);
+        assert_eq!(h.row("v").applied_k, Some(3));
+        assert_eq!(h.c.desired().get("v").map(|d| d.k), Some(5));
+        assert!(!h.tick(2_100));
+        assert!(!h.tick(2_149));
+        assert_eq!(swaps(&h), [set_call("v", 3)]);
+
+        // Passado o intervalo, o `tick` manda direto para o último alvo (o 4 nunca passa).
+        assert!(h.tick(2_150));
+        assert_eq!(swaps(&h), [set_call("v", 3), set_call("v", 5)]);
+        assert_eq!(h.row("v").applied_k, Some(5));
+        assert_eq!(h.c.model.busy, None);
+        // Trocas seguidas somam uma linha só.
+        let arrows: Vec<&str> = h.events().into_iter().filter(|e| e.contains('→')).collect();
+        assert_eq!(arrows, ["12:00 v: 3 → 5"]);
+
+        // Nada mais a mandar.
+        assert!(!h.tick(2_400));
+        assert_eq!(swaps(&h).len(), 2);
+        // Com o intervalo já passado, a tecla seguinte vai na hora.
+        assert!(h.key(Action::Dec, 2_500));
+        assert_eq!(swaps(&h).last(), Some(&set_call("v", 4)));
+    }
+
+    #[test]
+    fn value_clamped_to_grid() {
+        let mut h = H::new();
+        h.ctl
+            .set_catalog(vec![valued("v"), cheat("a", available())]);
+        h.connect(0);
+        h.sel("v");
+        for _ in 0..15 {
+            assert!(!h.key(Action::Inc, 100));
+        }
+        assert_eq!(h.row("v").k, 10);
+        for _ in 0..15 {
+            assert!(!h.key(Action::Dec, 200));
+        }
+        assert_eq!(h.row("v").k, 0);
+        // Cheat sem valor: as setas não fazem nada.
+        h.sel("a");
+        assert!(!h.key(Action::Inc, 300));
+        assert_eq!(h.row("a").k, 0);
+        assert!(swaps(&h).is_empty());
+    }
+
+    #[test]
+    fn value_clamped_to_grid_when_on() {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![valued("v")]);
+        h.connect(0);
+        h.c.model.cheats[0].k = 10;
+        assert!(h.toggle("v", 100));
+        // No fim da grade a tecla não muda nada, então não há troca.
+        assert!(!h.key(Action::Inc, 1_000));
+        assert!(swaps(&h).is_empty());
+        assert_eq!(h.row("v").k, 10);
+    }
+
+    #[test]
+    fn value_change_while_off_only_updates_display() {
+        let mut h = H::new();
+        let mut gone = valued("u");
+        gone.avail = not_found();
+        h.ctl.set_catalog(vec![valued("v"), gone]);
+        h.connect(0);
+        let events = h.events().len();
+
+        // Desligado e disponível.
+        h.sel("v");
+        assert!(!h.key(Action::Inc, 100));
+        assert_eq!(h.row("v").k, 3);
+        assert_eq!(h.row("v").applied_k, None);
+
+        // Indisponível com a marca de religar pendente: o desejado acompanha o valor mostrado.
+        h.c.set_desired("u", Some(desired_of(2, "v1")));
+        h.sel("u");
+        assert!(!h.key(Action::Dec, 200));
+        assert_eq!(h.row("u").k, 1);
+        assert_eq!(h.c.desired().get("u"), Some(&desired_of(1, "v1")));
+
+        assert!(swaps(&h).is_empty());
+        assert_eq!(h.events().len(), events, "nada vai para o registro");
+
+        // O jogo fechou: as setas ainda mudam o valor mostrado, e o desejado o guarda.
+        h.ctl.set_exited(true);
+        h.tick(300);
+        assert_eq!(h.c.model.conn, Conn::Waiting);
+        assert!(!h.key(Action::Inc, 400));
+        assert_eq!(h.row("u").k, 2);
+        assert_eq!(h.c.desired().get("u").map(|d| d.k), Some(2));
+    }
+
+    #[test]
+    fn value_failures_follow_table() {
+        let mut h = H::new();
+        h.ctl
+            .set_catalog(vec![valued("a"), valued("b"), valued("c"), valued("d")]);
+        h.connect(0);
+        for id in ["a", "b", "c", "d"] {
+            assert!(h.toggle(id, 100));
+        }
+
+        // Recusa limpa: o valor mostrado volta ao que está no jogo; continua ligado e desejado.
+        h.sel("a");
+        h.ctl
+            .push_outcome(OpOutcome::Refused("threads no trecho".to_string()));
+        assert!(h.key(Action::Inc, 1_000));
+        let a = h.row("a");
+        assert!(a.on);
+        assert_eq!((a.k, a.applied_k), (2, Some(2)));
+        assert_eq!(h.c.desired().get("a"), Some(&desired_of(2, "v1")));
+        assert_eq!(h.events().last(), Some(&"12:00 a: threads no trecho"));
+        assert_eq!(h.c.model.busy, None);
+        // O alvo foi descartado: o `tick` não tenta de novo.
+        assert!(!h.tick(1_500));
+        assert_eq!(swaps(&h).len(), 1);
+
+        // Bytes de outro: indisponível e fora dos desejados.
+        h.sel("b");
+        h.ctl.push_outcome(OpOutcome::Foreign);
+        assert!(h.key(Action::Inc, 2_000));
+        let b = h.row("b");
+        assert!(!b.on && !b.desired);
+        assert_eq!(
+            b.status(&h.c.model.conn),
+            crate::model::CheatStatus::Unavailable("alterado por outro".to_string())
+        );
+        assert!(!h.c.desired().contains_key("b"));
+
+        // Restos: `erro`, aviso fixo e fora dos desejados.
+        h.sel("c");
+        h.ctl.push_residue("escrita", &["c"]);
+        assert!(h.key(Action::Inc, 3_000));
+        let c = h.row("c");
+        assert!(c.residue && !c.on && !c.desired);
+        assert_eq!(
+            c.status(&h.c.model.conn),
+            crate::model::CheatStatus::Residue
+        );
+        assert!(h.c.model.banners.residue.is_some());
+
+        // O jogo fechou no meio da troca: o valor novo fica guardado no desejado.
+        h.sel("d");
+        h.ctl.push_outcome(OpOutcome::Gone);
+        assert!(h.key(Action::Inc, 4_000));
+        assert_eq!(h.c.model.conn, Conn::Waiting);
+        let d = h.row("d");
+        assert!(!d.on && d.desired);
+        assert_eq!(d.k, 3);
+        assert_eq!(h.c.desired().get("d"), Some(&desired_of(3, "v1")));
+        assert_eq!(h.events().last(), Some(&"12:00 o jogo fechou"));
+        assert_eq!(h.c.model.busy, None);
+        // As ligadas que não falharam continuam desejadas.
+        assert!(h.c.desired().contains_key("a"));
+    }
+
+    #[test]
+    fn off_with_pending_value_skips_swap() {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![valued("v")]);
+        h.connect(0);
+        assert!(h.toggle("v", 1_000));
+        assert!(h.key(Action::Inc, 2_000));
+        assert!(!h.key(Action::Inc, 2_050));
+        assert_eq!(h.row("v").k, 4);
+        assert_eq!(swaps(&h), [set_call("v", 3)]);
+
+        // O espaço desliga direto: a troca pendente não vai para o jogo.
+        h.ctl.clear_calls();
+        assert!(h.toggle("v", 2_060));
+        assert_eq!(
+            h.ctl.calls(),
+            [Call::Undo {
+                id: "v".to_string(),
+                busy: Some("desligando v…".to_string())
+            }]
+        );
+        let v = h.row("v");
+        assert!(!v.on && !v.desired);
+        assert_eq!(
+            (v.k, v.applied_k),
+            (4, None),
+            "o valor mostrado fica guardado"
+        );
+        assert!(!h.tick(2_500));
+        assert!(swaps(&h).is_empty());
+
+        // Ligar de novo usa o valor mostrado.
+        h.ctl.clear_calls();
+        assert!(h.toggle("v", 3_000));
+        assert_eq!(h.applies(), [apply_call(&[("v", 4)], "ligando v…")]);
+    }
+
+    #[test]
+    fn value_queue_survives_game_close() {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![valued("v")]);
+        h.connect(0);
+        assert!(h.toggle("v", 1_000));
+        assert!(h.key(Action::Inc, 2_000));
+        assert!(!h.key(Action::Inc, 2_050));
+        assert_eq!(h.row("v").k, 4);
+
+        // O jogo fecha com a troca ainda na fila: o valor mostrado fica guardado.
+        h.ctl.clear_calls();
+        h.reopen(2_100, 5_000);
+        assert!(!h.row("v").on);
+        assert_eq!(h.row("v").k, 4);
+        assert_eq!(h.c.desired().get("v"), Some(&desired_of(4, "v1")));
+        assert!(
+            swaps(&h).is_empty(),
+            "a troca da fila não vai para o jogo novo"
+        );
+
+        // A religação usa o valor guardado.
+        assert!(h.tick(5_100));
+        assert_eq!(h.applies(), [apply_call(&[("v", 4)], "religando…")]);
+        assert_eq!(h.row("v").applied_k, Some(4));
+
+        // Uma troca interrompida pelo fechamento guarda o valor novo.
+        h.ctl.push_outcome(OpOutcome::Gone);
+        assert!(h.key(Action::Inc, 6_000));
+        assert_eq!(h.c.model.conn, Conn::Waiting);
+        assert_eq!(h.c.desired().get("v"), Some(&desired_of(5, "v1")));
+        assert_eq!(h.row("v").k, 5);
+    }
+
+    #[test]
+    fn value_regridded_on_new_version() {
+        let mut h = H::new();
+        let mut shrunk = grid();
+        shrunk.max = 5.0;
+        h.ctl
+            .set_catalog(vec![valued("v"), valued("w"), valued("s"), {
+                let mut x = cheat("x", available());
+                x.value = Some(grid());
+                x
+            }]);
+        h.connect(0);
+        assert!(h.toggle("v", 1_000));
+        for i in 0..5 {
+            assert!(h.key(Action::Inc, 2_000 + 1_000 * i));
+        }
+        assert_eq!(h.row("v").k, 7);
+        h.c.model.cheats[1].k = 4; // w
+        h.c.model.cheats[2].k = 6; // s
+        h.c.model.cheats[3].k = 10; // x
+
+        // O jogo atualizou: `v` e `w` ganham outra grade; `x` uma grade menor; `s` fica igual.
+        let mut wide = grid();
+        wide.max = 100.0;
+        wide.step = 10.0;
+        wide.default_k = 1;
+        let mut v2 = cheat("v", available());
+        v2.value = Some(wide.clone());
+        let mut w2 = cheat("w", available());
+        w2.value = Some(wide);
+        let mut x2 = cheat("x", available());
+        x2.value = Some(shrunk);
+        let mut spec = SearchSpec::new(vec![v2, w2, valued("s"), x2]);
+        spec.version_key = "v2".to_string();
+        h.ctl.set_default_search(spec);
+        h.ctl.clear_calls();
+        h.reopen(9_000, 12_000);
+
+        // O valor antigo (7) vai ao ponto mais próximo da grade nova (10), e o desejado o guarda.
+        assert_eq!(h.row("v").k, 1);
+        assert_eq!(h.c.desired().get("v"), Some(&desired_of(1, "v1")));
+        assert!(
+            h.events()
+                .iter()
+                .any(|e| e.contains("v:") && e.contains("usando 10"))
+        );
+        // Sem religar sozinho: a versão é outra.
+        h.tick(12_100);
+        assert!(h.applies().is_empty());
+        assert_eq!(
+            event_count(&h, "v: versão nova; aperte espaço para ligar"),
+            1
+        );
+        // Quem não era desejado também leva o valor para a grade nova.
+        assert_eq!(h.row("w").k, 0);
+        assert!(
+            h.events()
+                .iter()
+                .any(|e| e.contains("w:") && e.contains("usando 0"))
+        );
+        // Grade menor: limitado ao fim.
+        assert_eq!(h.row("x").k, 5);
+        assert!(
+            h.events()
+                .iter()
+                .any(|e| e.contains("x:") && e.contains("usando 5"))
+        );
+        // Grade igual: nada muda e nada é dito.
+        assert_eq!(h.row("s").k, 6);
+        assert_eq!(event_count(&h, "s:"), 0);
+
+        // O espaço liga com o valor guardado.
+        assert!(h.toggle("v", 12_200));
+        assert_eq!(h.applies(), [apply_call(&[("v", 1)], "ligando v…")]);
+    }
+
+    #[test]
+    fn after_op_keys_keeps_only_quit_and_arrows() {
+        let mut h = H::new();
+        let keys = vec![
+            Action::Up,
+            Action::Down,
+            Action::Toggle,
+            Action::Dec,
+            Action::Retry,
+            Action::Quit,
+            Action::Inc,
+            Action::Toggle,
+        ];
+        assert_eq!(
+            h.c.after_op_keys(keys),
+            [Action::Dec, Action::Quit, Action::Inc]
+        );
+        assert!(h.c.after_op_keys(Vec::new()).is_empty());
+        assert!(
+            h.c.after_op_keys(vec![Action::Retry, Action::Up])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn tick_reports_session_calls() {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![cheat("a", available())]);
+        h.connect(0);
+        assert!(h.toggle("a", 100));
+        assert!(!h.tick(200), "ocioso: nenhuma chamada");
+        h.reopen(1_000, 4_000);
+        assert!(h.tick(4_100), "a religação chamou a sessão");
+        assert!(!h.tick(4_200));
+        // Sem sessão: nunca.
+        h.ctl.set_exited(true);
+        assert!(!h.tick(4_300));
+        assert!(!h.tick(9_000));
+    }
+
+    #[test]
+    fn shutdown_does_not_wait_for_search() {
+        let mut h = H::new();
+        h.ctl
+            .set_catalog(vec![cheat("a", available()), cheat("b", not_found())]);
+        h.connect(0);
+        assert!(h.toggle("a", 100));
+        h.ctl.set_undo_all(vec!["a".to_string()], Vec::new());
+
+        // Uma nova busca que dorme 10 s.
+        h.ctl.set_search_delay(Duration::from_secs(10));
+        assert!(h.c.start_refresh(h.at(5_000)));
+        assert!(h.searching());
+
+        h.ctl.clear_calls();
+        let started = Instant::now();
+        let out = h.c.shutdown(&mut *h.draw);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "o shutdown esperou a busca: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(out, (vec!["a".to_string()], Vec::new()));
+        assert!(!h.searching(), "a busca foi abandonada");
+        // `restaurando…` foi desenhado antes do desfazer, e a sessão continua (o `main` a solta).
+        assert_eq!(
+            h.ctl.calls(),
+            [Call::UndoAll {
+                busy: Some("restaurando…".to_string())
+            }]
+        );
+        assert_eq!(
+            h.ctl.drawn().and_then(|m| m.busy),
+            Some("restaurando…".to_string())
+        );
+    }
+
+    #[test]
+    fn shutdown_without_session_returns_nothing() {
+        let mut h = H::new();
+        h.ctl.set_find(Find::Found(100));
+        h.ctl.hold_search();
+        h.tick(0);
+        assert_eq!(h.c.model.conn, Conn::Connecting);
+        let started = Instant::now();
+        assert_eq!(h.c.shutdown(&mut *h.draw), (Vec::new(), Vec::new()));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!h.searching());
+        assert_eq!(h.ctl.count(|c| matches!(c, Call::UndoAll { .. })), 0);
+        h.ctl.release_search();
     }
 }

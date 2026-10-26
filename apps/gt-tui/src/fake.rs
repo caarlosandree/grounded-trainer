@@ -60,7 +60,9 @@ pub(crate) enum Call {
         busy: Option<String>,
     },
     DiscardGone,
-    UndoAll,
+    UndoAll {
+        busy: Option<String>,
+    },
     SessionDropped,
 }
 
@@ -557,7 +559,8 @@ impl Session<()> for FakeSession {
 
     fn undo_all(&mut self) -> (Vec<String>, Vec<String>) {
         let mut s = self.ctl.state();
-        s.calls.push(Call::UndoAll);
+        let busy = FakeCtl::drawn_busy(&s);
+        s.calls.push(Call::UndoAll { busy });
         s.undo_all.clone()
     }
 }

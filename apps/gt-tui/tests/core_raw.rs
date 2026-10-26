@@ -590,3 +590,136 @@ fn raw_panic_in_main_loop_restores() {
         other => panic!("diário inesperado: {other:?}"),
     }
 }
+
+/// Conecta o controlador ao alvo do `env` (já com a busca terminada).
+fn connect(c: &mut Controller<RawBackend>, now: Instant) {
+    let mut draw = |_: &Model| {};
+    c.start(&mut draw);
+    c.tick(now, &mut draw);
+    assert!(c.wait_search(now, Duration::from_secs(10)));
+    assert!(matches!(c.model.conn, Conn::Connected { engine: true, .. }));
+}
+
+#[test]
+fn raw_value_reapplied_after_reconnect() {
+    let e = env();
+    let control = e.control.clone();
+    let mut old = e.target;
+    let mut c = Controller::new(e.backend, Box::new(|| "00:00".to_string()), false, false);
+    let mut draw = |_: &Model| {};
+    let t0 = Instant::now();
+    connect(&mut c, t0);
+
+    // Liga com o valor padrão (`k = 2`) e troca para o fim da grade (`k = 3`).
+    select(&mut c, VALUE);
+    assert!(c.handle(Action::Toggle, t0, &mut draw));
+    wait_word(&old, 0x2222_2222);
+    assert!(c.handle(Action::Inc, t0, &mut draw));
+    wait_word(&old, 0x3333_3333);
+    let row = c.model.cheats.iter().find(|r| r.id == VALUE).unwrap();
+    assert_eq!((row.k, row.applied_k), (3, Some(3)));
+    let line = format!("Valor: {} → {}", grid().format(2), grid().format(3));
+    assert!(c.model.events.iter().any(|l| l.ends_with(&line)));
+
+    // O alvo morre e um novo abre: a religação leva o valor guardado.
+    old.child.kill().unwrap();
+    old.child.wait().unwrap();
+    let end = Instant::now() + Duration::from_secs(5);
+    let mut now = t0;
+    while !matches!(c.model.conn, Conn::Waiting) && Instant::now() < end {
+        now += Duration::from_millis(100);
+        c.tick(now, &mut draw);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(c.model.conn, Conn::Waiting);
+    assert_eq!(c.desired().get(VALUE).map(|d| d.k), Some(3));
+
+    let new = TestTarget::spawn_with(TargetOpts {
+        spin_value: true,
+        ..Default::default()
+    });
+    {
+        let mut ctl = control.lock().unwrap();
+        ctl.pid = Some(new.pid);
+        ctl.defs = defs_of(&new);
+    }
+    now += Duration::from_secs(3);
+    c.tick(now, &mut draw);
+    assert!(c.wait_search(now, Duration::from_secs(10)));
+    now += Duration::from_millis(100);
+    assert!(c.tick(now, &mut draw), "a religação chamou a sessão");
+    wait_word(&new, 0x3333_3333);
+    drop(c);
+    wait_word(&new, 0x1111_1111);
+}
+
+#[test]
+fn raw_shutdown_restores() {
+    let e = env();
+    let pid = e.target.pid;
+    let (spin_page, value_page) = (e.target.spin_page, e.target.value_page);
+    let dir = e._dir.path().to_path_buf();
+    let mut c = Controller::new(e.backend, Box::new(|| "00:00".to_string()), false, false);
+    let mut draw = |_: &Model| {};
+    let t0 = Instant::now();
+    connect(&mut c, t0);
+    for id in [TOGGLE, VALUE] {
+        select(&mut c, id);
+        assert!(c.handle(Action::Toggle, t0, &mut draw));
+    }
+    assert!(c.model.cheats.iter().all(|r| r.on));
+    assert_eq!(read(pid, spin_page, 3), [0x48, 0x89, 0xCF]);
+
+    // A saída desenha `restaurando…`, desfaz tudo e devolve o que restaurou.
+    let mut seen_busy = Vec::new();
+    let (mut restored, foreign) = c.shutdown(&mut |m: &Model| seen_busy.push(m.busy.clone()));
+    restored.sort();
+    assert_eq!(restored, [TOGGLE, VALUE]);
+    assert!(foreign.is_empty());
+    assert_eq!(seen_busy, [Some("restaurando…".to_string())]);
+    assert_eq!(read(pid, spin_page, 3), [0x48, 0x8B, 0xF9]);
+
+    drop(c);
+    assert_eq!(read(pid, spin_page, 3), [0x48, 0x8B, 0xF9]);
+    assert_eq!(read(pid, value_page, 5), [0xB8, 0x11, 0x11, 0x11, 0x11]);
+    match JournalStore::new(dir).peek().unwrap() {
+        Loaded::Missing => {}
+        Loaded::Ok(j) => assert!(j.entries.is_empty(), "restou: {:?}", j.entries),
+        other => panic!("diário inesperado: {other:?}"),
+    }
+}
+
+#[test]
+fn raw_search_panic_restores() {
+    let e = env();
+    let pid = e.target.pid;
+    let spin_page = e.target.spin_page;
+    let control = e.control.clone();
+    let dir = e._dir.path().to_path_buf();
+    let mut c = Controller::new(e.backend, Box::new(|| "00:00".to_string()), false, false);
+    let mut draw = |_: &Model| {};
+    let t0 = Instant::now();
+    connect(&mut c, t0);
+    select(&mut c, TOGGLE);
+    assert!(c.handle(Action::Toggle, t0, &mut draw));
+    assert_eq!(read(pid, spin_page, 3), [0x48, 0x89, 0xCF]);
+
+    // O `r` dispara a nova busca, que entra em pânico na thread dela.
+    control.lock().unwrap().search_panics = true;
+    assert!(!c.handle(Action::Retry, t0, &mut draw));
+    assert!(c.wait_search(t0, Duration::from_secs(10)));
+    assert!(c.search_panicked());
+
+    // A thread principal sai pelo caminho normal: desfaz e solta.
+    let (restored, foreign) = c.shutdown(&mut draw);
+    assert_eq!(restored, [TOGGLE]);
+    assert!(foreign.is_empty());
+    assert_eq!(read(pid, spin_page, 3), [0x48, 0x8B, 0xF9]);
+    drop(c);
+    assert_eq!(read(pid, spin_page, 3), [0x48, 0x8B, 0xF9]);
+    match JournalStore::new(dir).peek().unwrap() {
+        Loaded::Missing => {}
+        Loaded::Ok(j) => assert!(j.entries.is_empty(), "restou: {:?}", j.entries),
+        other => panic!("diário inesperado: {other:?}"),
+    }
+}
