@@ -105,6 +105,8 @@ fn row_of(c: CheatInfo) -> CheatRow {
         on: false,
         residue: false,
         desired: false,
+        field: c.field,
+        note: None,
     }
 }
 
@@ -971,6 +973,13 @@ impl<B: Backend> Controller<B> {
                 self.toggle_unavailable(&row, reason);
                 false
             }
+            Avail::Checking => {
+                self.event(format!(
+                    "{}: verificando a reflexão do jogo; tente de novo em instantes",
+                    row.name
+                ));
+                false
+            }
             Avail::Available { .. } => self.turn_on(&row, now, draw),
         }
     }
@@ -1328,6 +1337,8 @@ impl<B: Backend> Controller<B> {
                 continue;
             }
             match &row.avail {
+                // Cheat de valor esperando a reflexão: religado quando ela chegar.
+                Avail::Checking => {}
                 Avail::Unavailable(reason) => self.note_once(
                     &row.id,
                     Note::NotReapplied,

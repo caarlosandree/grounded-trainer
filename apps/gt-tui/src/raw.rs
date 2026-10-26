@@ -146,6 +146,7 @@ fn raw_search(
             category: def.category,
             value: def.value.clone(),
             avail: avail_of(def, pid)?,
+            field: false,
         });
     }
     Ok(Search {

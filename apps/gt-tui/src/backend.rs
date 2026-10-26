@@ -67,6 +67,8 @@ pub struct CheatInfo {
     pub value: Option<ValueSpec>,
     /// Disponibilidade segundo a busca.
     pub avail: Avail,
+    /// Cheat de valor (`[[field]]`, spec 005), não patch.
+    pub field: bool,
 }
 
 /// Resultado de abrir o alvo e buscar o catálogo; `P` é o que cada implementação leva

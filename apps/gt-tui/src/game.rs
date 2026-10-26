@@ -101,6 +101,7 @@ fn cheats_of(entries: &[Entry]) -> Vec<CheatInfo> {
             category: e.def.category,
             value: e.def.value.clone(),
             avail: avail_of(&e.state),
+            field: false,
         })
         .collect()
 }

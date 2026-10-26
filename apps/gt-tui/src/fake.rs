@@ -96,6 +96,7 @@ pub(crate) fn cheat(id: &str, avail: Avail) -> CheatInfo {
         category: Category::Itens,
         value: None,
         avail,
+        field: false,
     }
 }
 
