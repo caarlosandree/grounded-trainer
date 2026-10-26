@@ -67,10 +67,11 @@ pub struct FBoolLayout {
     pub field_mask: u32,
 }
 
-/// `FStructProperty`.
+/// `FStructProperty` e `FObjectPropertyBase`: o primeiro ponteiro depois do `FProperty`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FStructLayout {
-    /// Offset do ponteiro para a `UScriptStruct` do campo.
+    /// Offset do ponteiro para a `UScriptStruct` de uma `StructProperty`, que também é o da
+    /// classe apontada (`PropertyClass`) de um campo de objeto.
     pub struct_ptr: u32,
 }
 

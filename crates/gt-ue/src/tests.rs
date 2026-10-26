@@ -928,3 +928,34 @@ fn field_path_through_struct() {
     // A struct não é uma classe: não entra no índice.
     assert!(index.find_class("/Script/Engine", "TraitSettings").is_err());
 }
+
+#[test]
+fn object_field_class_follows_property_class() {
+    let mut s = synth();
+    let (engine, object, actor) = (s.engine_package, s.object_class, s.actor_class);
+    let pet_master = s.add_class(
+        engine,
+        "PetMaster",
+        Some(object),
+        0x40,
+        &[SynthField {
+            name: "CurrentPet",
+            kind: "ObjectProperty",
+            offset: 0x30,
+            size: 8,
+            bool_mask: None,
+        }],
+    );
+    let creature = s.add_class(engine, "Creature", Some(actor), 0x60, &[]);
+    s.link_struct(pet_master, "CurrentPet", creature);
+    let (mem, _image, index) = indexed(s);
+    let (field, class) = index
+        .object_field_class(&mem, pet_master, "CurrentPet")
+        .unwrap();
+    assert_eq!((field.offset, class), (0x30, creature));
+    // Campo que não é de objeto.
+    assert!(matches!(
+        index.object_field_class(&mem, actor, "RootComponent"),
+        Err(UeError::Malformed(_))
+    ));
+}

@@ -47,14 +47,31 @@ pub enum ResolvedRule {
     ClearBits { fields: Vec<Field> },
 }
 
+/// Um salto do caminho até o objeto de um cheat: o campo de objeto e a classe esperada do
+/// objeto para onde ele aponta (conferida com `is_a` a cada leitura).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectHop {
+    pub field: Field,
+    pub class: u64,
+}
+
 /// Cheat de valor resolvido pela reflexão.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedField {
-    /// Campo do pawn que aponta para o objeto; `None` quando o objeto é o próprio pawn.
-    pub object_field: Option<Field>,
-    /// Classe esperada do objeto, conferida com `is_a` a cada leitura.
+    /// Caminho de campos de objeto a partir do pawn; vazio quando o objeto é o próprio pawn. Com
+    /// mais de um salto (`PetMasterComponent.CurrentPetFull.HealthComponent`), o objeto é de
+    /// outro ator (o pet), e a falta dele só afeta este cheat.
+    pub object_path: Vec<ObjectHop>,
+    /// Classe esperada do objeto final, conferida com `is_a` a cada leitura.
     pub object_class: u64,
     pub rule: ResolvedRule,
+}
+
+impl ResolvedField {
+    /// O objeto não é do personagem (caminho com mais de um salto, como o do pet).
+    pub fn is_secondary(&self) -> bool {
+        self.object_path.len() > 1
+    }
 }
 
 /// Classes e campos do caminho até o pawn.
@@ -313,11 +330,31 @@ fn resolve_field<M: ReadMem + ?Sized>(
     def: &FieldDef,
 ) -> Result<ResolvedField, String> {
     let object_class = find_class(index, &def.object_class)?;
-    let object_field = if def.object == PAWN_OBJECT {
-        None
-    } else {
-        Some(object_field(index, mem, pawn_class, &def.object)?)
-    };
+    let mut object_path = Vec::new();
+    if def.object != PAWN_OBJECT {
+        let hops: Vec<&str> = def.object.split('.').collect();
+        let mut class = pawn_class;
+        for (i, name) in hops.iter().enumerate() {
+            if i + 1 == hops.len() {
+                let field = object_field(index, mem, class, name)?;
+                object_path.push(ObjectHop {
+                    field,
+                    class: object_class,
+                });
+                break;
+            }
+            // Salto do meio: a classe seguinte vem do próprio campo (`PropertyClass`).
+            let (field, next) = index.object_field_class(mem, class, name).map_err(|e| {
+                tracing::debug!("campo {name}: {e}");
+                match e {
+                    UeError::NotFound(_) => format!("campo {name} não encontrado"),
+                    _ => INCOHERENT.to_string(),
+                }
+            })?;
+            object_path.push(ObjectHop { field, class: next });
+            class = next;
+        }
+    }
     let rule = match &def.rule {
         FieldRule::Lock {
             field,
@@ -345,7 +382,7 @@ fn resolve_field<M: ReadMem + ?Sized>(
         },
     };
     Ok(ResolvedField {
-        object_field,
+        object_path,
         object_class,
         rule,
     })
@@ -468,6 +505,9 @@ pub struct PlayerSnapshot {
     pub objects: Vec<ObjSnap>,
     /// Por `id`, só dos cheats resolvidos.
     pub values: HashMap<String, FieldValues>,
+    /// Cheats de outro ator (o pet) cujo objeto não está disponível neste ciclo, com o motivo.
+    /// O personagem continua valendo para os outros.
+    pub missing: HashMap<String, Absent>,
 }
 
 impl PlayerSnapshot {
@@ -549,18 +589,28 @@ impl<M: ReadMem + ?Sized> Reader<'_, M> {
         Ok(())
     }
 
-    /// Objeto de um cheat: o pawn ou o componente apontado pelo campo do pawn.
+    /// Objeto de um cheat: o pawn ou o fim do caminho de campos de objeto, com a classe de cada
+    /// salto conferida.
     fn object(&mut self, pawn: u64, r: &ResolvedField) -> Result<u64, Absent> {
-        let (obj, what) = match &r.object_field {
-            None => (pawn, PAWN_OBJECT),
-            Some(f) => (self.pointer(pawn, f)?, f.name.as_str()),
-        };
-        let ok = obj != 0
-            && self
+        let mut obj = pawn;
+        if r.object_path.is_empty() {
+            let ok = self
                 .catalog
-                .object_is_a(self.index, self.mem, obj, r.object_class)?;
-        if !ok {
-            return Err(Absent::ComponentWrongClass(what.to_string()));
+                .object_is_a(self.index, self.mem, pawn, r.object_class)?;
+            if !ok {
+                return Err(Absent::ComponentWrongClass(PAWN_OBJECT.to_string()));
+            }
+        }
+        for hop in &r.object_path {
+            let next = self.pointer(obj, &hop.field)?;
+            let ok = next != 0
+                && self
+                    .catalog
+                    .object_is_a(self.index, self.mem, next, hop.class)?;
+            if !ok {
+                return Err(Absent::ComponentWrongClass(hop.field.name.clone()));
+            }
+            obj = next;
         }
         self.visit(obj)?;
         Ok(obj)
@@ -658,18 +708,31 @@ pub fn read_player<M: ReadMem + ?Sized>(
 
     // 4. Cada componente, conferido com a classe esperada.
     let mut values = HashMap::new();
+    let mut missing = HashMap::new();
     for entry in &catalog.entries {
         let Ok(resolved) = &entry.resolved else {
             continue;
         };
-        let obj = r.object(pawn, resolved)?;
-        values.insert(entry.id.clone(), r.values(obj, &resolved.rule)?);
+        let read = r
+            .object(pawn, resolved)
+            .and_then(|obj| r.values(obj, &resolved.rule));
+        match read {
+            Ok(v) => {
+                values.insert(entry.id.clone(), v);
+            }
+            // O pet (outro ator) pode não estar no mundo: só este cheat espera.
+            Err(absent) if resolved.is_secondary() => {
+                missing.insert(entry.id.clone(), absent);
+            }
+            Err(absent) => return Err(absent),
+        }
     }
     Ok(PlayerSnapshot {
         controller,
         pawn,
         objects: r.objects,
         values,
+        missing,
     })
 }
 
@@ -832,6 +895,11 @@ pub fn player_report<M: ReadMem + ?Sized>(
 }
 
 fn report_value(snapshot: &PlayerSnapshot, entry: &CatalogEntry) -> FieldReportValue {
+    if let Some(absent) = snapshot.missing.get(&entry.id) {
+        return FieldReportValue::Unavailable {
+            reason: absent.to_string(),
+        };
+    }
     let resolved = match &entry.resolved {
         Ok(r) => r,
         Err(reason) => {

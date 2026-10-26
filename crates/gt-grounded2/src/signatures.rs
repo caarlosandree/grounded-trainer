@@ -37,6 +37,8 @@ const EMBEDDED: &[(&str, &str)] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Category {
     Sobrevivencia,
+    /// Cheats do pet (o animal domesticado que segue o personagem).
+    Pet,
     Itens,
     Progressao,
     Movimento,
@@ -45,8 +47,9 @@ pub enum Category {
 
 impl Category {
     /// Todas as categorias, na ordem de exibição.
-    pub const ALL: [Category; 5] = [
+    pub const ALL: [Category; 6] = [
         Category::Sobrevivencia,
+        Category::Pet,
         Category::Itens,
         Category::Progressao,
         Category::Movimento,
@@ -57,6 +60,7 @@ impl Category {
     pub fn label(self) -> &'static str {
         match self {
             Category::Sobrevivencia => "SOBREVIVÊNCIA",
+            Category::Pet => "PET",
             Category::Itens => "ITENS",
             Category::Progressao => "PROGRESSÃO",
             Category::Movimento => "MOVIMENTO",
@@ -64,11 +68,12 @@ impl Category {
         }
     }
 
-    /// Lê o nome usado no TOML (`sobrevivencia`, `itens`, `progressao`, `movimento`,
+    /// Lê o nome usado no TOML (`sobrevivencia`, `pet`, `itens`, `progressao`, `movimento`,
     /// `diagnostico`).
     pub fn parse(text: &str) -> Option<Category> {
         match text {
             "sobrevivencia" => Some(Category::Sobrevivencia),
+            "pet" => Some(Category::Pet),
             "itens" => Some(Category::Itens),
             "progressao" => Some(Category::Progressao),
             "movimento" => Some(Category::Movimento),
@@ -624,7 +629,7 @@ fn check_category(file: &str, category: Option<&str>) -> Result<Category> {
                 file,
                 "category",
                 format!(
-                    "`{text}` não é sobrevivencia, itens, progressao, movimento nem diagnostico"
+                    "`{text}` não é sobrevivencia, pet, itens, progressao, movimento nem diagnostico"
                 ),
             )
         }),
@@ -1488,7 +1493,7 @@ offset = 3
         // Fase 5: o `[ue]` carrega nas duas formas (genérico e versão verificada).
         assert!(sigs.ue_for_version("c935e799-0b27c000").is_some());
         assert!(sigs.ue_for_version("cccc-dddd").is_some());
-        // Fase 5, Tarefa 10: os oito cheats de valor na ordem da spec 6.5, todos em sobrevivência.
+        // Fase 5: os oito cheats de valor da spec 6.5, em sobrevivência, e os três do pet, em PET.
         let ids: Vec<&str> = sigs.fields().iter().map(|f| f.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -1501,13 +1506,19 @@ offset = 3
                 "temperatura-estavel",
                 "sem-dano-queda",
                 "nao-morrer",
+                "pet-vida-infinita",
+                "pet-nao-morre",
+                "pet-stamina-infinita",
             ]
         );
-        assert!(
-            sigs.fields()
-                .iter()
-                .all(|f| f.category == Category::Sobrevivencia)
-        );
+        let category = |id: &str| {
+            if id.starts_with("pet-") {
+                Category::Pet
+            } else {
+                Category::Sobrevivencia
+            }
+        };
+        assert!(sigs.fields().iter().all(|f| f.category == category(&f.id)));
         let player = sigs.ue_for_version("c935e799-0b27c000").unwrap().player;
         assert_eq!(
             player.alt_pawn_fields,
@@ -1529,6 +1540,7 @@ offset = 3
             labels,
             vec![
                 "SOBREVIVÊNCIA",
+                "PET",
                 "ITENS",
                 "PROGRESSÃO",
                 "MOVIMENTO",
@@ -1537,6 +1549,7 @@ offset = 3
         );
         for (text, cat) in [
             ("sobrevivencia", Category::Sobrevivencia),
+            ("pet", Category::Pet),
             ("itens", Category::Itens),
             ("progressao", Category::Progressao),
             ("movimento", Category::Movimento),

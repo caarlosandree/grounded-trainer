@@ -253,3 +253,47 @@ object_class = "/Script/Maine.HealthComponent"
 rule = "clear_bits"
 fields = ["bCanDieFromDamage", "bCanDieEver"]
 kind = "bool"
+
+# Pet (pedido do dono em 2026-10-26, RESEARCH.md): o pet chamado vem do PetMasterComponent do personagem
+# (CurrentPetFull, um SurvivalCreature com os mesmos componentes). Sem pet no mundo, só estes esperam.
+[[field]]
+id = "pet-vida-infinita"
+name = "Vida infinita do pet"
+category = "pet"
+description = "Zera o dano recebido pelo pet a cada instante"
+object = "PetMasterComponent.CurrentPetFull.HealthComponent"
+object_class = "/Script/Maine.HealthComponent"
+rule = "lock"
+field = "CurrentDamage"
+kind = "float"
+mode = "lower"
+target = 0
+min = 0
+max = 100000
+
+[[field]]
+id = "pet-nao-morre"
+name = "Pet não morre"
+category = "pet"
+description = "A vida do pet cai, mas ele não morre"
+object = "PetMasterComponent.CurrentPetFull.HealthComponent"
+object_class = "/Script/Maine.HealthComponent"
+rule = "clear_bits"
+fields = ["bCanDieFromDamage", "bCanDieEver"]
+kind = "bool"
+
+# Montado, é a stamina do pet que gasta (vimos 70 com MaxStamina 60: a trava aprende o máximo efetivo).
+[[field]]
+id = "pet-stamina-infinita"
+name = "Stamina infinita do pet"
+category = "pet"
+description = "A stamina do pet (montaria) não fica abaixo do máximo"
+object = "PetMasterComponent.CurrentPetFull.StaminaComponent"
+object_class = "/Script/Maine.StaminaComponent"
+rule = "lock"
+field = "CurrentStamina"
+kind = "float"
+mode = "raise"
+target_field = "MaxStamina"
+min = 1
+max = 100000

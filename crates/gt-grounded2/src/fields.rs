@@ -34,6 +34,8 @@ pub enum PlayerState {
 pub enum Note {
     /// `aguardando o personagem`.
     Waiting,
+    /// `aguardando o pet`: o personagem está, mas o pet (outro ator) não.
+    WaitingPet,
     /// `alvo inválido`.
     InvalidTarget,
 }
@@ -224,6 +226,9 @@ impl FieldRuntime {
             }
         }
         self.invalid = invalid_now;
+        for id in snapshot.missing.keys().filter(|id| on.contains(id)) {
+            report.notes.insert(id.clone(), Note::WaitingPet);
+        }
         report
     }
 

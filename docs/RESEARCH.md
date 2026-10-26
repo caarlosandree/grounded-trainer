@@ -588,9 +588,16 @@ Build `c935e799-0b27c000`, backup do save feito pelo dono, FLiNG fechado. Plano 
   relido a cada ciclo mais o máximo aprendido.
 - Montado, os cheats seguem no personagem (`CachedSurvivalPlayerCharacter`); o `Pawn` alterna entre o personagem e a
   montaria durante o jogo, sem efeito nos cheats.
-- Pet (para uma spec futura): o `PetMasterComponent` do personagem (`+0x14b0`) tem `CurrentPetFull` (`+0x170`,
-  nulo nesta leitura), `bBuggyGodModeActive` (`+0x180`, `bool` nativo, `0x00`), `CurrentPetMaxHealth` (`+0x1c4`, 220)
-  e `CurrentPetDamage` (`+0x1c8`, 13,4).
+- **Pet** (pedido do dono, sem spec por decisão dele): o `PetMasterComponent` do personagem (`+0x14b0`) tem
+  `CurrentPetFull` (`+0x170`), `bBuggyGodModeActive` (`+0x180`, `bool` nativo, `0x00`, não usado),
+  `CurrentPetMaxHealth` (`+0x1c4`, 220) e `CurrentPetDamage` (`+0x1c8`, 13,4), que não batem com a vida real do pet
+  (320) e não são usados. O `+0x70` de um `ObjectProperty` é a classe apontada (`PropertyClass`, no mesmo lugar do
+  ponteiro da struct de uma `StructProperty`): `PetMasterComponent` → `PetMasterComponent`, `CurrentPetFull` →
+  `SurvivalCreature`, `HealthComponent` → `HealthComponent`. O pet é a montaria (vida 320, stamina 70 com
+  `MaxStamina` 60) e tem os mesmos componentes do personagem. `CurrentPetFull` fica nulo até o pet aparecer no mundo
+  e, depois, vale montado e desmontado (`scratch/p10/petwatch.py`: nulo às 12:07:20, o pet desde 12:08:05, com o
+  `Pawn` alternando entre o personagem e o pet ao montar). Os três cheats do pet (vida, não morre, stamina)
+  funcionaram no jogo; ficam na categoria `PET`.
 
 ## Hipóteses descartadas
 

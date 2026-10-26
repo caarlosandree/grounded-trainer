@@ -349,6 +349,33 @@ impl ReflectionIndex {
         }
     }
 
+    /// Campo de objeto (`ObjectProperty`/`ObjectPtrProperty`) chamado `name` em `class`, com a
+    /// classe para onde ele aponta (`PropertyClass`, lida no mesmo lugar do ponteiro da struct de
+    /// uma `StructProperty`, [`UeLayout::fstruct`]). Serve para seguir um caminho de objetos
+    /// (`PetMasterComponent.CurrentPetFull`) só pela reflexão.
+    pub fn object_field_class<M: ReadMem + ?Sized>(
+        &self,
+        mem: &M,
+        class: u64,
+        name: &str,
+    ) -> Result<(Field, u64), UeError> {
+        let (strukt, field) = self
+            .locate_field(mem, class, name)?
+            .ok_or_else(|| self.field_not_found(mem, class, name))?;
+        let out = self.read_field(mem, strukt, field, name)?;
+        if !is_object_family(&out.kind) {
+            return Err(UeError::Malformed(format!(
+                "{name} é {}, esperado um campo de objeto",
+                out.kind
+            )));
+        }
+        let at = field + u64::from(self.layout.fstruct.struct_ptr);
+        let target = self.read_link(mem, at)?.ok_or_else(|| {
+            UeError::Malformed(format!("o campo de objeto {name} não tem PropertyClass"))
+        })?;
+        Ok((out, target))
+    }
+
     /// Campo por caminho com ponto (`HungerSettings.MaxValue`): cada parte antes da última é uma
     /// `StructProperty`, e o campo seguinte é procurado na `UScriptStruct` dela. O `offset` (e o
     /// `byte` dos bits) devolvido é relativo ao objeto de `class`, e o `name` é o caminho inteiro.

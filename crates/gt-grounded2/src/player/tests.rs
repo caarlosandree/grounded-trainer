@@ -78,6 +78,9 @@ const BREATH_OFF: u32 = 0x70;
 const CACHED_OFF: u32 = 0x78;
 const CUR_TEMP: u32 = 0x30;
 const NEUTRAL_TEMP: f32 = 37.0;
+/// `SurvivalCharacter.PetMasterComponent` e `PetMasterComponent.CurrentPetFull`.
+const PET_MASTER_OFF: u32 = 0x70;
+const CURRENT_PET_OFF: u32 = 0x30;
 
 /// Objetos de um mundo sintético.
 struct World {
@@ -96,6 +99,9 @@ struct World {
     temperature: u64,
     health_class: u64,
     gobjects: u64,
+    pet: u64,
+    pet_master: u64,
+    pet_health: u64,
 }
 
 impl World {
@@ -290,15 +296,30 @@ fn world(omit: &[&str]) -> World {
         maine,
         "SurvivalCharacter",
         Some(actor),
-        0x70,
+        0x78,
         &keep(vec![
             object("HealthComponent", HEALTH_OFF),
             object("StaminaComponent", STAMINA_OFF),
             object("SurvivalComponent", SURVIVAL_OFF),
             object("BodyTemperatureComponent", TEMP_OFF),
             boolean("bTakeFallDamage", FALL_BYTE, FALL_MASK),
+            object("PetMasterComponent", PET_MASTER_OFF),
         ]),
     );
+    let creature_c = s.add_class(maine, "SurvivalCreature", Some(character_c), 0x80, &[]);
+    let pet_master_c = s.add_class(
+        maine,
+        "PetMasterComponent",
+        Some(object_c),
+        0x40,
+        &keep(vec![object("CurrentPetFull", CURRENT_PET_OFF)]),
+    );
+    if !omit.contains(&"CurrentPetFull") {
+        s.link_struct(pet_master_c, "CurrentPetFull", creature_c);
+    }
+    if !omit.contains(&"PetMasterComponent") {
+        s.link_struct(character_c, "PetMasterComponent", pet_master_c);
+    }
     let player_character_c = s.add_class(
         maine,
         "SurvivalPlayerCharacter",
@@ -383,6 +404,7 @@ fn world(omit: &[&str]) -> World {
     let second_controller = s.add_object(survival_controller_c, "Controller_1", maine);
     let pawn = s.add_object(player_character_c, "Player_0", maine);
     let creature = s.add_object(character_c, "Creature_0", maine);
+    let pet = s.add_object(creature_c, "Pet_0", maine);
     let mut components = |owner: u64| {
         let parts = [
             (s.add_object(health_c, "Health", owner), HEALTH_OFF),
@@ -397,6 +419,10 @@ fn world(omit: &[&str]) -> World {
     };
     let [health, stamina, survival, temperature] = components(pawn);
     components(creature);
+    let [pet_health, ..] = components(pet);
+    let pet_master = s.add_object(pet_master_c, "PetMaster", pawn);
+    s.set(pawn, PET_MASTER_OFF, &pet_master.to_le_bytes());
+    s.set(pet_master, CURRENT_PET_OFF, &pet.to_le_bytes());
     s.set(controller, PAWN_OFF, &pawn.to_le_bytes());
 
     let image = s.finish();
@@ -421,6 +447,9 @@ fn world(omit: &[&str]) -> World {
         temperature,
         health_class: health_c,
         gobjects: image.gobjects,
+        pet,
+        pet_master,
+        pet_health,
     };
     // Valores iniciais: tudo cheio, sem dano, temperatura neutra e bits ligados como no jogo.
     w.write_f32(stamina + u64::from(CUR_STAMINA), 100.0);
@@ -441,7 +470,7 @@ fn resolves_all_fields_by_name() {
     let Some(Ok(stamina)) = w.catalog.get("stamina-infinita") else {
         panic!("stamina não resolvida");
     };
-    assert_eq!(stamina.object_field.as_ref().unwrap().offset, STAMINA_OFF);
+    assert_eq!(stamina.object_path[0].field.offset, STAMINA_OFF);
     let ResolvedRule::Lock { field, target, .. } = &stamina.rule else {
         panic!("stamina não é trava");
     };
@@ -451,7 +480,7 @@ fn resolves_all_fields_by_name() {
     let Some(Ok(fall)) = w.catalog.get("sem-dano-queda") else {
         panic!("queda não resolvida");
     };
-    assert!(fall.object_field.is_none());
+    assert!(fall.object_path.is_empty());
     assert!(w.catalog.avail("nao-existe").is_err());
 
     let snap = w.read().unwrap();
@@ -875,4 +904,110 @@ fn watch_player_rescans_when_controller_invalid() {
     };
     let seen = watch(&w, &mem, None, 1, |_| {});
     assert_eq!(seen, vec![Err(Absent::ControllerAmbiguous)]);
+}
+
+// ---- pet (caminho com vários saltos) ----
+
+fn pet_defs() -> Vec<FieldDef> {
+    let path = |component: &str| format!("PetMasterComponent.CurrentPetFull.{component}");
+    vec![
+        lock(
+            "pet-vida-infinita",
+            &path("HealthComponent"),
+            "HealthComponent",
+            "CurrentDamage",
+            LockMode::Lower,
+            LockTarget::Const(0.0),
+        ),
+        bits(
+            "pet-nao-morre",
+            &path("HealthComponent"),
+            "HealthComponent",
+            &["bCanDieFromDamage", "bCanDieEver"],
+        ),
+    ]
+}
+
+/// Catálogo com os cheats do personagem e os do pet.
+fn with_pet(w: &World) -> FieldCatalog {
+    let mut defs = defs();
+    defs.extend(pet_defs());
+    FieldCatalog::resolve(&w.index, &w.mem, &cfg(), &defs)
+}
+
+fn read_with(w: &World, catalog: &FieldCatalog) -> Result<PlayerSnapshot, Absent> {
+    read_player(&w.mem, &w.index, catalog, &w.objects, w.controller)
+}
+
+#[test]
+fn pet_fields_resolve_through_property_class() {
+    let w = world(&[]);
+    let catalog = with_pet(&w);
+    assert_eq!(catalog.avail("pet-vida-infinita"), Ok(()));
+    let Some(Ok(r)) = catalog.get("pet-vida-infinita") else {
+        panic!("pet não resolvido");
+    };
+    assert_eq!(r.object_path.len(), 3);
+    assert!(r.is_secondary());
+    let snap = read_with(&w, &catalog).unwrap();
+    assert!(snap.missing.is_empty());
+    match snap.values["pet-vida-infinita"] {
+        FieldValues::Lock { obj, .. } => assert_eq!(obj, w.pet_health),
+        ref other => panic!("{other:?}"),
+    }
+    // O pet é escrito; o personagem continua com o dele.
+    w.write_f32(w.pet_health + u64::from(DAMAGE_OFF), 30.0);
+    let on = vec!["pet-vida-infinita".to_string()];
+    let actions = plan_tick(&snap_of(&w, &catalog), &catalog, &on);
+    assert!(matches!(
+        actions.as_slice(),
+        [FieldAction::WriteF32 { addr, .. }] if *addr == w.pet_health + u64::from(DAMAGE_OFF)
+    ));
+}
+
+fn snap_of(w: &World, catalog: &FieldCatalog) -> PlayerSnapshot {
+    read_with(w, catalog).unwrap()
+}
+
+#[test]
+fn pet_absent_only_affects_pet_fields() {
+    let w = world(&[]);
+    let catalog = with_pet(&w);
+    // Sem pet chamado: o personagem continua valendo.
+    w.write_u64(w.pet_master + u64::from(CURRENT_PET_OFF), 0);
+    let snap = read_with(&w, &catalog).unwrap();
+    assert_eq!(snap.values.len(), 8);
+    assert_eq!(
+        snap.missing.get("pet-vida-infinita"),
+        Some(&Absent::ComponentWrongClass("CurrentPetFull".into()))
+    );
+    assert!(snap.missing.contains_key("pet-nao-morre"));
+    // O pet chamado de novo: volta a valer.
+    w.write_u64(w.pet_master + u64::from(CURRENT_PET_OFF), w.pet);
+    let snap = read_with(&w, &catalog).unwrap();
+    assert!(snap.missing.is_empty());
+    assert_eq!(snap.values.len(), 10);
+}
+
+#[test]
+fn pet_pointing_to_player_never_written() {
+    let w = world(&[]);
+    let catalog = with_pet(&w);
+    // O ponteiro do pet apontando para o próprio personagem (não é SurvivalCreature).
+    w.write_u64(w.pet_master + u64::from(CURRENT_PET_OFF), w.pawn);
+    let snap = read_with(&w, &catalog).unwrap();
+    assert!(snap.missing.contains_key("pet-vida-infinita"));
+    assert!(!snap.values.contains_key("pet-vida-infinita"));
+}
+
+#[test]
+fn pet_path_without_property_class_is_unavailable() {
+    let w = world(&["CurrentPetFull"]);
+    let catalog = with_pet(&w);
+    assert_eq!(
+        catalog.avail("pet-vida-infinita"),
+        Err("campo CurrentPetFull não encontrado".to_string())
+    );
+    // O personagem não é afetado.
+    assert_eq!(catalog.avail("vida-infinita"), Ok(()));
 }
