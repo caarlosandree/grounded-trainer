@@ -12,12 +12,16 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
 use gt_core::procinfo::Identity;
+use gt_grounded2::fields::PlayerState;
+use gt_grounded2::ue::UE_ID;
 
 use crate::backend::{
-    Backend, CheatInfo, Find, OpOutcome, Recovered, Search, SearchError, Session,
+    Backend, CheatInfo, Find, JobKind, OpOutcome, Recovered, ReflectionOutcome, Search,
+    SearchError, Session,
 };
 use crate::keys::Action;
-use crate::model::{Avail, CheatRow, Conn, Model};
+use crate::model::{Avail, CheatRow, Conn, Model, PlayerLine};
+use crate::values::REFLECTION_UNRECOGNIZED;
 
 /// Devolve a hora do registro de eventos como `HH:MM`.
 pub type Clock = Box<dyn Fn() -> String>;
@@ -42,6 +46,14 @@ const RESTORING: &str = "restaurando…";
 /// Motivos do catálogo que as buscas automáticas tentam resolver.
 const NOT_FOUND: &str = "não encontrado";
 const INCONCLUSIVE: &str = "inconclusivo";
+
+/// Menor intervalo entre dois trabalhos da tarefa de reflexão (spec 005, 6.3).
+const REFLECTION_MIN_INTERVAL: Duration = Duration::from_secs(10);
+/// Por quanto tempo, depois da conexão (ou do `r`), o índice é tentado de novo.
+const INDEX_WINDOW: Duration = Duration::from_secs(120);
+/// Eventos de personagem que o controlador dá sozinho, nas transições.
+const PLAYER_FOUND: &str = "personagem encontrado";
+const PLAYER_LOST: &str = "personagem perdido";
 
 type SearchResult<P> = Result<Search<P>, SearchError>;
 
@@ -86,6 +98,25 @@ struct InFlight<P> {
     ops: HashMap<String, u64>,
 }
 
+/// O trabalho da tarefa de reflexão em andamento.
+struct JobInFlight {
+    rx: Receiver<ReflectionOutcome>,
+    kind: JobKind,
+    /// Número da conexão quando o trabalho começou.
+    conn_no: u64,
+    started: Instant,
+}
+
+/// O intervalo da tarefa de reflexão, dado quanto o último trabalho levou.
+fn reflection_interval(took: Duration) -> Duration {
+    REFLECTION_MIN_INTERVAL.max(took.saturating_mul(2))
+}
+
+/// Motivo que a nova busca tenta resolver (e que não derruba um cheat já disponível).
+fn retryable(reason: &str) -> bool {
+    reason == NOT_FOUND || reason == INCONCLUSIVE || reason == REFLECTION_UNRECOGNIZED
+}
+
 /// O intervalo entre duas buscas automáticas, dado quanto a última levou.
 fn auto_interval(took: Duration) -> Duration {
     AUTO_MIN_INTERVAL.max(took.saturating_mul(2))
@@ -114,7 +145,7 @@ fn row_of(c: CheatInfo) -> CheatRow {
 /// que já estava resolvido (disponível) nesta conexão e que a busca não acha (`não encontrado`,
 /// `inconclusivo`) fica como estava (spec 6.2).
 fn keeps_state(old: &Avail, new: &Avail) -> bool {
-    let lost = matches!(new, Avail::Unavailable(t) if t == NOT_FOUND || t == INCONCLUSIVE);
+    let lost = matches!(new, Avail::Unavailable(t) if retryable(t));
     lost && matches!(old, Avail::Available { .. })
 }
 
@@ -154,6 +185,19 @@ pub struct Controller<B: Backend> {
     next_auto: Option<Instant>,
     /// Quanto a última busca levou.
     last_took: Duration,
+    /// Trabalho da tarefa de reflexão em andamento (um de cada vez).
+    job: Option<JobInFlight>,
+    job_panicked: bool,
+    /// A sessão tem um índice da reflexão bom.
+    index_ok: bool,
+    /// Fim do prazo das novas tentativas do índice desta conexão (o `r` reinicia).
+    index_until: Option<Instant>,
+    /// Quando o próximo índice pode começar.
+    next_index: Option<Instant>,
+    /// Quando a próxima procura do controller pode começar.
+    next_controller: Option<Instant>,
+    /// O personagem estava achado no último ciclo de manutenção (`None`: ninguém procurou).
+    player_found: Option<bool>,
 }
 
 impl<B: Backend> Controller<B> {
@@ -181,6 +225,13 @@ impl<B: Backend> Controller<B> {
             auto_until: None,
             next_auto: None,
             last_took: Duration::ZERO,
+            job: None,
+            job_panicked: false,
+            index_ok: false,
+            index_until: None,
+            next_index: None,
+            next_controller: None,
+            player_found: None,
         }
     }
 
@@ -193,19 +244,25 @@ impl<B: Backend> Controller<B> {
     /// desejados, dispara as novas buscas automáticas e manda a troca de valor que esperava o
     /// intervalo. Devolve `true` se chamou a sessão numa operação (religar ou trocar o valor): o
     /// laço então descarta as teclas que chegaram durante a chamada, como depois do `handle`.
+    ///
+    /// A manutenção dos cheats de valor (spec 005, 6.7) também roda aqui, mas não conta como
+    /// operação: não muda o valor devolvido.
     pub fn tick(&mut self, now: Instant, draw: &mut dyn FnMut(&Model)) -> bool {
         self.poll_search(now);
+        self.poll_job(now);
         self.check_exit(now);
         if self.session.is_none() {
             self.poll_find(now, draw);
             return false;
         }
+        self.maybe_spawn_job(now);
         let mut called = self.run_reapply(now, draw);
         self.maybe_auto_search(now);
         // Só uma operação por volta: a troca que sobrou espera a próxima.
         if !called {
             called = self.run_pending_swap(now, draw);
         }
+        self.maintain_fields(now);
         called
     }
 
@@ -226,6 +283,8 @@ impl<B: Backend> Controller<B> {
     /// sobrar.
     pub fn shutdown(&mut self, draw: &mut dyn FnMut(&Model)) -> (Vec<String>, Vec<String>) {
         self.search = None;
+        // A tarefa de reflexão também é abandonada, e a manutenção para.
+        self.job = None;
         self.model.busy = Some(RESTORING.to_string());
         draw(&self.model);
         let out = self.session_call(|s| s.undo_all());
@@ -276,6 +335,28 @@ impl<B: Backend> Controller<B> {
     /// de pânico.
     pub fn search_panicked(&self) -> bool {
         self.search_panicked
+    }
+
+    /// Como [`Controller::wait_search`], para o trabalho da tarefa de reflexão.
+    #[doc(hidden)]
+    pub fn wait_job(&mut self, now: Instant, timeout: Duration) -> bool {
+        let Some(job) = self.job.take() else {
+            return false;
+        };
+        match job.rx.recv_timeout(timeout) {
+            Ok(out) => {
+                self.finish_job(job, out, now);
+                true
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                self.job = Some(job);
+                false
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.job_panicked = true;
+                true
+            }
+        }
     }
 
     // ---- registro, seleção e banners ----
@@ -514,6 +595,12 @@ impl<B: Backend> Controller<B> {
         self.sync_pending();
         self.auto_until = Some(now + AUTO_WINDOW);
         self.schedule_auto(inflight.started, took, now);
+        self.index_ok = false;
+        self.index_until = Some(now + INDEX_WINDOW);
+        self.next_index = Some(now);
+        self.next_controller = None;
+        self.player_found = None;
+        self.sync_field_avail();
         self.event(format!(
             "conectado ao jogo (PID {pid}, versão {version_key})"
         ));
@@ -599,6 +686,8 @@ impl<B: Backend> Controller<B> {
         }
         for c in cheats {
             match self.model.cheats.iter_mut().find(|r| r.id == c.id) {
+                // Os cheats de valor seguem a sessão (globais e índice), logo abaixo.
+                Some(row) if row.field => {}
                 Some(row) => {
                     if keeps_state(&row.avail, &c.avail) {
                         continue;
@@ -607,6 +696,11 @@ impl<B: Backend> Controller<B> {
                 }
                 None => self.model.cheats.push(row_of(c)),
             }
+        }
+        self.sync_field_avail();
+        // Globais que ficaram prontas: o índice pode tentar já.
+        if !self.index_ok && self.job.is_none() {
+            self.next_index = Some(now);
         }
         self.clamp_selected();
         let disk_was_unreadable = matches!(
@@ -683,6 +777,14 @@ impl<B: Backend> Controller<B> {
         self.notes.clear();
         self.warned_unverified.clear();
         self.last_find = Some(now);
+        // O trabalho da tarefa de reflexão é abandonado: nenhum endereço do processo antigo vale.
+        self.job = None;
+        self.index_ok = false;
+        self.index_until = None;
+        self.next_index = None;
+        self.next_controller = None;
+        self.player_found = None;
+        self.model.player = PlayerLine::Idle;
         self.model.busy = None;
         self.model.banners.stuck = None;
         self.model.banners.residue = None;
@@ -690,6 +792,7 @@ impl<B: Backend> Controller<B> {
             row.on = false;
             row.applied_k = None;
             row.residue = false;
+            row.note = None;
         }
         self.model.conn = if self.pid_fixed {
             Conn::PidGone
@@ -712,10 +815,11 @@ impl<B: Backend> Controller<B> {
     /// Há cheat que as buscas automáticas ainda tentam resolver: um mostrado como
     /// `não encontrado` ou `inconclusivo`, ou um desejado indisponível (spec 6.2).
     fn wants_auto_search(&self) -> bool {
-        let missing = self.model.visible().iter().any(|r| {
-            !r.on
-                && matches!(&r.avail, Avail::Unavailable(t) if t == NOT_FOUND || t == INCONCLUSIVE)
-        });
+        let missing = self
+            .model
+            .visible()
+            .iter()
+            .any(|r| !r.on && matches!(&r.avail, Avail::Unavailable(t) if retryable(t)));
         missing
             || self.model.cheats.iter().any(|r| {
                 !r.on
@@ -747,13 +851,17 @@ impl<B: Backend> Controller<B> {
             return false;
         };
         let pid = *pid;
-        let ids: Vec<String> = self
+        let mut ids: Vec<String> = self
             .model
             .cheats
             .iter()
             .filter(|r| !r.on)
             .map(|r| r.id.clone())
             .collect();
+        // As globais do Unreal entram na nova busca enquanto não há índice bom (spec 005, 6.7).
+        if !self.index_ok && self.model.cheats.iter().any(|r| r.field) {
+            ids.push(UE_ID.to_string());
+        }
         let expected = self.identity.clone();
         match self.spawn_search(SearchKind::Refresh, pid, Some(ids), expected, now) {
             Ok(()) => true,
@@ -762,6 +870,188 @@ impl<B: Backend> Controller<B> {
                 // Sem isso, a próxima volta tentaria (e avisaria) de novo.
                 self.next_auto = Some(now + auto_interval(self.last_took));
                 false
+            }
+        }
+    }
+
+    // ---- tarefa de reflexão e manutenção dos cheats de valor (spec 005, 6.3 e 6.7) ----
+
+    /// Há algum cheat de valor ligado ou desejado.
+    fn fields_wanted(&self) -> bool {
+        self.model
+            .cheats
+            .iter()
+            .any(|r| r.field && (r.on || self.desired.contains_key(&r.id)))
+    }
+
+    /// Acerta a disponibilidade das linhas de valor com a da sessão.
+    fn sync_field_avail(&mut self) {
+        let Some(avail) = self.session.as_ref().map(|s| s.field_avail()) else {
+            return;
+        };
+        for (id, a) in avail {
+            if let Some(row) = self.model.cheats.iter_mut().find(|r| r.field && r.id == id) {
+                row.avail = a;
+            }
+        }
+    }
+
+    fn poll_job(&mut self, now: Instant) {
+        let Some(job) = self.job.take() else {
+            return;
+        };
+        match job.rx.try_recv() {
+            Ok(out) => self.finish_job(job, out, now),
+            Err(TryRecvError::Empty) => self.job = Some(job),
+            Err(TryRecvError::Disconnected) => {
+                // Um pânico no trabalho não derruba a TUI: a próxima tentativa segue o intervalo.
+                tracing::error!("o trabalho da tarefa de reflexão terminou sem resultado");
+                self.job_panicked = true;
+                let next = Some(now + REFLECTION_MIN_INTERVAL);
+                match job.kind {
+                    JobKind::Index => self.next_index = next,
+                    JobKind::Controller => self.next_controller = next,
+                }
+            }
+        }
+    }
+
+    /// Junta o resultado de um trabalho. O de outra conexão é descartado (spec 005, Foco 2).
+    fn finish_job(&mut self, job: JobInFlight, out: ReflectionOutcome, now: Instant) {
+        if job.conn_no != self.conn_no || self.session.is_none() {
+            tracing::debug!("resultado da tarefa de reflexão descartado: a conexão mudou");
+            return;
+        }
+        let took = out.took;
+        let next = (job.started + reflection_interval(took)).max(now);
+        let Some(news) = self.session_call(|s| s.merge_reflection(out)) else {
+            return;
+        };
+        match job.kind {
+            JobKind::Index => {
+                let had = self.index_ok;
+                self.index_ok = news.index_ok;
+                self.next_index = news.retry.then_some(next);
+                self.sync_field_avail();
+                if self.index_ok && !had {
+                    // Os cheats de valor desejados esperavam o índice para religar.
+                    self.schedule_reapply();
+                }
+            }
+            JobKind::Controller => self.next_controller = Some(next),
+        }
+    }
+
+    /// Dispara o próximo trabalho, um de cada vez: o índice enquanto ele não está bom e dentro
+    /// do prazo; a procura do controller só com cheat de valor desejado (ou ligado).
+    fn maybe_spawn_job(&mut self, now: Instant) {
+        if self.job.is_some() || !self.model.cheats.iter().any(|r| r.field) {
+            return;
+        }
+        let index_due = !self.index_ok
+            && self.next_index.is_some_and(|t| now >= t)
+            && self.index_until.is_some_and(|u| now < u);
+        let controller_due = self.index_ok
+            && self.fields_wanted()
+            && self.next_controller.is_none_or(|t| now >= t)
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|s| s.needs_controller(now));
+        let kind = if index_due {
+            JobKind::Index
+        } else if controller_due {
+            JobKind::Controller
+        } else {
+            return;
+        };
+        let Some(job) = self.session.as_ref().and_then(|s| s.reflection_job(kind)) else {
+            // Nada a fazer agora (globais indisponíveis): o próximo resultado de busca reabre.
+            match kind {
+                JobKind::Index => self.next_index = None,
+                JobKind::Controller => self.next_controller = Some(now + REFLECTION_MIN_INTERVAL),
+            }
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("gt-reflexao".to_string())
+            .spawn(move || {
+                let _ = tx.send((job.run)());
+            });
+        match spawned {
+            Ok(_) => {
+                self.job = Some(JobInFlight {
+                    rx,
+                    kind,
+                    conn_no: self.conn_no,
+                    started: now,
+                });
+            }
+            Err(e) => {
+                tracing::warn!(erro = %e, "não foi possível iniciar a tarefa de reflexão");
+                let next = Some(now + REFLECTION_MIN_INTERVAL);
+                match kind {
+                    JobKind::Index => self.next_index = next,
+                    JobKind::Controller => self.next_controller = next,
+                }
+            }
+        }
+    }
+
+    /// Manutenção de ~10 Hz dos cheats de valor ligados. Não é operação (spec 005, 6.7): não
+    /// mexe nas teclas nem nas buscas. Fica suspensa com o diário não resolvido, sem motor ou
+    /// com o jogo possivelmente parado por nós.
+    fn maintain_fields(&mut self, now: Instant) {
+        if !self.fields_wanted() {
+            self.model.player = PlayerLine::Idle;
+            self.player_found = None;
+            for row in self.model.cheats.iter_mut().filter(|r| r.field) {
+                row.note = None;
+            }
+            return;
+        }
+        let engine = matches!(self.model.conn, Conn::Connected { engine: true, .. });
+        let stuck = self.session.as_ref().is_some_and(|s| s.is_stuck());
+        if !engine || stuck || !self.diary_resolved() {
+            return;
+        }
+        let on: Vec<String> = self
+            .model
+            .cheats
+            .iter()
+            .filter(|r| r.field && r.on)
+            .map(|r| r.id.clone())
+            .collect();
+        let Some(report) = self.session_call(|s| s.field_tick(&on, now)) else {
+            return;
+        };
+        for row in self.model.cheats.iter_mut().filter(|r| r.field) {
+            row.note = if row.on {
+                report.notes.get(&row.id).copied()
+            } else {
+                None
+            };
+        }
+        // Com nada ligado, a sessão não procura o personagem: a linha fica como estava.
+        if on.is_empty() {
+            return;
+        }
+        let found = report.player == PlayerState::Found;
+        match (self.player_found, found) {
+            (Some(false) | None, true) => self.event(PLAYER_FOUND),
+            (Some(true), false) => self.event(PLAYER_LOST),
+            _ => {}
+        }
+        self.player_found = Some(found);
+        self.model.player = if found {
+            PlayerLine::Found
+        } else {
+            PlayerLine::NotFound
+        };
+        for e in report.events {
+            if e != PLAYER_FOUND && e != PLAYER_LOST {
+                self.event(e);
             }
         }
     }
@@ -829,6 +1119,11 @@ impl<B: Backend> Controller<B> {
         }
         if matches!(self.model.conn, Conn::Connected { .. }) {
             self.auto_until = Some(now + AUTO_WINDOW);
+            // O `r` reinicia o prazo do índice (spec 005, 6.3).
+            self.index_until = Some(now + INDEX_WINDOW);
+            if !self.index_ok {
+                self.next_index = Some(now);
+            }
             if !self.search_live() {
                 self.start_refresh(now);
             }
@@ -1027,14 +1322,25 @@ impl<B: Backend> Controller<B> {
         self.note_op(&row.id);
         let busy = format!("ligando {}…", row.name);
         let id = row.id.clone();
-        let Some(outcome) = self.run_op(busy, draw, |s| s.apply(&[(id, k)])) else {
+        let field = row.field;
+        let Some(outcome) = self.run_op(busy, draw, |s| {
+            if field {
+                s.field_on(&id)
+            } else {
+                s.apply(&[(id.clone(), k)])
+            }
+        }) else {
             return false;
         };
         match outcome {
             OpOutcome::Done(pause) => {
                 self.mark_on(&row.id, k);
                 self.set_desired(&row.id, Some(Desired { k, version_key }));
-                self.event(format!("{} ligado (pausa {} ms)", row.name, ms(pause)));
+                if field {
+                    self.event(format!("{} ligado", row.name));
+                } else {
+                    self.event(format!("{} ligado (pausa {} ms)", row.name, ms(pause)));
+                }
                 self.warn_unverified(&row.id);
             }
             OpOutcome::Refused(reason) => self.event(format!("{}: {reason}", row.name)),
@@ -1055,14 +1361,21 @@ impl<B: Backend> Controller<B> {
         self.note_op(&row.id);
         let busy = format!("desligando {}…", row.name);
         let id = row.id.clone();
-        let Some(outcome) = self.run_op(busy, draw, |s| s.undo(&id)) else {
+        let field = row.field;
+        let Some(outcome) = self.run_op(busy, draw, |s| {
+            if field { s.field_off(&id) } else { s.undo(&id) }
+        }) else {
             return false;
         };
         match outcome {
             OpOutcome::Done(pause) => {
                 self.mark_off(&row.id);
                 self.set_desired(&row.id, None);
-                self.event(format!("{} desligado (pausa {} ms)", row.name, ms(pause)));
+                if field {
+                    self.event(format!("{} desligado", row.name));
+                } else {
+                    self.event(format!("{} desligado (pausa {} ms)", row.name, ms(pause)));
+                }
             }
             // Recusa limpa: continua ligado e desejado; o dono pode tentar de novo.
             OpOutcome::Refused(reason) => self.event(format!("{}: {reason}", row.name)),
@@ -1213,6 +1526,7 @@ impl<B: Backend> Controller<B> {
         if let Some(row) = self.model.cheats.iter_mut().find(|r| r.id == id) {
             row.on = false;
             row.applied_k = None;
+            row.note = None;
         }
     }
 
@@ -1329,6 +1643,7 @@ impl<B: Backend> Controller<B> {
             .cloned()
             .collect();
         let mut batch: Vec<(String, u64)> = Vec::new();
+        let mut fields: Vec<String> = Vec::new();
         for row in rows {
             let Some(wanted) = self.desired.get(&row.id).cloned() else {
                 continue;
@@ -1355,12 +1670,26 @@ impl<B: Backend> Controller<B> {
                         Note::NotReapplied,
                         format!("{}: não foi religado ({why})", row.name),
                     ),
+                    None if row.field => fields.push(row.id.clone()),
                     None => batch.push((row.id.clone(), Self::shown_k(&row))),
                 },
             }
         }
+        // Os cheats de valor, um a um (não pausam o jogo).
+        let mut called = false;
+        for id in fields {
+            self.note_op(&id);
+            let Some(outcome) = self.run_op("religando…".to_string(), draw, |s| s.field_on(&id))
+            else {
+                return called;
+            };
+            called = true;
+            if !self.finish_reapply_one(&id, 0, outcome, &version_key, now) {
+                return true;
+            }
+        }
         if batch.is_empty() {
-            return false;
+            return called;
         }
         for (id, _) in &batch {
             self.note_op(id);
@@ -3728,5 +4057,278 @@ mod tests {
         assert!(!h.searching());
         assert_eq!(h.ctl.count(|c| matches!(c, Call::UndoAll { .. })), 0);
         h.ctl.release_search();
+    }
+
+    // ---- cheats de valor (spec 005, plano 005 tarefa 16) ----
+
+    use crate::backend::ReflectionNews;
+    use crate::fake::field;
+    use gt_grounded2::fields::{Note as FieldNote, TickReport};
+    use gt_grounded2::player::Absent;
+
+    impl H {
+        fn wait_job(&mut self, ms: u64) -> bool {
+            let now = self.at(ms);
+            self.c.wait_job(now, WAIT)
+        }
+    }
+
+    fn report(player: PlayerState, notes: &[(&str, FieldNote)]) -> TickReport {
+        TickReport {
+            player,
+            notes: notes.iter().map(|(id, n)| (id.to_string(), *n)).collect(),
+            events: Vec::new(),
+            pawn_null_since: None,
+        }
+    }
+
+    fn retry_news() -> ReflectionNews {
+        ReflectionNews {
+            index_ok: false,
+            retry: true,
+            player_changed: None,
+        }
+    }
+
+    /// Conectado em 0 com um patch e o cheat de valor `f` (disponível pela sessão).
+    fn with_field() -> H {
+        let mut h = H::new();
+        h.ctl
+            .set_catalog(vec![cheat("p", available()), field("f", Avail::Checking)]);
+        h.ctl.set_field_avail(&[("f", available())]);
+        h.connect(0);
+        h
+    }
+
+    #[test]
+    fn stale_reflection_outcome_dropped() {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![field("f", Avail::Checking)]);
+        h.ctl.set_jobs(&[JobKind::Index]);
+        h.ctl.hold_jobs();
+        h.connect(0);
+        h.tick(0);
+        assert!(h.c.job.is_some());
+        // O jogo fecha e reabre com o índice da conexão anterior ainda rodando.
+        h.reopen(100, 3_000);
+        h.ctl.release_jobs();
+        h.tick(3_000);
+        assert!(h.wait_job(3_000));
+        // Só o resultado da sessão nova entrou; o da antiga foi abandonado.
+        let merges: Vec<u64> = h
+            .ctl
+            .calls()
+            .iter()
+            .filter_map(|c| match c {
+                Call::MergeReflection { session, .. } => Some(*session),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(merges, vec![2]);
+    }
+
+    #[test]
+    fn index_retry_interval_and_window() {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![field("f", Avail::Checking)]);
+        h.ctl.set_jobs(&[JobKind::Index]);
+        h.ctl.set_job_took(Duration::from_secs(10));
+        for _ in 0..20 {
+            h.ctl.push_news(retry_news());
+        }
+        h.connect(0);
+        // Intervalo: max(10 s, 2 × 10 s) = 20 s, por 120 s depois da conexão.
+        let mut runs_at = Vec::new();
+        for t in (0..=130_000).step_by(1_000) {
+            h.tick(t);
+            if h.c.job.is_some() {
+                runs_at.push(t);
+                assert!(h.wait_job(t));
+            }
+        }
+        assert_eq!(runs_at, vec![0, 20_000, 40_000, 60_000, 80_000, 100_000]);
+        // O `r` reinicia o prazo e tenta já.
+        h.key(Action::Retry, 131_000);
+        h.tick(131_000);
+        assert!(h.c.job.is_some());
+    }
+
+    #[test]
+    fn controller_job_only_with_field_desired() {
+        let mut h = with_field();
+        h.ctl.set_jobs(&[JobKind::Index, JobKind::Controller]);
+        h.ctl.set_needs_controller(true);
+        h.tick(0);
+        assert!(h.wait_job(0));
+        assert_eq!(h.ctl.merges(JobKind::Index), 1);
+        assert_eq!(h.row("f").avail, available());
+        // Sem cheat de valor desejado, ninguém procura o controller.
+        h.tick(100);
+        assert!(h.c.job.is_none());
+        assert!(h.toggle("f", 200));
+        h.tick(300);
+        assert!(h.wait_job(300));
+        assert_eq!(h.ctl.job_runs(JobKind::Controller), 1);
+    }
+
+    #[test]
+    fn field_on_while_checking_refused() {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![field("f", Avail::Checking)]);
+        h.ctl.set_field_avail(&[("f", Avail::Checking)]);
+        h.connect(0);
+        assert!(!h.toggle("f", 100));
+        assert!(
+            h.events()
+                .contains(&"12:00 f: verificando a reflexão do jogo; tente de novo em instantes")
+        );
+        assert_eq!(h.ctl.count(|c| matches!(c, Call::FieldOn { .. })), 0);
+        assert!(!h.row("f").on);
+    }
+
+    #[test]
+    fn maintenance_not_an_operation() {
+        let mut h = with_field();
+        assert!(h.toggle("f", 100));
+        let ops = h.c.op_counts.clone();
+        h.ctl.push_tick(report(PlayerState::Found, &[]));
+        // A manutenção chama a sessão, mas o `tick` não conta como operação.
+        assert!(!h.tick(200));
+        assert_eq!(h.ctl.field_ticks(), 1);
+        assert_eq!(h.c.op_counts, ops);
+        assert!(h.ctl.calls().contains(&Call::FieldTick {
+            on: vec!["f".to_string()]
+        }));
+    }
+
+    #[test]
+    fn maintenance_suspended_when_stuck_or_no_engine() {
+        let mut h = with_field();
+        assert!(h.toggle("f", 100));
+        h.ctl.set_stuck(true);
+        h.tick(200);
+        assert_eq!(h.ctl.field_ticks(), 0);
+        h.ctl.set_stuck(false);
+        h.tick(300);
+        assert_eq!(h.ctl.field_ticks(), 1);
+
+        // Sem motor (disco ilegível), nada.
+        let mut h = H::new();
+        let mut spec = SearchSpec::new(vec![field("f", Avail::Checking)]);
+        spec.disk = Err("disco ilegível".to_string());
+        h.ctl.set_default_search(spec);
+        h.ctl.set_field_avail(&[("f", available())]);
+        h.connect(0);
+        h.c.model.cheats[0].on = true;
+        h.tick(100);
+        assert_eq!(h.ctl.field_ticks(), 0);
+    }
+
+    #[test]
+    fn player_events_only_on_transition() {
+        let mut h = with_field();
+        assert!(h.toggle("f", 100));
+        let absent = || PlayerState::Absent(Absent::PawnNull);
+        for (i, player) in [
+            PlayerState::Found,
+            PlayerState::Found,
+            absent(),
+            absent(),
+            PlayerState::Found,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            h.ctl.push_tick(report(player, &[]));
+            h.tick(200 + i as u64 * 100);
+        }
+        assert_eq!(event_count(&h, "personagem encontrado"), 2);
+        assert_eq!(event_count(&h, "personagem perdido"), 1);
+        assert_eq!(h.c.model.player, PlayerLine::Found);
+        h.ctl.push_tick(report(absent(), &[]));
+        h.tick(800);
+        assert_eq!(h.c.model.player, PlayerLine::NotFound);
+    }
+
+    #[test]
+    fn reflexao_nao_reconhecida_keeps_state_and_auto_searches() {
+        let unrecognized = || unavailable(REFLECTION_UNRECOGNIZED);
+        assert!(keeps_state(&available(), &unrecognized()));
+        assert!(!keeps_state(&unrecognized(), &unrecognized()));
+
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![field("f", unrecognized())]);
+        h.ctl.set_field_avail(&[("f", unrecognized())]);
+        h.connect(0);
+        // Sem nada desejado, a nova busca automática acontece, com as globais (`@ue`).
+        h.tick(5_000);
+        assert!(h.wait(5_000));
+        let ids = h.ctl.search_ids();
+        assert_eq!(ids.len(), 2);
+        assert!(ids[1].as_ref().unwrap().contains(&UE_ID.to_string()));
+    }
+
+    #[test]
+    fn field_relinked_after_reconnect_same_version() {
+        let mut h = with_field();
+        assert!(h.toggle("f", 100));
+        assert!(h.c.desired().contains_key("f"));
+        h.reopen(200, 3_000);
+        h.tick(3_100);
+        let ons: Vec<Call> = h
+            .ctl
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, Call::FieldOn { .. }))
+            .collect();
+        assert_eq!(ons.len(), 2);
+        assert_eq!(
+            ons[1],
+            Call::FieldOn {
+                id: "f".to_string(),
+                busy: Some("religando…".to_string())
+            }
+        );
+        assert!(h.row("f").on);
+    }
+
+    #[test]
+    fn field_on_absent_player_waits() {
+        let mut h = with_field();
+        assert!(h.toggle("f", 100));
+        assert!(h.row("f").on);
+        h.ctl.push_tick(report(
+            PlayerState::Absent(Absent::NoController),
+            &[("f", FieldNote::Waiting)],
+        ));
+        h.tick(200);
+        assert_eq!(h.row("f").note, Some(FieldNote::Waiting));
+        assert_eq!(h.c.model.player, PlayerLine::NotFound);
+        // Achado, a marca some.
+        h.ctl.push_tick(report(PlayerState::Found, &[]));
+        h.tick(300);
+        assert_eq!(h.row("f").note, None);
+    }
+
+    #[test]
+    fn field_off_absent_player_succeeds() {
+        let mut h = with_field();
+        assert!(h.toggle("f", 100));
+        h.ctl.push_tick(report(
+            PlayerState::Absent(Absent::PawnNull),
+            &[("f", FieldNote::Waiting)],
+        ));
+        h.tick(200);
+        assert!(h.toggle("f", 300));
+        assert!(h.ctl.calls().contains(&Call::FieldOff {
+            id: "f".to_string(),
+            busy: Some("desligando f…".to_string())
+        }));
+        assert!(!h.row("f").on);
+        assert_eq!(h.row("f").note, None);
+        assert!(!h.c.desired().contains_key("f"));
+        // Nada ligado: a linha do personagem volta a `—`.
+        h.tick(400);
+        assert_eq!(h.c.model.player, PlayerLine::Idle);
     }
 }

@@ -9,14 +9,15 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gt_core::procinfo::Identity;
+use gt_grounded2::fields::TickReport;
 use gt_grounded2::signatures::Category;
 
 use crate::backend::{
-    Backend, CheatInfo, Find, OpOutcome, Recovered, Search, SearchError, SearchFn, Session,
-    TuiError,
+    Backend, CheatInfo, Find, JobKind, OpOutcome, Recovered, ReflectionJob, ReflectionNews,
+    ReflectionOutcome, Search, SearchError, SearchFn, Session, TuiError, idle_tick,
 };
 use crate::model::{Avail, Model};
 
@@ -64,6 +65,27 @@ pub(crate) enum Call {
         busy: Option<String>,
     },
     SessionDropped,
+    /// Um trabalho da tarefa de reflexão começou a rodar (na thread dele).
+    JobRun {
+        kind: JobKind,
+        /// Número da sessão que criou o trabalho.
+        session: u64,
+    },
+    MergeReflection {
+        kind: JobKind,
+        session: u64,
+    },
+    FieldOn {
+        id: String,
+        busy: Option<String>,
+    },
+    FieldOff {
+        id: String,
+        busy: Option<String>,
+    },
+    FieldTick {
+        on: Vec<String>,
+    },
 }
 
 /// O que uma busca devolve (a parte que o teste programa).
@@ -85,6 +107,18 @@ impl SearchSpec {
             version_key: "v1".to_string(),
             has_version_file: true,
         }
+    }
+}
+
+/// Cheat de valor de teste: categoria `Sobrevivencia`, nome igual ao `id`.
+pub(crate) fn field(id: &str, avail: Avail) -> CheatInfo {
+    CheatInfo {
+        id: id.to_string(),
+        name: id.to_string(),
+        category: Category::Sobrevivencia,
+        value: None,
+        avail,
+        field: true,
     }
 }
 
@@ -138,6 +172,20 @@ pub(crate) struct FakeState {
     /// Desfechos programados; cada um leva, se houver, os `id` pendentes que a operação deixa.
     pub outcomes: VecDeque<(OpOutcome, Option<Vec<String>>)>,
     pub undo_all: (Vec<String>, Vec<String>),
+    /// Sessões abertas até agora (cada sessão guarda o seu número).
+    pub sessions: u64,
+    /// Tipos de trabalho que a sessão oferece.
+    pub jobs: Vec<JobKind>,
+    /// Os trabalhos esperam até [`FakeCtl::release_jobs`].
+    pub job_hold: bool,
+    /// Quanto cada trabalho diz ter levado.
+    pub job_took: Duration,
+    /// Notícias das próximas junções (vazia: índice bom, sem nova tentativa).
+    pub news: VecDeque<ReflectionNews>,
+    pub field_avail: Vec<(String, Avail)>,
+    pub needs_controller: bool,
+    /// Relatórios dos próximos ciclos (vazia: ciclo sem manutenção).
+    pub tick_reports: VecDeque<TickReport>,
 }
 
 fn lock(state: &Mutex<FakeState>) -> MutexGuard<'_, FakeState> {
@@ -305,6 +353,56 @@ impl FakeCtl {
     pub fn clear_calls(&self) {
         self.state().calls.clear();
     }
+
+    /// A sessão passa a oferecer estes trabalhos da tarefa de reflexão.
+    pub fn set_jobs(&self, kinds: &[JobKind]) {
+        self.state().jobs = kinds.to_vec();
+    }
+
+    pub fn hold_jobs(&self) {
+        self.state().job_hold = true;
+    }
+
+    pub fn release_jobs(&self) {
+        self.state().job_hold = false;
+    }
+
+    pub fn set_job_took(&self, took: Duration) {
+        self.state().job_took = took;
+    }
+
+    /// Programa a notícia da próxima junção de um resultado.
+    pub fn push_news(&self, news: ReflectionNews) {
+        self.state().news.push_back(news);
+    }
+
+    pub fn set_field_avail(&self, avail: &[(&str, Avail)]) {
+        self.state().field_avail = avail
+            .iter()
+            .map(|(id, a)| (id.to_string(), a.clone()))
+            .collect();
+    }
+
+    pub fn set_needs_controller(&self, needs: bool) {
+        self.state().needs_controller = needs;
+    }
+
+    /// Programa o relatório do próximo ciclo de manutenção.
+    pub fn push_tick(&self, report: TickReport) {
+        self.state().tick_reports.push_back(report);
+    }
+
+    pub fn job_runs(&self, kind: JobKind) -> usize {
+        self.count(|c| matches!(c, Call::JobRun { kind: k, .. } if *k == kind))
+    }
+
+    pub fn merges(&self, kind: JobKind) -> usize {
+        self.count(|c| matches!(c, Call::MergeReflection { kind: k, .. } if *k == kind))
+    }
+
+    pub fn field_ticks(&self) -> usize {
+        self.count(|c| matches!(c, Call::FieldTick { .. }))
+    }
 }
 
 /// Alvo falso.
@@ -334,6 +432,14 @@ impl FakeBackend {
             pending: Vec::new(),
             outcomes: VecDeque::new(),
             undo_all: (Vec::new(), Vec::new()),
+            sessions: 0,
+            jobs: Vec::new(),
+            job_hold: false,
+            job_took: Duration::from_millis(10),
+            news: VecDeque::new(),
+            field_avail: Vec::new(),
+            needs_controller: false,
+            tick_reports: VecDeque::new(),
         };
         FakeBackend {
             ctl: FakeCtl(Arc::new(Mutex::new(state))),
@@ -440,10 +546,12 @@ impl Backend for FakeBackend {
         if let Some(e) = &s.open_error {
             return Err(TuiError::Other(e.clone()));
         }
+        s.sessions += 1;
         Ok(FakeSession {
             ctl: self.ctl.clone(),
             engine: engine && search.disk.is_ok(),
             disk: search.disk,
+            number: s.sessions,
         })
     }
 }
@@ -453,6 +561,8 @@ pub(crate) struct FakeSession {
     ctl: FakeCtl,
     engine: bool,
     disk: Result<(), String>,
+    /// Número desta sessão (o `Call` dos trabalhos diz de qual sessão eles vieram).
+    number: u64,
 }
 
 impl FakeSession {
@@ -573,5 +683,71 @@ impl Session<()> for FakeSession {
         let busy = FakeCtl::drawn_busy(&s);
         s.calls.push(Call::UndoAll { busy });
         s.undo_all.clone()
+    }
+
+    fn reflection_job(&self, kind: JobKind) -> Option<ReflectionJob> {
+        if !self.ctl.state().jobs.contains(&kind) {
+            return None;
+        }
+        let ctl = self.ctl.clone();
+        let session = self.number;
+        Some(ReflectionJob {
+            kind,
+            run: Box::new(move || {
+                ctl.state().calls.push(Call::JobRun { kind, session });
+                let end = Instant::now() + MAX_HOLD;
+                while ctl.state().job_hold && Instant::now() < end {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                let took = ctl.state().job_took;
+                ReflectionOutcome {
+                    kind,
+                    took,
+                    data: Box::new(session),
+                }
+            }),
+        })
+    }
+
+    fn merge_reflection(&mut self, out: ReflectionOutcome) -> ReflectionNews {
+        let mut s = self.ctl.state();
+        let session = out.data.downcast_ref::<u64>().copied().unwrap_or(0);
+        s.calls.push(Call::MergeReflection {
+            kind: out.kind,
+            session,
+        });
+        s.news.pop_front().unwrap_or(ReflectionNews {
+            index_ok: true,
+            retry: false,
+            player_changed: None,
+        })
+    }
+
+    fn field_avail(&self) -> Vec<(String, Avail)> {
+        self.ctl.state().field_avail.clone()
+    }
+
+    fn needs_controller(&self, _now: Instant) -> bool {
+        self.ctl.state().needs_controller
+    }
+
+    fn field_on(&mut self, id: &str) -> OpOutcome {
+        self.op(|busy| Call::FieldOn {
+            id: id.to_string(),
+            busy,
+        })
+    }
+
+    fn field_off(&mut self, id: &str) -> OpOutcome {
+        self.op(|busy| Call::FieldOff {
+            id: id.to_string(),
+            busy,
+        })
+    }
+
+    fn field_tick(&mut self, on: &[String], _now: Instant) -> TickReport {
+        let mut s = self.ctl.state();
+        s.calls.push(Call::FieldTick { on: on.to_vec() });
+        s.tick_reports.pop_front().unwrap_or_else(idle_tick)
     }
 }

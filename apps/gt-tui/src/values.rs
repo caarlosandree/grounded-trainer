@@ -399,3 +399,128 @@ fn build_index(reader: MemReader, g: &Globals, defs: &[FieldDef]) -> IndexData {
     let catalog = FieldCatalog::resolve(&index, &reader, &g.sigs.player, defs);
     Ok((index, catalog))
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use gt_grounded2::signatures::FieldRule;
+    use gt_testkit::synth_signatures;
+    use gt_ue::synth::SparseMem;
+
+    /// Índice e catálogo da cena sintética do alvo de teste, resolvido com `defs`.
+    fn index_data(defs: &[FieldDef]) -> IndexData {
+        let (image, _) = gt_testkit::ue::build(0x1000_0000, gt_testkit::ue::ARENA_LEN);
+        let mem = SparseMem::from_image(&image);
+        let (sigs, _) = synth_signatures();
+        let names = Names::new(&mem, image.names).unwrap();
+        let objects = ObjectArray::read(&mem, &sigs.layout, image.gobjects).unwrap();
+        let index = ReflectionIndex::build(
+            &mem,
+            &sigs.layout,
+            &objects,
+            &names,
+            &ScanBudget::standard(),
+        )
+        .unwrap();
+        let catalog = FieldCatalog::resolve(&index, &mem, &sigs.player, defs);
+        Ok((index, catalog))
+    }
+
+    fn outcome(data: IndexData) -> ReflectionOutcome {
+        ReflectionOutcome {
+            kind: JobKind::Index,
+            took: Duration::from_millis(5),
+            data: Box::new(data),
+        }
+    }
+
+    fn cheats() -> ValueCheats {
+        let (sigs, defs) = synth_signatures();
+        let globals = Ok(Globals {
+            sigs,
+            gobjects: 1,
+            names: 2,
+            verified: false,
+        });
+        ValueCheats::new(MemReader::new(1), defs, globals)
+    }
+
+    fn available_count(v: &ValueCheats) -> usize {
+        v.avail()
+            .iter()
+            .filter(|(_, a)| matches!(a, Avail::Available { .. }))
+            .count()
+    }
+
+    #[test]
+    fn checking_until_index_then_available_unverified() {
+        let mut v = cheats();
+        assert!(v.avail().iter().all(|(_, a)| *a == Avail::Checking));
+        let (_, defs) = synth_signatures();
+        let news = v.merge(outcome(index_data(&defs)));
+        assert!(news.index_ok && !news.retry);
+        // Globais sem `rva` conferido: disponível com `?`.
+        assert!(
+            v.avail()
+                .iter()
+                .all(|(_, a)| *a == Avail::Available { verified: false })
+        );
+    }
+
+    #[test]
+    fn good_index_not_replaced_by_worse() {
+        let mut v = cheats();
+        let (_, defs) = synth_signatures();
+        v.merge(outcome(index_data(&defs)));
+        assert_eq!(available_count(&v), 8);
+        // Um índice pior (um campo que falta) e uma falha não trocam o bom.
+        let mut worse = defs.clone();
+        if let FieldRule::Lock { field, .. } = &mut worse[0].rule {
+            *field = "NaoExiste".into();
+        }
+        let news = v.merge(outcome(index_data(&worse)));
+        assert!(news.index_ok);
+        assert_eq!(available_count(&v), 8);
+        let news = v.merge(outcome(Err(REFLECTION_INCOHERENT.to_string())));
+        assert!(news.index_ok && !news.retry);
+        assert_eq!(available_count(&v), 8);
+    }
+
+    #[test]
+    fn index_failure_reason_until_a_good_one() {
+        let mut v = cheats();
+        let news = v.merge(outcome(Err(REFLECTION_INCONCLUSIVE.to_string())));
+        assert!(!news.index_ok && news.retry);
+        assert!(
+            v.avail()
+                .iter()
+                .all(|(_, a)| *a == Avail::Unavailable(REFLECTION_INCONCLUSIVE.to_string()))
+        );
+        // Índice parcial: os que faltam mostram o motivo, e a tarefa tenta de novo.
+        let (_, mut defs) = synth_signatures();
+        if let FieldRule::Lock { field, .. } = &mut defs[1].rule {
+            *field = "CurrentFoo".into();
+        }
+        let news = v.merge(outcome(index_data(&defs)));
+        assert!(news.index_ok && news.retry);
+        let avail = v.avail();
+        assert_eq!(
+            avail[1].1,
+            Avail::Unavailable("campo CurrentFoo não encontrado".to_string())
+        );
+    }
+
+    #[test]
+    fn globals_reasons() {
+        let disk_err: Result<(), String> = Err("x".into());
+        assert_eq!(
+            globals_of(None, &disk_err).unwrap_err(),
+            DISK_UNREADABLE.to_string()
+        );
+        assert_eq!(
+            globals_of(None, &Ok(())).unwrap_err(),
+            REFLECTION_UNRECOGNIZED.to_string()
+        );
+    }
+}

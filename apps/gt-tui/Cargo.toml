@@ -34,6 +34,8 @@ test-backend = []
 
 [dev-dependencies]
 gt-testkit.workspace = true
+# Reflexão sintética nos testes do `values.rs`.
+gt-ue = { workspace = true, features = ["synth"] }
 gt-tui = { path = ".", features = ["test-backend"] }
 nix = { workspace = true, features = ["term"] }
 serde_json.workspace = true
