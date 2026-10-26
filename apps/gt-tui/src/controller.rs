@@ -34,6 +34,8 @@ const AUTO_WINDOW: Duration = Duration::from_secs(120);
 
 /// Mensagem do topo durante a recuperação do diário.
 const RECOVERING: &str = "recuperando o diário…";
+/// Mensagem do topo durante a restauração dos restos e o novo SIGCONT.
+const RESTORING: &str = "restaurando…";
 /// Motivos do catálogo que as buscas automáticas tentam resolver.
 const NOT_FOUND: &str = "não encontrado";
 const INCONCLUSIVE: &str = "inconclusivo";
@@ -255,11 +257,13 @@ impl<B: Backend> Controller<B> {
         self.model.banners.blocked.is_none()
     }
 
-    /// Chama a sessão e, depois, liga ou desliga o aviso de jogo parado. `None` sem sessão.
+    /// Chama a sessão e, depois, acerta o aviso de jogo parado e os restos (spec 6.8): vale para
+    /// toda chamada. `None` sem sessão.
     fn session_call<R>(&mut self, f: impl FnOnce(&mut B::Session) -> R) -> Option<R> {
         let session = self.session.as_mut()?;
         let out = f(session);
         self.sync_stuck();
+        self.sync_pending();
         Some(out)
     }
 
@@ -271,6 +275,25 @@ impl<B: Backend> Controller<B> {
             }
             _ => None,
         };
+    }
+
+    /// O motor é a fonte dos restos: cada linha pendente vira `erro` e as que ele já resolveu
+    /// voltam ao normal. O aviso fixo acompanha.
+    fn sync_pending(&mut self) {
+        let Some(pending) = self.session.as_ref().map(|s| s.pending_ids()) else {
+            return;
+        };
+        let new: Vec<String> = pending
+            .iter()
+            .filter(|id| !self.model.cheats.iter().any(|r| &r.id == *id && r.residue))
+            .cloned()
+            .collect();
+        for row in &mut self.model.cheats {
+            if row.residue && !pending.contains(&row.id) {
+                row.residue = false;
+            }
+        }
+        self.mark_residue(&new);
     }
 
     // ---- recuperação do diário ----
@@ -449,6 +472,7 @@ impl<B: Backend> Controller<B> {
         };
         self.sync_stuck();
         self.merge_connect(cheats);
+        self.sync_pending();
         self.auto_until = Some(now + AUTO_WINDOW);
         self.schedule_auto(inflight.started, took, now);
         self.event(format!(
@@ -720,27 +744,91 @@ impl<B: Backend> Controller<B> {
         }
     }
 
-    /// `r`: com o jogo conectado, refaz a busca dos cheats desligados (e reinicia o prazo das
-    /// buscas automáticas); sem conexão, procura o jogo na hora. Em `conectando`, `o processo
-    /// terminou` ou durante uma operação, não faz nada.
+    /// `r` (spec 6.6), só o primeiro degrau que se aplica: SIGCONT que falhou; restos de uma
+    /// falha; diário não resolvido (e, resolvido com o jogo conectado, abrir o motor e religar);
+    /// conectado, nova busca dos desligados (e reinício do prazo das automáticas); sem conexão,
+    /// procurar o jogo na hora. Em `conectando`, `o processo terminou` ou durante uma operação,
+    /// não faz nada. Devolve `true` se o `r` chamou a sessão ou a recuperação.
     fn retry(&mut self, now: Instant, draw: &mut dyn FnMut(&Model)) -> bool {
         if self.model.busy.is_some() {
             return false;
         }
-        match &self.model.conn {
-            Conn::Connecting | Conn::PidGone => {}
-            Conn::Connected { .. } => {
-                self.auto_until = Some(now + AUTO_WINDOW);
-                if !self.search_live() {
-                    self.start_refresh(now);
-                }
+        if matches!(self.model.conn, Conn::Connecting | Conn::PidGone) {
+            return false;
+        }
+        if self.session.as_ref().is_some_and(|s| s.is_stuck()) {
+            return self.resume(now, draw);
+        }
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|s| !s.pending_ids().is_empty())
+        {
+            return self.restore_residue(now, draw);
+        }
+        if !self.diary_resolved() {
+            return self.retry_recovery(draw);
+        }
+        if matches!(self.model.conn, Conn::Connected { .. }) {
+            self.auto_until = Some(now + AUTO_WINDOW);
+            if !self.search_live() {
+                self.start_refresh(now);
             }
-            Conn::Waiting | Conn::NoAccess(_) | Conn::Many(_) | Conn::Error(_) => {
-                self.last_find = None;
-                self.poll_find(now, draw);
-            }
+        } else {
+            self.last_find = None;
+            self.poll_find(now, draw);
         }
         false
+    }
+
+    /// Tenta de novo o SIGCONT que falhou (o aviso some quando dá certo).
+    fn resume(&mut self, now: Instant, draw: &mut dyn FnMut(&Model)) -> bool {
+        let Some(outcome) = self.run_op(RESTORING.to_string(), draw, |s| s.retry_resume()) else {
+            return false;
+        };
+        match outcome {
+            OpOutcome::Done(_) => self.event("o jogo foi retomado (SIGCONT enviado)"),
+            OpOutcome::Gone => self.on_game_closed(now),
+            OpOutcome::Refused(reason) | OpOutcome::Residue(reason) => {
+                self.event(format!("não foi possível retomar o jogo: {reason}"));
+            }
+            OpOutcome::Foreign => self.event("não foi possível retomar o jogo"),
+        }
+        true
+    }
+
+    /// Pede ao motor para restaurar os restos (`r` ou espaço num cheat em `erro`). Resolvidos,
+    /// o cheat volta a `[OFF]` (quem acerta as linhas é o `sync_pending`).
+    fn restore_residue(&mut self, now: Instant, draw: &mut dyn FnMut(&Model)) -> bool {
+        let Some(outcome) = self.run_op(RESTORING.to_string(), draw, |s| s.restore_pending())
+        else {
+            return false;
+        };
+        match outcome {
+            OpOutcome::Done(pause) => {
+                self.event(format!("restos restaurados (pausa {} ms)", ms(pause)));
+            }
+            OpOutcome::Gone => self.on_game_closed(now),
+            OpOutcome::Refused(reason) => {
+                self.event(format!("não foi possível restaurar os restos: {reason}"));
+            }
+            OpOutcome::Residue(cause) => {
+                self.event(format!("restos continuam no jogo ({cause})"));
+            }
+            OpOutcome::Foreign => self.event("restos: alterados por outro; saíram do registro"),
+        }
+        true
+    }
+
+    /// Tenta a recuperação do diário de novo. Resolvida com o jogo conectado, refaz a conexão a
+    /// partir da abertura do motor e religa os desejados no próximo `tick`.
+    fn retry_recovery(&mut self, draw: &mut dyn FnMut(&Model)) -> bool {
+        self.recover_diary(draw);
+        if self.diary_resolved() && matches!(self.model.conn, Conn::Connected { .. }) {
+            self.open_engine_if_possible();
+            self.schedule_reapply();
+        }
+        true
     }
 
     // ---- desejados ----
@@ -809,8 +897,7 @@ impl<B: Backend> Controller<B> {
             }
         }
         if row.residue {
-            // Pedir a restauração dos restos é da Tarefa 13.
-            return false;
+            return self.restore_residue(now, draw);
         }
         if row.on {
             return self.turn_off(&row, now, draw);
@@ -2273,9 +2360,7 @@ mod tests {
 
         // Lote com restos: todos os pendentes em `erro`, sem tentar um a um.
         let mut h = three();
-        h.ctl.set_pending(&["a", "b", "c"]);
-        h.ctl
-            .push_outcome(OpOutcome::Residue("escrita".to_string()));
+        h.ctl.push_residue("escrita", &["a", "b", "c"]);
         h.reopen(1_000, 4_000);
         h.tick(4_100);
         assert_eq!(h.applies(), std::slice::from_ref(&batch));
@@ -2293,8 +2378,7 @@ mod tests {
         // Restos num dos um a um: marca aquele e segue com os demais.
         let mut h = three();
         h.ctl.push_outcome(OpOutcome::Refused("lote".to_string()));
-        h.ctl
-            .push_outcome(OpOutcome::Residue("escrita".to_string()));
+        h.ctl.push_residue("escrita", &["a"]);
         h.ctl.push_outcome(OpOutcome::Done(Duration::ZERO));
         h.ctl.push_outcome(OpOutcome::Done(Duration::ZERO));
         h.reopen(1_000, 4_000);
@@ -2403,8 +2487,7 @@ mod tests {
         assert!(!h.c.desired().contains_key("b"));
 
         // Restos: `erro`, aviso fixo e fora dos desejados.
-        h.ctl
-            .push_outcome(OpOutcome::Residue("escrita".to_string()));
+        h.ctl.push_residue("escrita", &["c"]);
         assert!(h.toggle("c", 400));
         let c = h.row("c");
         assert!(c.residue && !c.on && !c.desired);
@@ -2651,5 +2734,311 @@ mod tests {
         assert_eq!(h.ctl.search_calls(), searches + 1);
         assert_eq!(connected(&h.c), (100, "v1".to_string(), true, true));
         assert_eq!(h.row("a").avail, available());
+    }
+
+    // ---- Tarefa 13: restos, SIGCONT e a tecla `r` completa ----
+
+    fn count_calls(h: &H, f: impl Fn(&Call) -> bool) -> usize {
+        h.ctl.count(f)
+    }
+
+    #[test]
+    fn retry_order() {
+        // Tudo ao mesmo tempo: SIGCONT que falhou, restos, diário bloqueado, jogo conectado.
+        let mut h = H::new();
+        h.ctl.push_recover(blocked("não foi possível restaurar x"));
+        h.ctl
+            .set_catalog(vec![cheat("a", available()), cheat("b", not_found())]);
+        h.connect(0);
+        h.ctl.set_pending(&["a"]);
+        h.ctl.set_stuck(true);
+        h.tick(100);
+        h.ctl.clear_calls();
+
+        // 1. SIGCONT: só ele, com `restaurando…` no topo; recusado, o aviso continua.
+        h.ctl.push_outcome(OpOutcome::Refused("EPERM".to_string()));
+        assert!(h.key(Action::Retry, 200));
+        assert_eq!(
+            h.ctl.calls(),
+            [Call::RetryResume {
+                busy: Some("restaurando…".to_string())
+            }]
+        );
+        assert!(h.c.model.banners.stuck.is_some());
+        assert!(
+            h.events()
+                .last()
+                .is_some_and(|e| e.contains("não foi possível retomar o jogo: EPERM"))
+        );
+        assert_eq!(h.c.model.busy, None);
+
+        // 2. Restos: o SIGCONT deu certo, o aviso some e a próxima tecla restaura.
+        h.ctl.clear_calls();
+        h.ctl.push_outcome(OpOutcome::Done(Duration::ZERO));
+        assert!(h.key(Action::Retry, 300));
+        assert_eq!(h.c.model.banners.stuck, None);
+        assert_eq!(
+            h.ctl.calls(),
+            [Call::RetryResume {
+                busy: Some("restaurando…".to_string())
+            }]
+        );
+        h.ctl.clear_calls();
+        assert!(h.key(Action::Retry, 400));
+        assert_eq!(
+            h.ctl.calls(),
+            [Call::RestorePending {
+                busy: Some("restaurando…".to_string())
+            }]
+        );
+        assert!(!h.row("a").residue);
+        assert_eq!(h.c.model.banners.residue, None);
+
+        // 3. Diário bloqueado: recupera de novo (ainda bloqueado), sem busca.
+        h.ctl.clear_calls();
+        h.ctl.push_recover(blocked("ainda x"));
+        assert!(h.key(Action::Retry, 500));
+        assert_eq!(
+            h.ctl.calls(),
+            [Call::Recover {
+                busy: Some("recuperando o diário…".to_string())
+            }]
+        );
+        assert_eq!(h.c.model.banners.blocked.as_deref(), Some("ainda x"));
+        assert!(!h.searching());
+
+        // 4. Diário resolvido e jogo conectado: o motor abre; depois, nova busca dos desligados.
+        h.ctl.clear_calls();
+        assert!(h.key(Action::Retry, 600));
+        assert_eq!(h.c.model.banners.blocked, None);
+        assert!(h.ctl.calls().contains(&Call::OpenEngine));
+        assert!(!h.searching());
+        h.ctl.clear_calls();
+        assert!(!h.key(Action::Retry, 700));
+        assert!(h.searching());
+        assert!(h.wait(700));
+        assert_eq!(
+            h.ctl.search_ids(),
+            [Some(vec!["a".to_string(), "b".to_string()])]
+        );
+        assert_eq!(count_calls(&h, |c| matches!(c, Call::Recover { .. })), 0);
+
+        // 5. Sem conexão: procura o jogo na hora.
+        let mut w = H::new();
+        w.tick(0);
+        w.ctl.clear_calls();
+        assert!(!w.key(Action::Retry, 100));
+        assert_eq!(w.ctl.calls(), [Call::Find]);
+    }
+
+    #[test]
+    fn retry_stuck_without_pending_or_diary_trouble() {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![cheat("a", available())]);
+        h.connect(0);
+        h.ctl.set_stuck(true);
+        // Mesmo sem nenhuma tick depois do `set_stuck`, o `r` já consulta a sessão.
+        h.ctl.clear_calls();
+        assert!(h.key(Action::Retry, 100));
+        assert_eq!(h.ctl.calls().len(), 1);
+        assert_eq!(h.c.model.banners.stuck, None);
+        assert_eq!(
+            h.events().last(),
+            Some(&"12:00 o jogo foi retomado (SIGCONT enviado)")
+        );
+    }
+
+    #[test]
+    fn restore_pending_clears_residue() {
+        // Pelo `r`.
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![
+            cheat("a", available()),
+            cheat("b", available()),
+            cheat("c", available()),
+        ]);
+        h.connect(0);
+        h.ctl.push_residue("escrita", &["a"]);
+        assert!(h.toggle("a", 100));
+        let a = h.row("a");
+        assert!(a.residue && !a.on);
+        assert_eq!(
+            a.status(&h.c.model.conn),
+            crate::model::CheatStatus::Residue
+        );
+        assert!(h.c.model.banners.residue.is_some());
+
+        // Resto não bloqueia ligar os outros cheats (spec 6.8).
+        assert!(h.toggle("b", 200));
+        assert!(h.row("b").on);
+        assert!(h.row("a").residue);
+
+        h.ctl.clear_calls();
+        assert!(h.key(Action::Retry, 300));
+        assert_eq!(
+            h.ctl.calls(),
+            [Call::RestorePending {
+                busy: Some("restaurando…".to_string())
+            }]
+        );
+        let a = h.row("a");
+        assert!(!a.residue && !a.on && !a.desired);
+        assert_eq!(a.status(&h.c.model.conn), crate::model::CheatStatus::Off);
+        assert_eq!(h.c.model.banners.residue, None);
+        assert!(h.row("b").on, "o outro cheat não muda");
+
+        // Pelo espaço no cheat em `erro`.
+        let mut s = H::new();
+        s.ctl
+            .set_catalog(vec![cheat("a", available()), cheat("c", available())]);
+        s.connect(0);
+        s.ctl.push_residue("escrita", &["a", "c"]);
+        assert!(s.toggle("a", 100));
+        assert!(s.row("a").residue);
+        assert!(s.row("c").residue, "o motor também deixou `c` pendente");
+        assert!(
+            s.c.model
+                .banners
+                .residue
+                .as_deref()
+                .is_some_and(|t| t.contains('a') && t.contains('c'))
+        );
+        s.ctl.clear_calls();
+        assert!(s.toggle("a", 200));
+        assert_eq!(
+            s.ctl.calls(),
+            [Call::RestorePending {
+                busy: Some("restaurando…".to_string())
+            }]
+        );
+        assert!(!s.row("a").residue && !s.row("c").residue);
+        assert_eq!(s.c.model.banners.residue, None);
+        assert!(!s.row("a").on);
+        // Voltou a `[OFF]`: o próximo espaço liga.
+        assert!(s.toggle("a", 300));
+        assert!(s.row("a").on);
+    }
+
+    #[test]
+    fn restore_pending_failures_keep_residue() {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![cheat("a", available())]);
+        h.connect(0);
+        h.ctl.push_residue("escrita", &["a"]);
+        assert!(h.toggle("a", 100));
+
+        // Restauração que não resolve: os restos continuam e o aviso também.
+        h.ctl.push_residue("sem permissão", &["a"]);
+        assert!(h.key(Action::Retry, 200));
+        assert!(h.row("a").residue);
+        assert!(h.c.model.banners.residue.is_some());
+        assert!(
+            h.events()
+                .last()
+                .is_some_and(|e| e.contains("restos continuam no jogo (sem permissão)"))
+        );
+
+        // O jogo fechou durante a restauração.
+        h.ctl.push_outcome(OpOutcome::Gone);
+        assert!(h.key(Action::Retry, 300));
+        assert_eq!(h.c.model.conn, Conn::Waiting);
+        assert!(!h.row("a").residue);
+        assert_eq!(h.c.model.banners.residue, None);
+        assert_eq!(h.c.model.busy, None);
+    }
+
+    #[test]
+    fn stuck_banner_appears_and_clears() {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![cheat("a", available())]);
+        h.connect(0);
+        assert_eq!(h.c.model.banners.stuck, None);
+
+        // Uma operação que deixa o jogo parado: o aviso aparece logo depois da chamada.
+        h.ctl.set_stuck(true);
+        assert!(h.toggle("a", 100));
+        assert_eq!(
+            h.c.model.banners.stuck.as_deref(),
+            Some("o jogo pode ter ficado parado: kill -CONT 100")
+        );
+
+        // O SIGCONT que falha de novo mantém o aviso.
+        h.ctl.push_outcome(OpOutcome::Refused("EPERM".to_string()));
+        assert!(h.key(Action::Retry, 200));
+        assert!(h.c.model.banners.stuck.is_some());
+
+        // Deu certo: o aviso some.
+        assert!(h.key(Action::Retry, 300));
+        assert_eq!(h.c.model.banners.stuck, None);
+        // E o jogo que fecha também apaga o aviso.
+        h.ctl.set_stuck(true);
+        h.tick(400);
+        assert!(h.c.model.banners.stuck.is_some());
+        h.ctl.set_exited(true);
+        h.tick(500);
+        assert_eq!(h.c.model.banners.stuck, None);
+    }
+
+    #[test]
+    fn retry_opens_engine_when_diary_resolves() {
+        let mut h = H::new();
+        h.ctl.push_recover(blocked("não foi possível restaurar x"));
+        h.c.start(&mut *h.draw);
+        h.ctl.push_recover(blocked("ainda bloqueado"));
+        h.ctl
+            .set_catalog(vec![cheat("a", available()), cheat("b", available())]);
+        h.connect(0);
+        assert_eq!(connected(&h.c), (100, "v1".to_string(), true, false));
+        // Desejados de antes: `a` da mesma versão, `b` de outra.
+        h.c.set_desired("a", Some(desired_of(0, "v1")));
+        h.c.set_desired("b", Some(desired_of(0, "v0")));
+        h.tick(100);
+        assert!(h.applies().is_empty(), "diário bloqueado: não escreve");
+
+        h.ctl.clear_calls();
+        assert!(h.key(Action::Retry, 1_000));
+        assert_eq!(
+            h.ctl.calls(),
+            [
+                Call::Recover {
+                    busy: Some("recuperando o diário…".to_string())
+                },
+                Call::OpenEngine
+            ]
+        );
+        assert_eq!(h.c.model.banners.blocked, None);
+        assert_eq!(connected(&h.c), (100, "v1".to_string(), true, true));
+        // A religação roda no `tick` seguinte, só para a mesma versão.
+        assert!(h.applies().is_empty());
+        h.tick(1_100);
+        assert_eq!(h.applies(), [apply_call(&[("a", 0)], "religando…")]);
+        assert!(h.row("a").on);
+        assert!(!h.row("b").on);
+        assert_eq!(
+            event_count(&h, "b: versão nova; aperte espaço para ligar"),
+            1
+        );
+    }
+
+    #[test]
+    fn retry_opens_engine_when_disk_becomes_readable() {
+        let mut h = H::new();
+        let mut bad = SearchSpec::new(vec![cheat("a", unavailable("disco ilegível"))]);
+        bad.disk = Err("sem cabeçalho".to_string());
+        h.ctl.set_default_search(bad);
+        h.connect(0);
+        assert_eq!(connected(&h.c), (100, "v1".to_string(), false, false));
+
+        // O disco volta a ser legível; só o `r` refaz a busca.
+        h.ctl
+            .push_search(Ok(SearchSpec::new(vec![cheat("a", available())])));
+        h.ctl.clear_calls();
+        assert!(!h.key(Action::Retry, 1_000));
+        assert!(h.wait(1_000));
+        assert_eq!(connected(&h.c), (100, "v1".to_string(), true, true));
+        assert!(h.ctl.calls().contains(&Call::OpenEngine));
+        assert_eq!(h.row("a").avail, available());
+        // O disco novo ficou na sessão (o `merge_search` do alvo falso o guarda).
+        assert_eq!(h.ctl.merge_ids().len(), 1);
     }
 }

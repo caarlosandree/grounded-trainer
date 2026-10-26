@@ -130,7 +130,8 @@ pub(crate) struct FakeState {
     pub exited: bool,
     pub stuck: bool,
     pub pending: Vec<String>,
-    pub outcomes: VecDeque<OpOutcome>,
+    /// Desfechos programados; cada um leva, se houver, os `id` pendentes que a operação deixa.
+    pub outcomes: VecDeque<(OpOutcome, Option<Vec<String>>)>,
     pub undo_all: (Vec<String>, Vec<String>),
 }
 
@@ -231,7 +232,15 @@ impl FakeCtl {
 
     /// Programa o desfecho da próxima operação da sessão (vazio, vale `Done(1 ms)`).
     pub fn push_outcome(&self, o: OpOutcome) {
-        self.state().outcomes.push_back(o);
+        self.state().outcomes.push_back((o, None));
+    }
+
+    /// Programa um desfecho `Residue` que deixa `ids` pendentes no motor (como o real).
+    pub fn push_residue(&self, cause: &str, ids: &[&str]) {
+        let pending = ids.iter().map(|s| s.to_string()).collect();
+        self.state()
+            .outcomes
+            .push_back((OpOutcome::Residue(cause.to_string()), Some(pending)));
     }
 
     pub fn set_undo_all(&self, restored: Vec<String>, foreign: Vec<String>) {
@@ -442,9 +451,14 @@ impl FakeSession {
         let mut s = self.ctl.state();
         let busy = FakeCtl::drawn_busy(&s);
         s.calls.push(make(busy));
-        s.outcomes
+        let (outcome, pending) = s
+            .outcomes
             .pop_front()
-            .unwrap_or(OpOutcome::Done(Duration::from_millis(1)))
+            .unwrap_or((OpOutcome::Done(Duration::from_millis(1)), None));
+        if let Some(pending) = pending {
+            s.pending = pending;
+        }
+        outcome
     }
 }
 
@@ -514,11 +528,19 @@ impl Session<()> for FakeSession {
     }
 
     fn restore_pending(&mut self) -> OpOutcome {
-        self.op(|busy| Call::RestorePending { busy })
+        let out = self.op(|busy| Call::RestorePending { busy });
+        if matches!(out, OpOutcome::Done(_)) {
+            self.ctl.state().pending.clear();
+        }
+        out
     }
 
     fn retry_resume(&mut self) -> OpOutcome {
-        self.op(|busy| Call::RetryResume { busy })
+        let out = self.op(|busy| Call::RetryResume { busy });
+        if matches!(out, OpOutcome::Done(_)) {
+            self.ctl.state().stuck = false;
+        }
+        out
     }
 
     fn is_stuck(&self) -> bool {
