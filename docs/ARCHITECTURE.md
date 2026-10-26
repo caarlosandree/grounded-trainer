@@ -49,9 +49,9 @@ grounded-trainer/
 │   │       ├── patch.rs          # validação de patch, fronteiras de instrução, regra de perigo, política
 │   │       ├── journal.rs        # diário em disco, trava OFD e decisão de recuperação (pura)
 │   │       ├── suspend.rs        # pausar/retomar o processo com conferência das threads
-│   │       ├── value.rs          # ValueSpec (i32/u32/f32), grade por k e bytes de um valor
+│   │       ├── value.rs          # ValueGrid (grade sem slot: i32/u32/f32, passos, formatação, 4 bytes) e ValueSpec { grid, slot }
 │   │       ├── global.rs         # globais por padrão AOB: alvo RIP-relativo e decisão de unicidade
-│   │       ├── engine.rs         # motor: patches com diário e pausa; escrita em dados e bits, sem pausa (feature write)
+│   │       ├── engine.rs         # motor: patches com diário e pausa; escrita em dados (bits, inteiro e set_word), sem pausa (feature write)
 │   │       ├── recovery.rs       # recuperação do diário no início de cada comando (feature write)
 │   │       └── session.rs        # sinais de encerramento, laço do run e toggle (feature write)
 │   ├── gt-ue/                    # leitor genérico da reflexão do Unreal Engine 5 (Fase 5), só leitura
@@ -66,8 +66,8 @@ grounded-trainer/
 │   ├── gt-grounded2/             # conhecimento específico do jogo
 │   │   ├── src/catalog.rs        # busca dos padrões dos patches e das globais numa passada
 │   │   ├── src/ue.rs             # estado das globais do Unreal e conferência barata (UeScan)
-│   │   ├── src/player.rs         # caminho até o personagem, catálogo dos cheats de valor e plano das escritas
-│   │   ├── src/fields.rs         # execução dos cheats de valor no motor (feature write)
+│   │   ├── src/player.rs         # caminho até o personagem e até o GameState, catálogo dos cheats de valor e plano das escritas (lock, bits, set, add)
+│   │   ├── src/fields.rs         # execução dos cheats de valor e da ação no motor (feature write)
 │   │   └── signatures/           # *.toml por build do jogo
 │   └── gt-testkit/               # apoio a testes (publish = false): TestTarget, bin_path e binários de apoio
 │       ├── src/bin/gt-testtarget.rs      # processo-alvo de teste (não é o gt)
@@ -139,6 +139,7 @@ As versões são fixadas no `Cargo.toml` na Fase 0, usando a estável mais recen
 - Versão com arquivo e `rva` conferido: patch "disponível (verificado)". Versão sem arquivo (ou sem entrada para o `id`) usa a definição genérica e, se o padrão for único na memória e no disco no mesmo lugar, fica "disponível (não verificado)".
 - Cada patch informa o próprio estado (tabela da spec 002, 6.4): disponível (verificado ou não verificado), ativo, pendente, bytes diferentes, fora do lugar, não encontrado, ambíguo, inconclusivo ou disco ilegível.
 - **Fase 5 (spec 005, 6.2 e 6.5):** o `generic.toml` também traz o bloco `[ue]`: os padrões das duas globais do Unreal (`gobjects` e `names`, com `disp_offset`, `insn_end` e `adjust` da resolução RIP-relativa), o `[ue.layout]` (offsets das estruturas de reflexão: `objects`, `uobject`, `ustruct`, `ffield`, `fprop`, `fbool`, `fstruct`) e o `[ue.player]` (classe do controller, campo do pawn, classe do pawn e campos alternativos, por nome). O `<chave>.toml` registra no `[ue]` o `rva` de cada global **resolvida** e pode sobrescrever o layout inteiro. Os cheats de valor são blocos `[[field]]`, separados dos `[[patch]]` (com `id` único entre os dois): objeto (campo do pawn ou `pawn`) e classe dele, regra `lock` (campo `float`, `mode` `raise`/`lower`/`exact`, alvo `target_field` (aceita `Struct.Campo`) ou `target` constante, faixa sã `min`/`max`) ou `clear_bits` (campos `bool`). Nenhum offset de campo do jogo vai às assinaturas: campos vêm da reflexão, por nome.
+  - **Spec 006 (carga, dano, ciência e movimento):** o `[[field]]` ganha `kind = "int"` (`IntProperty`, 4 bytes; o `lock` continua só com `float`) e duas regras: `set` (troca um valor de configuração do jogo pelo nosso enquanto ligado e devolve o original ao desligar; `fields` com um ou mais campos, e **exatamente um** entre `[field.value]` e `target`) e `add` (uma ação única de somar, com `result_max`, sem diário e sem desfazer). O bloco `[field.value]` (`type` `i32`/`f32`, `min`, `max`, `step`, `default`, `unit`, `decimals`, **sem `slot`**) dá ao cheat de valor a mesma grade e as mesmas teclas dos patches com valor; com `target`, `min`/`max` só conferem o `target` na carga. O campo opcional `root` (`"pawn"`, padrão, ou `"game_state"`) escolhe a raiz do caminho; `"game_state"` só vale com `add` e usa os campos novos do `[ue.player]` (`level_class`, `world_field`, `world_class`, `game_state_field`, `game_state_class`). Dois `set` sobre o mesmo campo são erro de carga. Os `[[field]]` **continuam sem sobrescrita** no `<chave>.toml`: só existem no `generic.toml`.
 - **Unicidade das globais:** um padrão de global é aceito com uma ocorrência ou com várias que resolvem todas para o mesmo endereço (só para **leitura** de globais; patches continuam exigindo ocorrência única). Com `rva`, o endereço resolvido tem de ser `base + rva` (senão `fora do lugar`); sem `rva`, fica não verificado.
 
 ### 5.4 Escrita segura de patches
@@ -152,6 +153,7 @@ Detalhes na spec `docs/specs/002-motor-patches.md` (6.2 a 6.8).
 7. **`stuck` persistente:** se o `SIGCONT` falha, o marcador "pausado por nós" fica no diário e o estado `stuck` é mantido até um `SIGCONT` bem-sucedido; toda operação seguinte (inclusive o desfazer da saída e o `Drop`) tenta de novo antes de qualquer outra coisa. A TUI mostra `kill -CONT <pid>` e o `r` tenta de novo.
 8. **Recuperação** (SIGKILL, travamento, queda de energia): no início de cada comando, o diário é conferido contra o `/proc` (`boot_id`, PID, horário de início). Outro boot ou processo: descarta. Mesmo processo: `SIGCONT` se estava pausado por nós e, para cada entrada em memória executável, reescreve os originais onde cada byte é o original ou o nosso; byte de outro → não escreve. O diário só é limpo quando tudo foi resolvido.
 9. **Escrita em dados** (Fase 5, spec 005 6.6): um segundo tipo de escrita, **sem pausa**, em campos de dados (1 a 8 bytes), numa política própria (regiões `rw-` do `maps` fora das imagens de módulo, em cache e relida quando o objeto muda ou uma escrita falha). Toda escrita relê imediatamente antes uma guarda do objeto (vtable, `InternalIndex`, `ClassPrivate`) e recusa se ela mudou. Travas de barra não vão ao diário (não há original a restaurar). Bits limpos vão: uma entrada `DataEntry` por cheat e byte (byte original, escrito, máscara e guarda), gravada **antes** da escrita. Restaurar (desligar, `undo_all`, `Drop`, recuperação) só devolve os bits da máscara ao original, preservando os outros; objeto trocado, byte ilegível ou fora de região `rw` descartam a entrada sem escrever. A recuperação trata as entradas de dados por essa regra, e não pela política de memória executável. Diários antigos (sem `data`) continuam legíveis.
+10. **Entradas de dados de N bytes** (spec 006, 6.8): a entrada de dados guarda, além dos bits da 005 (**1 byte** e máscara), o modo **inteiro** dos `set` (1 a 8 bytes; esta fase usa 4). `original` e `written` são sequências de bytes do mesmo tamanho, e `next` é opcional (só durante uma troca de valor). Restaurar no modo inteiro exige que **todos** os bytes atuais sejam iguais ao `written` (ou ao `next`) e escreve o `original` inteiro numa escrita só; qualquer byte diferente não escreve nada e só esquece a entrada, e nunca sobra um valor misturado. A identidade de uma entrada é o par (`id`, endereço), e não a estrutura inteira; atualizar (original novo na manutenção, `next` na troca) grava o diário antes da escrita e substitui a entrada do mesmo par. `Engine::set_word` escreve um campo `set` com esse protocolo e `Engine::restore_field` (antes `restore_bits`) resolve uma entrada de qualquer modo. A recuperação e o `gt-patch restore` seguem a mesma regra. Diários da 005 (um byte, sem modo) continuam legíveis como modo bits.
 
 ### 5.5 Code caves (Fase 6)
 Sem `VirtualAllocEx` de fora do processo, existem duas estratégias:
@@ -173,10 +175,19 @@ As instruções originais copiadas para a cave passam por relocação (endereço
 - "Congelar" valores = a manutenção de ~10 Hz no **ciclo do laço principal** da TUI (onde moram o motor e o diário),
   nunca dentro do jogo nem numa thread própria. Ela revalida o caminho controller → pawn → componente a cada ciclo e
   não conta como operação.
+- **Spec 006:** o cheat de valor ganha as regras `set` (original no diário, devolvido ao desligar, na saída e na
+  recuperação; o valor que o jogo põe no campo durante o cheat vira o original novo, e mais de 5 originais novos em
+  10 s param a escrita com `o jogo não deixa`) e `add` (ação única, no máximo uma por segundo, sem diário). A raiz
+  `game_state` (controller → `Outer` → `Level.OwningWorld` → `World.GameState` → `PartyComponent`) tem **leitura
+  própria**, sob demanda, fora do snapshot do pawn que a manutenção usa; cada salto é conferido por classe. O
+  **isolamento é por raiz e por cheat**: um componente nulo ou de classe errada deixa só os cheats dele em espera
+  (`aguardando o personagem` ou `aguardando o pet`), e uma falha num caminho não afeta o outro. Detalhes na spec
+  `006-progressao-e-movimento.md`.
 
 ### 5.7 Interface
 - `gt-tui`: ratatui num terminal ao lado do jogo. Comandos por teclado **no terminal** (sem hotkeys globais, por causa do Wayland). Detalhes na spec `docs/specs/003-interface-tui.md`.
 - **Tela:** lista única agrupada por categoria (`[ON ]`, `[OFF]`, `?` não verificado, `↻` religar pendente, `indisponível (<motivo>)`, `erro`), status de conexão no topo, aviso fixo para diário não resolvido ou jogo possivelmente parado, registro de eventos embaixo (200 linhas guardadas) e teclas no rodapé. Abaixo de 60×15 mostra só `aumente o terminal`.
+- **Cheats de valor com valor e ação** (spec 006): os `set` com `[field.value]` mostram o valor como os patches com valor e aceitam `←→`/`hl` (com o cheat desligado, só mudam o valor mostrado). A ação de somar mostra `[ação]` e a quantidade no lugar de `[ON ]`/`[OFF]`, não entra na contagem de cheats ligados do topo e executa no máximo uma vez por segundo (tecla segurada soma uma vez por segundo); sem controller, recusa e pede a procura do controller, e a linha `personagem:` segue o controller guardado depois dela.
 - **Teclas:** `↑↓`/`jk` movem; `espaço`/`Enter` liga e desliga; `←→`/`hl` trocam o valor (na hora, com intervalo mínimo de 150 ms entre trocas); `r` tenta SIGCONT, restos, diário ou nova busca, nessa ordem; `q`/`Esc`/Ctrl+C saem, desligando tudo sem confirmação.
 - **Núcleo testável:** o controlador fala com o jogo por uma interface de alvo (`Backend`), com a implementação do jogo, uma crua (contra o `gt-testtarget`, atrás da feature `test-backend`) e uma falsa nos testes unitários; o terminal também é uma interface, com versão falsa para testar a restauração.
 - **Reconexão:** procura o jogo a cada 2 s; depois de cada conexão, novas buscas a cada `max(5 s, 2 × duração da última)` por até 120 s; o `r` reinicia esse prazo de 120 s; cheats ligados antes da queda são religados sozinhos, só na mesma chave de versão (versão nova exige espaço). Com `--pid`, o fim do processo é um estado final. Disco do jogo ilegível = conectado sem motor, com todos os cheats em `indisponível (disco ilegível)` até um `r` com o disco legível.
@@ -232,6 +243,15 @@ As instruções originais copiadas para a cave passam por relocação (endereço
 | 2026-10-26 | Pawn escrito só se `is_a(SurvivalPlayerCharacter)`; montado, o personagem vem do `CachedSurvivalPlayerCharacter` do controller | Uma montaria no `Pawn` nunca é escrita (spec 005 6.3, P7) |
 | 2026-10-26 | Comandos `gt ue class` e `gt ue player` (com `--controller` e `--watch`), só leitura | Pesquisa e conferência depois de atualizações (spec 005 6.8) |
 | 2026-10-26 | Cheats do pet (vida, não morre, stamina) na categoria `PET`, pelo caminho `PetMasterComponent.CurrentPetFull.<componente>` com a classe de cada salto conferida (`PropertyClass`); sem o pet no mundo, só eles esperam (`aguardando o pet`) | Pedido do dono, sem spec por decisão dele; a regra "nunca escrever em criaturas" da spec 005 passa a ter a exceção do pet apontado pelo próprio personagem |
+| 2026-10-26 | Teleporte e velocidade do jogo (speedhack) fora da Fase 5 | Dono, spec 006: o jogo tem viagem rápida e o dono quer explorar |
+| 2026-10-26 | Regra `set`: original no diário antes da escrita, devolvido ao desligar; valor mudado pelo jogo durante o cheat vira o original novo; mais de 5 em 10 s para de escrever (`o jogo não deixa`) | IA, spec 006 6.4: não devolver um original velho por cima de um upgrade, sem brigar com o jogo |
+| 2026-10-26 | Num `set`, o original devolvido é o último valor que o jogo pôs no campo, e não o do momento de ligar | IA, aprovada pelo dono, spec 006 7 |
+| 2026-10-26 | Entrada de dados do diário de N bytes (até 8), modos bits e inteiro, com `next` na troca; restauração tudo-ou-nada no modo inteiro; identidade da entrada pelo par (`id`, endereço); diários da 005 legíveis | IA, spec 006 6.8: nunca sobra um valor misturado nem uma cópia velha |
+| 2026-10-26 | Grade de valores (`ValueGrid`) separada do `slot` no `gt-core`; `[field.value]` sem `slot`; `[[field]]` continua sem sobrescrita no `<chave>.toml` | IA, spec 006 6.5 |
+| 2026-10-26 | Ciência como ação de somar (`add`), sem trava e sem desfazer, sabendo que vai para o save; no máximo uma execução por segundo; faixa sã com `result_max` | Dono (ação, ciência no save) e IA aprovada pelo dono (limite e teto), spec 006 6.6 e 7 |
+| 2026-10-26 | Raízes independentes (pawn e `game_state`), cada uma com leitura própria; isolamento por cheat para todo componente; `root = "game_state"` só com `add` | IA, spec 006 6.3 |
+| 2026-10-26 | Velocidade pelos multiplicadores do próprio jogo (`CustomGroundSpeedMultiplier`/`CustomSwimSpeedMultiplier`), não pelo `MaxWalkSpeed`; pulos por `JumpMaxCount = 1000` | IA, spec 006 6.1 e 6.7.3: o `MaxWalkSpeed` não é a velocidade de corrida |
+| 2026-10-26 | Ressalvas novas no `AGENTS.md` 3 (ação sem desfazer, `set` sem bytes esperados) e valores acima da faixa normal do jogo nos `set` (dano ×100, carga 100, `JumpMaxCount` 1000) | IA, aprovada pelo dono, spec 006 4 e 7: o original volta ao desligar |
 | 2026-10-25 | `name` e `category` obrigatórios nas assinaturas; bloco `value` sobrescrito inteiro por versão | Lista agrupada e sem campos pela metade (spec 003, 6.3) |
 | 2026-10-25 | Núcleo da TUI testável por uma interface de alvo (jogo, crua e falsa) e por uma interface de terminal com versão falsa | Testar conexão, reconexão, sinais e restauração sem o jogo |
 | 2026-10-25 | `stuck` mantido até um `SIGCONT` bem-sucedido, com nova tentativa antes de cada operação; restos de falha viram `erro` e só a recuperação (`r`) resolve | Nunca deixar o jogo parado sem aviso (spec 003, 6.8) |

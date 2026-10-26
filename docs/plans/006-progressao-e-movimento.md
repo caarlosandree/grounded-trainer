@@ -342,8 +342,8 @@ para as regras sem processo, em `mod tests`.
   `value_is_sane`, `encode_value`, `read_game_state`, `plan_add`, `missing_note` (Tarefa 5).
 - Produz:
   - `Note` ganha `InvalidGameValue` (`valor do jogo inválido`) e `GameRefuses` (`o jogo não deixa`).
-  - `FieldRuntime::set_desired(&mut self, id: &str, value: f64)`: valor desejado de um `set` com `[field.value]` (o
-    `target`, se houver, é o padrão). O `tick` usa o desejado de cada `id` ligado.
+  - `FieldRuntime::set_desired(&mut self, id: &str, value: f64)`: valor desejado de um `set` com `[field.value]`
+    (com `target`, o valor escrito é sempre o `target`, e `set_desired` não se aplica). O `tick` usa o desejado de cada `id` ligado.
   - No `tick`, para cada `set` ligado: resolve antes a entrada de outro objeto (`DataEntryOtherObject` →
     `restore_field` e tenta de novo); chama `set_word` por campo com `accept = value_is_sane`; `Rejected` →
     `Note::InvalidGameValue`; `NewOriginal(x)` → evento `<nome>: o jogo mudou o valor para <X>; novo original` e
