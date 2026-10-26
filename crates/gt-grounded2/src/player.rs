@@ -850,6 +850,28 @@ pub fn read_game_state<M: ReadMem + ?Sized>(
     controller: u64,
     id: &str,
 ) -> Result<(u64, u64, Vec<GuardBytes>), GameStateAbsent> {
+    walk_game_state(
+        mem,
+        index,
+        catalog,
+        objects,
+        controller,
+        id,
+        &mut GameStateReport::default(),
+    )
+}
+
+/// Como [`read_game_state`], anotando em `hops` o endereço de cada salto que deu certo (para o
+/// relatório mostrar até onde o caminho chegou quando um deles falha).
+fn walk_game_state<M: ReadMem + ?Sized>(
+    mem: &M,
+    index: &ReflectionIndex,
+    catalog: &FieldCatalog,
+    objects: &ObjectArray,
+    controller: u64,
+    id: &str,
+    hops: &mut GameStateReport,
+) -> Result<(u64, u64, Vec<GuardBytes>), GameStateAbsent> {
     let Ok(path) = &catalog.path else {
         return Err(GameStateAbsent::ControllerInvalid);
     };
@@ -891,6 +913,7 @@ pub fn read_game_state<M: ReadMem + ?Sized>(
     {
         return Err(missing("Outer"));
     }
+    hops.level = Some(outer);
     let mut next = |from: u64, hop: &Field, class: u64| -> Result<u64, GameStateAbsent> {
         let ptr = r.pointer(from, hop).map_err(gone(&hop.name))?;
         let ok = ptr != 0
@@ -900,8 +923,11 @@ pub fn read_game_state<M: ReadMem + ?Sized>(
         if ok { Ok(ptr) } else { Err(missing(&hop.name)) }
     };
     let world = next(outer, &gs.world_field, gs.world_class)?;
+    hops.world = Some(world);
     let state = next(world, &gs.game_state_field, gs.game_state_class)?;
+    hops.game_state = Some(state);
     let obj = r.object(state, resolved).map_err(gone(id))?;
+    hops.object = Some(obj);
     r.check_fits(obj, &field.name, field.offset, field.size)
         .map_err(gone(&field.name))?;
     let guard = r
@@ -1175,15 +1201,35 @@ pub enum FieldReportValue {
     Set {
         fields: Vec<SetFieldReport>,
     },
-    /// Lido sob demanda pela ação, fora do snapshot do personagem.
-    OnDemand,
+    /// Valor atual do campo de uma ação (`add`), lido sob demanda pelo caminho do `GameState`.
+    Add {
+        addr: u64,
+        current: i32,
+    },
 }
 
 /// Um campo de um `set`, no relatório.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SetFieldReport {
+    /// Nome do campo na reflexão.
+    pub name: String,
     pub addr: u64,
+    /// Bytes atuais (`u32` little-endian).
     pub raw: u32,
+    /// Valor atual formatado pela grade do cheat (ou simples, sem grade).
+    pub value: String,
+}
+
+/// Caminho controller → `Level` → `World` → `GameState` → objeto da ação, até onde foi lido. Um
+/// salto que falha deixa os seguintes em `None` e o motivo em `error`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct GameStateReport {
+    pub level: Option<u64>,
+    pub world: Option<u64>,
+    pub game_state: Option<u64>,
+    /// Objeto da ação (o `PartyComponent`, no jogo).
+    pub object: Option<u64>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1202,6 +1248,8 @@ pub struct PlayerReport {
     pub character: Option<u64>,
     pub acknowledged_pawn: Option<u64>,
     pub fields: Vec<FieldReport>,
+    /// Caminho do `GameState`, quando há cheat de ação nessa raiz.
+    pub game_state: Option<GameStateReport>,
 }
 
 /// Lê o personagem e monta o relatório do `gt ue player`.
@@ -1221,12 +1269,27 @@ pub fn player_report<M: ReadMem + ?Sized>(
             .filter(|f| is_object_family(&f.kind))
             .and_then(|f| read_u64(mem, controller + u64::from(f.offset)).ok())
     });
+    let mut game_state = None;
     let fields = catalog
         .entries
         .iter()
-        .map(|entry| FieldReport {
-            id: entry.id.clone(),
-            value: report_value(&snapshot, entry),
+        .map(|entry| {
+            let value = match action_in_game_state(entry) {
+                Some(field) => {
+                    let mut hops = GameStateReport::default();
+                    let value = report_action(
+                        mem, index, catalog, objects, controller, entry, field, &mut hops,
+                    );
+                    // Um só caminho no relatório: o do primeiro cheat de ação.
+                    game_state.get_or_insert(hops);
+                    value
+                }
+                None => report_value(&snapshot, entry),
+            };
+            FieldReport {
+                id: entry.id.clone(),
+                value,
+            }
         })
         .collect();
     Ok(PlayerReport {
@@ -1235,7 +1298,48 @@ pub fn player_report<M: ReadMem + ?Sized>(
         character,
         acknowledged_pawn,
         fields,
+        game_state,
     })
+}
+
+/// O campo de uma ação (`add`) de raiz `game_state` resolvida, se `entry` for uma.
+fn action_in_game_state(entry: &CatalogEntry) -> Option<&Field> {
+    match &entry.resolved {
+        Ok(ResolvedField {
+            root: FieldRoot::GameState,
+            rule: ResolvedRule::Add { field, .. },
+            ..
+        }) => Some(field),
+        _ => None,
+    }
+}
+
+/// Lê o valor atual de uma ação pelo caminho do `GameState`; a falha mostra o salto que faltou.
+#[allow(clippy::too_many_arguments)]
+fn report_action<M: ReadMem + ?Sized>(
+    mem: &M,
+    index: &ReflectionIndex,
+    catalog: &FieldCatalog,
+    objects: &ObjectArray,
+    controller: u64,
+    entry: &CatalogEntry,
+    field: &Field,
+    hops: &mut GameStateReport,
+) -> FieldReportValue {
+    let fail = |reason: String, hops: &mut GameStateReport| {
+        hops.error = Some(reason.clone());
+        FieldReportValue::Unavailable { reason }
+    };
+    match walk_game_state(mem, index, catalog, objects, controller, &entry.id, hops) {
+        Ok((_, addr, _)) => match read_u32(mem, addr) {
+            Ok(raw) => FieldReportValue::Add {
+                addr,
+                current: i32::from_le_bytes(raw.to_le_bytes()),
+            },
+            Err(_) => fail(format!("{} ilegível", field.name), hops),
+        },
+        Err(absent) => fail(absent.to_string(), hops),
+    }
 }
 
 fn report_value(snapshot: &PlayerSnapshot, entry: &CatalogEntry) -> FieldReportValue {
@@ -1283,19 +1387,54 @@ fn report_value(snapshot: &PlayerSnapshot, entry: &CatalogEntry) -> FieldReportV
                 .collect();
             FieldReportValue::Bits { bits }
         }
-        (_, Some(FieldValues::Set { fields, .. })) => FieldReportValue::Set {
+        (
+            ResolvedRule::Set {
+                fields: defs, kind, ..
+            },
+            Some(FieldValues::Set { fields, .. }),
+        ) => FieldReportValue::Set {
             fields: fields
                 .iter()
-                .map(|&(addr, bytes)| SetFieldReport {
+                .zip(defs)
+                .map(|(&(addr, bytes), def)| SetFieldReport {
+                    name: def.name.clone(),
                     addr,
                     raw: u32::from_le_bytes(bytes),
+                    value: format_value(entry.grid.as_ref(), *kind, decode_value(*kind, &bytes)),
                 })
                 .collect(),
         },
-        _ if resolved.root == FieldRoot::GameState => FieldReportValue::OnDemand,
         _ => FieldReportValue::Unavailable {
             reason: INCOHERENT.to_string(),
         },
+    }
+}
+
+/// O valor `v` com as casas e a unidade da grade (ou sem grade, simples).
+pub(crate) fn format_value(grid: Option<&ValueGrid>, kind: FieldKind, v: f64) -> String {
+    match grid {
+        // Uma grade de um ponto só, em `v`, reaproveita a formatação sem prender `v` à faixa.
+        Some(g) => ValueGrid {
+            min: v,
+            max: v,
+            step: 1.0,
+            default_k: 0,
+            ..g.clone()
+        }
+        .format(0),
+        None => match kind {
+            FieldKind::Int => format!("{v:.0}"),
+            FieldKind::Float => format!("{v}"),
+        },
+    }
+}
+
+/// Os 4 bytes de um campo como número (para mostrar).
+pub(crate) fn decode_value(kind: FieldKind, bytes: &[u8]) -> f64 {
+    let raw: [u8; 4] = bytes.try_into().unwrap_or_default();
+    match kind {
+        FieldKind::Int => f64::from(i32::from_le_bytes(raw)),
+        FieldKind::Float => f64::from(f32::from_le_bytes(raw)),
     }
 }
 

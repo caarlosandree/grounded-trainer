@@ -14,14 +14,13 @@ use gt_core::Error as CoreError;
 use gt_core::engine::{BatchReport, Engine, SetOutcome};
 use gt_core::journal::GuardBytes;
 use gt_core::mem::ReadMem;
-use gt_core::value::ValueGrid;
 use gt_ue::read::read_u32;
 use gt_ue::{ObjectArray, ReflectionIndex};
 
 use crate::player::{
     Absent, AddRefusal, FieldAction, FieldCatalog, FieldValues, GameStateAbsent, MissingKind,
-    PlayerSnapshot, ResolvedField, ResolvedRule, encode_value, missing_kind, plan_add, plan_tick,
-    read_game_state, read_player, value_is_sane,
+    PlayerSnapshot, ResolvedField, ResolvedRule, decode_value, encode_value, format_value,
+    missing_kind, plan_add, plan_tick, read_game_state, read_player, value_is_sane,
 };
 use crate::signatures::{FieldKind, LockMode};
 
@@ -97,34 +96,6 @@ impl Fight {
         }
         self.news.push_back(now);
         self.news.len() > FIGHT_LIMIT
-    }
-}
-
-/// O valor `v` com as casas e a unidade da grade (ou sem grade, simples).
-fn format_value(grid: Option<&ValueGrid>, kind: FieldKind, v: f64) -> String {
-    match grid {
-        // Uma grade de um ponto só, em `v`, reaproveita a formatação sem prender `v` à faixa.
-        Some(g) => ValueGrid {
-            min: v,
-            max: v,
-            step: 1.0,
-            default_k: 0,
-            ..g.clone()
-        }
-        .format(0),
-        None => match kind {
-            FieldKind::Int => format!("{v:.0}"),
-            FieldKind::Float => format!("{v}"),
-        },
-    }
-}
-
-/// Os 4 bytes de um campo como número (para mostrar).
-fn decode_value(kind: FieldKind, bytes: &[u8]) -> f64 {
-    let raw: [u8; 4] = bytes.try_into().unwrap_or_default();
-    match kind {
-        FieldKind::Int => f64::from(i32::from_le_bytes(raw)),
-        FieldKind::Float => f64::from(f32::from_le_bytes(raw)),
     }
 }
 
@@ -669,6 +640,7 @@ impl FieldRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gt_core::value::ValueGrid;
 
     #[test]
     fn fight_counts_more_than_five_in_ten_seconds() {

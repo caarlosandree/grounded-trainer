@@ -1649,3 +1649,106 @@ fn plan_add_cases() {
         Err(AddRefusal::WouldExceed)
     );
 }
+
+// ---- relatório com carga, dano, ciência e movimento (spec 006, 6.10) ----
+
+fn report_with(w: &World, catalog: &FieldCatalog) -> PlayerReport {
+    player_report(&w.mem, &w.index, catalog, &w.objects, w.controller).unwrap()
+}
+
+fn report_field<'a>(report: &'a PlayerReport, id: &str) -> &'a FieldReportValue {
+    &report.fields.iter().find(|f| f.id == id).unwrap().value
+}
+
+#[test]
+fn report_includes_set_and_add() {
+    let w = world(&[]);
+    w.mem
+        .write(w.party + u64::from(SCIENCE_OFF), &1234i32.to_le_bytes());
+    let catalog = full_catalog(&w, &cfg_gs());
+    let report = report_with(&w, &catalog);
+
+    let FieldReportValue::Set { fields } = report_field(&report, "velocidade") else {
+        panic!("velocidade não é set");
+    };
+    let got: Vec<(&str, u64)> = fields.iter().map(|f| (f.name.as_str(), f.addr)).collect();
+    assert_eq!(
+        got,
+        vec![
+            (
+                "CustomGroundSpeedMultiplier",
+                w.movement + u64::from(GROUND_MULT_OFF)
+            ),
+            (
+                "CustomSwimSpeedMultiplier",
+                w.movement + u64::from(SWIM_MULT_OFF)
+            ),
+        ]
+    );
+    // Sem grade, o valor atual aparece formatado pelo tipo (1.0 no mundo sintético).
+    assert!(fields.iter().all(|f| !f.value.is_empty()));
+
+    let FieldReportValue::Set { fields } = report_field(&report, "carga") else {
+        panic!("carga não é set");
+    };
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].addr, w.hauling + u64::from(CAPACITY_OFF));
+
+    assert_eq!(
+        report_field(&report, "somar-ciencia"),
+        &FieldReportValue::Add {
+            addr: w.party + u64::from(SCIENCE_OFF),
+            current: 1234,
+        }
+    );
+}
+
+#[test]
+fn report_game_state_path() {
+    let w = world(&[]);
+    let catalog = full_catalog(&w, &cfg_gs());
+    let report = report_with(&w, &catalog);
+    assert_eq!(
+        report.game_state,
+        Some(GameStateReport {
+            level: Some(w.level),
+            world: Some(w.world),
+            game_state: Some(w.game_state),
+            object: Some(w.party),
+            error: None,
+        })
+    );
+    // Sem cheat de `game_state` no catálogo, não há caminho a mostrar.
+    let plain = FieldCatalog::resolve(&w.index, &w.mem, &cfg_gs(), &defs());
+    assert_eq!(report_with(&w, &plain).game_state, None);
+}
+
+#[test]
+fn report_game_state_missing_hop() {
+    let w = world(&[]);
+    let catalog = full_catalog(&w, &cfg_gs());
+    w.write_u64(w.world + u64::from(GAME_STATE_OFF), 0);
+    let report = report_with(&w, &catalog);
+    // Os saltos que deram certo continuam aparecendo; o que falhou vem como motivo.
+    assert_eq!(
+        report.game_state,
+        Some(GameStateReport {
+            level: Some(w.level),
+            world: Some(w.world),
+            game_state: None,
+            object: None,
+            error: Some("GameState ausente ou de classe inesperada".into()),
+        })
+    );
+    match report_field(&report, "somar-ciencia") {
+        FieldReportValue::Unavailable { reason } => {
+            assert!(reason.contains("GameState"), "{reason}");
+        }
+        other => panic!("{other:?}"),
+    }
+    // O resto do relatório segue valendo.
+    assert!(matches!(
+        report_field(&report, "carga"),
+        FieldReportValue::Set { .. }
+    ));
+}
