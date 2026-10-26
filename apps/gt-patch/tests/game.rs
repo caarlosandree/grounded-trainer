@@ -71,31 +71,25 @@ fn list_shows_test_patch_verified() {
     assert!(text.contains("disponível (verificado)"), "{text}");
 }
 
-#[test]
-#[ignore = "exige o jogo aberto"]
-fn single_toggle_round_trip() {
-    if !known_build() {
-        return;
-    }
+/// Liga e desliga `id` uma vez e confere que a memória volta ao disco no endereço do patch.
+fn round_trip(id: &str) {
     let state = tempfile::tempdir().unwrap();
     let list = gt_patch(state.path(), &["list"]);
     let text = String::from_utf8_lossy(&list.stdout).into_owned();
     // `<id>  <estado>  <módulo>+<offset>`
     let line = text
         .lines()
-        .find(|l| l.starts_with("teste-codificacao"))
-        .unwrap_or_else(|| panic!("patch ausente em: {text}"));
+        .find(|l| l.split_whitespace().next() == Some(id))
+        .unwrap_or_else(|| panic!("patch {id} ausente em: {text}"));
+    assert!(line.contains("disponível (verificado)"), "{line}");
     let offset = parse_hex(line.rsplit_once('+').unwrap().1.trim());
     let base = parse_hex(gt_json(&["inspect"])["module"]["base"].as_str().unwrap());
     let patch_addr = base + offset;
 
-    let out = gt_patch(
-        state.path(),
-        &["toggle", "teste-codificacao", "--times", "1"],
-    );
+    let out = gt_patch(state.path(), &["toggle", id, "--times", "1"]);
     assert!(
         out.status.success(),
-        "{}",
+        "{id}: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 
@@ -106,7 +100,32 @@ fn single_toggle_round_trip() {
         let len = chunk["len"].as_u64().unwrap();
         assert!(
             !(start..start + len).contains(&patch_addr),
-            "o patch deixou diferença em {patch_addr:#x}: {chunk}"
+            "{id} deixou diferença em {patch_addr:#x}: {chunk}"
         );
+    }
+}
+
+#[test]
+#[ignore = "exige o jogo aberto"]
+fn single_toggle_round_trip() {
+    if !known_build() {
+        return;
+    }
+    round_trip("teste-codificacao");
+}
+
+/// Cheats da Fase 4 (spec 004): cada um liga e desliga uma vez no endereço verificado.
+#[test]
+#[ignore = "exige o jogo aberto"]
+fn phase4_cheats_round_trip() {
+    if !known_build() {
+        return;
+    }
+    for id in [
+        "durabilidade-infinita",
+        "energia-infinita",
+        "recarga-instantanea",
+    ] {
+        round_trip(id);
     }
 }
