@@ -73,6 +73,55 @@ mod hex_opt {
     }
 }
 
+/// Bytes de uma entrada de dados: lê um número (formato da spec 005, um byte) ou texto
+/// hexadecimal; grava sempre hexadecimal.
+mod data_bytes {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Num(u8),
+        Text(String),
+    }
+
+    impl Raw {
+        fn into_bytes<E: Error>(self) -> Result<Vec<u8>, E> {
+            match self {
+                Raw::Num(n) => Ok(vec![n]),
+                Raw::Text(text) => super::hex_bytes::parse(&text).map_err(E::custom),
+            }
+        }
+    }
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        super::hex_bytes::serialize(bytes, s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        Raw::deserialize(d)?.into_bytes()
+    }
+
+    /// Versão opcional (`None` não é gravado: use com `skip_serializing_if` e `default`).
+    pub mod opt {
+        use serde::{Deserialize, Deserializer, Serializer};
+
+        pub fn serialize<S: Serializer>(bytes: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+            match bytes {
+                Some(bytes) => super::serialize(bytes, s),
+                None => s.serialize_none(),
+            }
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+            match Option::<super::Raw>::deserialize(d)? {
+                Some(raw) => raw.into_bytes().map(Some),
+                None => Ok(None),
+            }
+        }
+    }
+}
+
 /// Serialização de endereço como `"0x..."`.
 mod hex_addr {
     use serde::{Deserialize, Deserializer, Serializer, de::Error};
@@ -125,21 +174,94 @@ pub struct GuardBytes {
     pub bytes: Vec<u8>,
 }
 
-/// Bits limpos em dados do jogo (spec 005, 6.5.2 e 6.6): uma entrada por cheat e byte.
+/// Como uma entrada de dados foi escrita.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DataMode {
+    /// Bits limpos num byte (spec 005): só os bits da máscara são nossos.
+    #[default]
+    Bits,
+    /// Valor inteiro de 1 a 8 bytes (spec 006).
+    Whole,
+}
+
+/// Escrita em dados do jogo (spec 005, 6.5.2 e 6.6; spec 006, 6.8): uma entrada por cheat e
+/// endereço. `original`, `written` e `next` aceitam número (diário da 005) ou hexadecimal na
+/// leitura e são gravados em hexadecimal.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct DataEntry {
     pub id: String,
-    /// Endereço do byte.
+    /// Endereço do primeiro byte.
     #[serde(with = "hex_addr")]
     pub addr: u64,
-    /// Byte antes da primeira escrita neste objeto.
-    pub original: u8,
-    /// Byte escrito (o original com os bits da máscara limpos).
-    pub written: u8,
-    /// Bits nossos.
+    #[serde(default)]
+    pub mode: DataMode,
+    /// Bytes antes da primeira escrita neste objeto (`Bits`: 1 byte; `Whole`: 1 a 8).
+    #[serde(with = "data_bytes")]
+    pub original: Vec<u8>,
+    /// Bytes escritos (`Bits`: o original com os bits da máscara limpos).
+    #[serde(with = "data_bytes")]
+    pub written: Vec<u8>,
+    /// Bits nossos (só `Bits`; no `Whole` vale 0).
+    #[serde(default)]
     pub mask: u8,
-    /// Conferência de identidade do objeto dono do byte.
+    /// Bytes novos, só durante uma troca de valor; `None` fora dela.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "data_bytes::opt"
+    )]
+    pub next: Option<Vec<u8>>,
+    /// Conferência de identidade do objeto dono dos bytes.
     pub guard: Vec<GuardBytes>,
+}
+
+impl DataEntry {
+    /// Entrada de bits limpos num byte.
+    pub fn bits(
+        id: impl Into<String>,
+        addr: u64,
+        original: u8,
+        written: u8,
+        mask: u8,
+        guard: Vec<GuardBytes>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            addr,
+            mode: DataMode::Bits,
+            original: vec![original],
+            written: vec![written],
+            mask,
+            next: None,
+            guard,
+        }
+    }
+
+    /// Entrada de valor inteiro (1 a 8 bytes).
+    pub fn whole(
+        id: impl Into<String>,
+        addr: u64,
+        original: Vec<u8>,
+        written: Vec<u8>,
+        guard: Vec<GuardBytes>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            addr,
+            mode: DataMode::Whole,
+            original,
+            written,
+            mask: 0,
+            next: None,
+            guard,
+        }
+    }
+}
+
+/// Identidade de uma entrada de dados no motor: `id` e endereço.
+pub fn data_key(e: &DataEntry) -> (&str, u64) {
+    (e.id.as_str(), e.addr)
 }
 
 /// Conteúdo do diário: identidade do processo e os patches ativos.
@@ -337,42 +459,83 @@ pub enum EntryAction {
 }
 
 /// O que fazer com uma entrada de dados ao restaurar (desligar, sair ou recuperar).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DataAction {
-    /// Os bits da máscara já são os originais: só esquecer a entrada.
+    /// Já está no original (ou o jogo mudou o campo): só esquecer a entrada.
     Drop,
-    /// Escrever este byte: os bits da máscara voltam ao original, os outros ficam como estão.
-    Restore(u8),
-    /// O objeto não é mais o mesmo, o byte é ilegível ou não é gravável, ou algum bit da
-    /// máscara não é nem o nosso nem o original: esquecer sem escrever.
+    /// Escrever estes bytes no endereço da entrada. Em `Bits`, 1 byte: os bits da máscara
+    /// voltam ao original e os outros ficam como estão. Em `Whole`, o original inteiro.
+    Restore(Vec<u8>),
+    /// O objeto não é mais o mesmo, os bytes são ilegíveis ou não são graváveis, ou (em
+    /// `Bits`) algum bit da máscara não é nem o nosso nem o original: esquecer sem escrever.
     Discard,
 }
 
-/// Decide a restauração de uma entrada de dados (spec 005, 6.6). `current` é o byte lido agora
-/// (`None` se ilegível), `guard_ok` diz se a conferência de identidade bateu e `writable` se o
-/// byte está numa região `rw` do `maps` atual. Só os bits da máscara são considerados; um bit da
-/// máscara é "de outro" quando o original e o escrito eram iguais nele e o atual difere.
+/// Decide a restauração de uma entrada de dados (spec 005, 6.6; spec 006, 6.4 e 6.8).
+/// `current` são os bytes lidos agora (`None` se ilegíveis), `guard_ok` diz se a conferência de
+/// identidade bateu e `writable` se a região é `rw` no `maps` atual.
+///
+/// `Bits`: só os bits da máscara contam; um bit é "de outro" quando o original e o escrito eram
+/// iguais nele e o atual difere. `Whole`: o valor atual igual ao escrito (ou ao `next`) volta ao
+/// original; igual ao original, só esquece; qualquer outro valor (inclusive igual em parte) é
+/// do jogo: esquecer sem escrever.
 pub fn decide_data(
     e: &DataEntry,
-    current: Option<u8>,
+    current: Option<&[u8]>,
     guard_ok: bool,
     writable: bool,
 ) -> DataAction {
+    if !well_formed(e) {
+        return DataAction::Discard;
+    }
     let Some(current) = current else {
         return DataAction::Discard;
     };
     if !guard_ok || !writable {
         return DataAction::Discard;
     }
+    match e.mode {
+        DataMode::Bits => decide_bits(e, current),
+        DataMode::Whole => {
+            if current == e.written.as_slice() || e.next.as_deref() == Some(current) {
+                DataAction::Restore(e.original.clone())
+            } else {
+                DataAction::Drop
+            }
+        }
+    }
+}
+
+/// Tamanhos coerentes: o serde do diário não valida, e uma entrada malformada nunca pode
+/// virar escrita. `Whole`: `original` e `written` com o mesmo tamanho, de 1 a 8 bytes, e o
+/// `next` (se houver) também. `Bits`: `original` e `written` com 1 byte.
+fn well_formed(e: &DataEntry) -> bool {
+    match e.mode {
+        DataMode::Bits => e.original.len() == 1 && e.written.len() == 1,
+        DataMode::Whole => {
+            let len = e.original.len();
+            (1..=8).contains(&len)
+                && e.written.len() == len
+                && e.next.as_ref().is_none_or(|n| n.len() == len)
+        }
+    }
+}
+
+fn decide_bits(e: &DataEntry, current: &[u8]) -> DataAction {
+    let (Some(&current), Some(&original), Some(&written)) =
+        (current.first(), e.original.first(), e.written.first())
+    else {
+        return DataAction::Discard;
+    };
     let mask = e.mask;
-    let same = !(e.original ^ e.written);
-    if mask & same & (current ^ e.original) != 0 {
+    let same = !(original ^ written);
+    if mask & same & (current ^ original) != 0 {
         return DataAction::Discard;
     }
-    if current & mask == e.original & mask {
+    if current & mask == original & mask {
         DataAction::Drop
     } else {
-        DataAction::Restore((current & !mask) | (e.original & mask))
+        DataAction::Restore(vec![(current & !mask) | (original & mask)])
     }
 }
 
@@ -483,18 +646,28 @@ mod tests {
         }
     }
 
+    fn guard() -> Vec<GuardBytes> {
+        vec![GuardBytes {
+            addr: 0x7fff_0000_0000,
+            bytes: vec![0xaa, 0xbb],
+        }]
+    }
+
     fn data_entry(original: u8, written: u8, mask: u8) -> DataEntry {
-        DataEntry {
-            id: "nao-morrer".into(),
-            addr: 0x7fff_0000_011d,
+        DataEntry::bits(
+            "nao-morrer",
+            0x7fff_0000_011d,
             original,
             written,
             mask,
-            guard: vec![GuardBytes {
-                addr: 0x7fff_0000_0000,
-                bytes: vec![0xaa, 0xbb],
-            }],
-        }
+            guard(),
+        )
+    }
+
+    fn whole_entry(len: usize) -> DataEntry {
+        let original: Vec<u8> = (1..=len as u8).collect();
+        let written: Vec<u8> = (0x10..0x10 + len as u8).collect();
+        DataEntry::whole("carga", 0x7fff_0000_0200, original, written, guard())
     }
 
     #[test]
@@ -503,54 +676,54 @@ mod tests {
         let e = data_entry(0x07, 0x01, 0x06);
         // Ainda como escrevemos: os bits voltam, o alheio fica.
         assert_eq!(
-            decide_data(&e, Some(0x01), true, true),
-            DataAction::Restore(0x07)
+            decide_data(&e, Some(&[0x01]), true, true),
+            DataAction::Restore(vec![0x07])
         );
         // O jogo mexeu no bit alheio enquanto os nossos estavam limpos: ele é preservado.
         assert_eq!(
-            decide_data(&e, Some(0x00), true, true),
-            DataAction::Restore(0x06)
+            decide_data(&e, Some(&[0x00]), true, true),
+            DataAction::Restore(vec![0x06])
         );
         // Um dos nossos já voltou sozinho: só o outro é restaurado.
         assert_eq!(
-            decide_data(&e, Some(0x03), true, true),
-            DataAction::Restore(0x07)
+            decide_data(&e, Some(&[0x03]), true, true),
+            DataAction::Restore(vec![0x07])
         );
         // Os dois já originais: só esquecer.
-        assert_eq!(decide_data(&e, Some(0x06), true, true), DataAction::Drop);
-        assert_eq!(decide_data(&e, Some(0x07), true, true), DataAction::Drop);
+        assert_eq!(decide_data(&e, Some(&[0x06]), true, true), DataAction::Drop);
+        assert_eq!(decide_data(&e, Some(&[0x07]), true, true), DataAction::Drop);
         // Objeto trocado, byte ilegível ou fora de região gravável: descartar sem escrever.
         assert_eq!(
-            decide_data(&e, Some(0x01), false, true),
+            decide_data(&e, Some(&[0x01]), false, true),
             DataAction::Discard
         );
         assert_eq!(decide_data(&e, None, true, true), DataAction::Discard);
         assert_eq!(
-            decide_data(&e, Some(0x01), true, false),
+            decide_data(&e, Some(&[0x01]), true, false),
             DataAction::Discard
         );
         // Bit da máscara que já era 0 no original e foi ligado por outro: não é nosso.
         let partial = data_entry(0x04, 0x00, 0x06);
         assert_eq!(
-            decide_data(&partial, Some(0x02), true, true),
+            decide_data(&partial, Some(&[0x02]), true, true),
             DataAction::Discard
         );
         assert_eq!(
-            decide_data(&partial, Some(0x00), true, true),
-            DataAction::Restore(0x04)
+            decide_data(&partial, Some(&[0x00]), true, true),
+            DataAction::Restore(vec![0x04])
         );
         // `bool` nativo: máscara inteira.
         let native = data_entry(0x01, 0x00, 0xff);
         assert_eq!(
-            decide_data(&native, Some(0x00), true, true),
-            DataAction::Restore(0x01)
+            decide_data(&native, Some(&[0x00]), true, true),
+            DataAction::Restore(vec![0x01])
         );
         assert_eq!(
-            decide_data(&native, Some(0x01), true, true),
+            decide_data(&native, Some(&[0x01]), true, true),
             DataAction::Drop
         );
         assert_eq!(
-            decide_data(&native, Some(0x02), true, true),
+            decide_data(&native, Some(&[0x02]), true, true),
             DataAction::Discard
         );
     }
@@ -849,5 +1022,160 @@ mod tests {
         assert!(!store.is_locked().unwrap());
         let again = store.lock().unwrap();
         drop(again);
+    }
+
+    #[test]
+    fn journal_005_bits_entry_restores() {
+        let json = r#"{"id":"nao-morrer","addr":"0x7fff0000011d","original":6,"written":0,
+            "mask":6,"guard":[{"addr":"0x7fff00000000","bytes":"aabb"}]}"#;
+        let e: DataEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(e.mode, DataMode::Bits);
+        assert_eq!(e.original, vec![0x06]);
+        assert_eq!(e.written, vec![0x00]);
+        assert_eq!(e.mask, 0x06);
+        assert_eq!(e.next, None);
+        assert_eq!(
+            decide_data(&e, Some(&[0x00]), true, true),
+            DataAction::Restore(vec![0x06])
+        );
+    }
+
+    #[test]
+    fn whole_entry_roundtrip_hex() {
+        let mut e = whole_entry(4);
+        e.next = Some(vec![0xde, 0xad, 0xbe, 0xef]);
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains(r#""original":"01020304""#), "{json}");
+        assert!(json.contains(r#""written":"10111213""#), "{json}");
+        assert!(json.contains(r#""next":"deadbeef""#), "{json}");
+        assert!(json.contains(r#""mode":"whole""#), "{json}");
+        assert!(json.contains(r#""mask":0"#), "{json}");
+        let back: DataEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, e);
+        // Sem `next`, a chave não é gravada.
+        let plain = serde_json::to_string(&whole_entry(2)).unwrap();
+        assert!(!plain.contains("next"), "{plain}");
+    }
+
+    #[test]
+    fn decide_whole_cases() {
+        let mut e = whole_entry(4);
+        e.next = Some(vec![0xaa, 0xaa, 0xaa, 0xaa]);
+        let orig = vec![1, 2, 3, 4];
+        // Igual ao escrito: volta ao original.
+        assert_eq!(
+            decide_data(&e, Some(&[0x10, 0x11, 0x12, 0x13]), true, true),
+            DataAction::Restore(orig.clone())
+        );
+        // Igual ao `next`: volta ao original.
+        assert_eq!(
+            decide_data(&e, Some(&[0xaa; 4]), true, true),
+            DataAction::Restore(orig)
+        );
+        // Igual ao original: só esquece.
+        assert_eq!(
+            decide_data(&e, Some(&[1, 2, 3, 4]), true, true),
+            DataAction::Drop
+        );
+        // Três dos quatro bytes iguais ao escrito: o jogo mexeu, esquece sem escrever.
+        assert_eq!(
+            decide_data(&e, Some(&[0x10, 0x11, 0x12, 0x99]), true, true),
+            DataAction::Drop
+        );
+        // Guarda ruim, região ruim e leitura ilegível.
+        assert_eq!(
+            decide_data(&e, Some(&[0x10, 0x11, 0x12, 0x13]), false, true),
+            DataAction::Discard
+        );
+        assert_eq!(
+            decide_data(&e, Some(&[0x10, 0x11, 0x12, 0x13]), true, false),
+            DataAction::Discard
+        );
+        assert_eq!(decide_data(&e, None, true, true), DataAction::Discard);
+    }
+
+    #[test]
+    fn whole_entry_sizes_1_4_8() {
+        for len in [1usize, 4, 8] {
+            let e = whole_entry(len);
+            assert_eq!(
+                decide_data(&e, Some(&e.written), true, true),
+                DataAction::Restore(e.original.clone()),
+                "tamanho {len}"
+            );
+            assert_eq!(
+                decide_data(&e, Some(&e.original), true, true),
+                DataAction::Drop,
+                "tamanho {len}"
+            );
+            let mut other = e.written.clone();
+            other[0] ^= 0xff;
+            assert_eq!(
+                decide_data(&e, Some(&other), true, true),
+                DataAction::Drop,
+                "tamanho {len}"
+            );
+            let json = serde_json::to_string(&e).unwrap();
+            assert_eq!(serde_json::from_str::<DataEntry>(&json).unwrap(), e);
+        }
+    }
+
+    #[test]
+    fn decide_malformed_entry_discards() {
+        let cur4 = [0x10, 0x11, 0x12, 0x13];
+        // Whole: original e written de tamanhos diferentes.
+        let mut e = whole_entry(4);
+        e.written.pop();
+        assert_eq!(
+            decide_data(&e, Some(&cur4), true, true),
+            DataAction::Discard
+        );
+        // Whole: tamanho 0 e maior que 8.
+        for len in [0usize, 9] {
+            let mut e = whole_entry(4);
+            e.original = vec![1; len];
+            e.written = vec![2; len];
+            assert_eq!(
+                decide_data(&e, Some(&vec![2; len]), true, true),
+                DataAction::Discard,
+                "tamanho {len}"
+            );
+        }
+        // Whole: `next` de outro tamanho.
+        let mut e = whole_entry(4);
+        e.next = Some(vec![0xaa; 2]);
+        assert_eq!(
+            decide_data(&e, Some(&[0xaa; 2]), true, true),
+            DataAction::Discard
+        );
+        assert_eq!(
+            decide_data(&e, Some(&cur4), true, true),
+            DataAction::Discard
+        );
+        // Bits: original ou written com tamanho diferente de 1.
+        let mut e = data_entry(0x07, 0x01, 0x06);
+        e.original = vec![0x07, 0x00];
+        assert_eq!(
+            decide_data(&e, Some(&[0x01]), true, true),
+            DataAction::Discard
+        );
+        let mut e = data_entry(0x07, 0x01, 0x06);
+        e.written = Vec::new();
+        assert_eq!(
+            decide_data(&e, Some(&[0x01]), true, true),
+            DataAction::Discard
+        );
+        // Entrada sã continua restaurando.
+        let e = whole_entry(4);
+        assert!(matches!(
+            decide_data(&e, Some(&cur4), true, true),
+            DataAction::Restore(_)
+        ));
+    }
+
+    #[test]
+    fn data_key_is_id_and_addr() {
+        let e = data_entry(0x06, 0x00, 0x06);
+        assert_eq!(data_key(&e), ("nao-morrer", 0x7fff_0000_011d));
     }
 }

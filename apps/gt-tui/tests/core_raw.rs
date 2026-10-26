@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use gt_core::journal::{JournalStore, Loaded};
 use gt_core::mem::{MemReader, MemWriter};
 use gt_core::procinfo::identity;
-use gt_core::value::{ValueSpec, ValueType};
+use gt_core::value::{ValueGrid, ValueSpec, ValueType};
 use gt_grounded2::signatures::Category;
 use gt_testkit::{TargetOpts, TestTarget};
 use gt_tui::backend::{Backend, Find, OpOutcome, Recovered, Session};
@@ -23,16 +23,23 @@ static SERIAL: Mutex<()> = Mutex::new(());
 const TOGGLE: &str = "toggle";
 const VALUE: &str = "value";
 
-fn grid() -> ValueSpec {
-    ValueSpec {
+fn grid() -> ValueGrid {
+    ValueGrid {
         ty: ValueType::U32,
-        slot: 1,
         min: 0.0,
         max: f64::from(0x3333_3333_u32),
         step: f64::from(0x1111_1111_u32),
         default_k: 2,
         unit: None,
         decimals: 0,
+    }
+}
+
+/// A grade com o `slot` do imediato (bytes 1..5 do `value_page`).
+fn spec() -> ValueSpec {
+    ValueSpec {
+        grid: grid(),
+        slot: 1,
     }
 }
 
@@ -56,7 +63,7 @@ fn defs_of(t: &TestTarget) -> Vec<RawDef> {
             addr: t.value_page,
             expected: vec![0xB8, 0x11, 0x11, 0x11, 0x11],
             replacement: vec![0xB8, 0x22, 0x22, 0x22, 0x22],
-            value: Some(grid()),
+            value: Some(spec()),
             verified: true,
         },
     ]
@@ -932,4 +939,164 @@ fn raw_absent_then_found_resumes() {
             .count(),
         2
     );
+}
+
+// ---- valor nos cheats de valor e a ação (spec 006, 6.5 e 6.6; plano 006 tarefa 9) ----
+
+use gt_grounded2::fields::ActionOutcome;
+use gt_testkit::ue::{CAPACITY_OFF, SCIENCE_OFF};
+use gt_tui::backend::JobKind;
+
+/// Sessão crua contra o alvo com a reflexão sintética, com o índice montado.
+struct UeSession {
+    target: TestTarget,
+    ue: UeAddrs,
+    s: <RawBackend as Backend>::Session,
+    _backend: RawBackend,
+    _dir: tempfile::TempDir,
+    _guard: MutexGuard<'static, ()>,
+}
+
+fn ue_session(engine: bool) -> UeSession {
+    let guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let target = TestTarget::spawn_with(TargetOpts {
+        ue: true,
+        ..Default::default()
+    });
+    let ue = target.ue.unwrap();
+    let (sigs, fields) = synth_signatures();
+    let control = Arc::new(Mutex::new(RawControl {
+        pid: Some(target.pid),
+        defs: defs_of(&target),
+        version_key: "raw-1".into(),
+        search_delay: Duration::ZERO,
+        search_panics: false,
+        ue: Some(RawUe {
+            gobjects: ue.gobjects,
+            names: ue.names,
+            sigs,
+            fields,
+        }),
+    }));
+    let dir = tempfile::tempdir().unwrap();
+    let mut backend = RawBackend::new(control, dir.path().to_path_buf()).unwrap();
+    assert!(matches!(backend.recover(), Recovered::Clean { .. }));
+    let search = (backend.search_fn())(target.pid, None, None).unwrap();
+    let mut s = backend.open(search, engine).unwrap();
+    run_job(&mut s, JobKind::Index);
+    UeSession {
+        target,
+        ue,
+        s,
+        _backend: backend,
+        _dir: dir,
+        _guard: guard,
+    }
+}
+
+/// Roda um trabalho da tarefa de reflexão nesta thread e junta o resultado na sessão.
+fn run_job<S: Session<P>, P>(session: &mut S, kind: JobKind) {
+    let job = session.reflection_job(kind).expect("trabalho disponível");
+    let out = (job.run)();
+    session.merge_reflection(out);
+}
+
+fn read_i32(pid: i32, addr: u64) -> i32 {
+    i32::from_le_bytes(read(pid, addr, 4).try_into().unwrap())
+}
+
+#[test]
+fn field_on_sets_desired_k() {
+    let mut u = ue_session(true);
+    run_job(&mut u.s, JobKind::Controller);
+    let capacity = u.ue.hauling + u64::from(CAPACITY_OFF);
+    // `k = 49` na grade 1..100 de passo 1 é o valor 50.
+    assert!(is_done(&u.s.field_on("carga", 49)));
+    u.s.field_tick(&["carga".to_string()], Instant::now());
+    assert_eq!(read_i32(u.target.pid, capacity), 50);
+    // Um `k` fora da grade fica no máximo dela.
+    assert!(is_done(&u.s.field_on("carga", 5000)));
+    u.s.field_tick(
+        &["carga".to_string()],
+        Instant::now() + Duration::from_secs(1),
+    );
+    assert_eq!(read_i32(u.target.pid, capacity), 100);
+}
+
+#[test]
+fn set_value_field_updates_desired() {
+    let mut u = ue_session(true);
+    run_job(&mut u.s, JobKind::Controller);
+    let capacity = u.ue.hauling + u64::from(CAPACITY_OFF);
+    assert!(is_done(&u.s.field_on("carga", 49)));
+    let t0 = Instant::now();
+    u.s.field_tick(&["carga".to_string()], t0);
+    assert_eq!(read_i32(u.target.pid, capacity), 50);
+    // A troca só muda o desejado; a escrita vem no ciclo seguinte.
+    assert!(is_done(&u.s.set_value("carga", 9)));
+    assert_eq!(read_i32(u.target.pid, capacity), 50);
+    u.s.field_tick(&["carga".to_string()], t0 + Duration::from_secs(1));
+    assert_eq!(read_i32(u.target.pid, capacity), 10);
+    // Cheat de valor sem grade e desconhecido continuam recusados.
+    assert!(matches!(
+        u.s.set_value("pulos-infinitos", 1),
+        OpOutcome::Refused(_)
+    ));
+    assert!(matches!(
+        u.s.set_value("nao-existe", 1),
+        OpOutcome::Refused(_)
+    ));
+}
+
+#[test]
+fn action_refused_without_engine_or_stuck() {
+    {
+        let mut u = ue_session(false);
+        assert!(!u.s.has_engine());
+        assert_eq!(
+            u.s.field_action("somar-ciencia", 9),
+            ActionOutcome::Refused("sem motor".to_string())
+        );
+        assert!(!u.s.action_wants_controller());
+    }
+    // Uma linha que não é ação também é recusada.
+    let mut u = ue_session(true);
+    assert!(matches!(
+        u.s.field_action("carga", 0),
+        ActionOutcome::Refused(_)
+    ));
+    // Ligar uma ação não faz sentido.
+    assert!(matches!(
+        u.s.field_on("somar-ciencia", 0),
+        OpOutcome::Refused(_)
+    ));
+}
+
+#[test]
+fn action_needs_controller_marks_search() {
+    let mut u = ue_session(true);
+    let science = u.ue.party + u64::from(SCIENCE_OFF);
+    let start = read_i32(u.target.pid, science);
+    // Sem controller: pede a procura e não escreve.
+    assert_eq!(
+        u.s.field_action("somar-ciencia", 9),
+        ActionOutcome::NeedsController
+    );
+    assert!(u.s.action_wants_controller());
+    assert_eq!(read_i32(u.target.pid, science), start);
+    assert_eq!(u.s.take_controller_news(), None);
+    // A procura termina e avisa uma única vez.
+    run_job(&mut u.s, JobKind::Controller);
+    assert_eq!(u.s.take_controller_news(), Some(true));
+    assert_eq!(u.s.take_controller_news(), None);
+    assert!(!u.s.action_wants_controller());
+    // Agora a ação soma `100 × (9 + 1)`.
+    assert_eq!(
+        u.s.field_action("somar-ciencia", 9),
+        ActionOutcome::Done {
+            before: start,
+            after: start + 1000
+        }
+    );
+    assert_eq!(read_i32(u.target.pid, science), start + 1000);
 }

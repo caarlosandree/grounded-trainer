@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use gt_core::global::GlobalPattern;
 use gt_core::scan::Pattern;
-use gt_core::value::{ValueSpec, ValueType};
+use gt_core::value::{ValueGrid, ValueSpec, ValueType};
 use gt_ue::{
     FBoolLayout, FFieldLayout, FPropLayout, FStructLayout, ObjectsLayout, UObjectLayout,
     UStructLayout, UeLayout,
@@ -124,6 +124,23 @@ pub struct PlayerCfg {
     pub pawn_class: String,
     /// Campos alternativos tentados quando `pawn_field` falha.
     pub alt_pawn_fields: Vec<String>,
+    /// Caminho até o `GameState` (spec 006, 6.3); só existe se o `[ue.player]` traz os cinco campos.
+    pub game_state: Option<GameStateCfg>,
+}
+
+/// Caminho controller → `Outer` → `Level.OwningWorld` → `World.GameState` (spec 006, 6.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GameStateCfg {
+    /// Classe do `Outer` do controller, como `Pacote.Nome`.
+    pub level_class: String,
+    /// Campo do `Level` que aponta para o mundo.
+    pub world_field: String,
+    /// Classe esperada do mundo, como `Pacote.Nome`.
+    pub world_class: String,
+    /// Campo do mundo que aponta para o `GameState`.
+    pub game_state_field: String,
+    /// Classe esperada do `GameState`, como `Pacote.Nome`.
+    pub game_state_class: String,
 }
 
 /// Bloco `[ue]` já resolvido para uma versão do jogo.
@@ -155,6 +172,25 @@ pub enum LockTarget {
     Const(f32),
 }
 
+/// Tipo dos campos de uma regra `set`/`add` (spec 006, 6.2 e 6.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldKind {
+    /// `FloatProperty` (4 bytes).
+    Float,
+    /// `IntProperty` (4 bytes, com sinal).
+    Int,
+}
+
+/// Raiz do caminho até o objeto de um `[[field]]` (spec 006, 6.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FieldRoot {
+    /// O personagem (padrão, como na spec 005).
+    #[default]
+    Pawn,
+    /// O `GameState`: controller → `Outer` → `Level.OwningWorld` → `World.GameState`.
+    GameState,
+}
+
 /// Regra de um cheat de valor.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldRule {
@@ -168,6 +204,15 @@ pub enum FieldRule {
     },
     /// Limpa os bits dos campos `bool`, restaurando o original ao desligar.
     ClearBits { fields: Vec<String> },
+    /// Escreve o mesmo valor nos campos e devolve o original ao desligar (spec 006, 6.4). Com
+    /// `[field.value]` o `target` é `None`; com `target` constante o `value` é `None`.
+    Set {
+        fields: Vec<String>,
+        kind: FieldKind,
+        target: Option<f64>,
+    },
+    /// Soma a quantidade da grade a um campo `int`, sem diário nem desfazer (spec 006, 6.6).
+    Add { field: String, result_max: i64 },
 }
 
 /// Cheat de valor (`[[field]]`), já validado pela regra de carga.
@@ -182,7 +227,11 @@ pub struct FieldDef {
     pub object: String,
     /// Classe esperada do objeto (`Pacote.Nome`), conferida com `is_a`.
     pub object_class: String,
+    /// Raiz do caminho até o objeto (padrão: o personagem).
+    pub root: FieldRoot,
     pub rule: FieldRule,
+    /// Grade do valor ajustável (`[field.value]`), sem `slot`.
+    pub value: Option<ValueGrid>,
 }
 
 /// Conjunto das assinaturas carregadas: o genérico e uma lista de definições por versão.
@@ -258,6 +307,12 @@ struct PlayerBlock {
     pawn_class: String,
     #[serde(default)]
     alt_pawn_fields: Vec<String>,
+    // Os cinco do `game_state` vêm juntos ou nenhum (`build_player` confere).
+    level_class: Option<String>,
+    world_field: Option<String>,
+    world_class: Option<String>,
+    game_state_field: Option<String>,
+    game_state_class: Option<String>,
 }
 
 // Espelhos de `UeLayout` para o serde (o `gt-ue` não depende dele). Sem `Default`: todo campo é
@@ -359,6 +414,9 @@ struct GenericField {
     target: Option<toml::Value>,
     min: Option<toml::Value>,
     max: Option<toml::Value>,
+    root: Option<String>,
+    value: Option<ValueBlock>,
+    result_max: Option<toml::Value>,
 }
 
 #[derive(Deserialize)]
@@ -505,30 +563,26 @@ fn decimals_for(step: f64) -> u8 {
         .unwrap_or(6)
 }
 
-/// Converte o bloco `value` no `ValueSpec` e confere as regras de carga do valor (6.3).
-fn build_value(file: &str, block: &ValueBlock, replacement: &[u8]) -> Result<ValueSpec> {
-    let ty = match block.ty.as_ref() {
-        None => return Err(sig_err(file, "value.type", "campo obrigatório ausente")),
+/// `type` do bloco de valor (`i32`, `u32` ou `f32`).
+fn value_type(file: &str, block: &ValueBlock) -> Result<ValueType> {
+    match block.ty.as_ref() {
+        None => Err(sig_err(file, "value.type", "campo obrigatório ausente")),
         Some(toml::Value::String(t)) => match t.as_str() {
-            "i32" => ValueType::I32,
-            "u32" => ValueType::U32,
-            "f32" => ValueType::F32,
-            other => {
-                return Err(sig_err(
-                    file,
-                    "value.type",
-                    format!("`{other}` não é i32, u32 nem f32"),
-                ));
-            }
+            "i32" => Ok(ValueType::I32),
+            "u32" => Ok(ValueType::U32),
+            "f32" => Ok(ValueType::F32),
+            other => Err(sig_err(
+                file,
+                "value.type",
+                format!("`{other}` não é i32, u32 nem f32"),
+            )),
         },
-        Some(_) => return Err(sig_err(file, "value.type", "esperava um texto")),
-    };
-    let slot = match block.slot.as_ref() {
-        None => return Err(sig_err(file, "value.slot", "campo obrigatório ausente")),
-        Some(toml::Value::Integer(i)) => usize::try_from(*i)
-            .map_err(|_| sig_err(file, "value.slot", format!("{i} não é um offset válido")))?,
-        Some(_) => return Err(sig_err(file, "value.slot", "esperava um inteiro")),
-    };
+        Some(_) => Err(sig_err(file, "value.type", "esperava um texto")),
+    }
+}
+
+/// Monta a grade do bloco de valor (tudo menos o `slot`) e confere as regras de carga (6.3).
+fn build_grid(file: &str, block: &ValueBlock, ty: ValueType) -> Result<ValueGrid> {
     let min = value_number(file, "value.min", block.min.as_ref(), ty)?;
     let max = value_number(file, "value.max", block.max.as_ref(), ty)?;
     let step = value_number(file, "value.step", block.step.as_ref(), ty)?;
@@ -593,9 +647,8 @@ fn build_value(file: &str, block: &ValueBlock, replacement: &[u8]) -> Result<Val
         ));
     }
 
-    let spec = ValueSpec {
+    let grid = ValueGrid {
         ty,
-        slot,
         min,
         max,
         step,
@@ -605,7 +658,21 @@ fn build_value(file: &str, block: &ValueBlock, replacement: &[u8]) -> Result<Val
         unit,
         decimals: decimals.unwrap_or_else(|| decimals_for(step)),
     };
-    spec.check().map_err(|e| sig_err(file, "value", e))?;
+    grid.check().map_err(|e| sig_err(file, "value", e))?;
+    Ok(grid)
+}
+
+/// Converte o bloco `value` no `ValueSpec` e confere as regras de carga do valor (6.3).
+fn build_value(file: &str, block: &ValueBlock, replacement: &[u8]) -> Result<ValueSpec> {
+    let ty = value_type(file, block)?;
+    let slot = match block.slot.as_ref() {
+        None => return Err(sig_err(file, "value.slot", "campo obrigatório ausente")),
+        Some(toml::Value::Integer(i)) => usize::try_from(*i)
+            .map_err(|_| sig_err(file, "value.slot", format!("{i} não é um offset válido")))?,
+        Some(_) => return Err(sig_err(file, "value.slot", "esperava um inteiro")),
+    };
+    let grid = build_grid(file, block, ty)?;
+    let spec = ValueSpec { grid, slot };
     spec.check_slot(replacement)
         .map_err(|e| sig_err(file, "value.slot", e))?;
     Ok(spec)
@@ -781,11 +848,59 @@ fn build_player(file: &str, block: PlayerBlock) -> Result<PlayerCfg> {
     for alt in &block.alt_pawn_fields {
         check_not_blank(file, "ue.player.alt_pawn_fields", alt)?;
     }
+    // Os cinco campos do `game_state` vêm juntos ou nenhum (spec 006, 6.3).
+    let game_state = match (
+        block.level_class,
+        block.world_field,
+        block.world_class,
+        block.game_state_field,
+        block.game_state_class,
+    ) {
+        (None, None, None, None, None) => None,
+        (
+            Some(level_class),
+            Some(world_field),
+            Some(world_class),
+            Some(game_state_field),
+            Some(game_state_class),
+        ) => {
+            check_class_path(file, "ue.player.level_class", &level_class)?;
+            check_not_blank(file, "ue.player.world_field", &world_field)?;
+            check_class_path(file, "ue.player.world_class", &world_class)?;
+            check_not_blank(file, "ue.player.game_state_field", &game_state_field)?;
+            check_class_path(file, "ue.player.game_state_class", &game_state_class)?;
+            Some(GameStateCfg {
+                level_class,
+                world_field,
+                world_class,
+                game_state_field,
+                game_state_class,
+            })
+        }
+        (level_class, world_field, world_class, game_state_field, game_state_class) => {
+            let missing = [
+                ("level_class", level_class.is_none()),
+                ("world_field", world_field.is_none()),
+                ("world_class", world_class.is_none()),
+                ("game_state_field", game_state_field.is_none()),
+                ("game_state_class", game_state_class.is_none()),
+            ]
+            .into_iter()
+            .find_map(|(name, absent)| absent.then_some(name))
+            .unwrap_or("level_class");
+            return Err(sig_err(
+                file,
+                &format!("ue.player.{missing}"),
+                "os cinco campos do game_state vêm juntos: campo obrigatório ausente",
+            ));
+        }
+    };
     Ok(PlayerCfg {
         controller_class: block.controller_class,
         pawn_field: block.pawn_field,
         pawn_class: block.pawn_class,
         alt_pawn_fields: block.alt_pawn_fields,
+        game_state,
     })
 }
 
@@ -891,7 +1006,93 @@ fn field_number(file: &str, field: &str, id: &str, v: &toml::Value) -> Result<f3
     Ok(n)
 }
 
-/// Aplica a regra de carga (6.5) a um `[[field]]`.
+/// Grade do `[field.value]` de um `[[field]]`: sem `slot`, com o tipo esperado pelo `kind`.
+fn build_field_grid(
+    file: &str,
+    id: &str,
+    block: &ValueBlock,
+    expected: ValueType,
+) -> Result<ValueGrid> {
+    if block.slot.is_some() {
+        return Err(sig_err(
+            file,
+            "value.slot",
+            format!("`{id}`: o [field.value] não tem slot"),
+        ));
+    }
+    let ty = value_type(file, block)?;
+    if ty != expected {
+        return Err(sig_err(
+            file,
+            "value.type",
+            format!("`{id}`: o tipo do valor precisa casar com o kind do campo"),
+        ));
+    }
+    build_grid(file, block, ty)
+}
+
+/// Número do `[[field]]` para `set` (`target`, `min`, `max`): inteiro de 32 bits para `int`, finito
+/// e representável em `f32` para `float`.
+fn field_number64(
+    file: &str,
+    field: &str,
+    id: &str,
+    v: &toml::Value,
+    kind: FieldKind,
+) -> Result<f64> {
+    let err = |reason: String| sig_err(file, field, format!("`{id}`: {reason}"));
+    let n = match v {
+        toml::Value::Integer(i) => *i as f64,
+        toml::Value::Float(f) => *f,
+        other => {
+            return Err(err(format!(
+                "esperava um número, veio {}",
+                other.type_str()
+            )));
+        }
+    };
+    if !n.is_finite() {
+        return Err(err("precisa ser um número finito".into()));
+    }
+    match kind {
+        FieldKind::Int => {
+            if n.fract() != 0.0 {
+                return Err(err(format!("{n} precisa ser inteiro (kind = \"int\")")));
+            }
+            if n < f64::from(i32::MIN) || n > f64::from(i32::MAX) {
+                return Err(err(format!("{n} não cabe em um inteiro de 32 bits")));
+            }
+        }
+        FieldKind::Float => {
+            if n.abs() > f64::from(f32::MAX) {
+                return Err(err(format!("{n} não cabe em um f32")));
+            }
+        }
+    }
+    Ok(n)
+}
+
+/// Lista `fields` de uma regra: obrigatória, não vazia, sem nome vazio nem repetido.
+fn field_names(file: &str, id: &str, fields: Option<Vec<String>>) -> Result<Vec<String>> {
+    let err = |reason: &str| sig_err(file, "fields", format!("`{id}`: {reason}"));
+    let fields = match fields {
+        None => return Err(err("campo obrigatório ausente")),
+        Some(f) if f.is_empty() => return Err(err("lista vazia")),
+        Some(f) => f,
+    };
+    let mut seen = HashSet::new();
+    for f in &fields {
+        if f.trim().is_empty() {
+            return Err(err("nome vazio"));
+        }
+        if !seen.insert(f.as_str()) {
+            return Err(err(&format!("`{f}` repetido")));
+        }
+    }
+    Ok(fields)
+}
+
+/// Aplica a regra de carga (6.5 da spec 005 e 6.2 a 6.6 da 006) a um `[[field]]`.
 fn build_field(file: &str, raw: GenericField) -> Result<FieldDef> {
     let id = raw.id.as_str();
     check_not_blank(file, "id", id)?;
@@ -900,12 +1101,31 @@ fn build_field(file: &str, raw: GenericField) -> Result<FieldDef> {
     let category = check_category(file, raw.category.as_deref())?;
     check_not_blank(file, "object", &raw.object)?;
     check_class_path(file, "object_class", &raw.object_class)?;
+    let root = match raw.root.as_deref() {
+        None | Some("pawn") => FieldRoot::Pawn,
+        Some("game_state") => FieldRoot::GameState,
+        Some(other) => {
+            return Err(err("root", &format!("`{other}` não é pawn nem game_state")));
+        }
+    };
 
+    let mut value = None;
     let rule = match raw.rule.as_deref() {
         None => return Err(err("rule", "campo obrigatório ausente")),
         Some("lock") => {
             if raw.fields.is_some() {
-                return Err(err("fields", "só vale com rule = \"clear_bits\""));
+                return Err(err(
+                    "fields",
+                    "só vale com rule = \"clear_bits\" ou \"set\"",
+                ));
+            }
+            for (present, field) in [
+                (raw.value.is_some(), "value"),
+                (raw.result_max.is_some(), "result_max"),
+            ] {
+                if present {
+                    return Err(err(field, "não vale com rule = \"lock\""));
+                }
             }
             let field = match raw.field.as_deref() {
                 None => return Err(err("field", "campo obrigatório ausente")),
@@ -969,16 +1189,18 @@ fn build_field(file: &str, raw: GenericField) -> Result<FieldDef> {
             }
         }
         Some("clear_bits") => {
-            for (present, field) in [
-                (raw.field.is_some(), "field"),
-                (raw.mode.is_some(), "mode"),
-                (raw.target_field.is_some(), "target_field"),
-                (raw.target.is_some(), "target"),
-                (raw.min.is_some(), "min"),
-                (raw.max.is_some(), "max"),
+            for (present, field, only) in [
+                (raw.field.is_some(), "field", "lock"),
+                (raw.mode.is_some(), "mode", "lock"),
+                (raw.target_field.is_some(), "target_field", "lock"),
+                (raw.target.is_some(), "target", "lock"),
+                (raw.min.is_some(), "min", "lock"),
+                (raw.max.is_some(), "max", "lock"),
+                (raw.value.is_some(), "value", "set"),
+                (raw.result_max.is_some(), "result_max", "add"),
             ] {
                 if present {
-                    return Err(err(field, "só vale com rule = \"lock\""));
+                    return Err(err(field, &format!("só vale com rule = \"{only}\"")));
                 }
             }
             match raw.kind.as_deref() {
@@ -988,26 +1210,147 @@ fn build_field(file: &str, raw: GenericField) -> Result<FieldDef> {
                     return Err(err("kind", &format!("`{other}` não é bool (bits)")));
                 }
             }
-            let fields = match raw.fields {
-                None => return Err(err("fields", "campo obrigatório ausente")),
-                Some(f) if f.is_empty() => return Err(err("fields", "lista vazia")),
-                Some(f) => f,
-            };
-            let mut seen = HashSet::new();
-            for f in &fields {
-                if f.trim().is_empty() {
-                    return Err(err("fields", "nome vazio"));
-                }
-                if !seen.insert(f.as_str()) {
-                    return Err(err("fields", &format!("`{f}` repetido")));
+            FieldRule::ClearBits {
+                fields: field_names(file, id, raw.fields)?,
+            }
+        }
+        Some("set") => {
+            for (present, field) in [
+                (raw.field.is_some(), "field"),
+                (raw.mode.is_some(), "mode"),
+                (raw.target_field.is_some(), "target_field"),
+                (raw.result_max.is_some(), "result_max"),
+            ] {
+                if present {
+                    return Err(err(field, "não vale com rule = \"set\""));
                 }
             }
-            FieldRule::ClearBits { fields }
+            let kind = match raw.kind.as_deref() {
+                None => return Err(err("kind", "campo obrigatório ausente")),
+                Some("float") => FieldKind::Float,
+                Some("int") => FieldKind::Int,
+                Some(other) => {
+                    return Err(err("kind", &format!("`{other}` não é int nem float (set)")));
+                }
+            };
+            let fields = field_names(file, id, raw.fields)?;
+            let target = match (raw.value.as_ref(), raw.target.as_ref()) {
+                (Some(_), Some(_)) => {
+                    return Err(err("target", "value e target não podem vir juntos"));
+                }
+                (None, None) => return Err(err("value", "falta [field.value] ou target")),
+                (Some(block), None) => {
+                    // A faixa é a da grade: `min`/`max` soltos não valem.
+                    for (present, field) in [(raw.min.is_some(), "min"), (raw.max.is_some(), "max")]
+                    {
+                        if present {
+                            return Err(err(field, "com [field.value] a faixa é a da grade"));
+                        }
+                    }
+                    let expected = match kind {
+                        FieldKind::Int => ValueType::I32,
+                        FieldKind::Float => ValueType::F32,
+                    };
+                    value = Some(build_field_grid(file, id, block, expected)?);
+                    None
+                }
+                (None, Some(v)) => {
+                    let min = match raw.min.as_ref() {
+                        None => return Err(err("min", "obrigatório com target")),
+                        Some(v) => field_number64(file, "min", id, v, kind)?,
+                    };
+                    let max = match raw.max.as_ref() {
+                        None => return Err(err("max", "obrigatório com target")),
+                        Some(v) => field_number64(file, "max", id, v, kind)?,
+                    };
+                    if min > max {
+                        return Err(err("max", &format!("min {min} maior que max {max}")));
+                    }
+                    let t = field_number64(file, "target", id, v, kind)?;
+                    if t < min || t > max {
+                        return Err(err("target", &format!("{t} fora de [{min}, {max}]")));
+                    }
+                    Some(t)
+                }
+            };
+            FieldRule::Set {
+                fields,
+                kind,
+                target,
+            }
+        }
+        Some("add") => {
+            for (present, field) in [
+                (raw.fields.is_some(), "fields"),
+                (raw.mode.is_some(), "mode"),
+                (raw.target_field.is_some(), "target_field"),
+                (raw.target.is_some(), "target"),
+                (raw.min.is_some(), "min"),
+                (raw.max.is_some(), "max"),
+            ] {
+                if present {
+                    return Err(err(field, "não vale com rule = \"add\""));
+                }
+            }
+            let field = match raw.field.as_deref() {
+                None => return Err(err("field", "campo obrigatório ausente")),
+                Some(f) if f.trim().is_empty() => return Err(err("field", "vazio")),
+                Some(f) => f.to_string(),
+            };
+            match raw.kind.as_deref() {
+                None => return Err(err("kind", "campo obrigatório ausente")),
+                Some("int") => {}
+                Some(other) => {
+                    return Err(err("kind", &format!("`{other}` não é int (ação)")));
+                }
+            }
+            let Some(block) = raw.value.as_ref() else {
+                return Err(err("value", "campo obrigatório ausente"));
+            };
+            let grid = build_field_grid(file, id, block, ValueType::I32)?;
+            if grid.min <= 0.0 {
+                return Err(sig_err(
+                    file,
+                    "value.min",
+                    format!("`{id}`: a quantidade mínima precisa ser maior que 0"),
+                ));
+            }
+            let result_max = match raw.result_max.as_ref() {
+                None => return Err(err("result_max", "campo obrigatório ausente")),
+                Some(toml::Value::Integer(i)) => *i,
+                Some(_) => return Err(err("result_max", "esperava um inteiro")),
+            };
+            if (result_max as f64) <= grid.max {
+                return Err(err(
+                    "result_max",
+                    &format!(
+                        "{result_max} precisa ser maior que o max da grade ({})",
+                        grid.max
+                    ),
+                ));
+            }
+            value = Some(grid);
+            FieldRule::Add { field, result_max }
         }
         Some(other) => {
-            return Err(err("rule", &format!("`{other}` não é lock nem clear_bits")));
+            return Err(err(
+                "rule",
+                &format!("`{other}` não é lock, clear_bits, set nem add"),
+            ));
         }
     };
+
+    if root == FieldRoot::GameState {
+        if !matches!(rule, FieldRule::Add { .. }) {
+            return Err(err("root", "game_state só vale com rule = \"add\""));
+        }
+        if raw.object == "pawn" {
+            return Err(err(
+                "object",
+                "object = \"pawn\" não combina com root = \"game_state\"",
+            ));
+        }
+    }
     Ok(FieldDef {
         id: raw.id,
         name,
@@ -1015,8 +1358,45 @@ fn build_field(file: &str, raw: GenericField) -> Result<FieldDef> {
         description: raw.description,
         object: raw.object,
         object_class: raw.object_class,
+        root,
         rule,
+        value,
     })
+}
+
+/// Conferências entre `[[field]]` e `[ue.player]` (spec 006, 6.3): `root = "game_state"` exige o
+/// caminho no `[ue.player]`, e dois `set` não podem escrever o mesmo campo do mesmo objeto (um
+/// guardaria o valor do outro como original).
+fn check_field_set(file: &str, fields: &[FieldDef], ue: Option<&GenericUe>) -> Result<()> {
+    let has_game_state = ue.is_some_and(|ue| ue.player.game_state.is_some());
+    let mut sets: HashSet<(&str, &str)> = HashSet::new();
+    for def in fields {
+        if def.root == FieldRoot::GameState && !has_game_state {
+            return Err(sig_err(
+                file,
+                "root",
+                format!(
+                    "`{}`: root = \"game_state\" exige os cinco campos do game_state no [ue.player]",
+                    def.id
+                ),
+            ));
+        }
+        if let FieldRule::Set { fields: names, .. } = &def.rule {
+            for name in names {
+                if !sets.insert((def.object.as_str(), name.as_str())) {
+                    return Err(sig_err(
+                        file,
+                        "fields",
+                        format!(
+                            "`{}`: `{name}` de `{}` já é escrito por outro set",
+                            def.id, def.object
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_toml<T: for<'de> Deserialize<'de>>(file: &str, text: &str) -> Result<T> {
@@ -1084,6 +1464,7 @@ impl Signatures {
             }
             fields.push(build_field(GENERIC_FILE, f)?);
         }
+        check_field_set(GENERIC_FILE, &fields, ue.as_ref())?;
 
         let mut versions = BTreeMap::new();
         for (name, text) in version_files {
@@ -1494,10 +1875,11 @@ offset = 3
         assert!(sigs.ue_for_version("c935e799-0b27c000").is_some());
         assert!(sigs.ue_for_version("cccc-dddd").is_some());
         // Fase 5: os oito cheats de valor da spec 6.5, em sobrevivência, e os três do pet, em PET.
+        // Fase 6: depois deles vêm os seis da spec 006 (conferidos em `real_generic_toml_loads_six_new_fields`).
         let ids: Vec<&str> = sigs.fields().iter().map(|f| f.id.as_str()).collect();
         assert_eq!(
-            ids,
-            vec![
+            ids[..11],
+            [
                 "vida-infinita",
                 "stamina-infinita",
                 "comida-infinita",
@@ -1511,6 +1893,7 @@ offset = 3
                 "pet-stamina-infinita",
             ]
         );
+        assert_eq!(ids.len(), 17);
         let category = |id: &str| {
             if id.starts_with("pet-") {
                 Category::Pet
@@ -1518,7 +1901,11 @@ offset = 3
                 Category::Sobrevivencia
             }
         };
-        assert!(sigs.fields().iter().all(|f| f.category == category(&f.id)));
+        assert!(
+            sigs.fields()[..11]
+                .iter()
+                .all(|f| f.category == category(&f.id))
+        );
         let player = sigs.ue_for_version("c935e799-0b27c000").unwrap().player;
         assert_eq!(
             player.alt_pawn_fields,
@@ -1605,18 +1992,21 @@ offset = 3
         assert_eq!(def.name, "Valor");
         assert_eq!(def.category, Category::Movimento);
         let spec = def.value.as_ref().unwrap();
-        assert_eq!(spec.ty, ValueType::F32);
+        assert_eq!(spec.grid.ty, ValueType::F32);
         assert_eq!(spec.slot, 1);
-        assert_eq!((spec.min, spec.max, spec.step), (0.5, 4.0, 0.5));
-        assert_eq!(spec.default_k, 2);
-        assert_eq!(spec.unit.as_deref(), Some("x"));
-        assert_eq!(spec.decimals, 1);
+        assert_eq!(
+            (spec.grid.min, spec.grid.max, spec.grid.step),
+            (0.5, 4.0, 0.5)
+        );
+        assert_eq!(spec.grid.default_k, 2);
+        assert_eq!(spec.grid.unit.as_deref(), Some("x"));
+        assert_eq!(spec.grid.decimals, 1);
         assert_eq!(spec.bytes(&def.replacement, 2), def.replacement);
         assert_eq!(
             spec.bytes(&def.replacement, 3),
             vec![0xB8, 0, 0, 0x00, 0x40]
         );
-        assert_eq!(spec.format(2), "1.5x");
+        assert_eq!(spec.grid.format(2), "1.5x");
     }
 
     #[test]
@@ -1627,14 +2017,22 @@ offset = 3
         let repl = "B8 00 00 80 3F";
         let sigs = parse(&[("generic.toml", &value_generic(repl, block))]).unwrap();
         let spec = sigs.for_version("x")[0].value.clone().unwrap();
-        assert_eq!((spec.min, spec.default_k), (0.0, 2));
+        assert_eq!((spec.grid.min, spec.grid.default_k), (0.0, 2));
         // Sem `decimals`, deriva do passo.
-        assert_eq!(spec.decimals, 1);
+        assert_eq!(spec.grid.decimals, 1);
         // Tudo inteiro também vale.
         let block =
             "[patch.value]\ntype = \"f32\"\nslot = 1\nmin = 0\nmax = 4\nstep = 1\ndefault = 1\n";
         let sigs = parse(&[("generic.toml", &value_generic(repl, block))]).unwrap();
-        assert_eq!(sigs.for_version("x")[0].value.as_ref().unwrap().decimals, 0);
+        assert_eq!(
+            sigs.for_version("x")[0]
+                .value
+                .as_ref()
+                .unwrap()
+                .grid
+                .decimals,
+            0
+        );
     }
 
     #[test]
@@ -1649,7 +2047,7 @@ offset = 3
         let sigs = parse(&[("generic.toml", &value_generic(repl, &int_block("")))]).unwrap();
         let spec = sigs.for_version("x")[0].value.clone().unwrap();
         assert_eq!(
-            (spec.ty, spec.default_k, spec.decimals),
+            (spec.grid.ty, spec.grid.default_k, spec.grid.decimals),
             (ValueType::I32, 5, 0)
         );
         for (what, block, field) in [
@@ -1868,16 +2266,21 @@ offset = 3
         let sigs = parse(&[("generic.toml", &generic), ("aaaa-bbbb.toml", version)]).unwrap();
         let generic_def = &sigs.for_version("outra")[0];
         let version_def = &sigs.for_version("aaaa-bbbb")[0];
-        assert_eq!(generic_def.value.as_ref().unwrap().max, 4.0);
+        assert_eq!(generic_def.value.as_ref().unwrap().grid.max, 4.0);
         assert_eq!(generic_def.name, "Valor");
         let spec = version_def.value.as_ref().unwrap();
         assert_eq!(
-            (spec.min, spec.max, spec.step, spec.default_k),
+            (
+                spec.grid.min,
+                spec.grid.max,
+                spec.grid.step,
+                spec.grid.default_k
+            ),
             (1.0, 8.0, 1.0, 1)
         );
-        assert_eq!(spec.unit.as_deref(), Some("%"));
+        assert_eq!(spec.grid.unit.as_deref(), Some("%"));
         // `decimals` não herdado do bloco genérico (era 1); sem ele, deriva do passo (0).
-        assert_eq!(spec.decimals, 0);
+        assert_eq!(spec.grid.decimals, 0);
         assert_eq!(version_def.name, "Outro nome");
         assert_eq!(version_def.category, Category::Itens);
 
@@ -2109,6 +2512,7 @@ alt_pawn_fields = []
                 pawn_field: "Pawn".into(),
                 pawn_class: "/Script/Maine.SurvivalPlayerCharacter".into(),
                 alt_pawn_fields: vec![],
+                game_state: None,
             }
         );
 
@@ -2315,6 +2719,8 @@ kind = "bool"
                 description: "A stamina não acaba".into(),
                 object: "StaminaComponent".into(),
                 object_class: "/Script/Maine.StaminaComponent".into(),
+                root: FieldRoot::Pawn,
+                value: None,
                 rule: FieldRule::Lock {
                     field: "CurrentStamina".into(),
                     mode: LockMode::Raise,
@@ -2432,7 +2838,7 @@ kind = "bool"
             ),
             (
                 "rule desconhecida",
-                LOCK_FIELD.replace("\"lock\"", "\"set\""),
+                LOCK_FIELD.replace("\"lock\"", "\"soma\""),
                 "rule",
             ),
             (
@@ -2598,5 +3004,647 @@ kind = "bool"
         let ue = sigs.ue_for_version("c935e799-0b27c000").unwrap();
         assert_eq!(ue.gobjects.rva, Some(0xa53bc30));
         assert_eq!(ue.names.rva, Some(0xa499e50));
+    }
+
+    // ---- Spec 006: tipo `int`, regras `set` e `add`, `[field.value]` e raiz `game_state` ----
+
+    const SET_VALUE: &str = r#"
+[[field]]
+id = "carga"
+name = "Capacidade de carga"
+category = "itens"
+description = "Aumenta a carga"
+object = "HaulingComponent"
+object_class = "/Script/Maine.HaulingComponent"
+rule = "set"
+fields = ["Capacity"]
+kind = "int"
+
+[field.value]
+type = "i32"
+min = 1
+max = 100
+step = 1
+default = 20
+"#;
+
+    const SET_TARGET: &str = r#"
+[[field]]
+id = "pulos"
+name = "Pulos infinitos"
+category = "movimento"
+description = "Pula no ar"
+object = "pawn"
+object_class = "/Script/Engine.Character"
+rule = "set"
+fields = ["JumpMaxCount"]
+kind = "int"
+target = 1000
+min = 1
+max = 1000
+"#;
+
+    const ADD_FIELD: &str = r#"
+[[field]]
+id = "somar-ciencia"
+name = "Somar ciência"
+category = "progressao"
+description = "Soma ciência"
+object = "PartyComponent"
+object_class = "/Script/Maine.PartyComponent"
+root = "game_state"
+rule = "add"
+field = "ScienceFound"
+kind = "int"
+result_max = 100000
+
+[field.value]
+type = "i32"
+min = 100
+max = 10000
+step = 100
+default = 1000
+"#;
+
+    const UE_PLAYER_GAME_STATE: &str = r#"
+[ue.player]
+controller_class = "/Script/Maine.SurvivalPlayerController"
+pawn_field = "Pawn"
+pawn_class = "/Script/Maine.SurvivalPlayerCharacter"
+level_class = "/Script/Engine.Level"
+world_field = "OwningWorld"
+world_class = "/Script/Engine.World"
+game_state_field = "GameState"
+game_state_class = "/Script/Maine.InGameGameState"
+"#;
+
+    /// Campo do erro de carga de um `generic.toml` só com o texto dado.
+    fn field_err(text: &str) -> String {
+        let (file, field) = load_err(&[("generic.toml", text)]);
+        assert_eq!(file, "generic.toml");
+        field
+    }
+
+    /// Mesmos arquivos, mas com `[ue]` completo (com ou sem o caminho do `game_state`).
+    fn with_ue(fields: &str, game_state: bool) -> String {
+        let player = if game_state {
+            UE_PLAYER_GAME_STATE
+        } else {
+            UE_PLAYER
+        };
+        format!("{GENERIC}{UE_PATTERNS}{UE_LAYOUT}{player}{fields}")
+    }
+
+    fn only_field(text: &str) -> FieldDef {
+        let sigs = parse(&[("generic.toml", text)]).unwrap();
+        assert_eq!(sigs.fields().len(), 1);
+        sigs.fields()[0].clone()
+    }
+
+    #[test]
+    fn int_kind_loads() {
+        let def = only_field(SET_VALUE);
+        assert_eq!(def.root, FieldRoot::Pawn);
+        assert_eq!(
+            def.rule,
+            FieldRule::Set {
+                fields: vec!["Capacity".into()],
+                kind: FieldKind::Int,
+                target: None,
+            }
+        );
+        let grid = def.value.unwrap();
+        assert_eq!(grid.ty, ValueType::I32);
+        assert_eq!((grid.min, grid.max, grid.step), (1.0, 100.0, 1.0));
+        assert_eq!(grid.value(grid.default_k), 20.0);
+        // `float` também vale no `set`, com `f32`.
+        let float = SET_VALUE
+            .replace("kind = \"int\"", "kind = \"float\"")
+            .replace("type = \"i32\"", "type = \"f32\"");
+        let def = only_field(&float);
+        assert!(matches!(
+            def.rule,
+            FieldRule::Set {
+                kind: FieldKind::Float,
+                ..
+            }
+        ));
+        assert_eq!(def.value.unwrap().ty, ValueType::F32);
+    }
+
+    #[test]
+    fn set_with_value_or_target_only() {
+        // Só `target`: carrega, sem grade.
+        let def = only_field(SET_TARGET);
+        assert_eq!(def.value, None);
+        assert!(matches!(
+            def.rule,
+            FieldRule::Set { target: Some(t), kind: FieldKind::Int, .. } if t == 1000.0
+        ));
+        // Os dois.
+        let both = SET_VALUE.replace(
+            "kind = \"int\"\n",
+            "kind = \"int\"\ntarget = 5\nmin = 1\nmax = 9\n",
+        );
+        assert_eq!(field_err(&both), "target");
+        // Nenhum.
+        let none = SET_TARGET.replace("target = 1000\nmin = 1\nmax = 1000\n", "");
+        assert_eq!(field_err(&none), "value");
+    }
+
+    #[test]
+    fn set_target_needs_min_max() {
+        assert_eq!(field_err(&SET_TARGET.replace("min = 1\n", "")), "min");
+        assert_eq!(field_err(&SET_TARGET.replace("max = 1000\n", "")), "max");
+        assert_eq!(
+            field_err(&SET_TARGET.replace("min = 1\nmax = 1000", "min = 9\nmax = 3")),
+            "max"
+        );
+    }
+
+    #[test]
+    fn set_target_out_of_range() {
+        assert_eq!(
+            field_err(&SET_TARGET.replace("target = 1000", "target = 2000")),
+            "target"
+        );
+        assert_eq!(
+            field_err(&SET_TARGET.replace("target = 1000", "target = 0")),
+            "target"
+        );
+        // Os limites da faixa valem.
+        only_field(&SET_TARGET.replace("target = 1000", "target = 1"));
+    }
+
+    #[test]
+    fn set_value_with_loose_min_max_refused() {
+        let min = SET_VALUE.replace("kind = \"int\"\n", "kind = \"int\"\nmin = 1\n");
+        assert_eq!(field_err(&min), "min");
+        let max = SET_VALUE.replace("kind = \"int\"\n", "kind = \"int\"\nmax = 100\n");
+        assert_eq!(field_err(&max), "max");
+    }
+
+    #[test]
+    fn set_bool_refused() {
+        assert_eq!(
+            field_err(&SET_TARGET.replace("kind = \"int\"", "kind = \"bool\"")),
+            "kind"
+        );
+        assert_eq!(
+            field_err(&SET_TARGET.replace("kind = \"int\"\n", "")),
+            "kind"
+        );
+    }
+
+    #[test]
+    fn set_fields_empty_or_repeated() {
+        let with = |list: &str| SET_VALUE.replace("[\"Capacity\"]", list);
+        assert_eq!(field_err(&with("[]")), "fields");
+        assert_eq!(field_err(&with("[\"A\", \"A\"]")), "fields");
+        assert_eq!(field_err(&with("[\"\"]")), "fields");
+        assert_eq!(
+            field_err(&SET_VALUE.replace("fields = [\"Capacity\"]\n", "")),
+            "fields"
+        );
+        // Dois campos distintos carregam.
+        let def = only_field(&with("[\"A\", \"B\"]"));
+        assert!(matches!(def.rule, FieldRule::Set { fields, .. } if fields == ["A", "B"]));
+    }
+
+    #[test]
+    fn set_int_target_not_integer() {
+        assert_eq!(
+            field_err(&SET_TARGET.replace("target = 1000", "target = 1.5")),
+            "target"
+        );
+        // Com `float` o decimal vale.
+        let float = SET_TARGET
+            .replace("kind = \"int\"", "kind = \"float\"")
+            .replace("target = 1000", "target = 1.5");
+        assert!(matches!(
+            only_field(&float).rule,
+            FieldRule::Set { target: Some(t), kind: FieldKind::Float, .. } if t == 1.5
+        ));
+    }
+
+    #[test]
+    fn value_in_lock_or_clear_bits_refused() {
+        let block = "\n[field.value]\ntype = \"f32\"\nmin = 0\nmax = 1\nstep = 1\ndefault = 0\n";
+        assert_eq!(field_err(&format!("{LOCK_FIELD}{block}")), "value");
+        assert_eq!(field_err(&format!("{BITS_FIELD}{block}")), "value");
+    }
+
+    #[test]
+    fn lock_int_refused() {
+        assert_eq!(
+            field_err(&LOCK_FIELD.replace("kind = \"float\"", "kind = \"int\"")),
+            "kind"
+        );
+    }
+
+    #[test]
+    fn value_type_must_match_kind() {
+        // `int` só com `i32`; `float` só com `f32`; `u32` nunca.
+        let float = |t: &str| {
+            SET_VALUE
+                .replace("kind = \"int\"", "kind = \"float\"")
+                .replace("type = \"i32\"", &format!("type = \"{t}\""))
+        };
+        let int = |t: &str| SET_VALUE.replace("type = \"i32\"", &format!("type = \"{t}\""));
+        assert_eq!(field_err(&int("f32")), "value.type");
+        assert_eq!(field_err(&int("u32")), "value.type");
+        assert_eq!(field_err(&float("i32")), "value.type");
+        assert_eq!(field_err(&float("u32")), "value.type");
+        assert_eq!(field_err(&int("i64")), "value.type");
+        assert_eq!(
+            field_err(&SET_VALUE.replace("type = \"i32\"\n", "")),
+            "value.type"
+        );
+    }
+
+    #[test]
+    fn value_grid_rules() {
+        // As da spec 003 que não dependem do `slot`, com o campo certo no erro.
+        let cases: Vec<(&str, String, &str)> = vec![
+            ("sem min", SET_VALUE.replace("min = 1\n", ""), "value.min"),
+            (
+                "min maior que max",
+                SET_VALUE.replace("min = 1", "min = 200"),
+                "value.max",
+            ),
+            (
+                "step zero",
+                SET_VALUE.replace("step = 1", "step = 0"),
+                "value.step",
+            ),
+            (
+                "step negativo",
+                SET_VALUE.replace("step = 1", "step = -1"),
+                "value.step",
+            ),
+            (
+                "default fora da faixa",
+                SET_VALUE.replace("default = 20", "default = 500"),
+                "value.default",
+            ),
+            (
+                "sem default",
+                SET_VALUE.replace("default = 20\n", ""),
+                "value.default",
+            ),
+            (
+                "decimais em i32",
+                SET_VALUE.replace("default = 20", "default = 20\ndecimals = 1"),
+                "value.decimals",
+            ),
+            (
+                "decimal no TOML de i32",
+                SET_VALUE.replace("default = 20", "default = 20.5"),
+                "value.default",
+            ),
+            (
+                "unit não é texto",
+                SET_VALUE.replace("default = 20", "default = 20\nunit = 3"),
+                "value.unit",
+            ),
+            (
+                "default fora da grade",
+                SET_VALUE
+                    .replace("step = 1", "step = 7")
+                    .replace("default = 20", "default = 9"),
+                "value.default",
+            ),
+            (
+                "slot não existe no field",
+                SET_VALUE.replace("default = 20", "default = 20\nslot = 1"),
+                "value.slot",
+            ),
+        ];
+        for (what, text, field) in cases {
+            assert_eq!(field_err(&text), field, "caso: {what}");
+        }
+        // `f32` com decimais e unidade.
+        let float = SET_VALUE
+            .replace("kind = \"int\"", "kind = \"float\"")
+            .replace(
+                "type = \"i32\"\nmin = 1\nmax = 100\nstep = 1\ndefault = 20",
+                "type = \"f32\"\nmin = 0.5\nmax = 4\nstep = 0.25\ndefault = 2\nunit = \"x\"\ndecimals = 2",
+            );
+        let grid = only_field(&float).value.unwrap();
+        assert_eq!(grid.ty, ValueType::F32);
+        assert_eq!(grid.unit.as_deref(), Some("x"));
+        assert_eq!(grid.decimals, 2);
+        assert_eq!(grid.format(grid.default_k), "2.00x");
+    }
+
+    #[test]
+    fn add_rules() {
+        let ok = with_ue(ADD_FIELD, true);
+        let def = only_field_in(&ok);
+        assert_eq!(def.root, FieldRoot::GameState);
+        assert_eq!(
+            def.rule,
+            FieldRule::Add {
+                field: "ScienceFound".into(),
+                result_max: 100_000
+            }
+        );
+        let grid = def.value.unwrap();
+        assert_eq!((grid.min, grid.max, grid.step), (100.0, 10_000.0, 100.0));
+        assert_eq!(grid.value(grid.default_k), 1000.0);
+
+        let bad = |text: String| field_err(&with_ue(&text, true));
+        let cases: Vec<(&str, String, &str)> = vec![
+            (
+                "sem value",
+                ADD_FIELD
+                    .split("\n[field.value]")
+                    .next()
+                    .unwrap()
+                    .to_string(),
+                "value",
+            ),
+            (
+                "com target",
+                ADD_FIELD.replace("kind = \"int\"\n", "kind = \"int\"\ntarget = 5\n"),
+                "target",
+            ),
+            (
+                "kind float",
+                ADD_FIELD
+                    .replace("kind = \"int\"", "kind = \"float\"")
+                    .replace("type = \"i32\"", "type = \"f32\""),
+                "kind",
+            ),
+            (
+                "value f32",
+                ADD_FIELD.replace("type = \"i32\"", "type = \"f32\""),
+                "value.type",
+            ),
+            (
+                "min zero",
+                ADD_FIELD
+                    .replace("min = 100", "min = 0")
+                    .replace("default = 1000", "default = 0"),
+                "value.min",
+            ),
+            (
+                "min negativo",
+                ADD_FIELD.replace("min = 100", "min = -100"),
+                "value.min",
+            ),
+            (
+                "result_max igual ao max",
+                ADD_FIELD.replace("result_max = 100000", "result_max = 10000"),
+                "result_max",
+            ),
+            (
+                "result_max menor que o max",
+                ADD_FIELD.replace("result_max = 100000", "result_max = 50"),
+                "result_max",
+            ),
+            (
+                "sem result_max",
+                ADD_FIELD.replace("result_max = 100000\n", ""),
+                "result_max",
+            ),
+            (
+                "min solto",
+                ADD_FIELD.replace("kind = \"int\"\n", "kind = \"int\"\nmin = 1\n"),
+                "min",
+            ),
+            (
+                "max solto",
+                ADD_FIELD.replace("kind = \"int\"\n", "kind = \"int\"\nmax = 1\n"),
+                "max",
+            ),
+            (
+                "sem field",
+                ADD_FIELD.replace("field = \"ScienceFound\"\n", ""),
+                "field",
+            ),
+            (
+                "com fields",
+                ADD_FIELD.replace("kind = \"int\"\n", "kind = \"int\"\nfields = [\"A\"]\n"),
+                "fields",
+            ),
+        ];
+        for (what, text, field) in cases {
+            assert_eq!(bad(text), field, "caso: {what}");
+        }
+    }
+
+    /// Como `only_field`, para um texto que já traz o `[ue]`.
+    fn only_field_in(text: &str) -> FieldDef {
+        let sigs = parse(&[("generic.toml", text)]).unwrap();
+        assert_eq!(sigs.fields().len(), 1);
+        sigs.fields()[0].clone()
+    }
+
+    #[test]
+    fn root_unknown_refused() {
+        let bad = ADD_FIELD.replace("root = \"game_state\"", "root = \"world\"");
+        assert_eq!(field_err(&with_ue(&bad, true)), "root");
+        // `pawn` explícito é o padrão.
+        let pawn = SET_VALUE.replace("kind = \"int\"\n", "kind = \"int\"\nroot = \"pawn\"\n");
+        assert_eq!(only_field(&pawn).root, FieldRoot::Pawn);
+    }
+
+    #[test]
+    fn game_state_only_with_add() {
+        let root = "kind = \"int\"\nroot = \"game_state\"\n";
+        let set = SET_VALUE.replace("kind = \"int\"\n", root);
+        assert_eq!(field_err(&with_ue(&set, true)), "root");
+        let lock = LOCK_FIELD.replace(
+            "kind = \"float\"\n",
+            "kind = \"float\"\nroot = \"game_state\"\n",
+        );
+        assert_eq!(field_err(&with_ue(&lock, true)), "root");
+        let bits = BITS_FIELD.replace(
+            "kind = \"bool\"\n",
+            "kind = \"bool\"\nroot = \"game_state\"\n",
+        );
+        assert_eq!(field_err(&with_ue(&bits, true)), "root");
+    }
+
+    #[test]
+    fn game_state_with_object_pawn_refused() {
+        let bad = ADD_FIELD.replace("object = \"PartyComponent\"", "object = \"pawn\"");
+        assert_eq!(field_err(&with_ue(&bad, true)), "object");
+    }
+
+    #[test]
+    fn game_state_needs_player_cfg() {
+        // Sem `[ue]` nenhum.
+        assert_eq!(field_err(ADD_FIELD), "root");
+        // Com `[ue.player]` sem os cinco campos.
+        assert_eq!(field_err(&with_ue(ADD_FIELD, false)), "root");
+        // Com os cinco, carrega e o caminho fica no `PlayerCfg`.
+        let sigs = parse(&[("generic.toml", &with_ue(ADD_FIELD, true))]).unwrap();
+        let cfg = sigs.ue_for_version("x").unwrap().player.game_state.unwrap();
+        assert_eq!(
+            cfg,
+            GameStateCfg {
+                level_class: "/Script/Engine.Level".into(),
+                world_field: "OwningWorld".into(),
+                world_class: "/Script/Engine.World".into(),
+                game_state_field: "GameState".into(),
+                game_state_class: "/Script/Maine.InGameGameState".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn player_game_state_fields_come_together() {
+        let partial = UE_PLAYER_GAME_STATE.replace("world_field = \"OwningWorld\"\n", "");
+        let text = format!("{GENERIC}{UE_PATTERNS}{UE_LAYOUT}{partial}");
+        assert_eq!(field_err(&text), "ue.player.world_field");
+        let bad_class = UE_PLAYER_GAME_STATE.replace("/Script/Engine.Level", "Level");
+        let text = format!("{GENERIC}{UE_PATTERNS}{UE_LAYOUT}{bad_class}");
+        assert_eq!(field_err(&text), "ue.player.level_class");
+        // Sem nenhum dos cinco, o `game_state` fica ausente.
+        let sigs = parse(&[("generic.toml", &with_ue("", false))]).unwrap();
+        assert_eq!(sigs.ue_for_version("x").unwrap().player.game_state, None);
+    }
+
+    #[test]
+    fn add_with_pawn_root_accepted() {
+        let pawn = ADD_FIELD.replace("root = \"game_state\"\n", "");
+        let def = only_field(&pawn);
+        assert_eq!(def.root, FieldRoot::Pawn);
+        assert!(matches!(def.rule, FieldRule::Add { .. }));
+    }
+
+    #[test]
+    fn two_sets_same_field_refused() {
+        let other = SET_VALUE.replace("id = \"carga\"", "id = \"carga-2\"");
+        assert_eq!(field_err(&format!("{SET_VALUE}{other}")), "fields");
+        // Mesmo nome em outro objeto, ou outro nome no mesmo objeto, é permitido.
+        let other_object = other.replace("object = \"HaulingComponent\"", "object = \"Outro\"");
+        parse(&[("generic.toml", &format!("{SET_VALUE}{other_object}"))]).unwrap();
+        let other_name = other.replace("[\"Capacity\"]", "[\"Weight\"]");
+        parse(&[("generic.toml", &format!("{SET_VALUE}{other_name}"))]).unwrap();
+        // Um campo repetido entre os `fields` de dois sets também.
+        let multi = other.replace("[\"Capacity\"]", "[\"Weight\", \"Capacity\"]");
+        assert_eq!(field_err(&format!("{SET_VALUE}{multi}")), "fields");
+    }
+
+    #[test]
+    fn real_generic_toml_loads_six_new_fields() {
+        let sigs = Signatures::embedded().unwrap();
+        let fields = &sigs.fields()[11..];
+        let ids: Vec<&str> = fields.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "carga",
+                "dano",
+                "somar-ciencia",
+                "velocidade",
+                "pulos-infinitos",
+                "gravidade"
+            ]
+        );
+        let class = |s: &str| s.to_string();
+        let set = |names: &[&str], kind, target| FieldRule::Set {
+            fields: names.iter().map(|n| n.to_string()).collect(),
+            kind,
+            target,
+        };
+        // (object, object_class, root, categoria, regra)
+        let expected = [
+            (
+                "HaulingComponent",
+                "/Script/Maine.HaulingComponent",
+                FieldRoot::Pawn,
+                Category::Itens,
+                set(&["Capacity"], FieldKind::Int, None),
+            ),
+            (
+                "pawn",
+                "/Script/Maine.SurvivalCharacter",
+                FieldRoot::Pawn,
+                Category::Progressao,
+                set(&["CustomDamageMultiplier"], FieldKind::Float, None),
+            ),
+            (
+                "PartyComponent",
+                "/Script/Maine.PartyComponent",
+                FieldRoot::GameState,
+                Category::Progressao,
+                FieldRule::Add {
+                    field: class("ScienceFound"),
+                    result_max: 100_000,
+                },
+            ),
+            (
+                "CharacterMovement",
+                "/Script/Maine.MaineCharMovementComponent",
+                FieldRoot::Pawn,
+                Category::Movimento,
+                set(
+                    &["CustomGroundSpeedMultiplier", "CustomSwimSpeedMultiplier"],
+                    FieldKind::Float,
+                    None,
+                ),
+            ),
+            (
+                "pawn",
+                "/Script/Engine.Character",
+                FieldRoot::Pawn,
+                Category::Movimento,
+                set(&["JumpMaxCount"], FieldKind::Int, Some(1000.0)),
+            ),
+            (
+                "CharacterMovement",
+                "/Script/Maine.MaineCharMovementComponent",
+                FieldRoot::Pawn,
+                Category::Movimento,
+                set(&["GravityScale"], FieldKind::Float, None),
+            ),
+        ];
+        for (def, (object, object_class, root, category, rule)) in fields.iter().zip(expected) {
+            assert_eq!(def.object, object, "{}", def.id);
+            assert_eq!(def.object_class, object_class, "{}", def.id);
+            assert_eq!(def.root, root, "{}", def.id);
+            assert_eq!(def.category, category, "{}", def.id);
+            assert_eq!(def.rule, rule, "{}", def.id);
+        }
+        // Grades: (tipo, min, max, passo, padrão, unidade, casas); `pulos-infinitos` não tem grade.
+        let grids = [
+            (ValueType::I32, 1.0, 100.0, 1.0, 20.0, None, 0),
+            (ValueType::F32, 1.0, 100.0, 1.0, 10.0, Some("x"), 0),
+            (ValueType::I32, 100.0, 10_000.0, 100.0, 1000.0, None, 0),
+            (ValueType::F32, 0.5, 4.0, 0.25, 2.0, Some("x"), 2),
+        ];
+        for (def, (ty, min, max, step, default, unit, decimals)) in fields.iter().zip(grids) {
+            let grid = def.value.as_ref().unwrap_or_else(|| panic!("{}", def.id));
+            assert_eq!(
+                (grid.ty, grid.min, grid.max, grid.step),
+                (ty, min, max, step)
+            );
+            assert_eq!(grid.value(grid.default_k), default, "{}", def.id);
+            assert_eq!(grid.unit.as_deref(), unit, "{}", def.id);
+            assert_eq!(grid.decimals, decimals, "{}", def.id);
+        }
+        assert_eq!(fields[4].value, None);
+        let gravity = fields[5].value.as_ref().unwrap();
+        assert_eq!(gravity.ty, ValueType::F32);
+        assert_eq!((gravity.min, gravity.max, gravity.step), (0.1, 2.0, 0.1));
+        assert!((gravity.value(gravity.default_k) - 0.5).abs() < 1e-9);
+        assert_eq!(gravity.unit.as_deref(), Some("x"));
+        assert_eq!(gravity.decimals, 1);
+        // O caminho do `game_state` vem do `[ue.player]`.
+        let player = sigs.ue_for_version("cccc-dddd").unwrap().player;
+        assert_eq!(
+            player.game_state,
+            Some(GameStateCfg {
+                level_class: "/Script/Engine.Level".into(),
+                world_field: "OwningWorld".into(),
+                world_class: "/Script/Engine.World".into(),
+                game_state_field: "GameState".into(),
+                game_state_class: "/Script/Maine.InGameGameState".into(),
+            })
+        );
     }
 }

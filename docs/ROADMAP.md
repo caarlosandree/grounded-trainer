@@ -114,7 +114,7 @@ maioria dos cheats.
     mode pelos bits de morte do `HealthComponent`.
   - Itens: capacidade de carga.
   - Progressão: dano causado (`CustomDamageMultiplier`), ciência.
-  - Movimento: velocidade, pulos infinitos, gravidade, teleporte (salvar/carregar posição).
+  - Movimento: velocidade, pulos infinitos, gravidade. **Teleporte** (salvar/carregar posição) e **velocidade do jogo** (speedhack) ficam **fora da Fase 5** (decisão do dono: o jogo tem viagem rápida e o dono quer explorar; a velocidade do jogo é a menor prioridade, sem fase prevista).
 
 **Pronto quando:** os cheats de sobrevivência funcionam e continuam funcionando depois de uma atualização do jogo
 sem mudar nada no trainer (os offsets vêm do próprio jogo).
@@ -126,7 +126,7 @@ A fase foi dividida em duas specs:
   água, oxigênio, temperatura, sem dano de queda, não morrer). **Fechada em 2026-10-26**: os oito funcionaram no
   jogo com o dono (branch `fase-5-sobrevivencia`). Pendência: confirmar na próxima atualização do jogo que tudo
   continua funcionando sem mudar o trainer.
-- **Spec 006 — o resto da Fase 5:** carga, dano causado, ciência e movimento.
+- **Spec 006 — o resto da Fase 5:** carga, dano causado, ciência (como ação de somar) e movimento (velocidade, pulos infinitos, gravidade). **Fechada em 2026-10-26**: os seis cheats funcionaram no jogo com o dono (branch `fase-5-progressao`). Com isso a **Fase 5 está fechada**, com a pendência da spec 005: confirmar na próxima atualização do jogo que tudo continua funcionando sem mudar o trainer.
 
 ---
 

@@ -110,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             write_local(*addr, bytes)?;
         }
         format!(
-            ",\"ue\":{{\"gobjects\":\"{:#x}\",\"names\":\"{:#x}\",\"controller\":\"{:#x}\",\"pawn\":\"{:#x}\",\"creature\":\"{:#x}\",\"pawn_field_addr\":\"{:#x}\",\"health\":\"{:#x}\",\"alt_pawn\":\"{:#x}\"}}",
+            ",\"ue\":{{\"gobjects\":\"{:#x}\",\"names\":\"{:#x}\",\"controller\":\"{:#x}\",\"pawn\":\"{:#x}\",\"creature\":\"{:#x}\",\"pawn_field_addr\":\"{:#x}\",\"health\":\"{:#x}\",\"alt_pawn\":\"{:#x}\",\"hauling\":\"{:#x}\",\"movement\":\"{:#x}\",\"creature_hauling\":\"{:#x}\",\"creature_movement\":\"{:#x}\",\"level\":\"{:#x}\",\"world\":\"{:#x}\",\"game_state\":\"{:#x}\",\"party\":\"{:#x}\"}}",
             a.gobjects,
             a.names,
             a.controller,
@@ -118,7 +118,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             a.creature,
             a.pawn_field_addr,
             a.health,
-            a.alt_pawn
+            a.alt_pawn,
+            a.hauling,
+            a.movement,
+            a.creature_hauling,
+            a.creature_movement,
+            a.level,
+            a.world,
+            a.game_state,
+            a.party
         )
     } else {
         String::new()

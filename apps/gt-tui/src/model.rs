@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 
-use gt_core::value::ValueSpec;
+use gt_core::value::ValueGrid;
 use gt_grounded2::fields::Note;
 use gt_grounded2::signatures::Category;
 
@@ -92,7 +92,7 @@ pub struct CheatRow {
     /// Categoria (cabeçalho sob o qual aparece).
     pub category: Category,
     /// Definição do valor ajustável, se o cheat tem valor.
-    pub value: Option<ValueSpec>,
+    pub value: Option<ValueGrid>,
     /// Índice na grade do valor mostrado.
     pub k: u64,
     /// Índice na grade do valor que está no jogo (com o cheat ligado).
@@ -107,6 +107,8 @@ pub struct CheatRow {
     pub desired: bool,
     /// Cheat de valor (`[[field]]`), não patch.
     pub field: bool,
+    /// Ação de uma execução (`rule = "add"`, spec 006 6.6): nunca está ligada nem desejada.
+    pub action: bool,
     /// Com o cheat ligado, por que ele não escreveu neste ciclo.
     pub note: Option<Note>,
 }
@@ -248,7 +250,8 @@ impl Model {
 
     /// (disponíveis ou ligados, total), só dos cheats mostrados.
     pub fn counts(&self) -> (usize, usize) {
-        let visible = self.visible();
+        // Uma ação nunca está ligada: não entra na contagem (spec 006, 6.9).
+        let visible: Vec<&CheatRow> = self.visible().into_iter().filter(|r| !r.action).collect();
         let ok = visible
             .iter()
             .filter(|r| r.on || matches!(r.avail, Avail::Available { .. }))
@@ -310,6 +313,7 @@ mod tests {
             residue: false,
             desired: false,
             field: false,
+            action: false,
             note: None,
         }
     }
@@ -499,5 +503,17 @@ mod tests {
         assert_eq!(PlayerLine::Found.label(), "personagem: encontrado");
         assert_eq!(PlayerLine::NotFound.label(), "personagem: não encontrado");
         assert_eq!(Model::new(false).player, PlayerLine::Idle);
+    }
+
+    #[test]
+    fn top_count_ignores_action() {
+        let mut model = Model::new(false);
+        let mut on = row("a", Category::Itens, avail());
+        on.on = true;
+        let mut act = row("b", Category::Progressao, avail());
+        act.field = true;
+        act.action = true;
+        model.cheats = vec![on, act, row("c", Category::Itens, avail())];
+        assert_eq!(model.counts(), (2, 2));
     }
 }

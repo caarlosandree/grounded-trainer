@@ -6,16 +6,24 @@
 //!
 //! ```text
 //! gt-patch-harness --journal-dir D [--pid P --allow START:LEN]
-//!     [--hook panic-in-pause|kill-in-pause|sigint-in-pause|panic-after-apply|panic-after-bits]
+//!     [--hook panic-in-pause|kill-in-pause|sigint-in-pause|panic-after-apply|panic-after-bits
+//!             |panic-after-set|kill-after-next]
 //!     [--hook-pause N] [--fault cont-always|cont-once|write]
 //!     (run --addr A --expected HEX --replacement HEX [--set-value HEX]
 //!      | set-bits --id ID --addr A --mask M --guard A:HEX [--guard A:HEX ...]
+//!      | set-word --id ID --addr A --value HEX [--value HEX] --guard A:HEX [--guard A:HEX ...]
 //!      | restore)
 //! ```
 //!
 //! `set-bits` (spec 005, 6.6) abre o motor com a política de dados "qualquer região `rw`",
 //! limpa os bits e fica no laço do `run` (imprime `ativo`); na saída por sinal, desfaz e
 //! imprime `restaurado`. `--hook panic-after-bits` entra em pânico logo depois do `set_bits`.
+//!
+//! `set-word` (spec 006, 6.4) escreve o valor inteiro com o original no diário (o `accept` é
+//! sempre verdadeiro) e fica no laço como o `set-bits`. Um segundo `--value` vira uma troca
+//! logo depois; com `--hook kill-after-next` o processo morre por `SIGKILL` depois de gravar o
+//! `next` e antes de escrever o valor novo. `--hook panic-after-set` entra em pânico logo
+//! depois do `set-word`.
 //!
 //! `run` imprime `ativo` depois de aplicar, `valor trocado` depois de `--set-value` (que
 //! troca o `replacement` do patch ativo e segue no laço do `run`) e `restaurado` (ou
@@ -57,6 +65,12 @@ enum Cmd {
         mask: u8,
         guard: Vec<GuardBytes>,
     },
+    SetWord {
+        id: String,
+        addr: u64,
+        values: Vec<Vec<u8>>,
+        guard: Vec<GuardBytes>,
+    },
     Restore,
 }
 
@@ -67,6 +81,8 @@ struct Args {
     hook: Option<fn(HookPoint)>,
     /// `--hook panic-after-bits`: pânico do próprio harness logo depois do `set_bits`.
     panic_after_bits: bool,
+    /// `--hook panic-after-set`: pânico do próprio harness logo depois do `set_word`.
+    panic_after_set: bool,
     hook_pause: Option<u32>,
     fault: Option<Fault>,
     cmd: Cmd,
@@ -87,6 +103,12 @@ fn kill_in_pause(point: HookPoint) {
 fn sigint_in_pause(point: HookPoint) {
     if point == HookPoint::InPause {
         let _ = raise(Signal::SIGINT);
+    }
+}
+
+fn kill_after_next(point: HookPoint) {
+    if point == HookPoint::AfterNext {
+        let _ = raise(Signal::SIGKILL);
     }
 }
 
@@ -148,6 +170,7 @@ fn parse_hook(s: &str) -> Result<fn(HookPoint)> {
         "kill-in-pause" => kill_in_pause,
         "sigint-in-pause" => sigint_in_pause,
         "panic-after-apply" => panic_after_apply,
+        "kill-after-next" => kill_after_next,
         other => bail!("gancho desconhecido: {other}"),
     })
 }
@@ -168,7 +191,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
     };
     let (mut journal_dir, mut pid, mut allow, mut hook) = (None, None, None, None);
     let (mut hook_pause, mut fault) = (None, None);
-    let mut panic_after_bits = false;
+    let (mut panic_after_bits, mut panic_after_set) = (false, false);
     let cmd = loop {
         let Some(arg) = it.next() else {
             bail!("falta o subcomando (run ou restore)");
@@ -184,6 +207,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
                 let v = value(&mut it, &arg)?;
                 if v == "panic-after-bits" {
                     panic_after_bits = true;
+                } else if v == "panic-after-set" {
+                    panic_after_set = true;
                 } else {
                     hook = Some(parse_hook(&v)?);
                 }
@@ -222,6 +247,29 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
                     guard,
                 };
             }
+            "set-word" => {
+                let (mut id, mut addr) = (None, None);
+                let (mut values, mut guard) = (Vec::new(), Vec::new());
+                while let Some(flag) = it.next() {
+                    let v = value(&mut it, &flag)?;
+                    match flag.as_str() {
+                        "--id" => id = Some(v),
+                        "--addr" => addr = Some(parse_num(&v)?),
+                        "--value" => values.push(parse_hex(&v)?),
+                        "--guard" => guard.push(parse_guard(&v)?),
+                        other => bail!("opção desconhecida do set-word: {other}"),
+                    }
+                }
+                if values.is_empty() || values.len() > 2 {
+                    bail!("set-word espera um ou dois --value");
+                }
+                break Cmd::SetWord {
+                    id: id.context("set-word sem --id")?,
+                    addr: addr.context("set-word sem --addr")?,
+                    values,
+                    guard,
+                };
+            }
             "run" => {
                 let (mut addr, mut expected, mut replacement) = (None, None, None);
                 let mut set_value = None;
@@ -254,6 +302,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
         allow,
         hook,
         panic_after_bits,
+        panic_after_set,
         hook_pause,
         fault,
         cmd,
@@ -320,6 +369,7 @@ fn restore(args: Args) -> Result<()> {
     }
     if args.hook.is_some()
         || args.panic_after_bits
+        || args.panic_after_set
         || args.hook_pause.is_some()
         || args.fault.is_some()
     {
@@ -452,6 +502,59 @@ fn set_bits(args: Args, id: String, addr: u64, mask: u8, guard: Vec<GuardBytes>)
     finish_run(&mut engine, end)
 }
 
+fn set_word(
+    args: Args,
+    id: String,
+    addr: u64,
+    values: Vec<Vec<u8>>,
+    guard: Vec<GuardBytes>,
+) -> Result<()> {
+    let pid = args.pid.context("set-word exige --pid")?;
+    if args.allow.is_some() || args.fault.is_some() {
+        bail!("set-word não aceita --allow nem --fault");
+    }
+    let shutdown = Shutdown::install()?;
+    let store = JournalStore::new(args.journal_dir);
+    let lock = store.lock()?;
+    let report = recover(&store, &lock, &PauseConfig::default())?;
+    if !report.is_empty() {
+        print_recovery(&mut std::io::stdout().lock(), &report)?;
+    }
+    ensure_recovered(&report)?;
+    let target_id = identity(pid)?;
+    let policy: PolicyFn = Box::new(|_maps| WritePolicy::new(Vec::new()));
+    let opts = EngineOptions {
+        version_key: "harness".into(),
+        pause: PauseConfig {
+            hook: args.hook,
+            ..PauseConfig::default()
+        },
+    };
+    let mut engine = Engine::open(pid, Some(&target_id), store.clone(), &lock, policy, opts)?;
+    // Qualquer região `rw` do processo.
+    engine.set_data_policy(Box::new(|maps| {
+        WritePolicy::new(
+            maps.iter()
+                .filter(|r| r.perms.read && r.perms.write)
+                .map(|r| r.start..r.end)
+                .collect(),
+        )
+    }));
+    for value in &values {
+        engine.set_word(&id, addr, value, &guard, &|_| true)?;
+    }
+    if args.panic_after_set {
+        panic!("pânico de teste depois do set-word");
+    }
+    {
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "ativo")?;
+        out.flush()?;
+    }
+    let end = run_until_shutdown(&mut engine, &shutdown, TICK)?;
+    finish_run(&mut engine, end)
+}
+
 fn main() -> Result<()> {
     let mut args = parse_args(std::env::args().skip(1))?;
     match std::mem::replace(&mut args.cmd, Cmd::Restore) {
@@ -468,6 +571,12 @@ fn main() -> Result<()> {
             mask,
             guard,
         } => set_bits(args, id, addr, mask, guard),
+        Cmd::SetWord {
+            id,
+            addr,
+            values,
+            guard,
+        } => set_word(args, id, addr, values, guard),
     }
 }
 

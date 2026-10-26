@@ -297,6 +297,29 @@ fn write_report(out: &mut dyn Write, report: &PlayerReport) -> std::io::Result<(
                     .collect();
                 writeln!(out, "  {:<20} {}", f.id, list.join("  "))?;
             }
+            FieldReportValue::Set { fields } => {
+                let list: Vec<String> = fields
+                    .iter()
+                    .map(|v| format!("{}={} ({:#x})", v.name, v.value, v.addr))
+                    .collect();
+                writeln!(out, "  {:<20} {}", f.id, list.join("  "))?;
+            }
+            FieldReportValue::Add { addr, current } => {
+                writeln!(out, "  {:<20} atual {current}  ({addr:#x})", f.id)?;
+            }
+        }
+    }
+    if let Some(gs) = &report.game_state {
+        writeln!(
+            out,
+            "GameState: Level {}  World {}  GameState {}  objeto da ação {}",
+            ptr(gs.level),
+            ptr(gs.world),
+            ptr(gs.game_state),
+            ptr(gs.object)
+        )?;
+        if let Some(error) = &gs.error {
+            writeln!(out, "  caminho interrompido: {error}")?;
         }
     }
     Ok(())

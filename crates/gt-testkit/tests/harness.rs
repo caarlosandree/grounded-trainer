@@ -593,7 +593,10 @@ fn set_bits_sigkill_then_recover() {
         Loaded::Ok(j) => {
             assert!(j.entries.is_empty());
             assert_eq!(j.data.len(), 1);
-            assert_eq!((j.data[0].original, j.data[0].mask), (0x07, 0x06));
+            assert_eq!(
+                (j.data[0].original.as_slice(), j.data[0].mask),
+                ([0x07].as_slice(), 0x06)
+            );
         }
         other => panic!("diário inesperado: {other:?}"),
     }
@@ -655,5 +658,139 @@ fn set_bits_panic_restores() {
     );
     // O `Drop` do motor restaurou os bits.
     assert_eq!(bytes_at(t.pid, t.big_region + 0x100, 1), [0x07]);
+    assert_eq!(journal(dir.path()), Loaded::Missing);
+}
+
+// ---------------------------------------------------------------------------
+// Valor inteiro em dados (plano 006, tarefa 3)
+// ---------------------------------------------------------------------------
+
+const WORD_OLD: [u8; 4] = [1, 2, 3, 4];
+
+/// Palavra `[1, 2, 3, 4]` em `+0x200` do `big_region`, guarda de 8 bytes no início.
+fn word_object(t: &TestTarget) -> (u64, String) {
+    let w = gt_core::mem::MemWriter::open(t.pid).unwrap();
+    w.write(
+        t.big_region,
+        &[0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8],
+    )
+    .unwrap();
+    w.write(t.big_region + 0x200, &WORD_OLD).unwrap();
+    (
+        t.big_region + 0x200,
+        format!("{:#x}:c1c2c3c4c5c6c7c8", t.big_region),
+    )
+}
+
+/// `set-word` do `id` `carga` com os valores dados (o segundo é a troca).
+fn word_cmd(t: &TestTarget, dir: &Path, globals: &[&str], values: &[&str]) -> Command {
+    let (word, guard) = word_object(t);
+    let mut cmd = harness(dir);
+    cmd.args(["--pid".to_string(), t.pid.to_string()]);
+    cmd.args(globals);
+    cmd.args([
+        "set-word".to_string(),
+        "--id".to_string(),
+        "carga".to_string(),
+        "--addr".to_string(),
+        format!("{word:#x}"),
+    ]);
+    for v in values {
+        cmd.args(["--value", v]);
+    }
+    cmd.args(["--guard".to_string(), guard]);
+    cmd
+}
+
+#[test]
+fn set_word_sigkill_then_recover() {
+    let t = TestTarget::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = spawn(word_cmd(&t, dir.path(), &[], &["09090909"]));
+    let _reader = wait_line(&mut child, "ativo");
+    let word = t.big_region + 0x200;
+    assert_eq!(bytes_at(t.pid, word, 4), [9, 9, 9, 9]);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    match journal(dir.path()) {
+        Loaded::Ok(j) => {
+            assert_eq!(j.data.len(), 1);
+            assert_eq!(j.data[0].original, WORD_OLD.to_vec());
+            assert_eq!(j.data[0].written, vec![9, 9, 9, 9]);
+        }
+        other => panic!("diário inesperado: {other:?}"),
+    }
+    let out = restore(dir.path());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("restaurado: carga"), "{stdout}");
+    assert_eq!(bytes_at(t.pid, word, 4), WORD_OLD);
+    assert_eq!(journal(dir.path()), Loaded::Missing);
+}
+
+#[test]
+fn set_word_sigkill_between_next_and_write() {
+    let t = TestTarget::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = spawn(word_cmd(
+        &t,
+        dir.path(),
+        &["--hook", "kill-after-next"],
+        &["09090909", "07070707"],
+    ));
+    let status = wait_exit(&mut child);
+    assert!(!status.success(), "{status:?}");
+    let word = t.big_region + 0x200;
+    // O `next` está no diário e a escrita nova não aconteceu.
+    assert_eq!(bytes_at(t.pid, word, 4), [9, 9, 9, 9]);
+    match journal(dir.path()) {
+        Loaded::Ok(j) => {
+            assert_eq!(j.data.len(), 1);
+            assert_eq!(j.data[0].original, WORD_OLD.to_vec());
+            assert_eq!(j.data[0].written, vec![9, 9, 9, 9]);
+            assert_eq!(j.data[0].next, Some(vec![7, 7, 7, 7]));
+        }
+        other => panic!("diário inesperado: {other:?}"),
+    }
+    let out = restore(dir.path());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("restaurado: carga"), "{stdout}");
+    assert_eq!(bytes_at(t.pid, word, 4), WORD_OLD);
+    assert_eq!(journal(dir.path()), Loaded::Missing);
+}
+
+#[test]
+fn set_word_sigterm_restores() {
+    let t = TestTarget::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = spawn(word_cmd(&t, dir.path(), &[], &["09090909", "07070707"]));
+    let reader = wait_line(&mut child, "ativo");
+    assert_eq!(bytes_at(t.pid, t.big_region + 0x200, 4), [7, 7, 7, 7]);
+    kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM).unwrap();
+    let status = wait_exit(&mut child);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+    assert!(rest(reader).contains("restaurado"));
+    assert_eq!(bytes_at(t.pid, t.big_region + 0x200, 4), WORD_OLD);
+    assert_eq!(journal(dir.path()), Loaded::Missing);
+}
+
+#[test]
+fn set_word_panic_restores() {
+    let t = TestTarget::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let out = word_cmd(
+        &t,
+        dir.path(),
+        &["--hook", "panic-after-set"],
+        &["09090909"],
+    )
+    .output()
+    .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("pânico de teste"),
+        "{out:?}"
+    );
+    // O `Drop` do motor devolveu o original.
+    assert_eq!(bytes_at(t.pid, t.big_region + 0x200, 4), WORD_OLD);
     assert_eq!(journal(dir.path()), Loaded::Missing);
 }

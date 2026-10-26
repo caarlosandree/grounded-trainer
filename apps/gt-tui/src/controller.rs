@@ -12,7 +12,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
 use gt_core::procinfo::Identity;
-use gt_grounded2::fields::PlayerState;
+use gt_grounded2::fields::{ActionOutcome, Note as FieldNote, PlayerState};
 use gt_grounded2::ue::UE_ID;
 
 use crate::backend::{
@@ -21,7 +21,7 @@ use crate::backend::{
 };
 use crate::keys::Action;
 use crate::model::{Avail, CheatRow, Conn, Model, PlayerLine};
-use crate::values::REFLECTION_UNRECOGNIZED;
+use crate::values::{REFLECTION_UNRECOGNIZED, STUCK_REFUSAL};
 
 /// Devolve a hora do registro de eventos como `HH:MM`.
 pub type Clock = Box<dyn Fn() -> String>;
@@ -54,6 +54,15 @@ const INDEX_WINDOW: Duration = Duration::from_secs(120);
 /// Eventos de personagem que o controlador dá sozinho, nas transições.
 const PLAYER_FOUND: &str = "personagem encontrado";
 const PLAYER_LOST: &str = "personagem perdido";
+/// Eventos da procura do controller pedida pela ação (spec 006, 6.6).
+const ACTION_PLAYER_FOUND: &str = "personagem encontrado: aperte de novo para somar";
+const ACTION_PLAYER_MISSING: &str = "personagem não encontrado";
+/// Recusas da ação que dependem da procura do controller.
+const SEARCHING_PLAYER: &str = "procurando o personagem";
+const WAIT_SEARCH: &str = "aguarde a procura";
+/// Janela depois de uma execução da ação que escreveu, e intervalo mínimo entre duas linhas
+/// de registro com o mesmo motivo (spec 006, 6.6).
+const ACTION_WINDOW: Duration = Duration::from_secs(1);
 
 type SearchResult<P> = Result<Search<P>, SearchError>;
 
@@ -137,6 +146,7 @@ fn row_of(c: CheatInfo) -> CheatRow {
         residue: false,
         desired: false,
         field: c.field,
+        action: c.action,
         note: None,
     }
 }
@@ -198,6 +208,10 @@ pub struct Controller<B: Backend> {
     next_controller: Option<Instant>,
     /// O personagem estava achado no último ciclo de manutenção (`None`: ninguém procurou).
     player_found: Option<bool>,
+    /// Quando cada ação escreveu pela última vez (a janela de 1 s; zera ao reconectar).
+    action_last: HashMap<String, Instant>,
+    /// Quando cada motivo de recusa da ação foi ao registro pela última vez (por ação).
+    refusal_last: HashMap<(String, String), Instant>,
 }
 
 impl<B: Backend> Controller<B> {
@@ -232,6 +246,8 @@ impl<B: Backend> Controller<B> {
             next_index: None,
             next_controller: None,
             player_found: None,
+            action_last: HashMap::new(),
+            refusal_last: HashMap::new(),
         }
     }
 
@@ -255,6 +271,7 @@ impl<B: Backend> Controller<B> {
             self.poll_find(now, draw);
             return false;
         }
+        self.poll_controller_news();
         self.maybe_spawn_job(now);
         let mut called = self.run_reapply(now, draw);
         self.maybe_auto_search(now);
@@ -482,6 +499,8 @@ impl<B: Backend> Controller<B> {
         self.conn_no += 1;
         self.notes.clear();
         self.warned_unverified.clear();
+        self.action_last.clear();
+        self.refusal_last.clear();
         self.model.conn = Conn::Connecting;
         if let Err(e) = self.spawn_search(SearchKind::Connect, pid, None, None, now) {
             self.model.conn = Conn::Error(format!("não foi possível iniciar a busca: {e}"));
@@ -784,6 +803,8 @@ impl<B: Backend> Controller<B> {
         self.next_index = None;
         self.next_controller = None;
         self.player_found = None;
+        self.action_last.clear();
+        self.refusal_last.clear();
         self.model.player = PlayerLine::Idle;
         self.model.busy = None;
         self.model.banners.stuck = None;
@@ -951,8 +972,12 @@ impl<B: Backend> Controller<B> {
         let index_due = !self.index_ok
             && self.next_index.is_some_and(|t| now >= t)
             && self.index_until.is_some_and(|u| now < u);
+        let action_wants = self
+            .session
+            .as_ref()
+            .is_some_and(|s| s.action_wants_controller());
         let controller_due = self.index_ok
-            && self.fields_wanted()
+            && (self.fields_wanted() || action_wants)
             && self.next_controller.is_none_or(|t| now >= t)
             && self
                 .session
@@ -999,13 +1024,31 @@ impl<B: Backend> Controller<B> {
         }
     }
 
+    /// Colhe o resultado da procura do controller pedida pela ação (spec 006, 6.6): o evento e a
+    /// linha `personagem:`, que passa a seguir o controller guardado mesmo sem cheat ligado.
+    fn poll_controller_news(&mut self) {
+        let Some(found) = self.session_call(|s| s.take_controller_news()).flatten() else {
+            return;
+        };
+        self.player_found = Some(found);
+        self.model.player = if found {
+            PlayerLine::Found
+        } else {
+            PlayerLine::NotFound
+        };
+        self.event(if found {
+            ACTION_PLAYER_FOUND
+        } else {
+            ACTION_PLAYER_MISSING
+        });
+    }
+
     /// Manutenção de ~10 Hz dos cheats de valor ligados. Não é operação (spec 005, 6.7): não
     /// mexe nas teclas nem nas buscas. Fica suspensa com o diário não resolvido, sem motor ou
     /// com o jogo possivelmente parado por nós.
     fn maintain_fields(&mut self, now: Instant) {
         if !self.fields_wanted() {
-            self.model.player = PlayerLine::Idle;
-            self.player_found = None;
+            // A linha `personagem:` segue o controller guardado: nada a zerar sem cheat ligado.
             for row in self.model.cheats.iter_mut().filter(|r| r.field) {
                 row.note = None;
             }
@@ -1058,6 +1101,16 @@ impl<B: Backend> Controller<B> {
 }
 
 // ---- teclas, operações e religação ----
+
+/// Formata o inteiro `v` do jogo como a grade formata os valores (unidade incluída).
+fn fmt_int(grid: &gt_core::value::ValueGrid, v: i32) -> String {
+    let point = gt_core::value::ValueGrid {
+        min: f64::from(v),
+        max: f64::from(v),
+        ..grid.clone()
+    };
+    point.format(0)
+}
 
 /// Milissegundos da pausa, para o registro de eventos.
 fn ms(pause: Duration) -> u128 {
@@ -1257,6 +1310,9 @@ impl<B: Backend> Controller<B> {
                 return false;
             }
         }
+        if row.action {
+            return self.action_key(&row, now);
+        }
         if row.residue {
             return self.restore_residue(now, draw);
         }
@@ -1287,6 +1343,125 @@ impl<B: Backend> Controller<B> {
             self.set_desired(&row.id, None);
             self.event(format!("{}: não será mais religado", row.name));
         }
+    }
+
+    // ---- ação de somar (spec 006, 6.6) ----
+
+    /// Escreve a linha de registro da ação, no máximo uma por segundo para o mesmo motivo
+    /// (`key`), para uma tecla segurada não encher o registro.
+    fn throttled_event(&mut self, id: &str, key: &str, text: String, now: Instant) {
+        let slot = (id.to_string(), key.to_string());
+        let recent = self
+            .refusal_last
+            .get(&slot)
+            .is_some_and(|t| now.saturating_duration_since(*t) < ACTION_WINDOW);
+        if !recent {
+            self.refusal_last.insert(slot, now);
+            self.event(text);
+        }
+    }
+
+    /// Espaço/Enter numa linha `[ação]` com a conexão aberta. Devolve `true` se a execução
+    /// chegou a ler o jogo (só então é operação e descarta as teclas que chegaram durante ela).
+    fn action_key(&mut self, row: &CheatRow, now: Instant) -> bool {
+        match &row.avail {
+            Avail::Unavailable(reason) => {
+                let text = format!("{}: indisponível ({reason})", row.name);
+                self.throttled_event(&row.id, reason, text, now);
+                false
+            }
+            Avail::Checking => {
+                let text = format!(
+                    "{}: verificando a reflexão do jogo; tente de novo em instantes",
+                    row.name
+                );
+                self.throttled_event(&row.id, crate::model::CHECKING, text, now);
+                false
+            }
+            Avail::Available { .. } => self.run_action(row, now),
+        }
+    }
+
+    /// Executa a ação (passos 1 a 6 da spec 6.6; a sessão faz os passos 2 a 5).
+    fn run_action(&mut self, row: &CheatRow, now: Instant) -> bool {
+        let (id, name) = (row.id.as_str(), row.name.as_str());
+        // Uma execução por segundo: a tecla segurada é descartada.
+        let in_window = self
+            .action_last
+            .get(id)
+            .is_some_and(|t| now.saturating_duration_since(*t) < ACTION_WINDOW);
+        if in_window {
+            self.throttled_event(id, "aguarde", format!("{name}: aguarde"), now);
+            return false;
+        }
+        // Passo 1: a mesma mensagem que ligar um cheat receberia.
+        let stuck = self.session.as_ref().is_some_and(|s| s.is_stuck());
+        let block = self
+            .write_block()
+            .or_else(|| stuck.then_some(STUCK_REFUSAL));
+        if let Some(why) = block {
+            let text = format!("{name}: não foi possível ligar ({why})");
+            self.throttled_event(id, why, text, now);
+            return false;
+        }
+        let k = Self::shown_k(row);
+        let target = id.to_string();
+        let Some(outcome) = self.session_call(|s| s.field_action(&target, k)) else {
+            return false;
+        };
+        let spec = row.value.clone();
+        let show = |v: i32| {
+            spec.as_ref()
+                .map_or_else(|| v.to_string(), |g| fmt_int(g, v))
+        };
+        match outcome {
+            ActionOutcome::Done { before, after } => {
+                self.action_wrote(id, now);
+                self.event(format!("{name}: {} → {}", show(before), show(after)));
+                true
+            }
+            ActionOutcome::Raced { read } => {
+                self.action_wrote(id, now);
+                self.event(format!(
+                    "{name}: o jogo mudou o valor durante a escrita (lido {})",
+                    show(read)
+                ));
+                true
+            }
+            ActionOutcome::Refused(reason) => {
+                self.throttled_event(id, &reason, format!("{name}: {reason}"), now);
+                false
+            }
+            // Leu o jogo: é operação (descarta teclas), mas não escreveu e não abre a janela.
+            ActionOutcome::RefusedAfterRead(reason) => {
+                self.note_op(id);
+                self.throttled_event(id, &reason, format!("{name}: {reason}"), now);
+                true
+            }
+            ActionOutcome::NeedsController => {
+                // A procura segue o intervalo da tarefa de reflexão: dispara agora se já pode.
+                self.maybe_spawn_job(now);
+                let searching = matches!(&self.job, Some(j) if j.kind == JobKind::Controller);
+                let why = if searching {
+                    SEARCHING_PLAYER
+                } else {
+                    WAIT_SEARCH
+                };
+                // O controller guardado caiu: a linha `personagem:` deixa de dizer `encontrado`.
+                if self.player_found.is_some() {
+                    self.player_found = Some(false);
+                    self.model.player = PlayerLine::NotFound;
+                }
+                self.throttled_event(id, why, format!("{name}: {why}"), now);
+                false
+            }
+        }
+    }
+
+    /// Uma execução que escreveu: abre a janela e conta como operação.
+    fn action_wrote(&mut self, id: &str, now: Instant) {
+        self.action_last.insert(id.to_string(), now);
+        self.note_op(id);
     }
 
     /// O `k` com que um cheat é ligado: o valor mostrado, dentro da grade.
@@ -1325,7 +1500,7 @@ impl<B: Backend> Controller<B> {
         let field = row.field;
         let Some(outcome) = self.run_op(busy, draw, |s| {
             if field {
-                s.field_on(&id)
+                s.field_on(&id, k)
             } else {
                 s.apply(&[(id.clone(), k)])
             }
@@ -1430,7 +1605,8 @@ impl<B: Backend> Controller<B> {
         if k == row.k {
             return false;
         }
-        let in_game = row.on && row.applied_k.is_some();
+        // Com `o jogo não deixa`, as setas só mudam o valor mostrado (spec 006, 6.4).
+        let in_game = row.on && row.applied_k.is_some() && row.note != Some(FieldNote::GameRefuses);
         self.set_shown_k(&id, k);
         in_game && self.swap_due(now) && self.do_swap(&id, now, draw)
     }
@@ -1451,7 +1627,10 @@ impl<B: Backend> Controller<B> {
             .model
             .cheats
             .iter()
-            .find(|r| r.on && r.applied_k.is_some_and(|a| a != r.k))
+            .find(|r| {
+                r.on && r.note != Some(FieldNote::GameRefuses)
+                    && r.applied_k.is_some_and(|a| a != r.k)
+            })
             .map(|r| r.id.clone());
         match pending {
             Some(id) => self.do_swap(&id, now, draw),
@@ -1492,6 +1671,14 @@ impl<B: Backend> Controller<B> {
                     &spec.format(before),
                     &spec.format(k),
                 );
+            }
+            // Cheat de valor antes do índice da reflexão (`verificando…`): o valor mostrado é
+            // guardado e vale ao ligar ou religar; sem linha no registro nem volta do valor
+            // (spec 006, 6.5). `applied_k` acompanha para a troca não se repetir a cada volta.
+            OpOutcome::Refused(reason) if row.field && reason == crate::model::CHECKING => {
+                if let Some(r) = self.model.cheats.iter_mut().find(|r| r.id == id) {
+                    r.applied_k = Some(k);
+                }
             }
             // Recusa limpa: o jogo continua com o valor de antes e a tela volta a mostrá-lo.
             OpOutcome::Refused(reason) => {
@@ -1643,7 +1830,7 @@ impl<B: Backend> Controller<B> {
             .cloned()
             .collect();
         let mut batch: Vec<(String, u64)> = Vec::new();
-        let mut fields: Vec<String> = Vec::new();
+        let mut fields: Vec<(String, u64)> = Vec::new();
         for row in rows {
             let Some(wanted) = self.desired.get(&row.id).cloned() else {
                 continue;
@@ -1670,21 +1857,22 @@ impl<B: Backend> Controller<B> {
                         Note::NotReapplied,
                         format!("{}: não foi religado ({why})", row.name),
                     ),
-                    None if row.field => fields.push(row.id.clone()),
+                    None if row.field => fields.push((row.id.clone(), Self::shown_k(&row))),
                     None => batch.push((row.id.clone(), Self::shown_k(&row))),
                 },
             }
         }
         // Os cheats de valor, um a um (não pausam o jogo).
         let mut called = false;
-        for id in fields {
+        for (id, k) in fields {
             self.note_op(&id);
-            let Some(outcome) = self.run_op("religando…".to_string(), draw, |s| s.field_on(&id))
+            let Some(outcome) =
+                self.run_op("religando…".to_string(), draw, |s| s.field_on(&id, k))
             else {
                 return called;
             };
             called = true;
-            if !self.finish_reapply_one(&id, 0, outcome, &version_key, now) {
+            if !self.finish_reapply_one(&id, k, outcome, &version_key, now) {
                 return true;
             }
         }
@@ -1805,7 +1993,7 @@ impl<B: Backend> Controller<B> {
 mod tests {
     use std::path::PathBuf;
 
-    use gt_core::value::{ValueSpec, ValueType};
+    use gt_core::value::{ValueGrid, ValueType};
 
     use super::*;
     use crate::backend::SearchError;
@@ -1919,10 +2107,9 @@ mod tests {
         }
     }
 
-    fn grid() -> ValueSpec {
-        ValueSpec {
+    fn grid() -> ValueGrid {
+        ValueGrid {
             ty: ValueType::U32,
-            slot: 1,
             min: 0.0,
             max: 10.0,
             step: 1.0,
@@ -4286,6 +4473,7 @@ mod tests {
             ons[1],
             Call::FieldOn {
                 id: "f".to_string(),
+                k: 0,
                 busy: Some("religando…".to_string())
             }
         );
@@ -4327,8 +4515,601 @@ mod tests {
         assert!(!h.row("f").on);
         assert_eq!(h.row("f").note, None);
         assert!(!h.c.desired().contains_key("f"));
-        // Nada ligado: a linha do personagem volta a `—`.
+        // Nada ligado: a linha segue o controller guardado (o último ciclo não o achou).
         h.tick(400);
+        assert_eq!(h.c.model.player, PlayerLine::NotFound);
+    }
+
+    // ---- Tarefa 10 do plano 006: valor ajustável nos cheats de valor ----
+
+    /// Cheat de valor com a grade `grid()` (`0..=10`, padrão 2).
+    fn vfield(id: &str) -> CheatInfo {
+        let mut c = field(id, Avail::Checking);
+        c.value = Some(grid());
+        c
+    }
+
+    /// Conectado em 0 com o cheat de valor `f` (grade `grid()`), disponível pela sessão.
+    fn with_value_field() -> H {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![vfield("f")]);
+        h.ctl.set_field_avail(&[("f", available())]);
+        h.connect(0);
+        h
+    }
+
+    fn field_ons(h: &H) -> Vec<Call> {
+        h.ctl
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, Call::FieldOn { .. }))
+            .collect()
+    }
+
+    fn field_on_call(k: u64, busy: &str) -> Call {
+        Call::FieldOn {
+            id: "f".to_string(),
+            k,
+            busy: Some(busy.to_string()),
+        }
+    }
+
+    #[test]
+    fn field_value_arrows_off_and_on() {
+        let mut h = with_value_field();
+        assert_eq!(h.row("f").k, 2);
+        // Desligado, as setas só mudam o valor mostrado.
+        assert!(!h.key(Action::Inc, 100));
+        assert_eq!(h.row("f").k, 3);
+        assert!(swaps(&h).is_empty());
+        // Ligar usa o valor mostrado.
+        assert!(h.toggle("f", 200));
+        assert_eq!(field_ons(&h), [field_on_call(3, "ligando f…")]);
+        assert_eq!(h.row("f").applied_k, Some(3));
+        assert_eq!(h.c.desired().get("f").map(|d| d.k), Some(3));
+
+        // Ligado: uma tecla isolada vai na hora.
+        assert!(h.key(Action::Inc, 2_000));
+        assert_eq!(swaps(&h), [set_call("f", 4)]);
+        // Dentro dos 150 ms só muda o mostrado; passado o intervalo, vai o último valor.
+        assert!(!h.key(Action::Inc, 2_025));
+        assert!(!h.key(Action::Inc, 2_050));
+        assert_eq!(h.row("f").k, 6);
+        assert!(!h.tick(2_149));
+        assert!(h.tick(2_150));
+        assert_eq!(swaps(&h), [set_call("f", 4), set_call("f", 6)]);
+        assert_eq!(h.row("f").applied_k, Some(6));
+        assert_eq!(h.c.desired().get("f").map(|d| d.k), Some(6));
+        assert!(!h.tick(2_400));
+        assert_eq!(swaps(&h).len(), 2);
+    }
+
+    #[test]
+    fn field_relink_uses_shown_value() {
+        let mut h = with_value_field();
+        assert!(h.toggle("f", 100));
+        assert!(h.key(Action::Inc, 2_000));
+        assert_eq!(h.row("f").k, 3);
+        // O jogo fecha; as setas seguem mudando o mostrado (e o desejado).
+        h.ctl.set_exited(true);
+        h.tick(2_100);
+        h.ctl.set_exited(false);
+        assert!(!h.key(Action::Inc, 2_200));
+        assert_eq!(h.row("f").k, 4);
+        h.connect(4_200);
+        h.tick(4_300);
+        let ons = field_ons(&h);
+        assert_eq!(ons.len(), 2);
+        assert_eq!(ons[1], field_on_call(4, "religando…"));
+        assert!(h.row("f").on);
+        assert_eq!(h.row("f").applied_k, Some(4));
+    }
+
+    #[test]
+    fn field_swap_during_checking_keeps_shown_value() {
+        let mut h = with_value_field();
+        assert!(h.toggle("f", 100));
+        let before = h.c.model.events.len();
+        // A sessão ainda não tem o índice: recusa a troca com `verificando…`.
+        h.ctl
+            .push_outcome(OpOutcome::Refused(crate::model::CHECKING.to_string()));
+        assert!(h.key(Action::Inc, 2_000));
+        // O valor mostrado e o desejado ficam; nada vai ao registro.
+        assert_eq!(h.row("f").k, 3);
+        assert_eq!(h.c.desired().get("f").map(|d| d.k), Some(3));
+        assert_eq!(h.c.model.events.len(), before);
+        assert!(!h.events().iter().any(|e| e.contains("verificando")));
+        // Sem repetir a troca a cada volta.
+        assert!(!h.tick(2_200));
+        assert!(!h.tick(2_400));
+        assert_eq!(swaps(&h).len(), 1);
+    }
+
+    #[test]
+    fn set_maintenance_with_new_original_keeps_keys() {
+        let mut h = with_value_field();
+        assert!(h.toggle("f", 100));
+        let ops = h.c.op_counts.clone();
+        let mut r = report(PlayerState::Found, &[]);
+        r.events = vec!["f: o jogo mudou o valor para 7; novo original".to_string()];
+        h.ctl.push_tick(r);
+        // Não é operação: o `tick` não chama o laço de teclas a descartar e as buscas valem.
+        assert!(!h.tick(200));
+        assert_eq!(h.c.op_counts, ops);
+        assert_eq!(
+            event_count(&h, "f: o jogo mudou o valor para 7; novo original"),
+            1
+        );
+        assert_eq!(
+            h.c.after_op_keys(vec![Action::Inc, Action::Dec, Action::Quit]),
+            [Action::Inc, Action::Dec, Action::Quit]
+        );
+        // Uma busca iniciada antes ainda vale para este cheat.
+        assert!(h.row("f").on);
+    }
+
+    #[test]
+    fn game_refuses_arrows_only_change_shown() {
+        let mut h = with_value_field();
+        assert!(h.toggle("f", 100));
+        h.ctl
+            .push_tick(report(PlayerState::Found, &[("f", FieldNote::GameRefuses)]));
+        h.tick(200);
+        assert_eq!(h.row("f").note, Some(FieldNote::GameRefuses));
+        // Com a marca, as setas só mudam o valor mostrado, sem trocar nada no jogo.
+        assert!(!h.key(Action::Inc, 5_000));
+        assert!(!h.key(Action::Inc, 5_300));
+        assert_eq!(h.row("f").k, 4);
+        assert_eq!(h.c.desired().get("f").map(|d| d.k), Some(4));
+        h.ctl
+            .push_tick(report(PlayerState::Found, &[("f", FieldNote::GameRefuses)]));
+        assert!(!h.tick(5_600));
+        assert!(swaps(&h).is_empty());
+        // A marca some: o valor mostrado vai ao jogo.
+        h.ctl.push_tick(report(PlayerState::Found, &[]));
+        assert!(!h.tick(5_700));
+        assert_eq!(h.row("f").note, None);
+        assert!(h.tick(5_800));
+        assert_eq!(swaps(&h), [set_call("f", 4)]);
+    }
+
+    #[test]
+    fn game_refuses_cleared_on_reconnect() {
+        let mut h = with_value_field();
+        assert!(h.toggle("f", 100));
+        h.ctl
+            .push_tick(report(PlayerState::Found, &[("f", FieldNote::GameRefuses)]));
+        h.tick(200);
+        assert_eq!(h.row("f").note, Some(FieldNote::GameRefuses));
+        h.reopen(300, 3_000);
+        assert_eq!(h.row("f").note, None);
+        h.tick(3_100);
+        assert!(h.row("f").on);
+        assert_eq!(h.row("f").note, None);
+        // De novo as setas trocam o valor no jogo.
+        assert!(h.key(Action::Inc, 4_000));
+        assert_eq!(swaps(&h), [set_call("f", 3)]);
+    }
+
+    #[test]
+    fn set_maintenance_suspended_stuck_or_pending() {
+        let mut h = with_value_field();
+        assert!(h.toggle("f", 100));
+        h.ctl.set_stuck(true);
+        h.tick(200);
+        assert_eq!(h.ctl.field_ticks(), 0);
+        h.ctl.set_stuck(false);
+        h.tick(300);
+        assert_eq!(h.ctl.field_ticks(), 1);
+
+        // Resto pendente do `f`: a linha vira erro, sai da manutenção e nada é criado para ele.
+        h.ctl.set_pending(&["f"]);
+        h.tick(400);
+        assert!(h.row("f").residue);
+        assert!(!h.row("f").on);
+        let ticks = h.ctl.field_ticks();
+        h.tick(500);
+        h.tick(600);
+        assert_eq!(h.ctl.field_ticks(), ticks);
+        assert!(h.ctl.calls().iter().all(|c| match c {
+            Call::FieldTick { on } => !on.is_empty(),
+            _ => true,
+        }));
+    }
+
+    #[test]
+    fn set_turn_off_failure_marks_error_blocks_id() {
+        let mut h = with_value_field();
+        assert!(h.toggle("f", 100));
+        h.ctl.push_residue("escrita recusada", &["f"]);
+        assert!(h.toggle("f", 200));
+        assert!(h.row("f").residue);
+        assert!(!h.row("f").on);
+        assert!(!h.c.desired().contains_key("f"));
+        assert!(h.c.model.banners.residue.is_some());
+        assert_eq!(
+            event_count(&h, "f: falhou deixando restos no jogo (escrita recusada)"),
+            1
+        );
+        // Com o resto pendente, nada novo é criado para o id: espaço restaura, não liga.
+        assert!(h.toggle("f", 300));
+        assert_eq!(field_ons(&h).len(), 1);
+        assert!(
+            h.ctl
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::RestorePending { .. }))
+        );
+        // A manutenção não roda sem cheat de valor ligado.
+        let ticks = h.ctl.field_ticks();
+        h.tick(400);
+        assert_eq!(h.ctl.field_ticks(), ticks);
+    }
+    // ---- Tarefa 11 do plano 006: a ação de somar ----
+
+    /// Ação `ciencia` (grade `grid()`), no catálogo como `[[field]]` com `rule = "add"`.
+    fn action_info(avail: Avail) -> CheatInfo {
+        let mut c = field("ciencia", avail);
+        c.name = "Somar ciência".to_string();
+        c.value = Some(grid());
+        c.action = true;
+        c
+    }
+
+    /// Conectado em 0 com a ação disponível; o índice e a procura do controller são do fake.
+    fn with_action() -> H {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![action_info(Avail::Checking)]);
+        h.ctl.set_field_avail(&[("ciencia", available())]);
+        h.connect(0);
+        h
+    }
+
+    fn done(before: i32, after: i32) -> ActionOutcome {
+        ActionOutcome::Done { before, after }
+    }
+
+    fn press(h: &mut H, ms: u64) -> bool {
+        h.toggle("ciencia", ms)
+    }
+
+    #[test]
+    fn action_executes_once_and_logs() {
+        let mut h = with_action();
+        h.ctl.push_action(done(7400, 8400));
+        assert!(press(&mut h, 100));
+        assert_eq!(h.ctl.actions(), 1);
+        assert_eq!(event_count(&h, "Somar ciência: 7400 → 8400"), 1);
+        assert_eq!(h.c.op_counts.get("ciencia"), Some(&1));
+        assert!(!h.row("ciencia").on);
+        assert!(h.c.desired().is_empty());
+        // Uma corrida na releitura também escreveu: conta e abre a janela.
+        h.ctl.push_action(ActionOutcome::Raced { read: 123 });
+        assert!(press(&mut h, 1_200));
+        assert_eq!(
+            event_count(
+                &h,
+                "Somar ciência: o jogo mudou o valor durante a escrita (lido 123)"
+            ),
+            1
+        );
+        assert!(!press(&mut h, 1_300));
+        assert_eq!(h.ctl.actions(), 2);
+    }
+
+    #[test]
+    fn action_key_repeat_one_per_second() {
+        let mut h = with_action();
+        let mut called = 0;
+        for i in 1..=20u64 {
+            if press(&mut h, i * 100) {
+                called += 1;
+            }
+        }
+        assert_eq!(called, 2);
+        assert_eq!(h.ctl.actions(), 2);
+        assert_eq!(event_count(&h, "Somar ciência: aguarde"), 2);
+    }
+
+    #[test]
+    fn action_refusal_does_not_open_window() {
+        let mut h = with_action();
+        h.ctl.push_action(ActionOutcome::RefusedAfterRead(
+            "passaria do máximo".to_string(),
+        ));
+        // Leu o jogo: é operação (descarta teclas), mas não abre a janela.
+        assert!(press(&mut h, 100));
+        assert_eq!(event_count(&h, "Somar ciência: passaria do máximo"), 1);
+        assert_eq!(h.c.op_counts.get("ciencia"), Some(&1));
+        assert!(press(&mut h, 200));
+        assert_eq!(h.ctl.actions(), 2);
+        assert_eq!(h.c.op_counts.get("ciencia"), Some(&2));
+        assert_eq!(event_count(&h, "Somar ciência: aguarde"), 0);
+
+        // Recusa dos passos 1 e 2: não é operação.
+        let mut h = with_action();
+        h.ctl
+            .push_action(ActionOutcome::Refused("estado do jogo ausente".to_string()));
+        assert!(!press(&mut h, 100));
+        assert_eq!(event_count(&h, "Somar ciência: estado do jogo ausente"), 1);
+        assert_eq!(h.c.op_counts.get("ciencia"), None);
+    }
+
+    #[test]
+    fn action_refusal_lines_throttled() {
+        let mut h = with_action();
+        let refuse = |h: &H, reason: &str| {
+            h.ctl
+                .push_action(ActionOutcome::Refused(reason.to_string()))
+        };
+        for ms in [100, 200, 300] {
+            refuse(&h, "passaria do máximo");
+            press(&mut h, ms);
+        }
+        refuse(&h, "valor atual fora da faixa");
+        press(&mut h, 400);
+        assert_eq!(event_count(&h, "passaria do máximo"), 1);
+        assert_eq!(event_count(&h, "valor atual fora da faixa"), 1);
+        // Passado um segundo, o mesmo motivo volta ao registro.
+        refuse(&h, "passaria do máximo");
+        press(&mut h, 1_200);
+        assert_eq!(event_count(&h, "passaria do máximo"), 2);
+    }
+
+    #[test]
+    fn action_refusal_not_an_op() {
+        let mut h = with_action();
+        h.ctl
+            .push_action(ActionOutcome::Refused("estado do jogo ausente".to_string()));
+        assert!(!press(&mut h, 100));
+        h.ctl.push_action(ActionOutcome::NeedsController);
+        assert!(!press(&mut h, 200));
+        // Descarte por `aguarde` também não conta.
+        h.ctl.push_action(done(1, 2));
+        assert!(press(&mut h, 300));
+        assert!(!press(&mut h, 400));
+        assert_eq!(h.c.op_counts.get("ciencia"), Some(&1));
+    }
+
+    #[test]
+    fn action_not_desired_not_relinked() {
+        let mut h = with_action();
+        assert!(press(&mut h, 100));
+        assert!(h.c.desired().is_empty());
+        assert!(!h.row("ciencia").desired);
+        h.reopen(200, 3_000);
+        h.tick(3_100);
+        h.tick(3_200);
+        assert!(h.c.desired().is_empty());
+        assert!(!h.row("ciencia").on);
+        assert_eq!(h.ctl.count(|c| matches!(c, Call::FieldOn { .. })), 0);
+        assert_eq!(h.ctl.field_ticks(), 0);
+        assert_eq!(h.ctl.actions(), 1);
+    }
+
+    #[test]
+    fn action_untouched_on_exit_and_recovery() {
+        let mut h = with_action();
+        assert!(press(&mut h, 100));
+        // Saída: desfaz o que há para desfazer e não toca na ação.
+        let (restored, foreign) = h.c.shutdown(&mut *h.draw);
+        assert!(restored.is_empty() && foreign.is_empty());
+        assert_eq!(h.ctl.actions(), 1);
+        assert_eq!(
+            h.ctl
+                .count(|c| matches!(c, Call::FieldOn { .. } | Call::FieldOff { .. })),
+            0
+        );
+        // Recuperação (reconexão): a ação segue sem chamadas novas.
+        let mut h = with_action();
+        assert!(press(&mut h, 100));
+        h.reopen(200, 3_000);
+        h.tick(3_100);
+        assert_eq!(h.ctl.actions(), 1);
+        assert_eq!(
+            h.ctl
+                .count(|c| matches!(c, Call::FieldOn { .. } | Call::FieldOff { .. })),
+            0
+        );
+    }
+
+    /// Conectado com a ação, índice montado e a procura do controller disponível no fake.
+    fn with_action_search() -> H {
+        let mut h = with_action();
+        h.ctl.set_jobs(&[JobKind::Index, JobKind::Controller]);
+        h.ctl.set_needs_controller(true);
+        h.tick(0);
+        assert!(h.wait_job(0));
+        h
+    }
+
+    #[test]
+    fn action_triggers_controller_search() {
+        let mut h = with_action_search();
+        // Sem cheat de valor desejado nem ação pedida, ninguém procura o controller.
+        h.tick(50);
+        assert!(h.c.job.is_none());
+        h.ctl.push_action(ActionOutcome::NeedsController);
+        assert!(!press(&mut h, 100));
+        assert_eq!(event_count(&h, "Somar ciência: procurando o personagem"), 1);
+        assert!(matches!(&h.c.job, Some(j) if j.kind == JobKind::Controller));
+        assert!(h.wait_job(100));
+        assert_eq!(h.ctl.job_runs(JobKind::Controller), 1);
+        // Procura terminada: nenhuma nova roda sem nova tecla, mesmo passado o intervalo.
+        h.tick(5_000);
+        h.tick(10_200);
+        h.tick(20_000);
+        assert!(h.c.job.is_none());
+        assert_eq!(h.ctl.job_runs(JobKind::Controller), 1);
+        // Uma nova tecla, já fora do intervalo, procura de novo.
+        h.ctl.push_action(ActionOutcome::NeedsController);
+        assert!(!press(&mut h, 20_100));
+        assert!(h.wait_job(20_100));
+        assert_eq!(h.ctl.job_runs(JobKind::Controller), 2);
+    }
+
+    #[test]
+    fn action_within_interval_says_wait() {
+        let mut h = with_action_search();
+        h.ctl.push_action(ActionOutcome::NeedsController);
+        press(&mut h, 100);
+        assert!(h.wait_job(100));
+        h.ctl.push_action(ActionOutcome::NeedsController);
+        assert!(!press(&mut h, 200));
+        assert_eq!(event_count(&h, "Somar ciência: aguarde a procura"), 1);
+        assert!(h.c.job.is_none());
+        assert_eq!(h.ctl.job_runs(JobKind::Controller), 1);
+    }
+
+    #[test]
+    fn player_line_follows_stored_controller() {
+        let mut h = with_action_search();
         assert_eq!(h.c.model.player, PlayerLine::Idle);
+        h.ctl.push_action(ActionOutcome::NeedsController);
+        press(&mut h, 100);
+        assert!(h.wait_job(100));
+        h.ctl.set_controller_news(Some(true));
+        h.tick(200);
+        assert_eq!(h.c.model.player, PlayerLine::Found);
+        // O controller guardado caiu: a ação pede a procura e a linha passa a `não encontrado`.
+        h.ctl.push_action(ActionOutcome::NeedsController);
+        press(&mut h, 300);
+        assert_eq!(h.c.model.player, PlayerLine::NotFound);
+        h.tick(400);
+        assert_eq!(h.c.model.player, PlayerLine::NotFound);
+    }
+
+    #[test]
+    fn player_line_after_last_cheat_off_follows_stored_controller() {
+        let mut h = with_field();
+        assert!(h.toggle("f", 100));
+        h.ctl.push_tick(report(PlayerState::Found, &[]));
+        h.tick(200);
+        assert_eq!(h.c.model.player, PlayerLine::Found);
+        assert!(h.toggle("f", 300));
+        h.tick(400);
+        h.tick(500);
+        assert_eq!(h.c.model.player, PlayerLine::Found);
+    }
+
+    #[test]
+    fn controller_news_event_and_player_line() {
+        let mut h = with_action_search();
+        assert_eq!(h.c.model.player, PlayerLine::Idle);
+        h.ctl.push_action(ActionOutcome::NeedsController);
+        press(&mut h, 100);
+        assert!(h.wait_job(100));
+        h.ctl.set_controller_news(Some(true));
+        h.tick(200);
+        assert_eq!(
+            event_count(&h, "personagem encontrado: aperte de novo para somar"),
+            1
+        );
+        // A linha segue o controller guardado mesmo sem cheat ligado, e o evento sai uma vez.
+        assert_eq!(h.c.model.player, PlayerLine::Found);
+        h.tick(300);
+        h.tick(400);
+        assert_eq!(h.c.model.player, PlayerLine::Found);
+        assert_eq!(event_count(&h, "personagem encontrado"), 1);
+        // Aperta de novo: soma.
+        h.ctl.push_action(done(10, 20));
+        assert!(press(&mut h, 500));
+        assert_eq!(event_count(&h, "Somar ciência: 10 → 20"), 1);
+    }
+
+    #[test]
+    fn needs_controller_then_not_found() {
+        let mut h = with_action_search();
+        h.ctl.push_action(ActionOutcome::NeedsController);
+        press(&mut h, 100);
+        assert!(h.wait_job(100));
+        h.ctl.set_controller_news(Some(false));
+        h.tick(200);
+        assert_eq!(event_count(&h, "personagem não encontrado"), 1);
+        assert_eq!(h.c.model.player, PlayerLine::NotFound);
+        h.tick(300);
+        assert_eq!(h.c.model.player, PlayerLine::NotFound);
+        assert_eq!(event_count(&h, "personagem não encontrado"), 1);
+        assert_eq!(event_count(&h, "personagem encontrado"), 0);
+    }
+
+    #[test]
+    fn action_window_resets_on_reconnect() {
+        let mut h = with_action();
+        assert!(press(&mut h, 100));
+        assert!(!press(&mut h, 150));
+        assert!(!h.c.action_last.is_empty() && !h.c.refusal_last.is_empty());
+        // O jogo fecha e reabre (a procura do jogo leva 2 s): a janela e os limites recomeçam.
+        h.reopen(200, 2_300);
+        assert!(h.c.action_last.is_empty() && h.c.refusal_last.is_empty());
+        assert!(press(&mut h, 2_400));
+        assert_eq!(h.ctl.actions(), 2);
+        assert_eq!(event_count(&h, "Somar ciência: aguarde"), 1);
+    }
+
+    #[test]
+    fn action_checking_and_unavailable_states() {
+        // Verificando a reflexão.
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![action_info(Avail::Checking)]);
+        h.ctl.set_field_avail(&[("ciencia", Avail::Checking)]);
+        h.connect(0);
+        assert!(!press(&mut h, 100));
+        assert!(!press(&mut h, 200));
+        assert_eq!(
+            event_count(
+                &h,
+                "Somar ciência: verificando a reflexão do jogo; tente de novo em instantes"
+            ),
+            1
+        );
+        assert_eq!(h.ctl.actions(), 0);
+
+        // Indisponível.
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![action_info(Avail::Checking)]);
+        h.ctl
+            .set_field_avail(&[("ciencia", unavailable("campo X não encontrado"))]);
+        h.connect(0);
+        assert!(!press(&mut h, 100));
+        assert_eq!(
+            event_count(&h, "Somar ciência: indisponível (campo X não encontrado)"),
+            1
+        );
+        assert_eq!(h.ctl.actions(), 0);
+    }
+
+    #[test]
+    fn action_stuck_or_no_engine_uses_turn_on_message() {
+        let mut h = with_action();
+        h.ctl.set_stuck(true);
+        assert!(!press(&mut h, 100));
+        assert!(!press(&mut h, 200));
+        assert_eq!(
+            event_count(
+                &h,
+                "Somar ciência: não foi possível ligar (o jogo pode ter ficado parado; aperte r)"
+            ),
+            1
+        );
+        assert_eq!(h.ctl.actions(), 0);
+        assert_eq!(h.c.op_counts.get("ciencia"), None);
+
+        // Sem motor (disco ilegível): a mesma mensagem do ligar.
+        let mut h = H::new();
+        let mut spec = SearchSpec::new(vec![action_info(Avail::Checking)]);
+        spec.disk = Err("disco ilegível".to_string());
+        h.ctl.set_default_search(spec);
+        h.ctl.set_field_avail(&[("ciencia", available())]);
+        h.connect(0);
+        assert!(!press(&mut h, 100));
+        assert_eq!(
+            event_count(
+                &h,
+                "Somar ciência: não foi possível ligar (o motor não está aberto)"
+            ),
+            1
+        );
+        assert_eq!(h.ctl.actions(), 0);
     }
 }

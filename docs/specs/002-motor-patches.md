@@ -313,6 +313,12 @@ Decisão do dono: cobrir SIGKILL, travamento e queda de energia com um diário.
     e avisa. `restore` com o jogo fechado não é erro: descarta e sai com 0;
   - diário ilegível ou corrompido: não escreve nada no jogo, renomeia o arquivo para `journal.json.bad` e avisa.
 - A decisão de recuperação (o que fazer com cada entrada) é uma função pura, testada sem processo.
+- **Nota (spec 006, 6.8):** as entradas de dados do diário (spec 005) passam a ter **N bytes** (1 a 8), dois modos e
+  um campo opcional `next`. O modo **bits** (os da 005) continua com 1 byte e máscara. O modo **inteiro** (os `set`
+  da spec 006) restaura o campo inteiro só se todos os bytes atuais forem o `written` (ou o `next`); qualquer byte
+  diferente não escreve nada. A identidade de uma entrada é o par (`id`, endereço). Diários da 005 continuam
+  legíveis. A recuperação e o `gt-patch restore` tratam as entradas de N bytes por essa regra, e não pela de
+  memória executável desta seção.
 - **Nota (Fase 3, troca de valor):** uma troca de valor interrompida deixa no diário três conjuntos de bytes
   por patch: os originais, os do valor antigo (`replacement`) e os do valor novo (campo opcional `next`). Na
   recuperação, "o original ou o novo daquela posição" passa a valer também para o valor novo: cada byte igual ao

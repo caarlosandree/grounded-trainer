@@ -599,6 +599,61 @@ Build `c935e799-0b27c000`, backup do save feito pelo dono, FLiNG fechado. Plano 
   `Pawn` alternando entre o personagem e o pet ao montar). Os três cheats do pet (vida, não morre, stamina)
   funcionaram no jogo; ficam na categoria `PET`.
 
+## Sessão de 2026-10-26 (Fase 5): campos da spec 006 (carga, dano, ciência, movimento)
+
+Build `c935e799-0b27c000`, partida carregada, FLiNG fechado. **Só leitura**: `gt ue class`, `gt ue player`,
+`gt scan`/`gt disasm` e scripts em `scratch/p11/` (`instances.py`, `movewatch.py` a cada 0,25 s com o dono andando,
+correndo, agachando, pulando, planando, carregando, atacando, montando e gastando ciência; `propflags.py`). Offsets
+abaixo só para conferir testes: o trainer acha tudo por nome.
+
+| Cheat | Caminho e campo | Tipo | Valor lido | O jogo reescreve? |
+|---|---|---|---|---|
+| Carga | personagem → `SurvivalCharacter.HaulingComponent` (`+0x14d8`, classe `HaulingComponent`) → `Capacity` (`+0xf4`) | `IntProperty` | 5 | não na sessão (carregando itens) |
+| Dano causado | personagem → `SurvivalCharacter.CustomDamageMultiplier` (`+0x1330`) | `FloatProperty` | 1,0 | não (atacando) |
+| Pulos | personagem → `Character.JumpMaxCount` (`+0x488`) / `JumpCurrentCount` (`+0x48c`) | `IntProperty` | 1 / 0↔1 | só o contador, a cada pulo |
+| Gravidade | personagem → `Character.CharacterMovement` (`+0x348`, classe `MaineCharMovementComponent`) → `GravityScale` (`+0x1b8`) | `FloatProperty` | 1,0 | não, nem planando |
+| Velocidade | mesmo componente → `CustomGroundSpeedMultiplier` (`+0x11e8`), `CustomSwimSpeedMultiplier` (`+0x11f0`), `CustomFlySpeedMultiplier` (`+0x11ec`) | `FloatProperty` | 1,0 / 1,0 / 1,0 | não |
+| Ciência | controller → `Outer` (cabeçalho, `+0x20`: `Level`) → `Level.OwningWorld` (`+0xc0`) → `World.GameState` (`+0x1b0`, `BP_SurvivalGameState_C`) → `InGameGameState.PartyComponent` (`+0x318`) → `ScienceFound` (`+0x510`) | `IntProperty` | 7400 → 6400 ao gastar | é a ciência gastável |
+
+- **Velocidade:** `MaxWalkSpeed` (350) não muda ao correr; a corrida vem de `MaxSprintSpeed` (600) do
+  `MaineCharMovementComponent`. O cálculo da velocidade máxima (`+5951a6d`) faz `CustomGroundSpeedMultiplier ×
+  CurrentMaxGroundSpeed` em terra, `(MaxSwimSprintSpeed ou MaxSwimSpeed) × [+0x11a8] × CustomSwimSpeedMultiplier` na
+  água e usa `CustomFlySpeedMultiplier` no voo; depois aplica `min` com um teto de outro objeto (`[+0x1368]→+0x254`,
+  quando existe). Os multiplicadores são o ponto certo para o cheat: são do próprio jogo e valem 1,0. Também há
+  `MaximumCalculatedCharacterSpeed` 1500, não investigado (pode limitar multiplicadores altos).
+- **Gravidade:** `CurrentGravityScaleOverride` (`+0x1048`, 1,0) é um ajuste do jogo controlado por uma lista
+  (`+0x1040`); planar usa o modo `MovementMode = 6` com `CustomMovementMode = 2`, sem mexer no `GravityScale`.
+- **Ciência:** o `PartyComponent` fica no estado do jogo, não no personagem; o `CachedPartyComponent` do controller
+  segue nulo. Há quatro CDOs de `PartyComponent` (dos `GameState` padrão) e uma instância viva. O pawn e o controller
+  têm o mesmo `Outer` (`PersistentLevel`). `ResearchPoints` (865) não mudou ao gastar.
+- **Save (`PropertyFlags`, `+0x38` da `FProperty`):** nenhum dos campos acima tem `CPF_SaveGame` (`0x01000000`).
+  `ScienceFound` e `ResearchPoints` são `Transient` e replicados: o jogo salva a ciência por código próprio (ela
+  persiste entre sessões). Para os outros, é indício, não prova, de que não vão para o save.
+- **Montado:** o `RelativeLocation` da raiz do personagem fica `(0, 0, 0)` (preso à montaria) e a posição no mundo
+  (`+0x210` da `SceneComponent`, fora da reflexão) continua certa. Teleporte saiu do escopo (decisão do dono).
+
+## Sessão de 2026-10-26 (Fase 5): critério de pronto da spec 006 no jogo
+
+Build `c935e799-0b27c000`, backup do save feito pelo dono, FLiNG fechado. Plano 006, Tarefa 14.
+
+- Testes `#[ignore]` em `apps/gt-tui/tests/game.rs` (188 s): `game_globals_layout_and_fields_available` (os 17
+  cheats de valor disponíveis e verificados; busca de patches e globais 59 s com o jogo recém-aberto, índice 1,5 s,
+  controller 1,4 s), `game_bits_round_trip` (bits da spec 005 inalterados) e `game_set_round_trip`. Neste, cada ajuste
+  foi escrito com o valor padrão, conferido pelo diário e devolvido ao original ao desligar:
+
+  | Cheat | Original | Escrito |
+  |---|---|---|
+  | `carga` (`Capacity`) | 5 | 20 |
+  | `dano` (`CustomDamageMultiplier`) | 1,0 | 10,0 |
+  | `velocidade` (`CustomGroundSpeedMultiplier`, `CustomSwimSpeedMultiplier`) | 1,0 e 1,0 | 2,0 e 2,0 |
+  | `pulos-infinitos` (`JumpMaxCount`) | 1 | 1000 |
+  | `gravidade` (`GravityScale`) | 1,0 | 0,5 |
+
+- Critério 2–13 da spec 006 (seção 9) pela TUI com o dono: **tudo funcionou como esperado** (relato do dono): carga,
+  dano, somar ciência (uma vez por segundo, gasto e persistência no save), velocidade, pulos no ar, gravidade, montado,
+  morte e menu, save com os ajustes ligados, reinício do jogo com a TUI aberta, saída e estabilidade do jogo e do save.
+- Nenhum cheat saiu da spec; a grade de velocidade (×0,5 a ×4) ficou como estava.
+
 ## Hipóteses descartadas
 
 - (2026-10-25) "Os patches em `+57BD6D0`/`+5BBFE8C` indicam que as opções de cargas e arrastar item estavam
@@ -606,3 +661,7 @@ Build `c935e799-0b27c000`, backup do save feito pelo dono, FLiNG fechado. Plano 
 - (2026-10-26) "A função `+3e07870` não roda no solo porque só existem CDOs das classes dela": erro de método. A busca
   pelo início da vtable recuou 5 entradas além do começo real (`+9051a58` em vez de `+9051a80`), e as instâncias
   foram procuradas pela vtable errada. A função é do controller do jogador.
+- (2026-10-26) "A velocidade do personagem é o `MaxWalkSpeed`": ele fica em 350 ao correr; a corrida usa
+  `MaxSprintSpeed` e o jogo multiplica por `CustomGroundSpeedMultiplier`.
+- (2026-10-26) "A ciência é alcançável pelo `CachedPartyComponent` do controller": continua nulo com a partida
+  carregada; o caminho é pelo `World.GameState`.

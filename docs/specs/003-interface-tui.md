@@ -167,6 +167,11 @@ estável diferente (`ambíguo`, `bytes diferentes`, `fora do lugar`) troca o est
 o intervalo entre duas buscas automáticas é o maior entre ~5 s e duas vezes a duração da última busca, para que elas
 nunca ocupem mais da metade do tempo.
 
+> **Nota (spec 006, 6.5, 6.6 e 6.9):** os cheats de valor (`[[field]]`) também podem ter valor ajustável: o bloco
+> `[field.value]` é a grade do `[patch.value]` sem `slot`, com as mesmas teclas `←→` e as regras de 6.2 e 6.7
+> (desligado, as setas só mudam o valor mostrado; intervalo de 150 ms; o último valor mostrado vence). Existe também
+> a linha `[ação]` (Somar ciência): mostra `[ação]` e a quantidade no lugar de `[ON ]`/`[OFF]`, não entra na contagem
+> de cheats ligados do topo, executa no máximo uma vez por segundo e não tem estado, religar nem restauração.
 > **Nota (spec 005, 6.7):** as globais do Unreal `não encontrado`/`inconclusivo` e a conferência barata
 > `reflexão não reconhecida` também disparam a nova busca automática (mesmo sem cheat desejado) e também mantêm o estado
 > anterior de um cheat já disponível (`keeps_state`). A nova busca leva o id especial `@ue` enquanto não há índice bom.

@@ -230,6 +230,12 @@ A varredura:
 
 O custo de uma varredura completa é medido no começo da pesquisa (6.1) e registrado no `RESEARCH.md`.
 
+> **Nota (spec 006, 6.3 e 6.6):** a procura do controller ganha um gatilho novo: uma ação (Somar ciência) recusada
+> por controller ausente ou inválido também a pede, dentro do mesmo intervalo da tarefa, e a linha `personagem:`
+> passa a seguir o controller guardado depois dessa procura. O isolamento por cheat (o tratamento `missing`, antes só
+> do pet) vale agora para **todo** componente depois do pawn: um componente nulo ou de classe errada deixa em espera
+> só os cheats que dependem dele.
+
 **Quando a varredura roda.** A busca de padrões da conexão **não** varre objetos. Ela só resolve as duas globais e faz
 as conferências baratas do layout (nome 0, contagens, amostra de itens). Assim a conexão e os cheats de patch não
 ficam mais lentos do que hoje. Toda varredura de objetos acontece numa **tarefa de fundo própria** (a "tarefa de
@@ -280,7 +286,7 @@ Se qualquer conferência falhar, nada é escrito naquele ciclo, e o cheat mostra
 ### 6.5 Os cheats
 
 Todos ficam na categoria `sobrevivencia`, nesta ordem, e começam `OFF`. Nenhum tem valor ajustável (o bloco
-`[patch.value]` da spec 003 não se aplica). Cada um é um bloco **`[[field]]`** no `generic.toml`. O nome é outro para
+`[patch.value]` da spec 003 não se aplica). *Nota (spec 006, 6.5): a spec 006 traz cheats de valor com valor ajustável, pelo bloco `[field.value]` do `[[field]]`.* Cada um é um bloco **`[[field]]`** no `generic.toml`. O nome é outro para
 não confundir com `[patch.value]`. Cada bloco tem:
 - `id`, `name`, `description` e `category`;
 - o caminho (componente e campo);

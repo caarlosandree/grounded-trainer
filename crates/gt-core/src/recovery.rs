@@ -8,9 +8,10 @@
 //! só "a entrada cabe inteira em memória executável do `maps` atual e tem no máximo
 //! [`MAX_PATCH_LEN`] bytes". Entrada fora disso é de outro: não é tocada e sai do diário.
 //!
-//! As entradas de dados (bits, spec 005 6.6) não passam por essa política: cada uma é
-//! decidida por [`crate::journal::decide_data`], com a guarda do objeto relida e o byte numa
-//! região `rw` do `maps` atual.
+//! As entradas de dados (bits, spec 005 6.6; valor inteiro, spec 006 6.8) não passam por essa
+//! política: cada uma é decidida por [`crate::journal::decide_data`], com a guarda do objeto
+//! relida e o intervalo inteiro
+//! numa região `rw` do `maps` atual.
 
 use std::ops::Range;
 use std::path::PathBuf;

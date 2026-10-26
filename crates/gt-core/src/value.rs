@@ -29,16 +29,14 @@ impl ValueType {
     }
 }
 
-/// Definição de um valor ajustável: a grade `min + k·step` e onde ele mora em `replacement`.
+/// Grade de um valor ajustável: `min + k·step`, tipo, formatação e codificação.
 ///
 /// Os números em `f64` cobrem `i32`, `u32` e `f32` exatamente o bastante. A igualdade entre
 /// definições usa `default_k` (o índice na grade), não o valor do default.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ValueSpec {
+pub struct ValueGrid {
     /// Tipo do valor.
     pub ty: ValueType,
-    /// Offset, dentro de `replacement`, onde os bytes do valor vão.
-    pub slot: usize,
     /// Menor valor.
     pub min: f64,
     /// Maior valor.
@@ -53,7 +51,7 @@ pub struct ValueSpec {
     pub decimals: u8,
 }
 
-impl ValueSpec {
+impl ValueGrid {
     /// Maior `k` com `min + k·step <= max` (com folga de `step · 1e-4`).
     pub fn steps(&self) -> u64 {
         let k = ((self.max - self.min) / self.step + GRID_SLACK).floor();
@@ -94,22 +92,6 @@ impl ValueSpec {
             ValueType::U32 => (v.round() as u32).to_le_bytes(),
             ValueType::F32 => (v as f32).to_le_bytes(),
         }
-    }
-
-    /// `replacement` com `slot..slot+4` trocado pela codificação do ponto `k`.
-    ///
-    /// Se o `slot` não couber em `replacement`, devolve `replacement` sem mudança
-    /// (`check_slot` recusa esse caso antes).
-    pub fn bytes(&self, replacement: &[u8], k: u64) -> Vec<u8> {
-        let mut out = replacement.to_vec();
-        if let Some(dst) = self
-            .slot
-            .checked_add(VALUE_SIZE)
-            .and_then(|end| out.get_mut(self.slot..end))
-        {
-            dst.copy_from_slice(&self.encode(k));
-        }
-        out
     }
 
     /// Texto do ponto `k`: número com `decimals` casas (inteiros sem casas) e a `unit`.
@@ -178,6 +160,33 @@ impl ValueSpec {
         }
         Ok(())
     }
+}
+
+/// Valor ajustável de um patch: a grade e onde ele mora em `replacement`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValueSpec {
+    /// Grade de valores.
+    pub grid: ValueGrid,
+    /// Offset, dentro de `replacement`, onde os bytes do valor vão.
+    pub slot: usize,
+}
+
+impl ValueSpec {
+    /// `replacement` com `slot..slot+4` trocado pela codificação do ponto `k`.
+    ///
+    /// Se o `slot` não couber em `replacement`, devolve `replacement` sem mudança
+    /// (`check_slot` recusa esse caso antes).
+    pub fn bytes(&self, replacement: &[u8], k: u64) -> Vec<u8> {
+        let mut out = replacement.to_vec();
+        if let Some(dst) = self
+            .slot
+            .checked_add(VALUE_SIZE)
+            .and_then(|end| out.get_mut(self.slot..end))
+        {
+            dst.copy_from_slice(&self.grid.encode(k));
+        }
+        out
+    }
 
     /// Confere o `slot` em `replacement` com o `iced-x86`: coincide exatamente com o imediato de
     /// 4 bytes de uma instrução que não é desvio, e os bytes ali são o `default_k` codificado.
@@ -207,16 +216,19 @@ impl ValueSpec {
                 self.slot
             ));
         }
-        if self.ty == ValueType::U32 && imm.sign_extended_to_64 && self.max > f64::from(i32::MAX) {
+        if self.grid.ty == ValueType::U32
+            && imm.sign_extended_to_64
+            && self.grid.max > f64::from(i32::MAX)
+        {
             return Err(format!(
                 "u32 num imediato estendido com sinal exige max <= i32::MAX, mas max é {}",
-                self.max
+                self.grid.max
             ));
         }
-        if current != self.encode(self.default_k) {
+        if current != self.grid.encode(self.grid.default_k) {
             return Err(format!(
                 "os bytes do slot {current:02X?} não são o default codificado ({:02X?})",
-                self.encode(self.default_k)
+                self.grid.encode(self.grid.default_k)
             ));
         }
         Ok(())
@@ -228,10 +240,9 @@ mod tests {
     use super::*;
     use crate::patch::{PatchSpec, validate};
 
-    fn f32_spec(min: f64, max: f64, step: f64, default_k: u64, slot: usize) -> ValueSpec {
-        ValueSpec {
+    fn f32_grid(min: f64, max: f64, step: f64, default_k: u64) -> ValueGrid {
+        ValueGrid {
             ty: ValueType::F32,
-            slot,
             min,
             max,
             step,
@@ -241,10 +252,9 @@ mod tests {
         }
     }
 
-    fn int_spec(ty: ValueType, min: f64, max: f64, step: f64, slot: usize) -> ValueSpec {
-        ValueSpec {
+    fn int_grid(ty: ValueType, min: f64, max: f64, step: f64) -> ValueGrid {
+        ValueGrid {
             ty,
-            slot,
             min,
             max,
             step,
@@ -254,9 +264,16 @@ mod tests {
         }
     }
 
+    fn f32_spec(min: f64, max: f64, step: f64, default_k: u64, slot: usize) -> ValueSpec {
+        ValueSpec {
+            grid: f32_grid(min, max, step, default_k),
+            slot,
+        }
+    }
+
     #[test]
     fn grid_by_k_has_no_drift() {
-        let s = f32_spec(0.1, 10.0, 0.1, 0, 1);
+        let s = f32_grid(0.1, 10.0, 0.1, 0);
         assert_eq!(s.steps(), 99);
         assert!((s.value(99) - 10.0).abs() < 1e-6);
         assert!((s.value(0) - 0.1).abs() < 1e-12);
@@ -266,7 +283,7 @@ mod tests {
 
     #[test]
     fn nearest_k_clamps() {
-        let s = f32_spec(1.0, 5.0, 0.5, 0, 1);
+        let s = f32_grid(1.0, 5.0, 0.5, 0);
         assert_eq!(s.nearest_k(-3.0), 0);
         assert_eq!(s.nearest_k(1.0), 0);
         assert_eq!(s.nearest_k(1.26), 1);
@@ -276,25 +293,40 @@ mod tests {
 
     #[test]
     fn encode_types() {
-        let i = int_spec(ValueType::I32, -10.0, 10.0, 1.0, 0);
+        let i = int_grid(ValueType::I32, -10.0, 10.0, 1.0);
         // k = 9 → -1
         assert_eq!(i.encode(9), [0xFF, 0xFF, 0xFF, 0xFF]);
-        let u = int_spec(ValueType::U32, 0.0, 100.0, 1.0, 0);
+        let u = int_grid(ValueType::U32, 0.0, 100.0, 1.0);
         assert_eq!(u.encode(7), [0x07, 0, 0, 0]);
-        let f = f32_spec(0.0, 10.0, 0.5, 0, 0);
+        let f = f32_grid(0.0, 10.0, 0.5, 0);
         assert_eq!(f.encode(3), [0x00, 0x00, 0xC0, 0x3F]);
     }
 
     #[test]
     fn format_units() {
-        let mut f = f32_spec(0.0, 10.0, 0.5, 0, 0);
+        let mut f = f32_grid(0.0, 10.0, 0.5, 0);
         f.unit = Some("x".into());
         assert_eq!(f.format(3), "1.5x");
-        let i = int_spec(ValueType::I32, 0.0, 1000.0, 100.0, 0);
+        let i = int_grid(ValueType::I32, 0.0, 1000.0, 100.0);
         assert_eq!(i.format(1), "100");
-        let mut neg = f32_spec(-1.0, 1.0, 0.1, 0, 0);
+        let mut neg = f32_grid(-1.0, 1.0, 0.1, 0);
         neg.decimals = 1;
         assert_eq!(neg.format(10), "0.0");
+    }
+
+    #[test]
+    fn grid_check_without_slot() {
+        let g = ValueGrid {
+            ty: ValueType::I32,
+            min: 100.0,
+            max: 10_000.0,
+            step: 100.0,
+            default_k: 9,
+            unit: None,
+            decimals: 0,
+        };
+        assert_eq!(g.check(), Ok(()));
+        assert_eq!(g.format(g.default_k), "1000");
     }
 
     #[test]
@@ -306,26 +338,22 @@ mod tests {
 
     #[test]
     fn check_accepts_valid_and_rejects_bad_numbers() {
-        assert!(f32_spec(0.0, 10.0, 0.5, 3, 1).check().is_ok());
-        assert!(f32_spec(5.0, 1.0, 0.5, 0, 1).check().is_err());
-        assert!(f32_spec(0.0, 10.0, 0.0, 0, 1).check().is_err());
-        assert!(f32_spec(0.0, 10.0, -1.0, 0, 1).check().is_err());
-        assert!(f32_spec(0.0, f64::INFINITY, 1.0, 0, 1).check().is_err());
-        assert!(f32_spec(0.0, f64::NAN, 1.0, 0, 1).check().is_err());
-        assert!(f32_spec(0.0, 1e300, 1.0, 0, 1).check().is_err());
+        assert!(f32_grid(0.0, 10.0, 0.5, 3).check().is_ok());
+        assert!(f32_grid(5.0, 1.0, 0.5, 0).check().is_err());
+        assert!(f32_grid(0.0, 10.0, 0.0, 0).check().is_err());
+        assert!(f32_grid(0.0, 10.0, -1.0, 0).check().is_err());
+        assert!(f32_grid(0.0, f64::INFINITY, 1.0, 0).check().is_err());
+        assert!(f32_grid(0.0, f64::NAN, 1.0, 0).check().is_err());
+        assert!(f32_grid(0.0, 1e300, 1.0, 0).check().is_err());
         // default_k além da grade
-        assert!(f32_spec(0.0, 10.0, 0.5, 21, 1).check().is_err());
-        assert!(f32_spec(0.0, 10.0, 0.5, 20, 1).check().is_ok());
+        assert!(f32_grid(0.0, 10.0, 0.5, 21).check().is_err());
+        assert!(f32_grid(0.0, 10.0, 0.5, 20).check().is_ok());
         // inteiros: faixa do tipo e valores inteiros
-        assert!(
-            int_spec(ValueType::U32, -1.0, 10.0, 1.0, 0)
-                .check()
-                .is_err()
-        );
-        assert!(int_spec(ValueType::U32, 0.0, 4e9, 1.0, 0).check().is_ok());
-        assert!(int_spec(ValueType::U32, 0.0, 5e9, 1.0, 0).check().is_err());
-        assert!(int_spec(ValueType::I32, -3e9, 0.0, 1.0, 0).check().is_err());
-        assert!(int_spec(ValueType::I32, 0.0, 10.0, 0.5, 0).check().is_err());
+        assert!(int_grid(ValueType::U32, -1.0, 10.0, 1.0).check().is_err());
+        assert!(int_grid(ValueType::U32, 0.0, 4e9, 1.0).check().is_ok());
+        assert!(int_grid(ValueType::U32, 0.0, 5e9, 1.0).check().is_err());
+        assert!(int_grid(ValueType::I32, -3e9, 0.0, 1.0).check().is_err());
+        assert!(int_grid(ValueType::I32, 0.0, 10.0, 0.5).check().is_err());
     }
 
     #[test]
@@ -358,21 +386,26 @@ mod tests {
         assert!(s.check_slot(&[0x6A, 0x05, 0x90, 0x90, 0x90]).is_err());
         // mov rax, imm32 com U32 e max > i32::MAX
         let u = ValueSpec {
-            ty: ValueType::U32,
+            grid: ValueGrid {
+                ty: ValueType::U32,
+                min: 0.0,
+                max: 4_000_000_000.0,
+                step: 1.0,
+                default_k: 1,
+                unit: None,
+                decimals: 0,
+            },
             slot: 3,
-            min: 0.0,
-            max: 4_000_000_000.0,
-            step: 1.0,
-            default_k: 1,
-            unit: None,
-            decimals: 0,
         };
         let mov_rax = [0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00];
         let err = u.check_slot(&mov_rax).unwrap_err();
         assert!(err.contains("i32::MAX"), "{err}");
         // o mesmo com max dentro de i32::MAX passa
         let ok = ValueSpec {
-            max: f64::from(i32::MAX),
+            grid: ValueGrid {
+                max: f64::from(i32::MAX),
+                ..u.grid
+            },
             ..u
         };
         assert_eq!(ok.check_slot(&mov_rax), Ok(()));
@@ -395,8 +428,8 @@ mod tests {
             replacement: bytes,
         };
         let base = validate(patch(replacement.to_vec())).unwrap();
-        assert_eq!(s.steps(), 20);
-        for k in 0..=s.steps() {
+        assert_eq!(s.grid.steps(), 20);
+        for k in 0..=s.grid.steps() {
             let v = validate(patch(s.bytes(&replacement, k))).unwrap();
             assert_eq!(v.replacement_starts, base.replacement_starts, "k = {k}");
             assert_eq!(v.expected_starts, base.expected_starts, "k = {k}");

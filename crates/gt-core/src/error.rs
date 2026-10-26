@@ -121,6 +121,11 @@ pub enum Error {
     #[error("o cheat {id} tem restos pendentes no jogo; use a recuperação (r)")]
     DataPending { id: String },
 
+    /// A entrada viva do cheat é de outro objeto (guarda diferente) no mesmo endereço: quem
+    /// chama a resolve (`restore_field`) antes de escrever neste objeto.
+    #[error("o cheat {id} tem uma entrada de outro objeto neste endereço")]
+    DataEntryOtherObject { id: String },
+
     /// Outro `gt-patch` já segura a trava do diário.
     #[error("outro gt-patch ou gt-tui já está em execução")]
     AlreadyRunning,

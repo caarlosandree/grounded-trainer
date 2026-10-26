@@ -41,8 +41,10 @@
 //! pela política de dados ([`Engine::set_data_policy`]), sempre depois de conferir a
 //! identidade do objeto (bytes de guarda relidos imediatamente antes). [`Engine::write_data`]
 //! não vai ao diário (barras: não há original a restaurar). [`Engine::set_bits`] limpa bits
-//! e grava a entrada no diário **antes** de escrever; [`Engine::restore_bits`], o `undo_all`,
-//! o `Drop` e a recuperação devolvem só os bits da máscara ao original ([`decide_data`]).
+//! e grava a entrada no diário **antes** de escrever; [`Engine::set_word`] faz o mesmo com um
+//! valor inteiro (spec 006, 6.4). [`Engine::restore_field`], o `undo_all`, o `Drop` e a
+//! recuperação devolvem os bits da máscara (ou o valor inteiro) ao original ([`decide_data`]).
+//! Uma entrada viva por par (`id`, endereço) ([`data_key`]).
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -50,8 +52,8 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::Signal;
 
 use crate::journal::{
-    DataAction, DataEntry, EntryAction, GuardBytes, Journal, JournalEntry, JournalLock,
-    JournalStore, decide_data, decide_entry,
+    DataAction, DataEntry, DataMode, EntryAction, GuardBytes, Journal, JournalEntry, JournalLock,
+    JournalStore, data_key, decide_data, decide_entry,
 };
 use crate::maps::{MapRegion, read_maps};
 use crate::mem::{MemWriter, Pidfd};
@@ -273,6 +275,32 @@ fn resume_guard(guard: PauseGuard<'_>, fault: Option<Fault>, fired: &mut bool) -
     guard.resume()
 }
 
+/// Falhas injetadas nas escritas em dados (só para testes).
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DataFault {
+    /// Toda escrita de restauração de dados falha (`WriteRefused`) sem tocar no jogo.
+    RestoreFails,
+    /// A próxima escrita de `set_word` ou `write_data` grava estes bytes (o jogo mexeu no campo) e a releitura
+    /// diverge do pedido: `BytesMismatch` com um terceiro valor. Dispara uma vez.
+    ThirdValue(Vec<u8>),
+}
+
+/// Resultado de [`Engine::set_word`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SetOutcome {
+    /// O campo já tem o valor pedido (e a entrada é nossa): nada foi escrito.
+    Unchanged,
+    /// O valor foi escrito (entrada nova ou troca de valor).
+    Written,
+    /// Uma troca interrompida já tinha escrito o valor: só a entrada foi finalizada.
+    Finalized,
+    /// O jogo mudou o campo: este valor virou o novo original e o valor pedido foi escrito.
+    NewOriginal(Vec<u8>),
+    /// O valor atual do jogo não passou em `accept`: nada foi escrito.
+    Rejected(Vec<u8>),
+}
+
 /// Motor de patches de um processo.
 ///
 /// Quem cria o motor segura a [`JournalLock`] enquanto ele existir.
@@ -307,6 +335,8 @@ pub struct Engine {
     data: Vec<DataEntry>,
     /// Entradas de dados não resolvidas: restos de uma falha e as vindas da recuperação.
     data_pending: Vec<DataEntry>,
+    /// Falha injetada nas escritas em dados (só para testes).
+    data_fault: Option<DataFault>,
 }
 
 impl Engine {
@@ -356,6 +386,7 @@ impl Engine {
             data_maps: None,
             data: Vec::new(),
             data_pending: Vec::new(),
+            data_fault: None,
         })
     }
 
@@ -432,9 +463,37 @@ impl Engine {
         self.finish(result)
     }
 
-    /// Restaura os bits de todas as entradas de dados do `id` (vivas e pendentes), pela regra
-    /// de [`decide_data`]: restauradas e já originais em `restored`, descartadas em `foreign`.
-    pub fn restore_bits(&mut self, id: &str) -> Result<BatchReport> {
+    /// Escreve `value` (1 a 8 bytes) num campo de dados com o original no diário (spec 006,
+    /// 6.4). Começa por `retry_resume`; recusa se o `id` tem entrada pendente
+    /// ([`Error::DataPending`]); confere identidade, política de dados e guarda como o
+    /// [`Engine::write_data`]. Depois decide pelo valor atual:
+    ///
+    /// - sem entrada (`id`, `addr`): `accept(atual)` falso é [`SetOutcome::Rejected`]; senão
+    ///   guarda `original = atual` no diário **antes** de escrever;
+    /// - entrada de outro objeto (guarda diferente): [`Error::DataEntryOtherObject`];
+    /// - entrada com `next`: atual igual ao `next` finaliza ([`SetOutcome::Finalized`]); igual
+    ///   ao `written` retira o `next` e segue;
+    /// - atual igual ao `written`: igual ao valor pedido é [`SetOutcome::Unchanged`]; diferente
+    ///   é uma troca (`next` no diário, escrita, `written` novo);
+    /// - atual diferente do `written`: o jogo mudou o campo; `accept(atual)` falso é
+    ///   `Rejected`, senão o atual vira o novo original ([`SetOutcome::NewOriginal`]).
+    pub fn set_word(
+        &mut self,
+        id: &str,
+        addr: u64,
+        value: &[u8],
+        guard: &[GuardBytes],
+        accept: &dyn Fn(&[u8]) -> bool,
+    ) -> Result<SetOutcome> {
+        self.retry_resume()?;
+        let result = self.set_word_inner(id, addr, value, guard, accept);
+        self.finish(result)
+    }
+
+    /// Restaura todas as entradas de dados do `id` (vivas e pendentes, bits ou valor inteiro),
+    /// pela regra de [`decide_data`]: restauradas e já originais em `restored`, descartadas
+    /// em `foreign`. O valor inteiro volta de uma vez ou nada é escrito.
+    pub fn restore_field(&mut self, id: &str) -> Result<BatchReport> {
         self.retry_resume()?;
         let result = self.restore_data_inner(|e| e.id == id);
         let data = self.finish(result)?;
@@ -452,15 +511,22 @@ impl Engine {
     pub fn restore_data(&mut self, entries: Vec<DataEntry>) -> Result<RestoreReport> {
         self.retry_resume()?;
         for e in &entries {
-            if !self.data.contains(e) && !self.data_pending.contains(e) {
+            let key = data_key(e);
+            let known = self
+                .data
+                .iter()
+                .chain(self.data_pending.iter())
+                .any(|d| data_key(d) == key);
+            if !known {
                 self.data_pending.push(e.clone());
             }
         }
-        let result = self.restore_data_inner(|e| entries.contains(e));
+        let result =
+            self.restore_data_inner(|e| entries.iter().any(|x| data_key(x) == data_key(e)));
         self.finish(result)
     }
 
-    /// Entradas de dados vivas (bits limpos e confirmados).
+    /// Entradas de dados vivas (bits limpos ou valor inteiro escrito, uma por par `id` e endereço).
     pub fn data_entries(&self) -> &[DataEntry] {
         &self.data
     }
@@ -593,6 +659,19 @@ impl Engine {
         self.save_logged(true);
     }
 
+    /// Liga (ou desliga, com `None`) a falha injetada nas escritas em dados (só para testes).
+    #[doc(hidden)]
+    pub fn inject_data_fault_for_test(&mut self, fault: Option<DataFault>) {
+        self.data_fault = fault;
+    }
+
+    /// Põe uma entrada de dados como viva e grava o diário (só para testes).
+    #[doc(hidden)]
+    pub fn force_data_for_test(&mut self, entry: DataEntry) {
+        self.upsert_data(entry);
+        self.save_final();
+    }
+
     /// Põe uma entrada de dados como pendente e grava o diário (só para testes).
     #[doc(hidden)]
     pub fn force_data_pending_for_test(&mut self, entry: DataEntry) {
@@ -687,7 +766,223 @@ impl Engine {
             });
         }
         self.check_data_write(addr, bytes.len(), guard)?;
+        if let Some(DataFault::ThirdValue(third)) = self.data_fault.clone() {
+            // O jogo escreve entre a nossa escrita e a releitura (só para testes).
+            self.data_fault = None;
+            self.writer.write(addr, &third)?;
+            self.data_maps = None;
+            return Err(Error::BytesMismatch {
+                id: "dados".to_owned(),
+                expected: hex(bytes),
+                found: hex(&third),
+            });
+        }
         self.write_data_verified("dados", addr, bytes)
+    }
+
+    /// Entrada viva do par (`id`, `addr`).
+    fn live_entry(&self, id: &str, addr: u64) -> Option<&DataEntry> {
+        self.data.iter().find(|d| data_key(d) == (id, addr))
+    }
+
+    /// Põe a entrada entre as vivas, substituindo a do mesmo par.
+    fn upsert_data(&mut self, entry: DataEntry) {
+        match self
+            .data
+            .iter_mut()
+            .find(|d| data_key(d) == data_key(&entry))
+        {
+            Some(slot) => *slot = entry,
+            None => self.data.push(entry),
+        }
+    }
+
+    /// Põe a entrada entre as pendentes, substituindo a do mesmo par.
+    fn upsert_pending(&mut self, entry: DataEntry) {
+        match self
+            .data_pending
+            .iter_mut()
+            .find(|d| data_key(d) == data_key(&entry))
+        {
+            Some(slot) => *slot = entry,
+            None => self.data_pending.push(entry),
+        }
+    }
+
+    /// Tira dos vivos a entrada do mesmo par.
+    fn remove_data(&mut self, entry: &DataEntry) {
+        self.data.retain(|d| data_key(d) != data_key(entry));
+    }
+
+    /// `len` bytes em `addr`; `None` se ilegíveis.
+    fn read_bytes(&self, addr: u64, len: usize) -> Result<Option<Vec<u8>>> {
+        let mut buf = vec![0u8; len];
+        match self.writer.read_exact(addr, &mut buf) {
+            Ok(()) => Ok(Some(buf)),
+            Err(Error::Unmapped { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Bytes atuais da entrada (o tamanho do `original`); entrada malformada não lê nada
+    /// (`decide_data` a descarta).
+    fn read_entry_bytes(&self, e: &DataEntry) -> Result<Option<Vec<u8>>> {
+        if e.original.is_empty() || e.original.len() > MAX_DATA_WRITE {
+            return Ok(None);
+        }
+        self.read_bytes(e.addr, e.original.len())
+    }
+
+    fn set_word_inner(
+        &mut self,
+        id: &str,
+        addr: u64,
+        value: &[u8],
+        guard: &[GuardBytes],
+        accept: &dyn Fn(&[u8]) -> bool,
+    ) -> Result<SetOutcome> {
+        if self.data_pending.iter().any(|e| e.id == id) {
+            return Err(Error::DataPending { id: id.to_owned() });
+        }
+        if value.is_empty() || value.len() > MAX_DATA_WRITE {
+            return Err(Error::BadPatch {
+                id: id.to_owned(),
+                reason: format!(
+                    "escrita em dados de {} bytes (1 a {MAX_DATA_WRITE})",
+                    value.len()
+                ),
+            });
+        }
+        self.check_data_write(addr, value.len(), guard)?;
+        let len = value.len();
+        let current = self
+            .read_bytes(addr, len)?
+            .ok_or(Error::Unmapped { addr, len })?;
+
+        let Some(mut entry) = self.live_entry(id, addr).cloned() else {
+            if !accept(&current) {
+                return Ok(SetOutcome::Rejected(current));
+            }
+            let entry = DataEntry::whole(id, addr, current.clone(), value.to_vec(), guard.to_vec());
+            self.journal_then_write(entry, None, &current)?;
+            return Ok(SetOutcome::Written);
+        };
+        if entry.mode != DataMode::Whole
+            || entry.guard != guard
+            || entry.original.len() != len
+            || entry.written.len() != len
+        {
+            return Err(Error::DataEntryOtherObject { id: id.to_owned() });
+        }
+
+        // Restos de uma troca interrompida.
+        if let Some(next) = entry.next.clone() {
+            if current == next {
+                entry.written = next;
+                entry.next = None;
+                self.upsert_data(entry);
+                self.save_journal(false)?;
+                return Ok(SetOutcome::Finalized);
+            }
+            if current == entry.written {
+                entry.next = None;
+                self.upsert_data(entry.clone());
+                self.save_journal(false)?;
+            }
+        }
+
+        if current == entry.written {
+            if entry.written == value {
+                return Ok(SetOutcome::Unchanged);
+            }
+            // Troca de valor: `next` no diário, escrita, `written` novo.
+            let previous = entry.clone();
+            let mut swap = entry;
+            swap.next = Some(value.to_vec());
+            self.journal_then_write(swap, Some(previous), &current)?;
+            return Ok(SetOutcome::Written);
+        }
+
+        // O jogo mudou o campo: o valor dele, se são, vira o novo original.
+        if !accept(&current) {
+            return Ok(SetOutcome::Rejected(current));
+        }
+        let previous = entry.clone();
+        let fresh = DataEntry::whole(id, addr, current.clone(), value.to_vec(), guard.to_vec());
+        self.journal_then_write(fresh, Some(previous), &current)?;
+        Ok(SetOutcome::NewOriginal(current))
+    }
+
+    /// Grava `entry` no diário **antes** de escrever e escreve o valor dela (`next`, numa troca;
+    /// senão `written`). `previous` é a entrada de antes (a que volta se nada chegou a ser
+    /// escrito); `before` são os bytes lidos antes da escrita. Numa troca, termina gravando
+    /// `written = next` sem `next`.
+    fn journal_then_write(
+        &mut self,
+        entry: DataEntry,
+        previous: Option<DataEntry>,
+        before: &[u8],
+    ) -> Result<()> {
+        let swapping = entry.next.is_some();
+        let value = entry.next.clone().unwrap_or_else(|| entry.written.clone());
+        self.upsert_data(entry.clone());
+        if let Err(e) = self.save_journal(false) {
+            self.revert_entry(&entry, previous);
+            return Err(e);
+        }
+        if swapping {
+            self.fire_hook(HookPoint::AfterNext);
+        }
+        let written = if let Some(DataFault::ThirdValue(third)) = self.data_fault.clone() {
+            self.data_fault = None;
+            self.writer.write(entry.addr, &third).and_then(|()| {
+                Err(Error::BytesMismatch {
+                    id: entry.id.clone(),
+                    expected: hex(&value),
+                    found: hex(&third),
+                })
+            })
+        } else {
+            self.write_data_verified(&entry.id, entry.addr, &value)
+        };
+        if let Err(e) = written {
+            if matches!(e, Error::ProcessGone { .. }) {
+                return Err(e);
+            }
+            match self.read_bytes(entry.addr, before.len()) {
+                // Nada foi escrito: volta a entrada de antes (ou nenhuma).
+                Ok(Some(now)) if now == before => self.revert_entry(&entry, previous),
+                // O jogo mexeu no campo depois da nossa escrita (releitura com um terceiro
+                // valor): vale a regra do "jogo mudou o campo"; a entrada (com o `next`, se
+                // houver) segue viva e o próximo `set_word` a resolve.
+                Ok(Some(now)) if now != value => {}
+                // O campo ficou com o nosso valor sem confirmação, ou não dá para saber:
+                // pendente até a recuperação, que decide pelo `written`/`next` da entrada.
+                _ => {
+                    self.remove_data(&entry);
+                    self.upsert_pending(entry);
+                }
+            }
+            self.save_final();
+            return Err(e);
+        }
+        if swapping {
+            let mut done = entry;
+            done.written = value;
+            done.next = None;
+            self.upsert_data(done);
+            self.save_journal(false)?;
+        }
+        Ok(())
+    }
+
+    /// Desfaz a entrada em memória e no diário depois de uma escrita que não aconteceu.
+    fn revert_entry(&mut self, entry: &DataEntry, previous: Option<DataEntry>) {
+        match previous {
+            Some(p) => self.upsert_data(p),
+            None => self.remove_data(entry),
+        }
+        self.save_final();
     }
 
     fn set_bits_inner(
@@ -724,18 +1019,11 @@ impl Engine {
             // Já limpos: nada a escrever, e nenhum original a guardar.
             return Ok(());
         }
-        let entry = DataEntry {
-            id: id.to_owned(),
-            addr,
-            original: before,
-            written: before & !mask,
-            mask,
-            guard: guard.to_vec(),
-        };
+        let entry = DataEntry::bits(id, addr, before, before & !mask, mask, guard.to_vec());
         // O diário recebe a entrada antes da escrita.
-        self.data.push(entry.clone());
+        self.upsert_data(entry.clone());
         if let Err(e) = self.save_journal(false) {
-            self.data.retain(|d| *d != entry);
+            self.remove_data(&entry);
             return Err(e);
         }
         // O byte é recalculado de uma leitura imediatamente anterior à escrita.
@@ -748,11 +1036,11 @@ impl Engine {
             if matches!(e, Error::ProcessGone { .. }) {
                 return Err(e);
             }
-            self.data.retain(|d| *d != entry);
+            self.remove_data(&entry);
             // Se os bits continuam os originais, nada ficou escrito; senão, sobra pendente.
             match self.read_byte(addr) {
                 Ok(Some(now)) if now & mask == before & mask => {}
-                _ => self.data_pending.push(entry),
+                _ => self.upsert_pending(entry),
             }
             self.save_final();
             return Err(e);
@@ -779,12 +1067,13 @@ impl Engine {
         let mut report = RestoreReport::default();
         let mut failed: Option<Error> = None;
         for e in chosen {
-            let current = self.read_byte(e.addr)?;
+            let current = self.read_entry_bytes(&e)?;
             let guard_ok = self.guard_ok(&e.guard)?;
+            let end = e.addr.saturating_add(e.original.len() as u64);
             let writable = maps
                 .iter()
-                .any(|r| r.perms.read && r.perms.write && r.start <= e.addr && e.addr < r.end);
-            match decide_data(&e, current, guard_ok, writable) {
+                .any(|r| r.perms.read && r.perms.write && r.start <= e.addr && end <= r.end);
+            match decide_data(&e, current.as_deref(), guard_ok, writable) {
                 DataAction::Drop => report.dropped.push(e.id.clone()),
                 DataAction::Discard => {
                     tracing::warn!(
@@ -794,24 +1083,27 @@ impl Engine {
                     );
                     report.foreign.push(e.id.clone());
                 }
-                DataAction::Restore(byte) => {
-                    if let Err(err) = self.write_verified(&e.id, e.addr, &[byte]) {
+                DataAction::Restore(bytes) => {
+                    let written = if self.data_fault == Some(DataFault::RestoreFails) {
+                        Err(Error::WriteRefused { addr: e.addr })
+                    } else {
+                        self.write_verified(&e.id, e.addr, &bytes)
+                    };
+                    if let Err(err) = written {
                         if matches!(err, Error::ProcessGone { .. }) {
                             return Err(err);
                         }
-                        tracing::error!(id = %e.id, erro = %err, "falha ao restaurar os bits");
-                        self.data.retain(|d| *d != e);
-                        if !self.data_pending.contains(&e) {
-                            self.data_pending.push(e);
-                        }
+                        tracing::error!(id = %e.id, erro = %err, "falha ao restaurar o campo");
+                        self.remove_data(&e);
+                        self.upsert_pending(e);
                         failed.get_or_insert(err);
                         continue;
                     }
                     report.restored.push(e.id.clone());
                 }
             }
-            self.data.retain(|d| *d != e);
-            self.data_pending.retain(|d| *d != e);
+            self.remove_data(&e);
+            self.data_pending.retain(|d| data_key(d) != data_key(&e));
         }
         self.save_final();
         match failed {
@@ -1426,6 +1718,16 @@ impl Engine {
             cfg.hook = None;
         }
         cfg
+    }
+
+    /// Gancho de teste de um ponto sem estado próprio (fora do `Drop` e de pânico em curso).
+    fn fire_hook(&self, point: HookPoint) {
+        if let Some(hook) = self.pause_cfg.hook
+            && !self.in_drop
+            && !std::thread::panicking()
+        {
+            hook(point);
+        }
     }
 
     fn fire_after_apply(&mut self) {

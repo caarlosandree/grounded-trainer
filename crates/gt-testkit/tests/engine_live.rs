@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gt_core::Error;
-use gt_core::engine::{Engine, EngineOptions, PolicyFn};
+use gt_core::engine::{DataFault, Engine, EngineOptions, PolicyFn, SetOutcome};
 use gt_core::journal::{JournalEntry, JournalLock, JournalStore, Loaded};
 use gt_core::mem::{MemReader, MemWriter};
 use gt_core::patch::{PatchSpec, Validated, WritePolicy, validate};
@@ -1691,8 +1691,20 @@ fn set_bits_journals_before_write() {
         panic!("esperada uma entrada de dados: {:?}", j.data);
     };
     assert_eq!(
-        (e.id.as_str(), e.addr, e.original, e.written, e.mask),
-        ("nao-morrer", obj.byte, 0x07, 0x01, 0x06)
+        (
+            e.id.as_str(),
+            e.addr,
+            e.original.as_slice(),
+            e.written.as_slice(),
+            e.mask
+        ),
+        (
+            "nao-morrer",
+            obj.byte,
+            [0x07].as_slice(),
+            [0x01].as_slice(),
+            0x06
+        )
     );
     assert_eq!(e.guard, obj.guard);
     assert_eq!(engine.data_entries().len(), 1);
@@ -1715,7 +1727,7 @@ fn set_bits_maintenance_reclears() {
     assert_eq!(byte_at(&t, obj.byte), 0x01);
     let j = journal_now(&env);
     assert_eq!(j.data.len(), 1);
-    assert_eq!(j.data[0].original, 0x07);
+    assert_eq!(j.data[0].original, vec![0x07]);
     // Bits já limpos: nada muda.
     engine
         .set_bits("queda", obj.byte, 0x06, &obj.guard)
@@ -1734,7 +1746,7 @@ fn restore_keeps_foreign_bits() {
         .unwrap();
     // O jogo liga outro bit do mesmo byte enquanto os nossos estão limpos.
     poke(&t, obj.byte, &[0x81]);
-    let report = engine.restore_bits("nao-morrer").unwrap();
+    let report = engine.restore_field("nao-morrer").unwrap();
     assert_eq!(report.restored, vec!["nao-morrer"]);
     assert_eq!(byte_at(&t, obj.byte), 0x87);
     assert_eq!(env.store.peek().unwrap(), Loaded::Missing);
@@ -1752,7 +1764,7 @@ fn restore_guard_mismatch_discards() {
         .unwrap();
     // O objeto não é mais o mesmo: a entrada sai sem escrever nada.
     poke(&t, t.big_region, &[0x00]);
-    let report = engine.restore_bits("nao-morrer").unwrap();
+    let report = engine.restore_field("nao-morrer").unwrap();
     assert_eq!(report.foreign, vec!["nao-morrer"]);
     assert!(report.restored.is_empty());
     assert_eq!(byte_at(&t, obj.byte), 0x01);
@@ -1789,14 +1801,14 @@ fn set_bits_refused_with_pending() {
     let env = env();
     let obj = data_obj(&t);
     let mut engine = data_engine(&t, &env, &obj);
-    engine.force_data_pending_for_test(gt_core::journal::DataEntry {
-        id: "nao-morrer".into(),
-        addr: obj.byte,
-        original: 0x07,
-        written: 0x01,
-        mask: 0x06,
-        guard: obj.guard.clone(),
-    });
+    engine.force_data_pending_for_test(gt_core::journal::DataEntry::bits(
+        "nao-morrer",
+        obj.byte,
+        0x07,
+        0x01,
+        0x06,
+        obj.guard.clone(),
+    ));
     assert_eq!(engine.pending_ids(), vec!["nao-morrer"]);
     let err = engine
         .set_bits("nao-morrer", obj.byte, 0x06, &obj.guard)
@@ -1815,4 +1827,367 @@ fn set_bits_refused_with_pending() {
     let report = engine.restore_pending().unwrap();
     assert_eq!(report.dropped, vec!["nao-morrer"]);
     assert!(engine.pending_ids().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Escrita `set` de valor inteiro (plano 006, tarefa 3)
+// ---------------------------------------------------------------------------
+
+const OLD: [u8; 4] = [1, 2, 3, 4];
+const OURS: [u8; 4] = [9, 9, 9, 9];
+const OTHER: [u8; 4] = [7, 7, 7, 7];
+
+fn word_bytes(t: &TestTarget, addr: u64) -> [u8; 4] {
+    let mut b = [0u8; 4];
+    MemReader::new(t.pid).read_exact(addr, &mut b).unwrap();
+    b
+}
+
+fn accept_all(_: &[u8]) -> bool {
+    true
+}
+
+fn set(engine: &mut Engine, obj: &DataObj, value: &[u8]) -> gt_core::Result<SetOutcome> {
+    engine.set_word("carga", obj.word, value, &obj.guard, &accept_all)
+}
+
+#[test]
+fn set_word_creates_entry_before_write() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    poke(&t, obj.word, &OLD);
+    assert_eq!(set(&mut engine, &obj, &OURS).unwrap(), SetOutcome::Written);
+    assert_eq!(word_bytes(&t, obj.word), OURS);
+    let j = journal_now(&env);
+    let [e] = j.data.as_slice() else {
+        panic!("esperada uma entrada: {:?}", j.data);
+    };
+    assert_eq!(e.mode, gt_core::journal::DataMode::Whole);
+    assert_eq!(
+        (
+            e.id.as_str(),
+            e.addr,
+            e.original.as_slice(),
+            e.written.as_slice()
+        ),
+        ("carga", obj.word, OLD.as_slice(), OURS.as_slice())
+    );
+    assert_eq!(e.next, None);
+    assert_eq!(e.guard, obj.guard);
+}
+
+#[test]
+fn set_word_equal_value_creates_entry() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    poke(&t, obj.word, &OURS);
+    assert_eq!(set(&mut engine, &obj, &OURS).unwrap(), SetOutcome::Written);
+    let j = journal_now(&env);
+    assert_eq!(j.data.len(), 1);
+    assert_eq!(j.data[0].original, OURS.to_vec());
+    // Ligar de novo com o mesmo valor: nada a fazer.
+    assert_eq!(
+        set(&mut engine, &obj, &OURS).unwrap(),
+        SetOutcome::Unchanged
+    );
+}
+
+#[test]
+fn set_word_rejects_insane_current() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    poke(&t, obj.word, &OLD);
+    let out = engine
+        .set_word("carga", obj.word, &OURS, &obj.guard, &|_| false)
+        .unwrap();
+    assert_eq!(out, SetOutcome::Rejected(OLD.to_vec()));
+    assert_eq!(word_bytes(&t, obj.word), OLD);
+    assert!(engine.data_entries().is_empty());
+    assert_eq!(env.store.peek().unwrap(), Loaded::Missing);
+}
+
+#[test]
+fn set_word_game_change_new_original() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    poke(&t, obj.word, &OLD);
+    set(&mut engine, &obj, &OURS).unwrap();
+    // O jogo muda o campo; um valor insano não vira original.
+    poke(&t, obj.word, &OTHER);
+    let out = engine
+        .set_word("carga", obj.word, &OURS, &obj.guard, &|_| false)
+        .unwrap();
+    assert_eq!(out, SetOutcome::Rejected(OTHER.to_vec()));
+    assert_eq!(word_bytes(&t, obj.word), OTHER);
+    assert_eq!(journal_now(&env).data[0].original, OLD.to_vec());
+    // Valor são: vira o novo original, com o diário atualizado, uma entrada só.
+    let out = set(&mut engine, &obj, &OURS).unwrap();
+    assert_eq!(out, SetOutcome::NewOriginal(OTHER.to_vec()));
+    assert_eq!(word_bytes(&t, obj.word), OURS);
+    let j = journal_now(&env);
+    assert_eq!(j.data.len(), 1);
+    assert_eq!(j.data[0].original, OTHER.to_vec());
+    assert_eq!(engine.data_entries().len(), 1);
+    let report = engine.restore_field("carga").unwrap();
+    assert_eq!(report.restored, vec!["carga"]);
+    assert_eq!(word_bytes(&t, obj.word), OTHER);
+    assert_eq!(env.store.peek().unwrap(), Loaded::Missing);
+}
+
+#[test]
+fn set_word_swap_uses_next() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    poke(&t, obj.word, &OLD);
+    set(&mut engine, &obj, &OURS).unwrap();
+    assert_eq!(set(&mut engine, &obj, &OTHER).unwrap(), SetOutcome::Written);
+    assert_eq!(word_bytes(&t, obj.word), OTHER);
+    let j = journal_now(&env);
+    assert_eq!(j.data.len(), 1);
+    assert_eq!(j.data[0].original, OLD.to_vec());
+    assert_eq!(j.data[0].written, OTHER.to_vec());
+    assert_eq!(j.data[0].next, None);
+    assert_eq!(engine.data_entries()[0].next, None);
+    engine.restore_field("carga").unwrap();
+    assert_eq!(word_bytes(&t, obj.word), OLD);
+}
+
+#[test]
+fn set_word_next_equal_current_finalizes() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    // Troca interrompida depois da escrita: o campo já tem o `next`.
+    let mut e = gt_core::journal::DataEntry::whole(
+        "carga",
+        obj.word,
+        OLD.to_vec(),
+        OURS.to_vec(),
+        obj.guard.clone(),
+    );
+    e.next = Some(OTHER.to_vec());
+    engine.force_data_for_test(e);
+    poke(&t, obj.word, &OTHER);
+    assert_eq!(
+        set(&mut engine, &obj, &OTHER).unwrap(),
+        SetOutcome::Finalized
+    );
+    let j = journal_now(&env);
+    assert_eq!(j.data[0].written, OTHER.to_vec());
+    assert_eq!(j.data[0].next, None);
+    assert_eq!(
+        set(&mut engine, &obj, &OTHER).unwrap(),
+        SetOutcome::Unchanged
+    );
+}
+
+#[test]
+fn set_word_next_equal_written_drops_next_and_swaps() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    // Troca interrompida antes da escrita: o campo ainda tem o `written`.
+    let mut e = gt_core::journal::DataEntry::whole(
+        "carga",
+        obj.word,
+        OLD.to_vec(),
+        OURS.to_vec(),
+        obj.guard.clone(),
+    );
+    e.next = Some(OTHER.to_vec());
+    engine.force_data_for_test(e);
+    poke(&t, obj.word, &OURS);
+    // Mesmo valor do `written`: retira o `next` e nada mais.
+    assert_eq!(
+        set(&mut engine, &obj, &OURS).unwrap(),
+        SetOutcome::Unchanged
+    );
+    assert_eq!(journal_now(&env).data[0].next, None);
+    assert_eq!(word_bytes(&t, obj.word), OURS);
+}
+
+#[test]
+fn set_same_address_new_guard() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    poke(&t, obj.word, &OLD);
+    set(&mut engine, &obj, &OURS).unwrap();
+    // Outro objeto no mesmo endereço: guarda nova e valor próprio.
+    let marker2: Vec<u8> = (0..16u8).map(|i| 0xD0 | i).collect();
+    poke(&t, t.big_region, &marker2);
+    poke(&t, obj.word, &OTHER);
+    let guard2 = vec![gt_core::journal::GuardBytes {
+        addr: t.big_region,
+        bytes: marker2,
+    }];
+    let err = engine
+        .set_word("carga", obj.word, &OURS, &guard2, &accept_all)
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::DataEntryOtherObject { id } if id == "carga"),
+        "{err:?}"
+    );
+    assert_eq!(word_bytes(&t, obj.word), OTHER);
+    // Quem chama resolve a entrada antiga: a guarda dela não bate, nada é escrito.
+    let report = engine.restore_field("carga").unwrap();
+    assert_eq!(report.foreign, vec!["carga"]);
+    assert_eq!(word_bytes(&t, obj.word), OTHER);
+    assert!(engine.data_entries().is_empty());
+    // A entrada nova tem o original lido de novo.
+    let out = engine
+        .set_word("carga", obj.word, &OURS, &guard2, &accept_all)
+        .unwrap();
+    assert_eq!(out, SetOutcome::Written);
+    let j = journal_now(&env);
+    assert_eq!(j.data.len(), 1);
+    assert_eq!(j.data[0].original, OTHER.to_vec());
+    assert_eq!(j.data[0].guard, guard2);
+}
+
+#[test]
+fn restore_field_whole_ours_restores() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    poke(&t, obj.word, &OLD);
+    set(&mut engine, &obj, &OURS).unwrap();
+    let report = engine.restore_field("carga").unwrap();
+    assert_eq!(report.restored, vec!["carga"]);
+    assert_eq!(word_bytes(&t, obj.word), OLD);
+    assert_eq!(env.store.peek().unwrap(), Loaded::Missing);
+    assert!(engine.data_entries().is_empty());
+}
+
+#[test]
+fn restore_field_whole_game_value_forgets() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    poke(&t, obj.word, &OLD);
+    set(&mut engine, &obj, &OURS).unwrap();
+    // Valor do jogo, inclusive parecido com o nosso em parte dos bytes: nada é escrito.
+    poke(&t, obj.word, &[9, 9, 9, 5]);
+    let report = engine.restore_field("carga").unwrap();
+    assert_eq!(report.restored, vec!["carga"]);
+    assert_eq!(word_bytes(&t, obj.word), [9, 9, 9, 5]);
+    assert_eq!(env.store.peek().unwrap(), Loaded::Missing);
+}
+
+#[test]
+fn entry_update_then_failed_restore_no_stale_copy() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    poke(&t, obj.word, &OLD);
+    set(&mut engine, &obj, &OURS).unwrap();
+    // O jogo muda o campo: o original é atualizado (mesmo par, outra entrada).
+    poke(&t, obj.word, &OTHER);
+    assert_eq!(
+        set(&mut engine, &obj, &OURS).unwrap(),
+        SetOutcome::NewOriginal(OTHER.to_vec())
+    );
+    // A restauração falha: sobra uma entrada só por par, com o original atualizado.
+    engine.inject_data_fault_for_test(Some(DataFault::RestoreFails));
+    assert!(engine.restore_field("carga").is_err());
+    assert_eq!(engine.pending_ids(), vec!["carga"]);
+    assert!(engine.data_entries().is_empty());
+    let j = journal_now(&env);
+    assert_eq!(j.data.len(), 1);
+    assert_eq!(j.data[0].original, OTHER.to_vec());
+    assert_eq!(word_bytes(&t, obj.word), OURS);
+    // Sem a falha, a recuperação devolve o original novo, não o velho.
+    engine.inject_data_fault_for_test(None);
+    let report = engine.restore_pending().unwrap();
+    assert_eq!(report.restored, vec!["carga"]);
+    assert_eq!(word_bytes(&t, obj.word), OTHER);
+    assert!(engine.pending_ids().is_empty());
+    assert_eq!(env.store.peek().unwrap(), Loaded::Missing);
+}
+
+#[test]
+fn set_word_reread_third_value_keeps_entry_alive() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    poke(&t, obj.word, &OLD);
+    // O jogo escreve entre a nossa escrita e a releitura: terceiro valor.
+    engine.inject_data_fault_for_test(Some(DataFault::ThirdValue(OTHER.to_vec())));
+    let err = set(&mut engine, &obj, &OURS).unwrap_err();
+    assert!(matches!(err, Error::BytesMismatch { .. }), "{err:?}");
+    assert!(engine.pending_ids().is_empty());
+    assert_eq!(engine.data_entries().len(), 1);
+    assert_eq!(word_bytes(&t, obj.word), OTHER);
+    // O próximo `set_word` cai em "o jogo mudou o campo", sem `DataPending`.
+    assert_eq!(
+        set(&mut engine, &obj, &OURS).unwrap(),
+        SetOutcome::NewOriginal(OTHER.to_vec())
+    );
+    assert_eq!(word_bytes(&t, obj.word), OURS);
+    let j = journal_now(&env);
+    assert_eq!(j.data.len(), 1);
+    assert_eq!(j.data[0].original, OTHER.to_vec());
+}
+
+#[test]
+fn set_word_refused_with_pending_and_bad_len() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    assert!(matches!(
+        engine.set_word("carga", obj.word, &[], &obj.guard, &accept_all),
+        Err(Error::BadPatch { .. })
+    ));
+    assert!(matches!(
+        engine.set_word("carga", obj.word, &[0; 9], &obj.guard, &accept_all),
+        Err(Error::BadPatch { .. })
+    ));
+    engine.force_data_pending_for_test(gt_core::journal::DataEntry::whole(
+        "carga",
+        obj.word,
+        OLD.to_vec(),
+        OURS.to_vec(),
+        obj.guard.clone(),
+    ));
+    let err = set(&mut engine, &obj, &OURS).unwrap_err();
+    assert!(
+        matches!(&err, Error::DataPending { id } if id == "carga"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn undo_all_and_drop_restore_whole() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    poke(&t, obj.word, &OLD);
+    {
+        let mut engine = data_engine(&t, &env, &obj);
+        set(&mut engine, &obj, &OURS).unwrap();
+        engine.undo_all().unwrap();
+        assert_eq!(word_bytes(&t, obj.word), OLD);
+        set(&mut engine, &obj, &OURS).unwrap();
+        assert_eq!(word_bytes(&t, obj.word), OURS);
+    }
+    assert_eq!(word_bytes(&t, obj.word), OLD);
+    assert_eq!(env.store.peek().unwrap(), Loaded::Missing);
 }
