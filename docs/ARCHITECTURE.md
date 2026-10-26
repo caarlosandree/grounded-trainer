@@ -88,6 +88,7 @@ grounded-trainer/
 | `tempfile` | Diretórios e arquivos temporários nos testes (só `dev-dependencies`) |
 | `tracing` + `tracing-subscriber` | Logs (em arquivo enquanto a TUI estiver aberta); o `gt-core` usa só `tracing` (avisos de extensão de módulo) |
 | `signal-hook` | Restauração ao receber SIGINT/SIGTERM |
+| `chrono` (`default-features = false`, `clock`) | Hora local (HH:MM) no registro de eventos do `gt-tui` |
 
 As versões são fixadas no `Cargo.toml` na Fase 0, usando a estável mais recente.
 
@@ -168,3 +169,4 @@ As instruções originais copiadas para a cave passam por relocação (endereço
 | 2026-10-25 | Versão sem assinaturas: patch "não verificado" se o AOB for único em memória e disco e os bytes baterem | Não parar o trainer a cada atualização, sem abrir mão da conferência de bytes (dono) |
 | 2026-10-25 | Identidade do processo por PID + horário de início + `boot_id`; sinais por `pidfd`; escrita pelo descritor do `mem` | Nunca escrever nem sinalizar um PID reaproveitado |
 | 2026-10-25 | Escrita só nas seções executáveis (do disco) do módulo declarado pelo patch | Escrever é mais rígido que ler; o cabeçalho em memória poderia ser alterado |
+| 2026-10-25 | `gt-patch` e `gt-tui` com a feature `write`; o `gt` continua só leitura | Spec 003: a TUI aplica patches pelo mesmo motor do `gt-patch`; a escrita segue isolada atrás da feature (decisão do dono) |

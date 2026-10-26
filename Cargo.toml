@@ -32,6 +32,7 @@ signal-hook = "0.4.5"
 serde_json = "1.0.154"
 libc = "0.2.191"
 tempfile = "3.27.0"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
