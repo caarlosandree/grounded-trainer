@@ -50,15 +50,89 @@ pub fn decode_entry(header: u16, raw: &[u8]) -> Result<String, UeError> {
     }
 }
 
-/// Consulta de nomes por índice, com cache (os nomes não mudam com o jogo rodando).
-pub struct Names<'m, M: ReadMem> {
-    mem: &'m M,
+/// Tabela de blocos do pool com o cache dos nomes já lidos. Não guarda a memória: quem consulta
+/// passa o leitor, então o índice de classes pode ficar com a sua própria cópia.
+pub(crate) struct NameLookup {
     /// Ponteiros dos blocos já lidos, na ordem.
     blocks: Vec<u64>,
     cache: Mutex<HashMap<u32, String>>,
 }
 
-impl<'m, M: ReadMem> Names<'m, M> {
+impl NameLookup {
+    /// Cópia dos blocos e do cache atual.
+    pub(crate) fn snapshot(&self) -> Self {
+        Self {
+            blocks: self.blocks.clone(),
+            cache: Mutex::new(
+                self.cache
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone(),
+            ),
+        }
+    }
+
+    /// Nome do índice de comparação `index` (bloco `index >> 16`, deslocamento `(index & 0xffff) * 2`).
+    pub(crate) fn name<M: ReadMem + ?Sized>(&self, mem: &M, index: u32) -> Result<String, UeError> {
+        if let Some(hit) = self
+            .cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&index)
+        {
+            return Ok(hit.clone());
+        }
+        let block = (index >> 16) as usize;
+        let Some(&base) = self.blocks.get(block) else {
+            return Err(UeError::Malformed(format!(
+                "nome {index:#x}: o bloco {block} não existe"
+            )));
+        };
+        let entry = base + u64::from(index & 0xffff) * 2;
+        let mut head = [0u8; 2];
+        read_bytes(mem, entry, &mut head)?;
+        let header = u16::from_le_bytes(head);
+        let nbytes = entry_bytes(header);
+        if nbytes == 0 {
+            return Err(UeError::Malformed(format!("nome {index:#x} vazio")));
+        }
+        if nbytes > MAX_NAME_BYTES {
+            return Err(UeError::Malformed(format!(
+                "nome {index:#x} com {nbytes} bytes (máximo {MAX_NAME_BYTES})"
+            )));
+        }
+        let raw = read_vec(mem, entry + 2, nbytes)?;
+        let text = decode_entry(header, &raw)?;
+        self.cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(index, text.clone());
+        Ok(text)
+    }
+
+    /// Nome de um `FName` (`ComparisonIndex`, `Number`): com `number > 0` acrescenta `_{number-1}`.
+    pub(crate) fn fname<M: ReadMem + ?Sized>(
+        &self,
+        mem: &M,
+        comparison: u32,
+        number: u32,
+    ) -> Result<String, UeError> {
+        let base = self.name(mem, comparison)?;
+        Ok(if number > 0 {
+            format!("{base}_{}", number - 1)
+        } else {
+            base
+        })
+    }
+}
+
+/// Consulta de nomes por índice, com cache (os nomes não mudam com o jogo rodando).
+pub struct Names<'m, M: ReadMem + ?Sized> {
+    mem: &'m M,
+    lookup: NameLookup,
+}
+
+impl<'m, M: ReadMem + ?Sized> Names<'m, M> {
     /// `pool_blocks` é o endereço do ponteiro do bloco 0; os seguintes vêm a cada 8 bytes. A leitura
     /// para no primeiro ponteiro nulo ou não canônico (os blocos são alocados em ordem).
     pub fn new(mem: &'m M, pool_blocks: u64) -> Result<Self, UeError> {
@@ -87,61 +161,30 @@ impl<'m, M: ReadMem> Names<'m, M> {
         }
         Ok(Self {
             mem,
-            blocks,
-            cache: Mutex::new(HashMap::new()),
+            lookup: NameLookup {
+                blocks,
+                cache: Mutex::new(HashMap::new()),
+            },
         })
     }
 
     /// Quantidade de blocos lidos.
     pub fn block_count(&self) -> usize {
-        self.blocks.len()
+        self.lookup.blocks.len()
+    }
+
+    /// A tabela de blocos e o cache, para quem precisa consultar nomes sem guardar o leitor.
+    pub(crate) fn lookup(&self) -> &NameLookup {
+        &self.lookup
     }
 
     /// Nome do índice de comparação `index` (bloco `index >> 16`, deslocamento `(index & 0xffff) * 2`).
     pub fn name(&self, index: u32) -> Result<String, UeError> {
-        if let Some(hit) = self
-            .cache
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&index)
-        {
-            return Ok(hit.clone());
-        }
-        let block = (index >> 16) as usize;
-        let Some(&base) = self.blocks.get(block) else {
-            return Err(UeError::Malformed(format!(
-                "nome {index:#x}: o bloco {block} não existe"
-            )));
-        };
-        let entry = base + u64::from(index & 0xffff) * 2;
-        let mut head = [0u8; 2];
-        read_bytes(self.mem, entry, &mut head)?;
-        let header = u16::from_le_bytes(head);
-        let nbytes = entry_bytes(header);
-        if nbytes == 0 {
-            return Err(UeError::Malformed(format!("nome {index:#x} vazio")));
-        }
-        if nbytes > MAX_NAME_BYTES {
-            return Err(UeError::Malformed(format!(
-                "nome {index:#x} com {nbytes} bytes (máximo {MAX_NAME_BYTES})"
-            )));
-        }
-        let raw = read_vec(self.mem, entry + 2, nbytes)?;
-        let text = decode_entry(header, &raw)?;
-        self.cache
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(index, text.clone());
-        Ok(text)
+        self.lookup.name(self.mem, index)
     }
 
     /// Nome de um `FName` (`ComparisonIndex`, `Number`): com `number > 0` acrescenta `_{number-1}`.
     pub fn fname(&self, comparison: u32, number: u32) -> Result<String, UeError> {
-        let base = self.name(comparison)?;
-        Ok(if number > 0 {
-            format!("{base}_{}", number - 1)
-        } else {
-            base
-        })
+        self.lookup.fname(self.mem, comparison, number)
     }
 }

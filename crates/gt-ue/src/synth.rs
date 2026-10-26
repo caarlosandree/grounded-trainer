@@ -302,9 +302,23 @@ impl SynthUe {
         props_size: u32,
         fields: &[SynthField],
     ) -> u64 {
+        self.add_class_of(self.class_class, pkg, name, super_class, props_size, fields)
+    }
+
+    /// Como [`SynthUe::add_class`], mas com a meta-classe do objeto dada: uma classe de Blueprint
+    /// tem como classe uma `BlueprintGeneratedClass`, que é filha de `Class`.
+    pub fn add_class_of(
+        &mut self,
+        meta_class: u64,
+        pkg: u64,
+        name: &str,
+        super_class: Option<u64>,
+        props_size: u32,
+        fields: &[SynthField],
+    ) -> u64 {
         let class_size = self.class_size();
         let addr = self.alloc(u64::from(class_size), 16);
-        self.init_object(addr, self.class_class, class_size, name, pkg);
+        self.init_object(addr, meta_class, class_size, name, pkg);
         let first = self.build_fields(fields);
         self.init_struct(addr, super_class, first, props_size);
         self.instance_sizes
@@ -473,14 +487,16 @@ impl SynthUe {
         self.write_u32(addr + u64::from(s.properties_size), props);
     }
 
-    /// `FFieldClass` do tipo `kind` (nome do tipo em `+0`), um por tipo.
+    /// `FFieldClass` do tipo `kind` (nome do tipo em `ffield.class_name`), um por tipo.
     fn field_class(&mut self, kind: &'static str) -> u64 {
         if let Some(&addr) = self.field_classes.get(kind) {
             return addr;
         }
-        let addr = self.alloc(0x20, 16);
-        self.writes.push((addr, vec![0u8; 0x20]));
-        self.write_fname(addr, kind);
+        let name_at = self.layout.ffield.class_name;
+        let size = round8(0x20.max(name_at + 8));
+        let addr = self.alloc(u64::from(size), 16);
+        self.writes.push((addr, vec![0u8; size as usize]));
+        self.write_fname(addr + u64::from(name_at), kind);
         self.field_classes.insert(kind, addr);
         addr
     }

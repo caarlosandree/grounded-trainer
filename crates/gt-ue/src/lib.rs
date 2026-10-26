@@ -4,7 +4,9 @@
 //! cada classe vêm da própria reflexão, por nome.
 
 pub mod check;
+pub mod dump;
 pub mod error;
+pub mod index;
 pub mod layout;
 pub mod names;
 pub mod objects;
@@ -13,7 +15,9 @@ pub mod read;
 pub mod synth;
 
 pub use check::cheap_check;
+pub use dump::{ClassDump, ClassQuery, describe_class};
 pub use error::UeError;
+pub use index::{BoolBits, Field, ReflectionIndex, is_object_family};
 pub use layout::{
     FBoolLayout, FFieldLayout, FPropLayout, ObjectsLayout, UObjectLayout, UStructLayout, UeLayout,
 };

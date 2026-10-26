@@ -36,6 +36,13 @@ pub fn read_vec<M: ReadMem + ?Sized>(mem: &M, addr: u64, len: usize) -> Result<V
     Ok(buf)
 }
 
+/// Lê um byte em `addr`.
+pub fn read_u8<M: ReadMem + ?Sized>(mem: &M, addr: u64) -> Result<u8, UeError> {
+    let mut buf = [0u8; 1];
+    read_bytes(mem, addr, &mut buf)?;
+    Ok(buf[0])
+}
+
 /// Lê um `u32` little-endian em `addr`.
 pub fn read_u32<M: ReadMem + ?Sized>(mem: &M, addr: u64) -> Result<u32, UeError> {
     let mut buf = [0u8; 4];

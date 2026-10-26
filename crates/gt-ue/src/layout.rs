@@ -45,6 +45,8 @@ pub struct UStructLayout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FFieldLayout {
     pub class_private: u32,
+    /// Offset do nome do tipo (`FName`) dentro da `FFieldClass`.
+    pub class_name: u32,
     pub next: u32,
     pub name: u32,
 }
@@ -106,6 +108,7 @@ impl UeLayout {
             },
             ffield: FFieldLayout {
                 class_private: 0x8,
+                class_name: 0x0,
                 next: 0x18,
                 name: 0x20,
             },

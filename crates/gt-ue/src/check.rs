@@ -15,7 +15,7 @@ const SAMPLE_SPREAD: u32 = 16;
 /// Os três itens baratos: o nome 0 é `None`; as contagens são coerentes; numa amostra de itens,
 /// `item[o.InternalIndex].Object == o`. O `Err` traz o detalhe para o log; quem mostra ao usuário
 /// usa sempre `reflexão não reconhecida`.
-pub fn cheap_check<M: ReadMem>(
+pub fn cheap_check<M: ReadMem + ?Sized>(
     mem: &M,
     layout: &UeLayout,
     gobjects: u64,
