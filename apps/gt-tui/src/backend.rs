@@ -28,6 +28,8 @@ pub enum Find {
     Many(Vec<i32>),
     /// Com `--pid`: o processo não existe.
     PidGone,
+    /// Outra falha ao procurar (motivo); a TUI mostra `erro` e tenta de novo.
+    Error(String),
 }
 
 /// Falha ao abrir o alvo e buscar o catálogo.

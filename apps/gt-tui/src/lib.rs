@@ -1,6 +1,9 @@
 //! Interface do jogador no terminal (biblioteca do `gt-tui`).
 
 pub mod backend;
+pub mod controller;
+#[cfg(test)]
+pub(crate) mod fake;
 pub mod game;
 pub mod keys;
 pub mod model;

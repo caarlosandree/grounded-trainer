@@ -187,7 +187,7 @@ impl Backend for GameBackend {
             }
             Err(e) => {
                 tracing::warn!(erro = %e, "falha ao procurar o jogo");
-                Find::NotRunning
+                Find::Error(e.to_string())
             }
         }
     }

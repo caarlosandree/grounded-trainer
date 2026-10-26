@@ -12,7 +12,8 @@ use gt_core::value::{ValueSpec, ValueType};
 use gt_grounded2::signatures::Category;
 use gt_testkit::{TargetOpts, TestTarget};
 use gt_tui::backend::{Backend, Find, OpOutcome, Recovered, Session};
-use gt_tui::model::Avail;
+use gt_tui::controller::Controller;
+use gt_tui::model::{Avail, Conn, Model};
 use gt_tui::raw::{RawBackend, RawControl, RawDef};
 
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -389,4 +390,79 @@ fn raw_drop_order_keeps_the_lock_until_the_session_falls() {
         [0x48, 0x8B, 0xF9]
     );
     assert!(RawBackend::new(e.control.clone(), e._dir.path().to_path_buf()).is_ok());
+}
+
+#[test]
+#[ignore = "Tarefa 12"]
+fn raw_slow_search_responsive() {
+    let e = env();
+    e.control.lock().unwrap().search_delay = Duration::from_secs(3);
+    let mut c = Controller::new(e.backend, Box::new(|| "00:00".to_string()), false, false);
+    let mut draw = |_: &Model| {};
+    let t0 = Instant::now();
+    c.start(&mut draw);
+
+    // A busca dorme 3 s na thread; o laço continua respondendo (limite da spec: 250 ms, aqui
+    // o dobro por folga em máquina carregada).
+    c.tick(t0, &mut draw);
+    assert_eq!(c.model.conn, Conn::Connecting);
+    for i in 1..=5 {
+        let started = Instant::now();
+        c.tick(t0 + Duration::from_millis(100 * i), &mut draw);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "tick demorou {:?} durante a busca",
+            started.elapsed()
+        );
+        assert_eq!(c.model.conn, Conn::Connecting);
+        // Tarefa 12: o mesmo para `c.handle(Action::Quit, ..)`.
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    assert!(c.wait_search(t0 + Duration::from_secs(4), Duration::from_secs(10)));
+    assert!(matches!(c.model.conn, Conn::Connected { engine: true, .. }));
+}
+
+#[test]
+fn raw_controller_connects_and_detects_close() {
+    let e = env();
+    let t_pid = e.target.pid;
+    let mut c = Controller::new(e.backend, Box::new(|| "00:00".to_string()), false, false);
+    let mut draw = |_: &Model| {};
+    let t0 = Instant::now();
+    c.start(&mut draw);
+
+    c.tick(t0, &mut draw);
+    assert!(c.wait_search(t0, Duration::from_secs(10)));
+    let Conn::Connected { pid, engine, .. } = &c.model.conn else {
+        panic!("esperava conectado: {:?}", c.model.conn);
+    };
+    assert_eq!((*pid, *engine), (t_pid, true));
+    let ids: Vec<&str> = c.model.cheats.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids, [TOGGLE, VALUE]);
+    assert!(
+        c.model
+            .cheats
+            .iter()
+            .all(|r| r.avail == Avail::Available { verified: true })
+    );
+
+    // O alvo morre: a TUI percebe sem nenhuma operação em andamento.
+    let mut e_target = e.target;
+    e_target.child.kill().unwrap();
+    e_target.child.wait().unwrap();
+    let end = Instant::now() + Duration::from_secs(5);
+    let mut now = t0;
+    while !matches!(c.model.conn, Conn::Waiting) && Instant::now() < end {
+        now += Duration::from_millis(100);
+        c.tick(now, &mut draw);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(c.model.conn, Conn::Waiting);
+    assert!(
+        c.model
+            .events
+            .back()
+            .is_some_and(|l| l.ends_with("o jogo fechou"))
+    );
 }
