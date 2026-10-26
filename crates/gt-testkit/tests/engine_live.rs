@@ -5,7 +5,8 @@ use std::cell::Cell;
 use std::ops::Range;
 use std::os::unix::fs::PermissionsExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use gt_core::Error;
@@ -14,8 +15,9 @@ use gt_core::journal::{JournalEntry, JournalLock, JournalStore, Loaded};
 use gt_core::mem::{MemReader, MemWriter};
 use gt_core::patch::{PatchSpec, Validated, WritePolicy, validate};
 use gt_core::procinfo::{Identity, ThreadPos, identity, list_tids, read_stat, read_task_stat};
+use gt_core::recovery::recover;
 use gt_core::suspend::{
-    HookPoint, PauseConfig, is_stopped_now, open_checked, pause, sample_pcs, wait_until,
+    Fault, HookPoint, PauseConfig, is_stopped_now, open_checked, pause, sample_pcs, wait_until,
 };
 use gt_testkit::{TargetOpts, TestTarget};
 use nix::sys::signal::{Signal, kill};
@@ -176,13 +178,23 @@ fn open_engine(
     ranges: Vec<Range<u64>>,
     hook: Option<fn(HookPoint)>,
 ) -> Engine {
-    let policy: PolicyFn = Box::new(move |_maps| WritePolicy::new(ranges.clone()));
-    let opts = EngineOptions {
-        version_key: "teste".into(),
-        pause: PauseConfig {
+    open_engine_with(
+        pid,
+        env,
+        ranges,
+        PauseConfig {
             hook,
             ..PauseConfig::default()
         },
+    )
+}
+
+/// Como `open_engine`, mas com o `PauseConfig` completo (falhas injetadas, contador).
+fn open_engine_with(pid: i32, env: &Env, ranges: Vec<Range<u64>>, cfg: PauseConfig) -> Engine {
+    let policy: PolicyFn = Box::new(move |_maps| WritePolicy::new(ranges.clone()));
+    let opts = EngineOptions {
+        version_key: "teste".into(),
+        pause: cfg,
     };
     Engine::open(pid, None, env.store.clone(), &env.lock, policy, opts).unwrap()
 }
@@ -844,5 +856,164 @@ fn toggle_cycles_and_ends_off() {
     assert!(!called.get());
     assert_eq!(report.cycles, 0);
     assert_eq!(bytes_at(t.pid, t.exec2, 3), NOP3);
+    assert!(missing(&env));
+}
+
+// ---------------------------------------------------------------------------
+// SIGCONT que falha (plano 003, tarefa 1)
+// ---------------------------------------------------------------------------
+
+/// Diário atual (falha se não existir ou estiver ilegível).
+fn journal_now(env: &Env) -> gt_core::journal::Journal {
+    match env.store.peek().unwrap() {
+        Loaded::Ok(j) => j,
+        other => panic!("diário inesperado: {other:?}"),
+    }
+}
+
+fn fault_cfg(fault: Fault) -> PauseConfig {
+    PauseConfig {
+        fault: Some(fault),
+        ..PauseConfig::default()
+    }
+}
+
+#[test]
+fn cont_fails_once_then_next_op_resumes() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let mut engine = open_engine_with(
+        t.pid,
+        &env,
+        vec![exec2_range(&t)],
+        fault_cfg(Fault::ContFailsOnce),
+    );
+    assert!(!engine.is_stuck());
+    let err = engine
+        .apply(vec![patch("p", t.exec2, &NOP3, &NOP2_NOP)])
+        .unwrap_err();
+    assert!(matches!(err, Error::Io(_)), "{err:?}");
+    assert!(engine.is_stuck());
+    assert!(is_stopped_now(t.pid).unwrap());
+    let j = journal_now(&env);
+    assert!(j.paused_by_us);
+    // A escrita aconteceu: a entrada fica pendente no diário.
+    assert_eq!(bytes_at(t.pid, t.exec2, 3), NOP2_NOP);
+    assert_eq!(j.entries.len(), 1);
+    assert_eq!(j.entries[0].id, "p");
+
+    // A operação seguinte tenta o SIGCONT antes de tudo e depois restaura.
+    let report = engine.restore_entries(j.entries).unwrap();
+    assert_eq!(report.restored, vec!["p".to_string()]);
+    assert!(!engine.is_stuck());
+    assert!(wait_all_running(t.pid), "{:?}", states(t.pid));
+    assert!(!is_stopped_now(t.pid).unwrap());
+    assert_eq!(bytes_at(t.pid, t.exec2, 3), NOP3);
+    assert!(missing(&env));
+}
+
+#[test]
+fn cont_fails_always_keeps_marker_after_undo_and_drop() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let mut engine = open_engine_with(
+        t.pid,
+        &env,
+        vec![exec2_range(&t)],
+        fault_cfg(Fault::ContFailsAlways),
+    );
+    engine
+        .apply(vec![patch("p", t.exec2, &NOP3, &NOP2_NOP)])
+        .unwrap_err();
+    assert!(engine.is_stuck());
+    assert!(journal_now(&env).paused_by_us);
+
+    // O desfazer é recusado com o erro do SIGCONT, sem escrever nada.
+    let err = engine.undo_all().unwrap_err();
+    assert!(matches!(err, Error::Io(_)), "{err:?}");
+    assert_eq!(bytes_at(t.pid, t.exec2, 3), NOP2_NOP);
+    assert!(journal_now(&env).paused_by_us);
+
+    drop(engine);
+    assert!(journal_now(&env).paused_by_us);
+    assert!(is_stopped_now(t.pid).unwrap());
+
+    let report = recover(&env.store, &env.lock, &PauseConfig::default()).unwrap();
+    assert!(report.resumed, "{report:?}");
+    assert!(wait_all_running(t.pid), "{:?}", states(t.pid));
+    assert_eq!(bytes_at(t.pid, t.exec2, 3), NOP3);
+    assert!(missing(&env));
+}
+
+#[test]
+fn drop_with_stuck_and_nothing_active_keeps_marker() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let counter = Arc::new(AtomicU32::new(0));
+    let mut engine = open_engine_with(
+        t.pid,
+        &env,
+        vec![exec2_range(&t)],
+        PauseConfig {
+            fault: Some(Fault::ContFailsAlways),
+            resume_counter: Some(counter.clone()),
+            ..PauseConfig::default()
+        },
+    );
+    engine.force_stuck_for_test();
+    assert!(engine.is_stuck());
+    assert!(journal_now(&env).paused_by_us);
+    drop(engine);
+    assert_eq!(counter.load(Ordering::SeqCst), 1);
+    let j = journal_now(&env);
+    assert!(j.paused_by_us);
+    assert!(j.entries.is_empty());
+}
+
+#[test]
+fn retry_resume_without_stuck_sends_nothing() {
+    let t = TestTarget::spawn();
+    let env = env();
+    kill(Pid::from_raw(t.pid), Signal::SIGSTOP).unwrap();
+    assert!(
+        wait_until(
+            || is_stopped_now(t.pid),
+            Duration::from_secs(2),
+            Duration::from_millis(1)
+        )
+        .unwrap()
+    );
+    let mut engine = open_engine(t.pid, &env, vec![exec2_range(&t)], None);
+    engine.retry_resume().unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(is_stopped_now(t.pid).unwrap());
+    drop(engine);
+    kill(Pid::from_raw(t.pid), Signal::SIGCONT).unwrap();
+}
+
+#[test]
+fn stuck_with_dead_target_clears_registry_and_journal() {
+    let mut t = TestTarget::spawn();
+    let env = env();
+    let mut engine = open_engine(t.pid, &env, vec![exec2_range(&t)], None);
+    engine.force_stuck_for_test();
+    assert!(journal_now(&env).paused_by_us);
+    t.child.kill().unwrap();
+    t.child.wait().unwrap();
+    let err = engine.retry_resume().unwrap_err();
+    assert!(matches!(err, Error::ProcessGone { .. }), "{err:?}");
+    assert!(!engine.is_stuck());
+    assert!(missing(&env));
+}
+
+#[test]
+fn drop_with_stuck_and_dead_target_clears_journal() {
+    let mut t = TestTarget::spawn();
+    let env = env();
+    let mut engine = open_engine(t.pid, &env, vec![exec2_range(&t)], None);
+    engine.force_stuck_for_test();
+    t.child.kill().unwrap();
+    t.child.wait().unwrap();
+    drop(engine);
     assert!(missing(&env));
 }

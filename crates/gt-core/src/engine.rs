@@ -12,7 +12,10 @@
 //! recuperação, restos de uma falha). O `Drop` desfaz os ativos e tenta resolver o resto.
 
 use std::ops::Range;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+
+use nix::sys::signal::Signal;
 
 use crate::journal::{EntryAction, Journal, JournalEntry, JournalLock, JournalStore, decide_entry};
 use crate::maps::{MapRegion, read_maps};
@@ -22,7 +25,7 @@ use crate::patch::{
 };
 use crate::procinfo::{Identity, ThreadPos, check_alive, identity};
 use crate::suspend::{
-    HookPoint, PauseConfig, PauseGuard, Thread, is_stopped_now, pause, resume_points,
+    Fault, HookPoint, PauseConfig, PauseGuard, Thread, is_stopped_now, pause, resume_points,
 };
 use crate::{Error, Result};
 
@@ -192,6 +195,36 @@ fn settle_resume(
     })
 }
 
+/// Erro do SIGCONT simulado pela injeção de falha dos testes.
+fn simulated_cont_error() -> Error {
+    Error::Io(std::io::Error::other("falha de SIGCONT simulada"))
+}
+
+/// A injeção de falha deve trocar este SIGCONT por um erro? `ContFailsOnce` dispara uma
+/// vez por motor (`fired`); só vale quando fomos nós que enviamos o `SIGSTOP`.
+fn inject_cont_fault(fault: Option<Fault>, fired: &mut bool, sent_stop: bool) -> bool {
+    if !sent_stop {
+        return false;
+    }
+    match fault {
+        Some(Fault::ContFailsAlways) => true,
+        Some(Fault::ContFailsOnce) if !*fired => {
+            *fired = true;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Retoma o alvo ao fim de uma tentativa pausada, com a falha de SIGCONT dos testes.
+fn resume_guard(guard: PauseGuard<'_>, fault: Option<Fault>, fired: &mut bool) -> Result<()> {
+    if inject_cont_fault(fault, fired, guard.sent_stop()) {
+        guard.forget_resume();
+        return Err(simulated_cont_error());
+    }
+    guard.resume()
+}
+
 /// Motor de patches de um processo.
 ///
 /// Quem cria o motor segura a [`JournalLock`] enquanto ele existir.
@@ -211,6 +244,11 @@ pub struct Engine {
     in_pause_fired: bool,
     after_apply_fired: bool,
     in_drop: bool,
+    /// O SIGCONT falhou e o alvo pode ter ficado parado por nós: vale até um SIGCONT
+    /// bem-sucedido (ou o jogo fechar). Enquanto valer, todo diário grava o marcador.
+    stuck: bool,
+    /// A falha injetada `ContFailsOnce` já disparou neste motor.
+    cont_fault_fired: bool,
 }
 
 impl Engine {
@@ -254,23 +292,28 @@ impl Engine {
             in_pause_fired: false,
             after_apply_fired: false,
             in_drop: false,
+            stuck: false,
+            cont_fault_fired: false,
         })
     }
 
     /// Aplica um lote de patches (spec 6.2, passos 1–8). Tudo ou nada.
     pub fn apply(&mut self, batch: Vec<Validated>) -> Result<BatchReport> {
+        self.retry_resume()?;
         let result = self.apply_inner(batch);
         self.finish(result)
     }
 
     /// Desfaz os patches ativos com estes `id` (os outros `id` são ignorados).
     pub fn undo(&mut self, ids: &[&str]) -> Result<BatchReport> {
+        self.retry_resume()?;
         let result = self.undo_inner(|v| ids.contains(&v.spec.id.as_str()));
         self.finish(result)
     }
 
     /// Desfaz todos os patches ativos.
     pub fn undo_all(&mut self) -> Result<BatchReport> {
+        self.retry_resume()?;
         let result = self.undo_inner(|_| true);
         self.finish(result)
     }
@@ -280,6 +323,7 @@ impl Engine {
     ///
     /// Falha por perigo ou prazo mantém as entradas no diário.
     pub fn restore_entries(&mut self, entries: Vec<JournalEntry>) -> Result<RestoreReport> {
+        self.retry_resume()?;
         let result = self.restore_inner(entries);
         self.finish(result)
     }
@@ -301,12 +345,63 @@ impl Engine {
         &self.store
     }
 
+    /// O último SIGCONT falhou e o alvo pode ter ficado parado por nós. Enquanto isso
+    /// valer, o diário mantém o marcador "pausado por nós".
+    pub fn is_stuck(&self) -> bool {
+        self.stuck
+    }
+
+    /// Tenta de novo o SIGCONT que falhou. Sem `stuck`, não faz nada e não envia sinal.
+    ///
+    /// Com `stuck`, envia SIGCONT pelo `pidfd`: sucesso limpa o estado e regrava o diário
+    /// sem o marcador (apagando o arquivo se não houver entradas); [`Error::ProcessGone`]
+    /// descarta o registro e o diário; qualquer outra falha mantém o estado e o devolve.
+    ///
+    /// Toda operação do motor (e o `Drop`) chama isto antes de qualquer outra coisa,
+    /// inclusive antes da conferência "o alvo já está parado?": um alvo que nós deixamos
+    /// parado pareceria parado por outro.
+    pub fn retry_resume(&mut self) -> Result<()> {
+        if !self.stuck {
+            return Ok(());
+        }
+        if let Some(counter) = &self.pause_cfg.resume_counter {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+        let sent = if self.pause_cfg.fault == Some(Fault::ContFailsAlways) {
+            Err(simulated_cont_error())
+        } else {
+            self.pidfd.send(Signal::SIGCONT)
+        };
+        match sent {
+            Ok(()) => {
+                tracing::warn!(pid = self.pid, "SIGCONT enviado de novo; jogo retomado");
+                self.stuck = false;
+                self.save_final();
+                Ok(())
+            }
+            Err(e) => {
+                if !matches!(e, Error::ProcessGone { .. }) {
+                    tracing::error!(erro = %e, "nova tentativa de SIGCONT falhou; o diário mantém o marcador");
+                }
+                self.finish(Err(e))
+            }
+        }
+    }
+
+    /// Marca o motor como `stuck` e grava o diário com o marcador (só para testes).
+    #[doc(hidden)]
+    pub fn force_stuck_for_test(&mut self) {
+        self.stuck = true;
+        self.save_logged(true);
+    }
+
     /// `ProcessGone` descarta o registro e limpa o diário (sem escrever nada).
     fn finish<T>(&mut self, result: Result<T>) -> Result<T> {
         if let Err(Error::ProcessGone { pid }) = &result {
             tracing::warn!(pid, "o jogo fechou; patches descartados sem escrever");
             self.active.clear();
             self.pending.clear();
+            self.stuck = false;
             if let Err(e) = self.store.clear() {
                 tracing::error!(erro = %e, "falha ao limpar o diário");
             }
@@ -387,6 +482,7 @@ impl Engine {
                 if !f.dirty {
                     self.forget_pending(&entries);
                 }
+                self.stuck |= f.stuck;
                 self.save_logged(f.stuck);
                 Err(f.error)
             }
@@ -537,6 +633,7 @@ impl Engine {
                         }
                     }
                 }
+                self.stuck |= f.stuck;
                 self.save_logged(f.stuck);
                 Err(f.error)
             }
@@ -634,7 +731,10 @@ impl Engine {
                     attempt,
                     "alvo retomado antes da pausa e diário sem marcador; nova tentativa"
                 );
-                settle_resume(Ok(Step::Resumed), guard.resume())?;
+                settle_resume(
+                    Ok(Step::Resumed),
+                    resume_guard(guard, self.pause_cfg.fault, &mut self.cont_fault_fired),
+                )?;
                 self.save_journal(true).map_err(Failure::clean)?;
                 marked = true;
                 timeout_retries += 1;
@@ -645,7 +745,8 @@ impl Engine {
             let pause_len = started.elapsed();
             // O SIGCONT sai sempre por aqui (nunca pelo `Drop` do guarda), para que a falha
             // dele chegue a quem grava o diário.
-            match settle_resume(step, guard.resume())? {
+            let cont = resume_guard(guard, self.pause_cfg.fault, &mut self.cont_fault_fired);
+            match settle_resume(step, cont)? {
                 Step::Danger(id) => {
                     danger_retries += 1;
                     last_danger = Some(id);
@@ -828,6 +929,8 @@ impl Engine {
 
     /// Grava o diário com o estado em memória; sem entradas nem marcador, apaga.
     fn save_journal(&self, paused_by_us: bool) -> Result<()> {
+        // `stuck` mantém o marcador em toda gravação, até um SIGCONT bem-sucedido.
+        let paused_by_us = paused_by_us || self.stuck;
         let entries = self.journal_entries();
         if entries.is_empty() && !paused_by_us {
             return self.store.clear();
@@ -870,6 +973,12 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         self.in_drop = true;
+        // Primeiro o SIGCONT que falhou, mesmo sem nenhum patch ativo.
+        match self.retry_resume() {
+            Ok(()) => {}
+            Err(Error::ProcessGone { .. }) => return,
+            Err(e) => tracing::error!(erro = %e, "falha ao retomar o jogo na saída"),
+        }
         if !self.active.is_empty() {
             match self.undo_all() {
                 Ok(_) => {}
@@ -973,6 +1082,48 @@ mod tests {
         assert!(!needs_marker(true, true));
         assert!(!needs_marker(false, false));
         assert!(!needs_marker(false, true));
+    }
+
+    #[test]
+    fn cont_fault_injection_rules() {
+        let mut fired = false;
+        // Sem falha configurada, ou sem SIGSTOP nosso, nunca injeta.
+        assert!(!inject_cont_fault(None, &mut fired, true));
+        assert!(!inject_cont_fault(
+            Some(Fault::ContFailsAlways),
+            &mut fired,
+            false
+        ));
+        assert!(!inject_cont_fault(
+            Some(Fault::WriteAndRollbackFail),
+            &mut fired,
+            true
+        ));
+        // `ContFailsOnce` dispara uma vez só (e só conta quando de fato disparou).
+        assert!(!inject_cont_fault(
+            Some(Fault::ContFailsOnce),
+            &mut fired,
+            false
+        ));
+        assert!(!fired);
+        assert!(inject_cont_fault(
+            Some(Fault::ContFailsOnce),
+            &mut fired,
+            true
+        ));
+        assert!(!inject_cont_fault(
+            Some(Fault::ContFailsOnce),
+            &mut fired,
+            true
+        ));
+        // `ContFailsAlways` sempre injeta.
+        for _ in 0..3 {
+            assert!(inject_cont_fault(
+                Some(Fault::ContFailsAlways),
+                &mut fired,
+                true
+            ));
+        }
     }
 
     #[test]
