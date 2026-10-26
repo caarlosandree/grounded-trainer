@@ -167,6 +167,10 @@ estável diferente (`ambíguo`, `bytes diferentes`, `fora do lugar`) troca o est
 o intervalo entre duas buscas automáticas é o maior entre ~5 s e duas vezes a duração da última busca, para que elas
 nunca ocupem mais da metade do tempo.
 
+> **Nota (spec 005, 6.7):** as globais do Unreal `não encontrado`/`inconclusivo` e a conferência barata
+> `reflexão não reconhecida` também disparam a nova busca automática (mesmo sem cheat desejado) e também mantêm o estado
+> anterior de um cheat já disponível (`keeps_state`). A nova busca leva o id especial `@ue` enquanto não há índice bom.
+
 **Jogo fechou** (o `pidfd` fica legível, ou a identidade muda): o motor descarta os patches sem escrever (spec 002
 6.7), o registro de eventos diz "o jogo fechou", e a TUI volta para `aguardando o jogo` (ou `o processo terminou`,
 com `--pid`). Os cheats que estavam ligados continuam marcados como **desejados** (abaixo). Se isso acontecer no meio

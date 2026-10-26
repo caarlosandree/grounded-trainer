@@ -18,6 +18,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo test --workspace -- --ignored   # exige o jogo aberto
 cargo run -p gt-cli -- inspect
+cargo run -q --release -p gt-cli -- ue class SurvivalCharacter   # campos de uma classe pela reflexão
+cargo run -q --release -p gt-cli -- ue player --watch 2           # personagem e valores dos cheats de valor
 cargo run -p gt-tui
 ```
 

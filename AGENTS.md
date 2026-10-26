@@ -31,6 +31,7 @@ Nenhum código de funcionalidade sem spec aprovada. Exceções: correções triv
 
 - **Toda escrita na memória do jogo é reversível**: guarde os bytes originais antes de escrever.
 - **Verifique antes de escrever**: se os bytes atuais no endereço não forem os esperados, recuse o patch e informe. Isso evita corromper o jogo numa versão diferente.
+- **Ressalvas das travas de barra** (spec 005, 7): numa trava de barra (vida, stamina, comida, água, oxigênio, temperatura), desligar só para de escrever (a barra fica onde está, decisão do dono), e a conferência antes de escrever é a identidade do objeto e do campo (guarda do objeto, caminho revalidado), não bytes esperados, porque o valor muda o tempo todo. Bits continuam reversíveis: o original vai ao diário antes da escrita.
 - **Restauração garantida**: ao sair do trainer (normal, Ctrl+C, SIGTERM, pânico), desfaça todos os patches ativos.
 - **Nunca altere arquivos do jogo em disco** (`steamapps/common/Grounded2`). Só memória do processo em execução.
 - **Saves:** nenhuma funcionalidade mexe em arquivos de save. Antes de testes arriscados, peça ao dono para fazer backup do save.
@@ -43,6 +44,7 @@ Nenhum código de funcionalidade sem spec aprovada. Exceções: correções triv
 - Todo achado vai para `docs/RESEARCH.md` com: **versão do jogo**, data, endereço (`módulo+offset`), bytes, desmontagem e como foi descoberto.
 - Endereços fixos nunca vão para o código: use **assinaturas AOB** em `signatures/*.toml`, versionadas por build do jogo.
 - Assinaturas devem ser únicas no módulo. Uma assinatura com 0 ou 2+ ocorrências é tratada como "indisponível", nunca "pega a primeira".
+- **Exceção, só para leitura de globais** (spec 005, 6.2): o padrão de uma global do motor (`GUObjectArray`, `FNamePool`) é aceito com várias ocorrências desde que todas resolvam para o mesmo endereço. Patches continuam exigindo ocorrência única.
 - Ao final de cada sessão de pesquisa, registre também as hipóteses descartadas.
 
 ## 5. Código
