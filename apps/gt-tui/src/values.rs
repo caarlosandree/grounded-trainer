@@ -364,9 +364,15 @@ impl ValueCheats {
                 return waiting(Absent::Unreadable);
             }
         };
-        let report = r
-            .runtime
-            .tick(engine, &self.reader, &r.index, &objects, controller, on);
+        let report = r.runtime.tick(
+            engine,
+            &self.reader,
+            &r.index,
+            &objects,
+            controller,
+            on,
+            now,
+        );
         match report.player {
             PlayerState::Absent(Absent::ControllerInvalid) => self.controller = None,
             PlayerState::Absent(Absent::PawnNull) => {

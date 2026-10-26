@@ -1591,6 +1591,44 @@ fn read_game_state_pawn_null_ok() {
 }
 
 #[test]
+fn read_game_state_refuses_add_with_pawn_root() {
+    let w = world(&[]);
+    // Um `add` de raiz `pawn` resolve, mas não é lido nesta spec: nem pelo `GameState`...
+    let mut all = defs();
+    all.extend(new_defs());
+    all.push(FieldDef {
+        id: "somar-carga".into(),
+        name: "Somar carga".into(),
+        object: "HaulingComponent".into(),
+        object_class: format!("{MAINE}.HaulingComponent"),
+        root: FieldRoot::Pawn,
+        rule: FieldRule::Add {
+            field: "Capacity".into(),
+            result_max: 1000,
+        },
+        ..add_def()
+    });
+    let catalog = FieldCatalog::resolve(&w.index, &w.mem, &cfg_gs(), &all);
+    assert!(catalog.avail("somar-carga").is_ok());
+    let got = read_game_state(
+        &w.mem,
+        &w.index,
+        &catalog,
+        &w.objects,
+        w.controller,
+        "somar-carga",
+    );
+    assert_eq!(
+        got.map(|_| ()),
+        Err(GameStateAbsent::Missing("somar-carga".into()))
+    );
+    // ...nem pelo ciclo, que o ignora sem derrubar a leitura do personagem.
+    let snap = w.read_with_catalog(&catalog).unwrap();
+    assert!(!snap.values.contains_key("somar-carga"));
+    assert!(!snap.missing.contains_key("somar-carga"));
+}
+
+#[test]
 fn plan_add_cases() {
     assert_eq!(plan_add(7400, 1000, 100_000), Ok(8400));
     assert_eq!(plan_add(-1, 1000, 100_000), Err(AddRefusal::OutOfRange));

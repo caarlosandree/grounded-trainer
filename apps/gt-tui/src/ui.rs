@@ -299,6 +299,8 @@ fn cheat_line(
         Some(Note::Waiting) => " aguardando o personagem",
         Some(Note::WaitingPet) => " aguardando o pet",
         Some(Note::InvalidTarget) => " alvo inválido",
+        Some(Note::InvalidGameValue) => " valor do jogo inválido",
+        Some(Note::GameRefuses) => " o jogo não deixa",
         None => "",
     };
     let (state, style, has_value) = match &status {

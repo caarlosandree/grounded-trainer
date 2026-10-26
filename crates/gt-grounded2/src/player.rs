@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use gt_core::journal::GuardBytes;
 use gt_core::mem::ReadMem;
+use gt_core::value::ValueGrid;
 use gt_ue::read::{read_u8, read_u32, read_u64, read_vec};
 use gt_ue::{Field, ObjectArray, ReflectionIndex, ScanBudget, UeError, UeLayout, is_object_family};
 use serde::Serialize;
@@ -128,6 +129,8 @@ struct CatalogEntry {
     id: String,
     /// Nome curto do cheat (para os eventos).
     name: String,
+    /// Grade do valor ajustável (`[field.value]`), se houver.
+    grid: Option<ValueGrid>,
     resolved: Result<ResolvedField, String>,
 }
 
@@ -174,6 +177,7 @@ impl FieldCatalog {
                 CatalogEntry {
                     id: def.id.clone(),
                     name: def.name.clone(),
+                    grid: def.value.clone(),
                     resolved,
                 }
             })
@@ -202,6 +206,14 @@ impl FieldCatalog {
             .iter()
             .find(|e| e.id == id)
             .map(|e| e.name.as_str())
+    }
+
+    /// Grade do valor ajustável do cheat `id` (`[field.value]`), se ele tiver uma.
+    pub fn grid(&self, id: &str) -> Option<&ValueGrid> {
+        self.entries
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|e| e.grid.as_ref())
     }
 
     /// `id` dos cheats, na ordem das definições.
@@ -751,8 +763,9 @@ impl<M: ReadMem + ?Sized> Reader<'_, M> {
         Ok(obj)
     }
 
-    fn values(&mut self, obj: u64, rule: &ResolvedRule) -> Result<FieldValues, Absent> {
-        Ok(match rule {
+    /// Valores do cheat no ciclo; `None` para a ação (`add`), lida só sob demanda.
+    fn values(&mut self, obj: u64, rule: &ResolvedRule) -> Result<Option<FieldValues>, Absent> {
+        Ok(Some(match rule {
             ResolvedRule::Lock { field, target, .. } => FieldValues::Lock {
                 obj,
                 addr: obj + u64::from(field.offset),
@@ -789,8 +802,8 @@ impl<M: ReadMem + ?Sized> Reader<'_, M> {
                 FieldValues::Set { obj, fields: out }
             }
             // A soma só é lida sob demanda (`read_game_state`), nunca no ciclo.
-            ResolvedRule::Add { .. } => return Err(Absent::Unreadable),
-        })
+            ResolvedRule::Add { .. } => return Ok(None),
+        }))
     }
 }
 
@@ -846,8 +859,9 @@ pub fn read_game_state<M: ReadMem + ?Sized>(
     let (Some(Ok(resolved)), Ok(gs)) = (catalog.get(id), &catalog.game_state) else {
         return Err(missing(id));
     };
+    // Só a ação de raiz `game_state` é lida aqui; um `add` de raiz `pawn` não é lido nesta spec.
     let field = match &resolved.rule {
-        ResolvedRule::Add { field, .. } => field,
+        ResolvedRule::Add { field, .. } if resolved.root == FieldRoot::GameState => field,
         _ => return Err(missing(id)),
     };
     let mut r = Reader {
@@ -963,9 +977,10 @@ pub fn read_player<M: ReadMem + ?Sized>(
             .object(pawn, resolved)
             .and_then(|obj| r.values(obj, &resolved.rule));
         match read {
-            Ok(v) => {
+            Ok(Some(v)) => {
                 values.insert(entry.id.clone(), v);
             }
+            Ok(None) => {}
             // Um componente ou o pet pode não estar no objeto neste ciclo: só este cheat espera.
             // Só a falha no próprio pawn (sem caminho) derruba a leitura.
             Err(absent) if !resolved.object_path.is_empty() => {

@@ -2,16 +2,23 @@
 //! Execução dos cheats de valor contra o `gt-testtarget --ue` (spec 005, 6.4 a 6.6): o motor de
 //! verdade, com o diário num `TempDir` e a política de dados do jogo (regiões `rw`).
 
+use std::cell::Cell;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
 use gt_core::Error;
-use gt_core::engine::{Engine, EngineOptions, PolicyFn};
+use gt_core::engine::{DataFault, Engine, EngineOptions, PolicyFn};
 use gt_core::journal::{DataEntry, JournalLock, JournalStore, Loaded};
 use gt_core::mem::{MemReader, MemWriter};
 use gt_core::patch::WritePolicy;
 use gt_core::suspend::PauseConfig;
-use gt_grounded2::fields::{FieldRuntime, Note, PlayerState};
+use gt_grounded2::fields::{ActionOutcome, FieldRuntime, Note, PlayerState};
 use gt_grounded2::player::{FieldCatalog, FieldValues, read_player};
 use gt_grounded2::policy::data_policy;
-use gt_testkit::ue::{DAMAGE_OFF, DIE_BYTE, HEALTH_OFF};
+use gt_testkit::ue::{
+    CAPACITY_OFF, DAMAGE_MULT_OFF, DAMAGE_OFF, DIE_BYTE, GRAVITY_OFF, GROUND_MULT_OFF, HAULING_OFF,
+    HEALTH_OFF, JUMP_OFF, PARTY_OFF, SCIENCE_OFF, SWIM_MULT_OFF, WORLD_OFF,
+};
 use gt_testkit::{TargetOpts, TestTarget, UeAddrs, synth_signatures};
 use gt_ue::{Names, ObjectArray, ReflectionIndex, ScanBudget, UeLayout};
 
@@ -25,6 +32,12 @@ struct Scene {
     runtime: FieldRuntime,
     engine: Engine,
     store: JournalStore,
+    /// Relógio injetado nos ciclos.
+    now: Instant,
+    /// Quantas vezes a política de dados foi recalculada (o `maps` foi relido).
+    policy_calls: Rc<Cell<u32>>,
+    /// Intervalo `[início, fim)` onde a política de dados recusa escrever (`(0, 0)`: nenhum).
+    forbidden: Rc<Cell<(u64, u64)>>,
     _lock: JournalLock,
     _dir: tempfile::TempDir,
 }
@@ -52,7 +65,15 @@ fn scene() -> Scene {
         pause: PauseConfig::default(),
     };
     let mut engine = Engine::open(t.pid, None, store.clone(), &lock, policy, opts).unwrap();
-    engine.set_data_policy(Box::new(|maps| data_policy(&[], maps)));
+    let policy_calls = Rc::new(Cell::new(0u32));
+    let forbidden = Rc::new(Cell::new((0u64, 0u64)));
+    let (calls, hole) = (Rc::clone(&policy_calls), Rc::clone(&forbidden));
+    engine.set_data_policy(Box::new(move |maps| {
+        calls.set(calls.get() + 1);
+        let (start, end) = hole.get();
+        let images: Vec<_> = (start < end).then_some(start..end).into_iter().collect();
+        data_policy(&images, maps)
+    }));
     Scene {
         t,
         ue,
@@ -62,6 +83,9 @@ fn scene() -> Scene {
         runtime: FieldRuntime::new(catalog),
         engine,
         store,
+        now: Instant::now(),
+        policy_calls,
+        forbidden,
         _lock: lock,
         _dir: dir,
     }
@@ -69,6 +93,12 @@ fn scene() -> Scene {
 
 impl Scene {
     fn tick(&mut self, on: &[&str]) -> gt_grounded2::fields::TickReport {
+        self.tick_after(on, Duration::from_millis(100))
+    }
+
+    /// Um ciclo `after` depois do anterior (relógio injetado).
+    fn tick_after(&mut self, on: &[&str], after: Duration) -> gt_grounded2::fields::TickReport {
+        self.now += after;
         let on: Vec<String> = on.iter().map(|s| s.to_string()).collect();
         self.runtime.tick(
             &mut self.engine,
@@ -77,7 +107,37 @@ impl Scene {
             &self.objects,
             self.ue.controller,
             &on,
+            self.now,
         )
+    }
+
+    fn action(&mut self, controller: Option<u64>, amount: i32) -> ActionOutcome {
+        self.runtime.run_action(
+            &mut self.engine,
+            &self.reader,
+            &self.index,
+            &self.objects,
+            controller,
+            "somar-ciencia",
+            amount,
+        )
+    }
+
+    fn i32_at(&self, addr: u64) -> i32 {
+        self.f32_at(addr).to_bits() as i32
+    }
+
+    fn cap(&self) -> u64 {
+        self.ue.hauling + u64::from(CAPACITY_OFF)
+    }
+
+    fn science(&self) -> u64 {
+        self.ue.party + u64::from(SCIENCE_OFF)
+    }
+
+    /// Mexe no campo `Capacity` como o jogo faria.
+    fn game_sets_capacity(&self, v: i32) {
+        self.poke(self.cap(), &v.to_le_bytes());
     }
 
     /// Endereço do campo de trava `id` no personagem atual.
@@ -347,4 +407,388 @@ fn raise_target_learns_effective_max() {
     s.poke(stamina, &40f32.to_le_bytes());
     s.tick(&["stamina-infinita"]);
     assert_eq!(s.f32_at(stamina), 100.0);
+}
+
+const SET_IDS: [&str; 5] = [
+    "carga",
+    "dano",
+    "velocidade",
+    "gravidade",
+    "pulos-infinitos",
+];
+
+fn journal_data_len(s: &Scene) -> usize {
+    match s.store.peek().unwrap() {
+        Loaded::Ok(j) => j.data.len(),
+        Loaded::Missing => 0,
+        other => panic!("diário inesperado: {other:?}"),
+    }
+}
+
+#[test]
+fn set_writes_and_turn_off_restores() {
+    let mut s = scene();
+    let (ground, swim) = (
+        s.ue.movement + u64::from(GROUND_MULT_OFF),
+        s.ue.movement + u64::from(SWIM_MULT_OFF),
+    );
+    let gravity = s.ue.movement + u64::from(GRAVITY_OFF);
+    let damage = s.ue.pawn + u64::from(DAMAGE_MULT_OFF);
+    let jump = s.ue.pawn + u64::from(JUMP_OFF);
+    let first = s.tick(&SET_IDS);
+    assert_eq!(first.player, PlayerState::Found);
+    assert!(first.notes.is_empty(), "{:?}", first.notes);
+    // Escrever o valor desejado não gera evento: só o personagem achado.
+    assert_eq!(first.events, vec!["personagem encontrado".to_string()]);
+    assert_eq!(s.i32_at(s.cap()), 20);
+    assert_eq!(s.f32_at(damage), 10.0);
+    assert_eq!((s.f32_at(ground), s.f32_at(swim)), (2.0, 2.0));
+    assert_eq!(s.f32_at(gravity), 0.5);
+    assert_eq!(s.i32_at(jump), 1000);
+    assert_eq!(journal_data_len(&s), 6);
+    // Os ciclos seguintes não escrevem nem falam nada.
+    let again = s.tick(&SET_IDS);
+    assert!(again.notes.is_empty() && again.events.is_empty());
+    assert_eq!(journal_data_len(&s), 6);
+    for id in SET_IDS {
+        let r = s.runtime.turn_off(&mut s.engine, id).unwrap();
+        assert_eq!(r.restored, vec![id.to_string()]);
+    }
+    assert_eq!(s.i32_at(s.cap()), 10);
+    assert_eq!(s.f32_at(damage), 1.0);
+    assert_eq!((s.f32_at(ground), s.f32_at(swim)), (1.0, 1.0));
+    assert_eq!(s.f32_at(gravity), 1.0);
+    assert_eq!(s.i32_at(jump), 1);
+    assert_eq!(s.store.peek().unwrap(), Loaded::Missing);
+}
+
+#[test]
+fn set_value_change_goes_through_next() {
+    let mut s = scene();
+    let (ground, swim) = (
+        s.ue.movement + u64::from(GROUND_MULT_OFF),
+        s.ue.movement + u64::from(SWIM_MULT_OFF),
+    );
+    s.tick(&["velocidade"]);
+    assert_eq!(s.f32_at(ground), 2.0);
+    s.runtime.set_desired("velocidade", 3.0);
+    let report = s.tick(&["velocidade"]);
+    assert!(report.notes.is_empty() && report.events.is_empty());
+    assert_eq!((s.f32_at(ground), s.f32_at(swim)), (3.0, 3.0));
+    match s.store.peek().unwrap() {
+        Loaded::Ok(j) => {
+            assert_eq!(j.data.len(), 2);
+            for e in &j.data {
+                assert_eq!(e.written, 3.0f32.to_le_bytes().to_vec());
+                assert_eq!(e.original, 1.0f32.to_le_bytes().to_vec());
+                assert_eq!(e.next, None);
+            }
+        }
+        other => panic!("diário inesperado: {other:?}"),
+    }
+    s.runtime.turn_off(&mut s.engine, "velocidade").unwrap();
+    assert_eq!((s.f32_at(ground), s.f32_at(swim)), (1.0, 1.0));
+    // Com `target`, o valor do cheat é o `target`, até alguém pedir outro.
+    s.runtime.set_desired("pulos-infinitos", 7.0);
+    s.tick(&["pulos-infinitos"]);
+    assert_eq!(s.i32_at(s.ue.pawn + u64::from(JUMP_OFF)), 7);
+}
+
+#[test]
+fn set_game_change_becomes_new_original() {
+    let mut s = scene();
+    s.tick(&["carga"]);
+    s.game_sets_capacity(15);
+    let report = s.tick(&["carga"]);
+    assert_eq!(
+        report.events,
+        vec!["carga: o jogo mudou o valor para 15; novo original".to_string()]
+    );
+    assert!(report.notes.is_empty());
+    assert_eq!(s.i32_at(s.cap()), 20);
+    // Sem mudança nova, nenhuma linha nova.
+    assert!(s.tick(&["carga"]).events.is_empty());
+    s.runtime.turn_off(&mut s.engine, "carga").unwrap();
+    assert_eq!(s.i32_at(s.cap()), 15);
+    assert_eq!(s.store.peek().unwrap(), Loaded::Missing);
+}
+
+#[test]
+fn set_invalid_game_value_note_and_resume() {
+    let mut s = scene();
+    let gravity = s.ue.movement + u64::from(GRAVITY_OFF);
+    s.poke(gravity, &f32::NAN.to_le_bytes());
+    let first = s.tick(&["gravidade"]);
+    assert_eq!(first.notes["gravidade"], Note::InvalidGameValue);
+    assert!(
+        first
+            .events
+            .contains(&"gravidade: valor do jogo inválido".to_string())
+    );
+    assert_eq!(journal_data_len(&s), 0);
+    // A marca persiste, o evento não.
+    let second = s.tick(&["gravidade"]);
+    assert_eq!(second.notes["gravidade"], Note::InvalidGameValue);
+    assert!(second.events.is_empty(), "{:?}", second.events);
+    assert!(s.f32_at(gravity).is_nan());
+    // O valor volta a ser são: o cheat escreve e a marca some.
+    s.poke(gravity, &1.0f32.to_le_bytes());
+    let third = s.tick(&["gravidade"]);
+    assert!(third.notes.is_empty());
+    assert_eq!(s.f32_at(gravity), 0.5);
+    s.runtime.turn_off(&mut s.engine, "gravidade").unwrap();
+    assert_eq!(s.f32_at(gravity), 1.0);
+}
+
+#[test]
+fn set_reread_mismatch_next_tick_new_original() {
+    let mut s = scene();
+    s.engine
+        .inject_data_fault_for_test(Some(DataFault::ThirdValue(15i32.to_le_bytes().to_vec())));
+    // O jogo escreve logo depois de nós: a releitura vê um terceiro valor.
+    let first = s.tick(&["carga"]);
+    assert_eq!(first.notes["carga"], Note::Waiting);
+    assert_eq!(s.i32_at(s.cap()), 15);
+    assert_eq!(s.engine.data_entries().len(), 1);
+    // O ciclo seguinte registra o novo original e escreve o desejado.
+    let second = s.tick(&["carga"]);
+    assert_eq!(
+        second.events,
+        vec!["carga: o jogo mudou o valor para 15; novo original".to_string()]
+    );
+    assert!(second.notes.is_empty());
+    assert_eq!(s.i32_at(s.cap()), 20);
+    s.runtime.turn_off(&mut s.engine, "carga").unwrap();
+    assert_eq!(s.i32_at(s.cap()), 15);
+}
+
+/// O jogo reescreve a carga a cada ciclo até o cheat desistir; devolve o último relatório.
+fn provoke_block(s: &mut Scene) -> gt_grounded2::fields::TickReport {
+    s.tick(&["carga"]);
+    let mut last = None;
+    for i in 0..6 {
+        s.game_sets_capacity(30 + i);
+        let r = s.tick(&["carga"]);
+        if i < 5 {
+            assert!(r.notes.is_empty(), "ciclo {i}: {:?}", r.notes);
+            assert_eq!(s.i32_at(s.cap()), 20, "ciclo {i}");
+        }
+        last = Some(r);
+    }
+    last.unwrap()
+}
+
+#[test]
+fn set_game_fights_blocks_after_five() {
+    let mut s = scene();
+    let sixth = provoke_block(&mut s);
+    assert_eq!(sixth.notes["carga"], Note::GameRefuses);
+    assert_eq!(
+        sixth.events,
+        vec![
+            "carga: o jogo mudou o valor para 35; novo original".to_string(),
+            "carga: o jogo não deixa".to_string()
+        ]
+    );
+    // A entrada foi resolvida: o valor do jogo ficou com o jogo e o diário está vazio.
+    assert_eq!(s.i32_at(s.cap()), 35);
+    assert_eq!(s.store.peek().unwrap(), Loaded::Missing);
+    // Bloqueado: nada é escrito e nenhuma linha nova aparece.
+    s.game_sets_capacity(36);
+    let seventh = s.tick(&["carga"]);
+    assert_eq!(seventh.notes["carga"], Note::GameRefuses);
+    assert!(seventh.events.is_empty(), "{:?}", seventh.events);
+    assert_eq!(s.i32_at(s.cap()), 36);
+    assert_eq!(journal_data_len(&s), 0);
+    // Outro pawn: a marca some e o cheat escreve no objeto novo.
+    let alt_cap = s.u64_at(s.ue.alt_pawn + u64::from(HAULING_OFF)) + u64::from(CAPACITY_OFF);
+    s.swap_pawn(s.ue.alt_pawn);
+    let swapped = s.tick(&["carga"]);
+    assert!(swapped.notes.is_empty(), "{:?}", swapped.notes);
+    assert_eq!(s.i32_at(alt_cap), 20);
+    assert_eq!(s.i32_at(s.cap()), 36);
+}
+
+#[test]
+fn set_block_cleared_by_turn_off() {
+    let mut s = scene();
+    provoke_block(&mut s);
+    s.runtime.turn_off(&mut s.engine, "carga").unwrap();
+    let report = s.tick(&["carga"]);
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+    assert_eq!(s.i32_at(s.cap()), 20);
+    // A janela também recomeçou: precisa de mais de cinco de novo.
+    for i in 0..5 {
+        s.game_sets_capacity(50 + i);
+        assert!(s.tick(&["carga"]).notes.is_empty());
+    }
+}
+
+#[test]
+fn set_fight_window_slides() {
+    let mut s = scene();
+    s.tick(&["carga"]);
+    // Um original novo a cada 3 s: a janela de 10 s nunca passa de quatro.
+    for i in 0..10 {
+        s.game_sets_capacity(30 + i);
+        let r = s.tick_after(&["carga"], Duration::from_secs(3));
+        assert!(r.notes.is_empty(), "ciclo {i}: {:?}", r.notes);
+        assert_eq!(s.i32_at(s.cap()), 20);
+    }
+}
+
+#[test]
+fn set_partial_failure_completes_later() {
+    let mut s = scene();
+    let (ground, swim) = (
+        s.ue.movement + u64::from(GROUND_MULT_OFF),
+        s.ue.movement + u64::from(SWIM_MULT_OFF),
+    );
+    // O campo de natação fica fora da região escrevível neste ciclo.
+    s.forbidden.set((swim, swim + 4));
+    let first = s.tick(&["velocidade"]);
+    assert_eq!(first.notes["velocidade"], Note::Waiting);
+    assert_eq!((s.f32_at(ground), s.f32_at(swim)), (2.0, 1.0));
+    assert_eq!(s.engine.data_entries().len(), 1);
+    // De volta: a manutenção completa o campo que faltava.
+    s.forbidden.set((0, 0));
+    s.engine.refresh_data_maps().unwrap();
+    let second = s.tick(&["velocidade"]);
+    assert!(second.notes.is_empty(), "{:?}", second.notes);
+    assert_eq!((s.f32_at(ground), s.f32_at(swim)), (2.0, 2.0));
+    assert_eq!(s.engine.data_entries().len(), 2);
+    s.runtime.turn_off(&mut s.engine, "velocidade").unwrap();
+    assert_eq!((s.f32_at(ground), s.f32_at(swim)), (1.0, 1.0));
+    assert_eq!(s.store.peek().unwrap(), Loaded::Missing);
+}
+
+#[test]
+fn set_pawn_swap_resolves_old_entry() {
+    let mut s = scene();
+    let alt_cap = s.u64_at(s.ue.alt_pawn + u64::from(HAULING_OFF)) + u64::from(CAPACITY_OFF);
+    let alt_before = s.i32_at(alt_cap);
+    s.tick(&["carga"]);
+    assert_eq!(s.i32_at(s.cap()), 20);
+    s.swap_pawn(s.ue.alt_pawn);
+    let report = s.tick(&["carga"]);
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+    // O antigo volta ao original; o novo ganha a entrada dele.
+    assert_eq!(s.i32_at(s.cap()), 10);
+    assert_eq!(s.i32_at(alt_cap), 20);
+    let entries: Vec<u64> = s.engine.data_entries().iter().map(|e| e.addr).collect();
+    assert_eq!(entries, vec![alt_cap]);
+    s.runtime.turn_off(&mut s.engine, "carga").unwrap();
+    assert_eq!(s.i32_at(alt_cap), alt_before);
+}
+
+#[test]
+fn mount_never_written() {
+    let mut s = scene();
+    let c = s.ue.creature;
+    let mounts = [
+        s.ue.creature_hauling + u64::from(CAPACITY_OFF),
+        s.ue.creature_movement + u64::from(GROUND_MULT_OFF),
+        s.ue.creature_movement + u64::from(SWIM_MULT_OFF),
+        s.ue.creature_movement + u64::from(GRAVITY_OFF),
+        c + u64::from(JUMP_OFF),
+        c + u64::from(DAMAGE_MULT_OFF),
+    ];
+    let before: Vec<u32> = mounts.iter().map(|a| s.f32_at(*a).to_bits()).collect();
+    // A criatura no `Pawn` (montado): o personagem continua sendo o alvo.
+    s.swap_pawn(c);
+    for _ in 0..3 {
+        let report = s.tick(&SET_IDS);
+        assert!(report.notes.is_empty(), "{:?}", report.notes);
+    }
+    let after: Vec<u32> = mounts.iter().map(|a| s.f32_at(*a).to_bits()).collect();
+    assert_eq!(before, after);
+    assert!(
+        s.engine
+            .data_entries()
+            .iter()
+            .all(|e| !mounts.contains(&e.addr))
+    );
+    // E o personagem recebeu os valores.
+    assert_eq!(s.i32_at(s.cap()), 20);
+    assert_eq!(s.f32_at(s.ue.pawn + u64::from(DAMAGE_MULT_OFF)), 10.0);
+}
+
+#[test]
+fn action_adds_and_rereads() {
+    let mut s = scene();
+    let c = Some(s.ue.controller);
+    assert_eq!(
+        s.action(c, 1000),
+        ActionOutcome::Done {
+            before: 500,
+            after: 1500
+        }
+    );
+    assert_eq!(s.i32_at(s.science()), 1500);
+    assert_eq!(
+        s.action(c, 100),
+        ActionOutcome::Done {
+            before: 1500,
+            after: 1600
+        }
+    );
+    // Sem diário e sem entrada no motor: a ação não é reversível.
+    assert_eq!(s.store.peek().unwrap(), Loaded::Missing);
+    assert!(s.engine.data_entries().is_empty());
+    // Até o teto exato do resultado.
+    s.poke(s.science(), &99_000i32.to_le_bytes());
+    assert_eq!(
+        s.action(c, 1000),
+        ActionOutcome::Done {
+            before: 99_000,
+            after: 100_000
+        }
+    );
+}
+
+#[test]
+fn action_refusals() {
+    let mut s = scene();
+    let c = Some(s.ue.controller);
+    let refused = |text: &str| ActionOutcome::Refused(text.to_string());
+    s.poke(s.science(), &(-5i32).to_le_bytes());
+    assert_eq!(s.action(c, 1000), refused("valor atual fora da faixa"));
+    s.poke(s.science(), &100_001i32.to_le_bytes());
+    assert_eq!(s.action(c, 1000), refused("valor atual fora da faixa"));
+    s.poke(s.science(), &99_500i32.to_le_bytes());
+    assert_eq!(s.action(c, 1000), refused("passaria do máximo"));
+    assert_eq!(s.i32_at(s.science()), 99_500);
+    // Sem controller, ou com um que não é mais válido: pede a procura.
+    assert_eq!(s.action(None, 1000), ActionOutcome::NeedsController);
+    assert_eq!(
+        s.action(Some(s.ue.pawn), 1000),
+        ActionOutcome::NeedsController
+    );
+    // Controller válido, mas o mundo sumiu do nível.
+    s.poke(s.ue.level + u64::from(WORLD_OFF), &0u64.to_le_bytes());
+    assert_eq!(s.action(c, 1000), refused("estado do jogo ausente"));
+    assert_eq!(s.i32_at(s.science()), 99_500);
+}
+
+#[test]
+fn action_refreshes_maps_on_new_object() {
+    let mut s = scene();
+    let c = Some(s.ue.controller);
+    let calls = |s: &Scene| s.policy_calls.get();
+    let start = calls(&s);
+    s.action(c, 100);
+    // A primeira execução relê o `maps`; a segunda, no mesmo objeto, não.
+    assert_eq!(calls(&s), start + 1);
+    s.action(c, 100);
+    assert_eq!(calls(&s), start + 1);
+    // Outro `PartyComponent` (cópia em outra região): o endereço muda e o `maps` é relido.
+    let mut copy = vec![0u8; 0x40];
+    s.reader.read_exact(s.ue.party, &mut copy).unwrap();
+    let other = s.t.big_region;
+    s.poke(other, &copy);
+    s.poke(s.ue.game_state + u64::from(PARTY_OFF), &other.to_le_bytes());
+    let out = s.action(c, 100);
+    assert!(matches!(out, ActionOutcome::Done { .. }), "{out:?}");
+    assert_eq!(calls(&s), start + 2);
+    assert_eq!(s.i32_at(other + u64::from(SCIENCE_OFF)), 800);
 }
