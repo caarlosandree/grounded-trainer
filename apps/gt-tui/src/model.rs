@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 
-use gt_core::value::ValueSpec;
+use gt_core::value::ValueGrid;
 use gt_grounded2::fields::Note;
 use gt_grounded2::signatures::Category;
 
@@ -92,7 +92,7 @@ pub struct CheatRow {
     /// Categoria (cabeçalho sob o qual aparece).
     pub category: Category,
     /// Definição do valor ajustável, se o cheat tem valor.
-    pub value: Option<ValueSpec>,
+    pub value: Option<ValueGrid>,
     /// Índice na grade do valor mostrado.
     pub k: u64,
     /// Índice na grade do valor que está no jogo (com o cheat ligado).

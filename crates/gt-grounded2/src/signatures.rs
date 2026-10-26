@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use gt_core::global::GlobalPattern;
 use gt_core::scan::Pattern;
-use gt_core::value::{ValueSpec, ValueType};
+use gt_core::value::{ValueGrid, ValueSpec, ValueType};
 use gt_ue::{
     FBoolLayout, FFieldLayout, FPropLayout, FStructLayout, ObjectsLayout, UObjectLayout,
     UStructLayout, UeLayout,
@@ -593,9 +593,8 @@ fn build_value(file: &str, block: &ValueBlock, replacement: &[u8]) -> Result<Val
         ));
     }
 
-    let spec = ValueSpec {
+    let grid = ValueGrid {
         ty,
-        slot,
         min,
         max,
         step,
@@ -605,7 +604,8 @@ fn build_value(file: &str, block: &ValueBlock, replacement: &[u8]) -> Result<Val
         unit,
         decimals: decimals.unwrap_or_else(|| decimals_for(step)),
     };
-    spec.check().map_err(|e| sig_err(file, "value", e))?;
+    grid.check().map_err(|e| sig_err(file, "value", e))?;
+    let spec = ValueSpec { grid, slot };
     spec.check_slot(replacement)
         .map_err(|e| sig_err(file, "value.slot", e))?;
     Ok(spec)
@@ -1605,18 +1605,21 @@ offset = 3
         assert_eq!(def.name, "Valor");
         assert_eq!(def.category, Category::Movimento);
         let spec = def.value.as_ref().unwrap();
-        assert_eq!(spec.ty, ValueType::F32);
+        assert_eq!(spec.grid.ty, ValueType::F32);
         assert_eq!(spec.slot, 1);
-        assert_eq!((spec.min, spec.max, spec.step), (0.5, 4.0, 0.5));
-        assert_eq!(spec.default_k, 2);
-        assert_eq!(spec.unit.as_deref(), Some("x"));
-        assert_eq!(spec.decimals, 1);
+        assert_eq!(
+            (spec.grid.min, spec.grid.max, spec.grid.step),
+            (0.5, 4.0, 0.5)
+        );
+        assert_eq!(spec.grid.default_k, 2);
+        assert_eq!(spec.grid.unit.as_deref(), Some("x"));
+        assert_eq!(spec.grid.decimals, 1);
         assert_eq!(spec.bytes(&def.replacement, 2), def.replacement);
         assert_eq!(
             spec.bytes(&def.replacement, 3),
             vec![0xB8, 0, 0, 0x00, 0x40]
         );
-        assert_eq!(spec.format(2), "1.5x");
+        assert_eq!(spec.grid.format(2), "1.5x");
     }
 
     #[test]
@@ -1627,14 +1630,22 @@ offset = 3
         let repl = "B8 00 00 80 3F";
         let sigs = parse(&[("generic.toml", &value_generic(repl, block))]).unwrap();
         let spec = sigs.for_version("x")[0].value.clone().unwrap();
-        assert_eq!((spec.min, spec.default_k), (0.0, 2));
+        assert_eq!((spec.grid.min, spec.grid.default_k), (0.0, 2));
         // Sem `decimals`, deriva do passo.
-        assert_eq!(spec.decimals, 1);
+        assert_eq!(spec.grid.decimals, 1);
         // Tudo inteiro também vale.
         let block =
             "[patch.value]\ntype = \"f32\"\nslot = 1\nmin = 0\nmax = 4\nstep = 1\ndefault = 1\n";
         let sigs = parse(&[("generic.toml", &value_generic(repl, block))]).unwrap();
-        assert_eq!(sigs.for_version("x")[0].value.as_ref().unwrap().decimals, 0);
+        assert_eq!(
+            sigs.for_version("x")[0]
+                .value
+                .as_ref()
+                .unwrap()
+                .grid
+                .decimals,
+            0
+        );
     }
 
     #[test]
@@ -1649,7 +1660,7 @@ offset = 3
         let sigs = parse(&[("generic.toml", &value_generic(repl, &int_block("")))]).unwrap();
         let spec = sigs.for_version("x")[0].value.clone().unwrap();
         assert_eq!(
-            (spec.ty, spec.default_k, spec.decimals),
+            (spec.grid.ty, spec.grid.default_k, spec.grid.decimals),
             (ValueType::I32, 5, 0)
         );
         for (what, block, field) in [
@@ -1868,16 +1879,21 @@ offset = 3
         let sigs = parse(&[("generic.toml", &generic), ("aaaa-bbbb.toml", version)]).unwrap();
         let generic_def = &sigs.for_version("outra")[0];
         let version_def = &sigs.for_version("aaaa-bbbb")[0];
-        assert_eq!(generic_def.value.as_ref().unwrap().max, 4.0);
+        assert_eq!(generic_def.value.as_ref().unwrap().grid.max, 4.0);
         assert_eq!(generic_def.name, "Valor");
         let spec = version_def.value.as_ref().unwrap();
         assert_eq!(
-            (spec.min, spec.max, spec.step, spec.default_k),
+            (
+                spec.grid.min,
+                spec.grid.max,
+                spec.grid.step,
+                spec.grid.default_k
+            ),
             (1.0, 8.0, 1.0, 1)
         );
-        assert_eq!(spec.unit.as_deref(), Some("%"));
+        assert_eq!(spec.grid.unit.as_deref(), Some("%"));
         // `decimals` não herdado do bloco genérico (era 1); sem ele, deriva do passo (0).
-        assert_eq!(spec.decimals, 0);
+        assert_eq!(spec.grid.decimals, 0);
         assert_eq!(version_def.name, "Outro nome");
         assert_eq!(version_def.category, Category::Itens);
 

@@ -3,7 +3,7 @@
 //! Só desenho: nada aqui altera o modelo nem toca o terminal. As cores e os estilos são
 //! enfeite; o que importa (e o que os testes conferem) são os textos.
 
-use gt_core::value::ValueSpec;
+use gt_core::value::ValueGrid;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -378,7 +378,7 @@ fn truncate(text: &str, max: usize) -> String {
 }
 
 /// `1.5x ◀ ▶`.
-fn value_text(spec: &ValueSpec, k: u64) -> String {
+fn value_text(spec: &ValueGrid, k: u64) -> String {
     format!("{} ◀ ▶", spec.format(k))
 }
 
@@ -501,10 +501,9 @@ mod tests {
             .unwrap_or_else(|| panic!("sem {needle:?} em:\n{}", lines.join("\n")))
     }
 
-    fn speed() -> ValueSpec {
-        ValueSpec {
+    fn speed() -> ValueGrid {
+        ValueGrid {
             ty: ValueType::F32,
-            slot: 0,
             min: 0.5,
             max: 3.0,
             step: 0.5,

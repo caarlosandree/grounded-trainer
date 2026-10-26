@@ -111,7 +111,7 @@ fn cheats_of(
             id: e.def.id.clone(),
             name: e.def.name.clone(),
             category: e.def.category,
-            value: e.def.value.clone(),
+            value: e.def.value.as_ref().map(|v| v.grid.clone()),
             avail: avail_of(&e.state),
             field: false,
         })

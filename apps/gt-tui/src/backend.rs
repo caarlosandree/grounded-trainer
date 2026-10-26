@@ -14,7 +14,7 @@ use gt_core::engine::{BatchReport, RestoreReport};
 use gt_core::journal::DiscardReason;
 use gt_core::procinfo::Identity;
 use gt_core::recovery::RecoveryReport;
-use gt_core::value::ValueSpec;
+use gt_core::value::ValueGrid;
 use gt_grounded2::fields::{PlayerState, TickReport};
 use gt_grounded2::player::Absent;
 use gt_grounded2::signatures::Category;
@@ -68,7 +68,7 @@ pub struct CheatInfo {
     /// Categoria.
     pub category: Category,
     /// Definição do valor ajustável, se houver.
-    pub value: Option<ValueSpec>,
+    pub value: Option<ValueGrid>,
     /// Disponibilidade segundo a busca.
     pub avail: Avail,
     /// Cheat de valor (`[[field]]`, spec 005), não patch.

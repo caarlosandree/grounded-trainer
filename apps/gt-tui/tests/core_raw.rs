@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use gt_core::journal::{JournalStore, Loaded};
 use gt_core::mem::{MemReader, MemWriter};
 use gt_core::procinfo::identity;
-use gt_core::value::{ValueSpec, ValueType};
+use gt_core::value::{ValueGrid, ValueSpec, ValueType};
 use gt_grounded2::signatures::Category;
 use gt_testkit::{TargetOpts, TestTarget};
 use gt_tui::backend::{Backend, Find, OpOutcome, Recovered, Session};
@@ -23,16 +23,23 @@ static SERIAL: Mutex<()> = Mutex::new(());
 const TOGGLE: &str = "toggle";
 const VALUE: &str = "value";
 
-fn grid() -> ValueSpec {
-    ValueSpec {
+fn grid() -> ValueGrid {
+    ValueGrid {
         ty: ValueType::U32,
-        slot: 1,
         min: 0.0,
         max: f64::from(0x3333_3333_u32),
         step: f64::from(0x1111_1111_u32),
         default_k: 2,
         unit: None,
         decimals: 0,
+    }
+}
+
+/// A grade com o `slot` do imediato (bytes 1..5 do `value_page`).
+fn spec() -> ValueSpec {
+    ValueSpec {
+        grid: grid(),
+        slot: 1,
     }
 }
 
@@ -56,7 +63,7 @@ fn defs_of(t: &TestTarget) -> Vec<RawDef> {
             addr: t.value_page,
             expected: vec![0xB8, 0x11, 0x11, 0x11, 0x11],
             replacement: vec![0xB8, 0x22, 0x22, 0x22, 0x22],
-            value: Some(grid()),
+            value: Some(spec()),
             verified: true,
         },
     ]

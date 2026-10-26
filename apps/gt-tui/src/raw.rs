@@ -139,7 +139,7 @@ fn avail_of(def: &RawDef, pid: i32) -> Result<Avail, SearchError> {
     let on_grid = def
         .value
         .as_ref()
-        .is_some_and(|v| (0..=v.steps()).any(|k| v.bytes(&def.replacement, k) == buf));
+        .is_some_and(|v| (0..=v.grid.steps()).any(|k| v.bytes(&def.replacement, k) == buf));
     if buf == def.expected || on_grid {
         Ok(Avail::Available {
             verified: def.verified,
@@ -187,7 +187,7 @@ fn raw_search(
             id: def.id.clone(),
             name: def.name.clone(),
             category: def.category,
-            value: def.value.clone(),
+            value: def.value.as_ref().map(|v| v.grid.clone()),
             avail: avail_of(def, pid)?,
             field: false,
         });

@@ -1805,7 +1805,7 @@ impl<B: Backend> Controller<B> {
 mod tests {
     use std::path::PathBuf;
 
-    use gt_core::value::{ValueSpec, ValueType};
+    use gt_core::value::{ValueGrid, ValueType};
 
     use super::*;
     use crate::backend::SearchError;
@@ -1919,10 +1919,9 @@ mod tests {
         }
     }
 
-    fn grid() -> ValueSpec {
-        ValueSpec {
+    fn grid() -> ValueGrid {
+        ValueGrid {
             ty: ValueType::U32,
-            slot: 1,
             min: 0.0,
             max: 10.0,
             step: 1.0,
