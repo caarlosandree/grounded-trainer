@@ -17,8 +17,8 @@ use gt_core::mem::ReadMem;
 use gt_ue::{ObjectArray, ReflectionIndex};
 
 use crate::player::{
-    Absent, FieldAction, FieldCatalog, FieldValues, PlayerSnapshot, ResolvedRule, plan_tick,
-    read_player,
+    Absent, FieldAction, FieldCatalog, FieldValues, MissingKind, PlayerSnapshot, ResolvedRule,
+    missing_kind, plan_tick, read_player,
 };
 use crate::signatures::LockMode;
 
@@ -38,6 +38,14 @@ pub enum Note {
     WaitingPet,
     /// `alvo inválido`.
     InvalidTarget,
+}
+
+/// A marca de um cheat ligado cujo objeto falta: `aguardando o pet` ou `aguardando o personagem`.
+pub fn missing_note(kind: MissingKind) -> Note {
+    match kind {
+        MissingKind::Pet => Note::WaitingPet,
+        MissingKind::Component => Note::Waiting,
+    }
 }
 
 /// Resultado de um ciclo.
@@ -227,7 +235,11 @@ impl FieldRuntime {
         }
         self.invalid = invalid_now;
         for id in snapshot.missing.keys().filter(|id| on.contains(id)) {
-            report.notes.insert(id.clone(), Note::WaitingPet);
+            let kind = match self.catalog.get(id) {
+                Some(Ok(resolved)) => missing_kind(resolved),
+                _ => MissingKind::Component,
+            };
+            report.notes.insert(id.clone(), missing_note(kind));
         }
         report
     }
@@ -279,5 +291,16 @@ impl FieldRuntime {
             Some(_) => Ok(done),
             None => Err(CoreError::NotActive { id: id.to_string() }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_note_follows_the_kind() {
+        assert_eq!(missing_note(MissingKind::Pet), Note::WaitingPet);
+        assert_eq!(missing_note(MissingKind::Component), Note::Waiting);
     }
 }

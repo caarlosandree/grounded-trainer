@@ -297,6 +297,16 @@ fn write_report(out: &mut dyn Write, report: &PlayerReport) -> std::io::Result<(
                     .collect();
                 writeln!(out, "  {:<20} {}", f.id, list.join("  "))?;
             }
+            FieldReportValue::Set { fields } => {
+                let list: Vec<String> = fields
+                    .iter()
+                    .map(|v| format!("{:#010x} ({:#x})", v.raw, v.addr))
+                    .collect();
+                writeln!(out, "  {:<20} bruto {}", f.id, list.join("  "))?;
+            }
+            FieldReportValue::OnDemand => {
+                writeln!(out, "  {:<20} lido sob demanda pela ação", f.id)?;
+            }
         }
     }
     Ok(())

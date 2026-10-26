@@ -8,7 +8,7 @@ use gt_ue::synth::{SparseMem, SynthField, SynthUe};
 use gt_ue::{Names, ObjectArray, ReflectionIndex, ScanBudget, UeLayout};
 
 use super::*;
-use crate::signatures::{Category, FieldRoot};
+use crate::signatures::{Category, FieldKind, FieldRoot, GameStateCfg};
 
 const ARENA: u64 = 0x1000_0000;
 const ARENA_LEN: usize = 64 << 20;
@@ -31,6 +31,16 @@ fn float(name: &'static str, offset: u32) -> SynthField {
     SynthField {
         name,
         kind: "FloatProperty",
+        offset,
+        size: 4,
+        bool_mask: None,
+    }
+}
+
+fn int(name: &'static str, offset: u32) -> SynthField {
+    SynthField {
+        name,
+        kind: "IntProperty",
         offset,
         size: 4,
         bool_mask: None,
@@ -81,6 +91,21 @@ const NEUTRAL_TEMP: f32 = 37.0;
 /// `SurvivalCharacter.PetMasterComponent` e `PetMasterComponent.CurrentPetFull`.
 const PET_MASTER_OFF: u32 = 0x70;
 const CURRENT_PET_OFF: u32 = 0x30;
+/// `SurvivalCharacter.HaulingComponent`, `.CharacterMovement` e `.CustomDamageMultiplier`.
+const HAULING_OFF: u32 = 0x88;
+const MOVEMENT_OFF: u32 = 0x90;
+const DAMAGE_MULT_OFF: u32 = 0x98;
+/// `HaulingComponent.Capacity`.
+const CAPACITY_OFF: u32 = 0x34;
+/// `MaineCharMovementComponent`: os dois multiplicadores e a gravidade.
+const GROUND_MULT_OFF: u32 = 0x30;
+const SWIM_MULT_OFF: u32 = 0x34;
+const GRAVITY_OFF: u32 = 0x3c;
+/// `Level.OwningWorld`, `World.GameState`, `InGameGameState.PartyComponent` e `PartyComponent.ScienceFound`.
+const WORLD_OFF: u32 = 0x40;
+const GAME_STATE_OFF: u32 = 0x48;
+const PARTY_OFF: u32 = 0x38;
+const SCIENCE_OFF: u32 = 0x30;
 
 /// Objetos de um mundo sintético.
 struct World {
@@ -102,6 +127,12 @@ struct World {
     pet: u64,
     pet_master: u64,
     pet_health: u64,
+    level: u64,
+    world: u64,
+    game_state: u64,
+    party: u64,
+    hauling: u64,
+    movement: u64,
 }
 
 impl World {
@@ -148,6 +179,20 @@ fn cfg() -> PlayerCfg {
         pawn_class: format!("{MAINE}.SurvivalPlayerCharacter"),
         alt_pawn_fields: vec!["CachedSurvivalPlayerCharacter".into()],
         game_state: None,
+    }
+}
+
+/// O `[ue.player]` com o caminho do `GameState`.
+fn cfg_gs() -> PlayerCfg {
+    PlayerCfg {
+        game_state: Some(GameStateCfg {
+            level_class: "/Script/Engine.Level".into(),
+            world_field: "OwningWorld".into(),
+            world_class: "/Script/Engine.World".into(),
+            game_state_field: "GameState".into(),
+            game_state_class: format!("{MAINE}.InGameGameState"),
+        }),
+        ..cfg()
     }
 }
 
@@ -301,8 +346,11 @@ fn world(omit: &[&str]) -> World {
         maine,
         "SurvivalCharacter",
         Some(actor),
-        0x78,
+        0xb0,
         &keep(vec![
+            object("HaulingComponent", HAULING_OFF),
+            object("CharacterMovement", MOVEMENT_OFF),
+            float("CustomDamageMultiplier", DAMAGE_MULT_OFF),
             object("HealthComponent", HEALTH_OFF),
             object("StaminaComponent", STAMINA_OFF),
             object("SurvivalComponent", SURVIVAL_OFF),
@@ -311,7 +359,7 @@ fn world(omit: &[&str]) -> World {
             object("PetMasterComponent", PET_MASTER_OFF),
         ]),
     );
-    let creature_c = s.add_class(maine, "SurvivalCreature", Some(character_c), 0x80, &[]);
+    let creature_c = s.add_class(maine, "SurvivalCreature", Some(character_c), 0xb0, &[]);
     let pet_master_c = s.add_class(
         maine,
         "PetMasterComponent",
@@ -329,8 +377,54 @@ fn world(omit: &[&str]) -> World {
         maine,
         "SurvivalPlayerCharacter",
         Some(character_c),
-        0x80,
+        0xb0,
         &[],
+    );
+    let hauling_c = s.add_class(
+        maine,
+        "HaulingComponent",
+        Some(object_c),
+        0x40,
+        &keep(vec![int("Capacity", CAPACITY_OFF)]),
+    );
+    let movement_c = s.add_class(
+        maine,
+        "MaineCharMovementComponent",
+        Some(object_c),
+        0x50,
+        &keep(vec![
+            float("CustomGroundSpeedMultiplier", GROUND_MULT_OFF),
+            float("CustomSwimSpeedMultiplier", SWIM_MULT_OFF),
+            float("GravityScale", GRAVITY_OFF),
+        ]),
+    );
+    let level_c = s.add_class(
+        engine,
+        "Level",
+        Some(object_c),
+        0x60,
+        &keep(vec![object("OwningWorld", WORLD_OFF)]),
+    );
+    let world_c = s.add_class(
+        engine,
+        "World",
+        Some(object_c),
+        0x70,
+        &keep(vec![object("GameState", GAME_STATE_OFF)]),
+    );
+    let game_state_c = s.add_class(
+        maine,
+        "InGameGameState",
+        Some(actor),
+        0x60,
+        &keep(vec![object("PartyComponent", PARTY_OFF)]),
+    );
+    let party_c = s.add_class(
+        maine,
+        "PartyComponent",
+        Some(object_c),
+        0x40,
+        &keep(vec![int("ScienceFound", SCIENCE_OFF)]),
     );
     let health_c = s.add_class(
         maine,
@@ -405,8 +499,16 @@ fn world(omit: &[&str]) -> World {
         &keep(vec![float("CurrentBodyTemperature", CUR_TEMP)]),
     );
 
-    let controller = s.add_object(survival_controller_c, "Controller_0", maine);
-    let second_controller = s.add_object(survival_controller_c, "Controller_1", maine);
+    // O controller e o pawn compartilham o `Outer` (o nível persistente), como no jogo.
+    let level = s.add_object(level_c, "PersistentLevel", maine);
+    let world = s.add_object(world_c, "World_0", maine);
+    let game_state = s.add_object(game_state_c, "GameState_0", level);
+    let party = s.add_object(party_c, "Party", game_state);
+    s.set(level, WORLD_OFF, &world.to_le_bytes());
+    s.set(world, GAME_STATE_OFF, &game_state.to_le_bytes());
+    s.set(game_state, PARTY_OFF, &party.to_le_bytes());
+    let controller = s.add_object(survival_controller_c, "Controller_0", level);
+    let second_controller = s.add_object(survival_controller_c, "Controller_1", level);
     let pawn = s.add_object(player_character_c, "Player_0", maine);
     let creature = s.add_object(character_c, "Creature_0", maine);
     let pet = s.add_object(creature_c, "Pet_0", maine);
@@ -425,6 +527,10 @@ fn world(omit: &[&str]) -> World {
     let [health, stamina, survival, temperature] = components(pawn);
     components(creature);
     let [pet_health, ..] = components(pet);
+    let hauling = s.add_object(hauling_c, "Hauling", pawn);
+    let movement = s.add_object(movement_c, "Movement", pawn);
+    s.set(pawn, HAULING_OFF, &hauling.to_le_bytes());
+    s.set(pawn, MOVEMENT_OFF, &movement.to_le_bytes());
     let pet_master = s.add_object(pet_master_c, "PetMaster", pawn);
     s.set(pawn, PET_MASTER_OFF, &pet_master.to_le_bytes());
     s.set(pet_master, CURRENT_PET_OFF, &pet.to_le_bytes());
@@ -455,6 +561,12 @@ fn world(omit: &[&str]) -> World {
         pet,
         pet_master,
         pet_health,
+        level,
+        world,
+        game_state,
+        party,
+        hauling,
+        movement,
     };
     // Valores iniciais: tudo cheio, sem dano, temperatura neutra e bits ligados como no jogo.
     w.write_f32(stamina + u64::from(CUR_STAMINA), 100.0);
@@ -463,6 +575,10 @@ fn world(omit: &[&str]) -> World {
         w.write_f32(survival + u64::from(off), 100.0);
     }
     w.write_f32(temperature + u64::from(CUR_TEMP), NEUTRAL_TEMP);
+    w.mem
+        .write(hauling + u64::from(CAPACITY_OFF), &20i32.to_le_bytes());
+    w.mem
+        .write(party + u64::from(SCIENCE_OFF), &7400i32.to_le_bytes());
     w
 }
 
@@ -607,25 +723,46 @@ fn food_target_comes_from_struct_member() {
 #[test]
 fn component_wrong_class_absent() {
     let w = world(&[]);
-    w.write_u64(w.pawn + u64::from(HEALTH_OFF), w.stamina);
-    assert_eq!(
-        w.read(),
-        Err(Absent::ComponentWrongClass("HealthComponent".into()))
-    );
-    // Componente nulo também não serve.
-    w.write_u64(w.pawn + u64::from(HEALTH_OFF), 0);
-    assert_eq!(
-        w.read(),
-        Err(Absent::ComponentWrongClass("HealthComponent".into()))
-    );
+    // Um componente de classe errada (ou nulo) deixa só os cheats dele esperando; o resto segue.
+    for bad in [w.stamina, 0] {
+        w.write_u64(w.pawn + u64::from(HEALTH_OFF), bad);
+        let snap = w.read().unwrap();
+        for id in ["vida-infinita", "nao-morrer"] {
+            assert_eq!(
+                snap.missing.get(id),
+                Some(&Absent::ComponentWrongClass("HealthComponent".into())),
+                "{id}"
+            );
+            assert!(!snap.values.contains_key(id), "{id}");
+        }
+        assert!(snap.values.contains_key("stamina-infinita"));
+        assert!(snap.values.contains_key("sem-dano-queda"));
+    }
+    // O próprio pawn de classe errada para `object = "pawn"` continua derrubando a leitura.
+    w.write_u64(w.controller + u64::from(PAWN_OFF), w.creature);
+    assert_eq!(w.read(), Err(Absent::PawnWrongClass));
 }
 
 #[test]
 fn props_size_exceeded_absent() {
     let w = world(&[]);
-    // A classe do componente diz que o objeto acaba antes do byte dos bits.
+    // A classe do componente diz que o objeto acaba antes do byte dos bits: só os cheats dele esperam.
     let props = w.health_class + u64::from(w.layout.ustruct.properties_size);
     w.mem.write(props, &DIE_BYTE.to_le_bytes());
+    let snap = w.read().unwrap();
+    assert!(matches!(
+        snap.missing.get("nao-morrer"),
+        Some(Absent::FieldOutsideObject(_))
+    ));
+    assert!(snap.values.contains_key("stamina-infinita"));
+
+    // O campo do próprio pawn (sem caminho) fora do objeto derruba a leitura.
+    let w = world(&[]);
+    let class = gt_ue::read::read_u64(&w.mem, w.pawn + u64::from(w.layout.uobject.class)).unwrap();
+    w.mem.write(
+        class + u64::from(w.layout.ustruct.properties_size),
+        &FALL_BYTE.to_le_bytes(),
+    );
     assert!(matches!(w.read(), Err(Absent::FieldOutsideObject(_))));
 }
 
@@ -1015,4 +1152,462 @@ fn pet_path_without_property_class_is_unavailable() {
     );
     // O personagem não é afetado.
     assert_eq!(catalog.avail("vida-infinita"), Ok(()));
+}
+
+// ---- set, add e game_state (spec 006, 6.2 a 6.4 e 6.6) ----
+
+fn set_def(
+    id: &str,
+    object: &str,
+    class: &str,
+    fields: &[&str],
+    kind: FieldKind,
+    target: f64,
+) -> FieldDef {
+    FieldDef {
+        id: id.into(),
+        name: id.into(),
+        category: Category::Sobrevivencia,
+        description: String::new(),
+        object: object.into(),
+        object_class: format!("{MAINE}.{class}"),
+        root: FieldRoot::Pawn,
+        value: None,
+        rule: FieldRule::Set {
+            fields: fields.iter().map(|s| s.to_string()).collect(),
+            kind,
+            target: Some(target),
+        },
+    }
+}
+
+fn add_def() -> FieldDef {
+    FieldDef {
+        id: "somar-ciencia".into(),
+        name: "Somar ciência".into(),
+        category: Category::Sobrevivencia,
+        description: String::new(),
+        object: "PartyComponent".into(),
+        object_class: format!("{MAINE}.PartyComponent"),
+        root: FieldRoot::GameState,
+        value: None,
+        rule: FieldRule::Add {
+            field: "ScienceFound".into(),
+            result_max: 100_000,
+        },
+    }
+}
+
+/// Os cheats novos da spec 6.7.
+fn new_defs() -> Vec<FieldDef> {
+    vec![
+        set_def(
+            "carga",
+            "HaulingComponent",
+            "HaulingComponent",
+            &["Capacity"],
+            FieldKind::Int,
+            20.0,
+        ),
+        set_def(
+            "dano",
+            "pawn",
+            "SurvivalCharacter",
+            &["CustomDamageMultiplier"],
+            FieldKind::Float,
+            10.0,
+        ),
+        set_def(
+            "velocidade",
+            "CharacterMovement",
+            "MaineCharMovementComponent",
+            &["CustomGroundSpeedMultiplier", "CustomSwimSpeedMultiplier"],
+            FieldKind::Float,
+            2.0,
+        ),
+        set_def(
+            "gravidade",
+            "CharacterMovement",
+            "MaineCharMovementComponent",
+            &["GravityScale"],
+            FieldKind::Float,
+            0.5,
+        ),
+        add_def(),
+    ]
+}
+
+/// Catálogo com os cheats antigos, os novos e o caminho do `GameState`.
+fn full_catalog(w: &World, cfg: &PlayerCfg) -> FieldCatalog {
+    let mut all = defs();
+    all.extend(new_defs());
+    FieldCatalog::resolve(&w.index, &w.mem, cfg, &all)
+}
+
+fn read_gs(
+    w: &World,
+    catalog: &FieldCatalog,
+) -> Result<(u64, u64, Vec<GuardBytes>), GameStateAbsent> {
+    read_game_state(
+        &w.mem,
+        &w.index,
+        catalog,
+        &w.objects,
+        w.controller,
+        "somar-ciencia",
+    )
+}
+
+#[test]
+fn int_field_checks_type_and_size() {
+    let w = world(&[]);
+    // Um `FloatProperty` pedido como `int`, e um `IntProperty` pedido como `float`.
+    let mut all = new_defs();
+    all.push(set_def(
+        "float-como-int",
+        "pawn",
+        "SurvivalCharacter",
+        &["CustomDamageMultiplier"],
+        FieldKind::Int,
+        1.0,
+    ));
+    all.push(set_def(
+        "int-como-float",
+        "HaulingComponent",
+        "HaulingComponent",
+        &["Capacity"],
+        FieldKind::Float,
+        1.0,
+    ));
+    let catalog = FieldCatalog::resolve(&w.index, &w.mem, &cfg_gs(), &all);
+    assert_eq!(
+        catalog.avail("float-como-int"),
+        Err("reflexão incoerente".to_string())
+    );
+    assert_eq!(
+        catalog.avail("int-como-float"),
+        Err("reflexão incoerente".to_string())
+    );
+    assert_eq!(catalog.avail("carga"), Ok(()));
+}
+
+#[test]
+fn resolves_new_fields_by_name() {
+    let w = world(&[]);
+    let catalog = full_catalog(&w, &cfg_gs());
+    for def in new_defs() {
+        assert_eq!(catalog.avail(&def.id), Ok(()), "{}", def.id);
+    }
+    let Some(Ok(carga)) = catalog.get("carga") else {
+        panic!("carga não resolvida");
+    };
+    assert_eq!(carga.root, FieldRoot::Pawn);
+    assert_eq!(carga.object_path[0].field.offset, HAULING_OFF);
+    let ResolvedRule::Set {
+        fields,
+        kind,
+        target,
+    } = &carga.rule
+    else {
+        panic!("carga não é set");
+    };
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].offset, CAPACITY_OFF);
+    assert_eq!((*kind, *target), (FieldKind::Int, Some(20.0)));
+
+    let Some(Ok(vel)) = catalog.get("velocidade") else {
+        panic!("velocidade não resolvida");
+    };
+    let ResolvedRule::Set { fields, .. } = &vel.rule else {
+        panic!("velocidade não é set");
+    };
+    let offsets: Vec<u32> = fields.iter().map(|f| f.offset).collect();
+    assert_eq!(offsets, [GROUND_MULT_OFF, SWIM_MULT_OFF]);
+
+    let Some(Ok(dano)) = catalog.get("dano") else {
+        panic!("dano não resolvido");
+    };
+    assert!(dano.object_path.is_empty());
+
+    let Some(Ok(ciencia)) = catalog.get("somar-ciencia") else {
+        panic!("ciência não resolvida");
+    };
+    assert_eq!(ciencia.root, FieldRoot::GameState);
+    assert_eq!(ciencia.object_path[0].field.offset, PARTY_OFF);
+    let ResolvedRule::Add { field, result_max } = &ciencia.rule else {
+        panic!("ciência não é add");
+    };
+    assert_eq!((field.offset, *result_max), (SCIENCE_OFF, 100_000));
+}
+
+#[test]
+fn game_state_class_missing_only_affects_action() {
+    let w = world(&[]);
+    let mut bad = cfg_gs();
+    if let Some(gs) = bad.game_state.as_mut() {
+        gs.game_state_class = format!("{MAINE}.NaoExiste");
+    }
+    let catalog = full_catalog(&w, &bad);
+    assert_eq!(
+        catalog.avail("somar-ciencia"),
+        Err("classe NaoExiste não encontrada".to_string())
+    );
+    for id in ["vida-infinita", "carga", "dano", "velocidade", "gravidade"] {
+        assert_eq!(catalog.avail(id), Ok(()), "{id}");
+    }
+    assert!(w.read_with_catalog(&catalog).is_ok());
+
+    // Campo do caminho que falta: também só a ação.
+    let w = world(&["OwningWorld"]);
+    let catalog = full_catalog(&w, &cfg_gs());
+    assert_eq!(
+        catalog.avail("somar-ciencia"),
+        Err("campo OwningWorld não encontrado".to_string())
+    );
+    assert_eq!(catalog.avail("carga"), Ok(()));
+
+    // Sem o bloco no `[ue.player]`, a ação fica indisponível e o resto segue.
+    let w = world(&[]);
+    let catalog = full_catalog(&w, &cfg());
+    assert!(catalog.avail("somar-ciencia").is_err());
+    assert_eq!(catalog.avail("carga"), Ok(()));
+}
+
+#[test]
+fn pawn_class_missing_only_affects_pawn_root() {
+    let w = world(&[]);
+    let mut bad = cfg_gs();
+    bad.pawn_class = format!("{MAINE}.NaoExiste");
+    let catalog = full_catalog(&w, &bad);
+    let reason = Err("classe NaoExiste não encontrada".to_string());
+    for id in ["vida-infinita", "carga", "dano", "velocidade"] {
+        assert_eq!(catalog.avail(id), reason, "{id}");
+    }
+    assert_eq!(catalog.avail("somar-ciencia"), Ok(()));
+    // A ação segue funcionando sem o pawn.
+    assert!(read_gs(&w, &catalog).is_ok());
+}
+
+impl World {
+    fn read_with_catalog(&self, catalog: &FieldCatalog) -> Result<PlayerSnapshot, Absent> {
+        read_with(self, catalog)
+    }
+}
+
+#[test]
+fn hauling_null_only_waits_carga() {
+    let w = world(&[]);
+    let catalog = full_catalog(&w, &cfg_gs());
+    let snap = w.read_with_catalog(&catalog).unwrap();
+    // O `game_state` não é lido pelo snapshot do pawn.
+    assert!(!snap.values.contains_key("somar-ciencia"));
+    assert!(!snap.missing.contains_key("somar-ciencia"));
+    match &snap.values["carga"] {
+        FieldValues::Set { obj, fields } => {
+            assert_eq!(*obj, w.hauling);
+            assert_eq!(
+                fields,
+                &[(w.hauling + u64::from(CAPACITY_OFF), 20i32.to_le_bytes())]
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+
+    w.write_u64(w.pawn + u64::from(HAULING_OFF), 0);
+    let snap = w.read_with_catalog(&catalog).unwrap();
+    assert!(snap.values.contains_key("vida-infinita"));
+    assert!(snap.values.contains_key("dano"));
+    assert!(!snap.values.contains_key("carga"));
+    assert_eq!(
+        snap.missing.get("carga"),
+        Some(&Absent::ComponentWrongClass("HaulingComponent".into()))
+    );
+    let Some(Ok(carga)) = catalog.get("carga") else {
+        panic!("carga não resolvida");
+    };
+    assert_eq!(missing_kind(carga), MissingKind::Component);
+}
+
+#[test]
+fn pet_missing_keeps_waiting_pet() {
+    let w = world(&[]);
+    let mut all = defs();
+    all.extend(new_defs());
+    all.extend(pet_defs());
+    let catalog = FieldCatalog::resolve(&w.index, &w.mem, &cfg_gs(), &all);
+    w.write_u64(w.pet_master + u64::from(CURRENT_PET_OFF), 0);
+    let snap = w.read_with_catalog(&catalog).unwrap();
+    assert!(snap.missing.contains_key("pet-vida-infinita"));
+    assert!(snap.values.contains_key("carga"));
+    let Some(Ok(pet)) = catalog.get("pet-vida-infinita") else {
+        panic!("pet não resolvido");
+    };
+    assert_eq!(missing_kind(pet), MissingKind::Pet);
+}
+
+#[test]
+fn movement_null_waits_speed_and_gravity() {
+    let w = world(&[]);
+    let catalog = full_catalog(&w, &cfg_gs());
+    let snap = w.read_with_catalog(&catalog).unwrap();
+    assert!(matches!(
+        snap.values.get("gravidade"),
+        Some(FieldValues::Set { obj, .. }) if *obj == w.movement
+    ));
+    w.write_u64(w.pawn + u64::from(MOVEMENT_OFF), 0);
+    let snap = w.read_with_catalog(&catalog).unwrap();
+    for id in ["velocidade", "gravidade"] {
+        assert!(snap.missing.contains_key(id), "{id}");
+        assert!(!snap.values.contains_key(id), "{id}");
+    }
+    for id in ["vida-infinita", "carga", "dano"] {
+        assert!(snap.values.contains_key(id), "{id}");
+    }
+    // O objeto de movimento de classe errada (o de carga) também só espera.
+    w.write_u64(w.pawn + u64::from(MOVEMENT_OFF), w.hauling);
+    let snap = w.read_with_catalog(&catalog).unwrap();
+    assert!(snap.missing.contains_key("gravidade"));
+    assert!(snap.values.contains_key("carga"));
+}
+
+#[test]
+fn plan_set_nan_and_negative_zero() {
+    let zero = 0.0f32.to_le_bytes();
+    let values = FieldValues::Set {
+        obj: 0x100,
+        fields: vec![
+            (0x10, f32::NAN.to_le_bytes()),
+            (0x20, (-0.0f32).to_le_bytes()),
+            (0x30, 0.0f32.to_le_bytes()),
+            (0x40, f32::INFINITY.to_le_bytes()),
+            (0x50, 2.0e9f32.to_le_bytes()),
+        ],
+    };
+    let steps = plan_set(&values, zero, FieldKind::Float);
+    let sane: Vec<bool> = steps.iter().map(|s| s.sane).collect();
+    assert_eq!(sane, [false, true, true, false, false]);
+    // `-0.0` tem os mesmos números que `0.0`, mas bytes diferentes: conta como diferente.
+    let same: Vec<bool> = steps.iter().map(|s| s.same).collect();
+    assert_eq!(same, [false, false, true, false, false]);
+    assert_eq!(steps[1].addr, 0x20);
+
+    // `int`: fora de [-1e9, 1e9] não é são.
+    let ints = FieldValues::Set {
+        obj: 0x100,
+        fields: vec![
+            (0x10, 2_000_000_000i32.to_le_bytes()),
+            (0x20, (-5i32).to_le_bytes()),
+        ],
+    };
+    let sane: Vec<bool> = plan_set(&ints, 20i32.to_le_bytes(), FieldKind::Int)
+        .iter()
+        .map(|s| s.sane)
+        .collect();
+    assert_eq!(sane, [false, true]);
+    // Valores de outra regra não geram passos.
+    let lock = FieldValues::Bits {
+        obj: 1,
+        bytes: Vec::new(),
+    };
+    assert!(plan_set(&lock, zero, FieldKind::Float).is_empty());
+}
+
+#[test]
+fn encode_value_is_little_endian() {
+    assert_eq!(encode_value(FieldKind::Int, 1000.0), 1000i32.to_le_bytes());
+    assert_eq!(encode_value(FieldKind::Float, 0.5), 0.5f32.to_le_bytes());
+}
+
+#[test]
+fn read_game_state_checks_each_hop() {
+    let w = world(&[]);
+    let catalog = full_catalog(&w, &cfg_gs());
+    let (obj, addr, guard) = read_gs(&w, &catalog).unwrap();
+    assert_eq!(obj, w.party);
+    assert_eq!(addr, w.party + u64::from(SCIENCE_OFF));
+    assert_eq!(guard.len(), 3);
+
+    let outer = w.controller + u64::from(w.layout.uobject.outer);
+    let cases: [(u64, u64, &str); 6] = [
+        (outer, w.pawn, "Outer"),
+        (outer, 0, "Outer"),
+        (w.level + u64::from(WORLD_OFF), 0, "OwningWorld"),
+        (w.level + u64::from(WORLD_OFF), w.pawn, "OwningWorld"),
+        (w.world + u64::from(GAME_STATE_OFF), w.pawn, "GameState"),
+        (w.game_state + u64::from(PARTY_OFF), 0, "PartyComponent"),
+    ];
+    for (at, bad, hop) in cases {
+        let good = gt_ue::read::read_u64(&w.mem, at).unwrap();
+        w.write_u64(at, bad);
+        assert_eq!(
+            read_gs(&w, &catalog).map(|_| ()),
+            Err(GameStateAbsent::Missing(hop.to_string())),
+            "{hop}"
+        );
+        w.write_u64(at, good);
+        assert!(read_gs(&w, &catalog).is_ok(), "{hop} restaurado");
+    }
+    // O `GameState` de outra classe (um pawn) e a classe final errada.
+    w.write_u64(w.game_state + u64::from(PARTY_OFF), w.hauling);
+    assert_eq!(
+        read_gs(&w, &catalog).map(|_| ()),
+        Err(GameStateAbsent::Missing("PartyComponent".into()))
+    );
+    w.write_u64(w.game_state + u64::from(PARTY_OFF), w.party);
+    // `PropertiesSize` do componente menor que o campo.
+    let party_class =
+        gt_ue::read::read_u64(&w.mem, w.party + u64::from(w.layout.uobject.class)).unwrap();
+    let props = party_class + u64::from(w.layout.ustruct.properties_size);
+    w.mem.write(props, &SCIENCE_OFF.to_le_bytes());
+    assert!(matches!(
+        read_gs(&w, &catalog),
+        Err(GameStateAbsent::Missing(_))
+    ));
+}
+
+#[test]
+fn read_game_state_rejects_invalid_controller() {
+    let w = world(&[]);
+    let catalog = full_catalog(&w, &cfg_gs());
+    let got = read_game_state(
+        &w.mem,
+        &w.index,
+        &catalog,
+        &w.objects,
+        w.pawn,
+        "somar-ciencia",
+    );
+    assert_eq!(got.map(|_| ()), Err(GameStateAbsent::ControllerInvalid));
+}
+
+#[test]
+fn read_game_state_pawn_null_ok() {
+    let w = world(&[]);
+    let catalog = full_catalog(&w, &cfg_gs());
+    w.write_u64(w.controller + u64::from(PAWN_OFF), 0);
+    assert_eq!(w.read_with_catalog(&catalog), Err(Absent::PawnNull));
+    let (obj, _, _) = read_gs(&w, &catalog).unwrap();
+    assert_eq!(obj, w.party);
+}
+
+#[test]
+fn plan_add_cases() {
+    assert_eq!(plan_add(7400, 1000, 100_000), Ok(8400));
+    assert_eq!(plan_add(-1, 1000, 100_000), Err(AddRefusal::OutOfRange));
+    assert_eq!(plan_add(100_001, 1, 100_000), Err(AddRefusal::OutOfRange));
+    assert_eq!(
+        plan_add(99_500, 1000, 100_000),
+        Err(AddRefusal::WouldExceed)
+    );
+    assert_eq!(plan_add(99_000, 1000, 100_000), Ok(100_000));
+    // Perto de `i32::MAX`: a soma é em 64 bits e não estoura.
+    assert_eq!(
+        plan_add(i32::MAX, i32::MAX, i64::MAX),
+        Err(AddRefusal::WouldExceed)
+    );
+    assert_eq!(plan_add(i32::MAX - 1, 1, i64::from(i32::MAX)), Ok(i32::MAX));
+    assert_eq!(
+        plan_add(i32::MAX, 1, i64::from(i32::MAX)),
+        Err(AddRefusal::WouldExceed)
+    );
 }

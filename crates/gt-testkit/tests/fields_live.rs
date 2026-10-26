@@ -9,7 +9,7 @@ use gt_core::mem::{MemReader, MemWriter};
 use gt_core::patch::WritePolicy;
 use gt_core::suspend::PauseConfig;
 use gt_grounded2::fields::{FieldRuntime, Note, PlayerState};
-use gt_grounded2::player::{Absent, FieldCatalog, FieldValues, read_player};
+use gt_grounded2::player::{FieldCatalog, FieldValues, read_player};
 use gt_grounded2::policy::data_policy;
 use gt_testkit::ue::{DAMAGE_OFF, DIE_BYTE, HEALTH_OFF};
 use gt_testkit::{TargetOpts, TestTarget, UeAddrs, synth_signatures};
@@ -311,12 +311,11 @@ fn region_not_rw_refused() {
         &s.t.exec_page.to_le_bytes(),
     );
     let report = s.tick(&["vida-infinita", "nao-morrer"]);
-    assert!(matches!(
-        report.player,
-        PlayerState::Absent(Absent::ComponentWrongClass(_) | Absent::Unreadable)
-    ));
+    // Só os cheats do componente esperam; o personagem continua achado (spec 006, 6.3).
+    assert_eq!(report.player, PlayerState::Found);
     assert_eq!(report.notes["vida-infinita"], Note::Waiting);
-    assert_eq!(report.events, Vec::<String>::new());
+    assert_eq!(report.notes["nao-morrer"], Note::Waiting);
+    assert_eq!(report.events, vec!["personagem encontrado".to_string()]);
     assert_eq!(s.u8_at(s.t.exec_page + u64::from(DAMAGE_OFF)), exec_before);
     // E uma escrita direta fora da política é recusada pelo motor.
     let err = s.engine.write_data(s.t.exec_page, &[0], &[]).unwrap_err();
