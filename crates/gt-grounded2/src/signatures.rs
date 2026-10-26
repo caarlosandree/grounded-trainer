@@ -3,11 +3,19 @@
 //! `generic.toml` define cada patch para qualquer versão do jogo; `<chave>.toml` registra o que
 //! foi verificado numa build (o `rva`) e pode sobrescrever `pattern`, `offset`, `expected` e
 //! `replacement`. Os arquivos são embutidos na compilação.
+//!
+//! Fase 5 (spec 005): o `generic.toml` também traz o bloco `[ue]` (layout das estruturas de
+//! reflexão, padrões das globais e o caminho até o personagem) e os cheats de valor `[[field]]`.
+//! O `<chave>.toml` registra o `rva` das globais e pode substituir o `[ue.layout]` inteiro.
 
 use std::collections::{BTreeMap, HashSet};
 
+use gt_core::global::GlobalPattern;
 use gt_core::scan::Pattern;
 use gt_core::value::{ValueSpec, ValueType};
+use gt_ue::{
+    FBoolLayout, FFieldLayout, FPropLayout, ObjectsLayout, UObjectLayout, UStructLayout, UeLayout,
+};
 use serde::Deserialize;
 
 use crate::GAME_EXE;
@@ -91,17 +99,118 @@ pub struct PatchDef {
     pub value: Option<ValueSpec>,
 }
 
+/// Global do motor achada por padrão (spec 005, 6.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalDef {
+    pub pattern: GlobalPattern,
+    /// `rva` da global **resolvida** (depois do `adjust`), se a versão tem arquivo com ele.
+    pub rva: Option<u64>,
+}
+
+/// Caminho até o personagem (spec 005, 6.3), por nomes da reflexão.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerCfg {
+    /// Classe do controller, como `Pacote.Nome`.
+    pub controller_class: String,
+    /// Campo do controller que aponta para o pawn.
+    pub pawn_field: String,
+    /// Classe esperada do pawn, como `Pacote.Nome`.
+    pub pawn_class: String,
+    /// Campos alternativos tentados quando `pawn_field` falha.
+    pub alt_pawn_fields: Vec<String>,
+}
+
+/// Bloco `[ue]` já resolvido para uma versão do jogo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UeSigs {
+    pub layout: UeLayout,
+    pub gobjects: GlobalDef,
+    pub names: GlobalDef,
+    pub player: PlayerCfg,
+}
+
+/// Modo de uma trava: quando ela escreve (spec 005, 6.5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockMode {
+    /// Só sobe o valor até o alvo (barras).
+    Raise,
+    /// Só desce o valor até o alvo (dano acumulado).
+    Lower,
+    /// Leva o valor ao alvo sempre que for diferente (temperatura).
+    Exact,
+}
+
+/// De onde vem o alvo de uma trava. Outro nome para não colidir com o `Target` do processo.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LockTarget {
+    /// Outro campo do mesmo objeto, relido a cada ciclo.
+    Field(String),
+    /// Constante do `generic.toml`.
+    Const(f32),
+}
+
+/// Regra de um cheat de valor.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldRule {
+    /// Reescreve um campo `float` com o alvo, dentro da faixa sã `[min, max]`.
+    Lock {
+        field: String,
+        mode: LockMode,
+        target: LockTarget,
+        min: f32,
+        max: f32,
+    },
+    /// Limpa os bits dos campos `bool`, restaurando o original ao desligar.
+    ClearBits { fields: Vec<String> },
+}
+
+/// Cheat de valor (`[[field]]`), já validado pela regra de carga.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldDef {
+    pub id: String,
+    /// Nome curto, mostrado na lista.
+    pub name: String,
+    pub category: Category,
+    pub description: String,
+    /// Campo de componente no pawn, ou `"pawn"` para o próprio pawn.
+    pub object: String,
+    /// Classe esperada do objeto (`Pacote.Nome`), conferida com `is_a`.
+    pub object_class: String,
+    pub rule: FieldRule,
+}
+
 /// Conjunto das assinaturas carregadas: o genérico e uma lista de definições por versão.
 #[derive(Debug, Clone)]
 pub struct Signatures {
     generic: Vec<PatchDef>,
     versions: BTreeMap<String, VersionSigs>,
+    ue: Option<GenericUe>,
+    fields: Vec<FieldDef>,
 }
 
 #[derive(Debug, Clone)]
 struct VersionSigs {
     product_version: Option<String>,
     defs: Vec<PatchDef>,
+    ue: Option<VersionUe>,
+}
+
+/// `[ue]` do genérico, já validado.
+#[derive(Debug, Clone)]
+struct GenericUe {
+    layout: UeLayout,
+    gobjects: GlobalPattern,
+    names: GlobalPattern,
+    player: PlayerCfg,
+}
+
+/// `[ue]` de um `<chave>.toml`, já validado.
+#[derive(Debug, Clone)]
+struct VersionUe {
+    gobjects_rva: Option<u64>,
+    names_rva: Option<u64>,
+    /// Substitui o layout genérico inteiro.
+    layout: Option<UeLayout>,
 }
 
 #[derive(Deserialize)]
@@ -109,6 +218,134 @@ struct VersionSigs {
 struct GenericFile {
     #[serde(default)]
     patch: Vec<GenericPatch>,
+    ue: Option<GenericUeBlock>,
+    #[serde(default)]
+    field: Vec<GenericField>,
+}
+
+/// Bloco `[ue]` do `generic.toml`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GenericUeBlock {
+    gobjects: GlobalBlock,
+    names: GlobalBlock,
+    layout: LayoutBlock,
+    player: PlayerBlock,
+}
+
+/// `gobjects = { pattern, disp_offset, insn_end, adjust }`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GlobalBlock {
+    pattern: String,
+    disp_offset: usize,
+    insn_end: usize,
+    #[serde(default)]
+    adjust: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlayerBlock {
+    controller_class: String,
+    pawn_field: String,
+    pawn_class: String,
+    #[serde(default)]
+    alt_pawn_fields: Vec<String>,
+}
+
+// Espelhos de `UeLayout` para o serde (o `gt-ue` não depende dele). Sem `Default`: todo campo é
+// obrigatório, porque o código nunca assume os valores de um build.
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LayoutBlock {
+    objects: ObjectsBlock,
+    uobject: UObjectBlock,
+    ustruct: UStructBlock,
+    ffield: FFieldBlock,
+    fprop: FPropBlock,
+    fbool: FBoolBlock,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObjectsBlock {
+    chunks: u32,
+    max_elements: u32,
+    num_elements: u32,
+    max_chunks: u32,
+    num_chunks: u32,
+    items_per_chunk: u32,
+    item_size: u32,
+    item_object: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UObjectBlock {
+    flags: u32,
+    index: u32,
+    class: u32,
+    name: u32,
+    outer: u32,
+    cdo_flag: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UStructBlock {
+    super_struct: u32,
+    child_properties: u32,
+    properties_size: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FFieldBlock {
+    class_private: u32,
+    class_name: u32,
+    next: u32,
+    name: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FPropBlock {
+    element_size: u32,
+    offset: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FBoolBlock {
+    field_size: u32,
+    byte_offset: u32,
+    byte_mask: u32,
+    field_mask: u32,
+}
+
+/// Bloco `[[field]]`. Os números ficam como `toml::Value` porque `f32` direto recusa inteiro TOML.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GenericField {
+    id: String,
+    // `name`, `category` e `rule` são obrigatórios, mas a falta é reportada pela regra de carga
+    // (com o campo certo), não pelo serde.
+    name: Option<String>,
+    category: Option<String>,
+    description: String,
+    object: String,
+    object_class: String,
+    rule: Option<String>,
+    field: Option<String>,
+    fields: Option<Vec<String>>,
+    kind: Option<String>,
+    mode: Option<String>,
+    target_field: Option<String>,
+    target: Option<toml::Value>,
+    min: Option<toml::Value>,
+    max: Option<toml::Value>,
 }
 
 #[derive(Deserialize)]
@@ -151,6 +388,16 @@ struct VersionFile {
     product_version: Option<String>,
     #[serde(default)]
     patch: Vec<VersionPatch>,
+    ue: Option<VersionUeBlock>,
+}
+
+/// Bloco `[ue]` do `<chave>.toml`: `rva` das globais resolvidas e, se preciso, o layout inteiro.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionUeBlock {
+    gobjects_rva: Option<u64>,
+    names_rva: Option<u64>,
+    layout: Option<LayoutBlock>,
 }
 
 #[derive(Deserialize)]
@@ -351,15 +598,19 @@ fn build_value(file: &str, block: &ValueBlock, replacement: &[u8]) -> Result<Val
     Ok(spec)
 }
 
-/// Aplica a regra de carga (6.3) a uma definição em texto.
-fn build(file: &str, raw: RawDef) -> Result<PatchDef> {
-    let name = match raw.name {
-        None => return Err(sig_err(file, "name", "campo obrigatório ausente")),
-        Some(n) if n.trim().is_empty() => return Err(sig_err(file, "name", "vazio")),
-        Some(n) => n,
-    };
-    let category = match raw.category.as_deref() {
-        None => return Err(sig_err(file, "category", "campo obrigatório ausente")),
+/// `name` obrigatório e não vazio.
+fn check_name(file: &str, name: Option<String>) -> Result<String> {
+    match name {
+        None => Err(sig_err(file, "name", "campo obrigatório ausente")),
+        Some(n) if n.trim().is_empty() => Err(sig_err(file, "name", "vazio")),
+        Some(n) => Ok(n),
+    }
+}
+
+/// `category` obrigatória e conhecida.
+fn check_category(file: &str, category: Option<&str>) -> Result<Category> {
+    match category {
+        None => Err(sig_err(file, "category", "campo obrigatório ausente")),
         Some(text) => Category::parse(text).ok_or_else(|| {
             sig_err(
                 file,
@@ -368,8 +619,14 @@ fn build(file: &str, raw: RawDef) -> Result<PatchDef> {
                     "`{text}` não é sobrevivencia, itens, progressao, movimento nem diagnostico"
                 ),
             )
-        })?,
-    };
+        }),
+    }
+}
+
+/// Aplica a regra de carga (6.3) a uma definição em texto.
+fn build(file: &str, raw: RawDef) -> Result<PatchDef> {
+    let name = check_name(file, raw.name)?;
+    let category = check_category(file, raw.category.as_deref())?;
     let module = raw.module.unwrap_or_else(|| GAME_EXE.to_string());
     if module != GAME_EXE {
         return Err(sig_err(
@@ -442,6 +699,310 @@ fn build(file: &str, raw: RawDef) -> Result<PatchDef> {
     })
 }
 
+/// Padrão de global: o `disp32` e o fim da instrução têm de caber no padrão.
+fn build_global(file: &str, name: &str, block: &GlobalBlock) -> Result<GlobalPattern> {
+    let field = |what: &str| format!("ue.{name}.{what}");
+    let pattern = Pattern::parse(&block.pattern)
+        .map_err(|e| sig_err(file, &field("pattern"), e.to_string()))?;
+    let disp_end = block
+        .disp_offset
+        .checked_add(4)
+        .filter(|&end| end <= pattern.len())
+        .ok_or_else(|| {
+            sig_err(
+                file,
+                &field("disp_offset"),
+                format!(
+                    "o disp32 em [{}, +4) não cabe no pattern de {} posições",
+                    block.disp_offset,
+                    pattern.len()
+                ),
+            )
+        })?;
+    if block.insn_end < disp_end || block.insn_end > pattern.len() {
+        return Err(sig_err(
+            file,
+            &field("insn_end"),
+            format!(
+                "{} precisa estar entre o fim do disp32 ({disp_end}) e o fim do pattern ({})",
+                block.insn_end,
+                pattern.len()
+            ),
+        ));
+    }
+    Ok(GlobalPattern {
+        pattern,
+        disp_offset: block.disp_offset,
+        insn_end: block.insn_end,
+        adjust: block.adjust,
+    })
+}
+
+/// Nome de classe como `Pacote.Nome`.
+fn check_class_path(file: &str, field: &str, text: &str) -> Result<()> {
+    match text.rsplit_once('.') {
+        Some((pkg, name))
+            if !pkg.is_empty() && !name.is_empty() && !text.chars().any(char::is_whitespace) =>
+        {
+            Ok(())
+        }
+        _ => Err(sig_err(
+            file,
+            field,
+            format!("`{text}` não está no formato Pacote.Nome"),
+        )),
+    }
+}
+
+fn check_not_blank(file: &str, field: &str, text: &str) -> Result<()> {
+    if text.trim().is_empty() {
+        return Err(sig_err(file, field, "vazio"));
+    }
+    Ok(())
+}
+
+fn build_player(file: &str, block: PlayerBlock) -> Result<PlayerCfg> {
+    check_class_path(file, "ue.player.controller_class", &block.controller_class)?;
+    check_not_blank(file, "ue.player.pawn_field", &block.pawn_field)?;
+    check_class_path(file, "ue.player.pawn_class", &block.pawn_class)?;
+    for alt in &block.alt_pawn_fields {
+        check_not_blank(file, "ue.player.alt_pawn_fields", alt)?;
+    }
+    Ok(PlayerCfg {
+        controller_class: block.controller_class,
+        pawn_field: block.pawn_field,
+        pawn_class: block.pawn_class,
+        alt_pawn_fields: block.alt_pawn_fields,
+    })
+}
+
+fn build_layout(file: &str, block: LayoutBlock) -> Result<UeLayout> {
+    let o = block.objects;
+    if o.items_per_chunk == 0 {
+        return Err(sig_err(
+            file,
+            "ue.layout.objects.items_per_chunk",
+            "precisa ser maior que 0",
+        ));
+    }
+    if o.item_size == 0 {
+        return Err(sig_err(
+            file,
+            "ue.layout.objects.item_size",
+            "precisa ser maior que 0",
+        ));
+    }
+    let (u, s, f, p, b) = (
+        block.uobject,
+        block.ustruct,
+        block.ffield,
+        block.fprop,
+        block.fbool,
+    );
+    Ok(UeLayout {
+        objects: ObjectsLayout {
+            chunks: o.chunks,
+            max_elements: o.max_elements,
+            num_elements: o.num_elements,
+            max_chunks: o.max_chunks,
+            num_chunks: o.num_chunks,
+            items_per_chunk: o.items_per_chunk,
+            item_size: o.item_size,
+            item_object: o.item_object,
+        },
+        uobject: UObjectLayout {
+            flags: u.flags,
+            index: u.index,
+            class: u.class,
+            name: u.name,
+            outer: u.outer,
+            cdo_flag: u.cdo_flag,
+        },
+        ustruct: UStructLayout {
+            super_struct: s.super_struct,
+            child_properties: s.child_properties,
+            properties_size: s.properties_size,
+        },
+        ffield: FFieldLayout {
+            class_private: f.class_private,
+            class_name: f.class_name,
+            next: f.next,
+            name: f.name,
+        },
+        fprop: FPropLayout {
+            element_size: p.element_size,
+            offset: p.offset,
+        },
+        fbool: FBoolLayout {
+            field_size: b.field_size,
+            byte_offset: b.byte_offset,
+            byte_mask: b.byte_mask,
+            field_mask: b.field_mask,
+        },
+    })
+}
+
+fn build_generic_ue(file: &str, block: GenericUeBlock) -> Result<GenericUe> {
+    Ok(GenericUe {
+        gobjects: build_global(file, "gobjects", &block.gobjects)?,
+        names: build_global(file, "names", &block.names)?,
+        layout: build_layout(file, block.layout)?,
+        player: build_player(file, block.player)?,
+    })
+}
+
+/// Número finito (`f32`) de um campo do `[[field]]`: inteiro ou decimal do TOML.
+fn field_number(file: &str, field: &str, id: &str, v: &toml::Value) -> Result<f32> {
+    let n = match v {
+        toml::Value::Integer(i) => *i as f64,
+        toml::Value::Float(f) => *f,
+        other => {
+            return Err(sig_err(
+                file,
+                field,
+                format!("`{id}`: esperava um número, veio {}", other.type_str()),
+            ));
+        }
+    };
+    let n = n as f32;
+    if !n.is_finite() {
+        return Err(sig_err(
+            file,
+            field,
+            format!("`{id}`: precisa ser um número finito"),
+        ));
+    }
+    Ok(n)
+}
+
+/// Aplica a regra de carga (6.5) a um `[[field]]`.
+fn build_field(file: &str, raw: GenericField) -> Result<FieldDef> {
+    let id = raw.id.as_str();
+    check_not_blank(file, "id", id)?;
+    let err = |field: &str, reason: &str| sig_err(file, field, format!("`{id}`: {reason}"));
+    let name = check_name(file, raw.name.clone())?;
+    let category = check_category(file, raw.category.as_deref())?;
+    check_not_blank(file, "object", &raw.object)?;
+    check_class_path(file, "object_class", &raw.object_class)?;
+
+    let rule = match raw.rule.as_deref() {
+        None => return Err(err("rule", "campo obrigatório ausente")),
+        Some("lock") => {
+            if raw.fields.is_some() {
+                return Err(err("fields", "só vale com rule = \"clear_bits\""));
+            }
+            let field = match raw.field.as_deref() {
+                None => return Err(err("field", "campo obrigatório ausente")),
+                Some(f) if f.trim().is_empty() => return Err(err("field", "vazio")),
+                Some(f) => f.to_string(),
+            };
+            match raw.kind.as_deref() {
+                None => return Err(err("kind", "campo obrigatório ausente")),
+                Some("float") => {}
+                Some(other) => {
+                    return Err(err(
+                        "kind",
+                        &format!("`{other}` não é float (trava de valor)"),
+                    ));
+                }
+            }
+            let mode = match raw.mode.as_deref() {
+                None => return Err(err("mode", "campo obrigatório ausente")),
+                Some("raise") => LockMode::Raise,
+                Some("lower") => LockMode::Lower,
+                Some("exact") => LockMode::Exact,
+                Some(other) => {
+                    return Err(err(
+                        "mode",
+                        &format!("`{other}` não é raise, lower nem exact"),
+                    ));
+                }
+            };
+            let min = match raw.min.as_ref() {
+                None => return Err(err("min", "campo obrigatório ausente")),
+                Some(v) => field_number(file, "min", id, v)?,
+            };
+            let max = match raw.max.as_ref() {
+                None => return Err(err("max", "campo obrigatório ausente")),
+                Some(v) => field_number(file, "max", id, v)?,
+            };
+            if min > max {
+                return Err(err("max", &format!("min {min} maior que max {max}")));
+            }
+            let target = match (raw.target_field, raw.target.as_ref()) {
+                (Some(_), Some(_)) => {
+                    return Err(err("target", "target e target_field não podem vir juntos"));
+                }
+                (None, None) => return Err(err("target", "falta target ou target_field")),
+                (Some(f), None) if f.trim().is_empty() => return Err(err("target_field", "vazio")),
+                (Some(f), None) => LockTarget::Field(f),
+                (None, Some(v)) => {
+                    let t = field_number(file, "target", id, v)?;
+                    if t < min || t > max {
+                        return Err(err("target", &format!("{t} fora de [{min}, {max}]")));
+                    }
+                    LockTarget::Const(t)
+                }
+            };
+            FieldRule::Lock {
+                field,
+                mode,
+                target,
+                min,
+                max,
+            }
+        }
+        Some("clear_bits") => {
+            for (present, field) in [
+                (raw.field.is_some(), "field"),
+                (raw.mode.is_some(), "mode"),
+                (raw.target_field.is_some(), "target_field"),
+                (raw.target.is_some(), "target"),
+                (raw.min.is_some(), "min"),
+                (raw.max.is_some(), "max"),
+            ] {
+                if present {
+                    return Err(err(field, "só vale com rule = \"lock\""));
+                }
+            }
+            match raw.kind.as_deref() {
+                None => return Err(err("kind", "campo obrigatório ausente")),
+                Some("bool") => {}
+                Some(other) => {
+                    return Err(err("kind", &format!("`{other}` não é bool (bits)")));
+                }
+            }
+            let fields = match raw.fields {
+                None => return Err(err("fields", "campo obrigatório ausente")),
+                Some(f) if f.is_empty() => return Err(err("fields", "lista vazia")),
+                Some(f) => f,
+            };
+            let mut seen = HashSet::new();
+            for f in &fields {
+                if f.trim().is_empty() {
+                    return Err(err("fields", "nome vazio"));
+                }
+                if !seen.insert(f.as_str()) {
+                    return Err(err("fields", &format!("`{f}` repetido")));
+                }
+            }
+            FieldRule::ClearBits { fields }
+        }
+        Some(other) => {
+            return Err(err("rule", &format!("`{other}` não é lock nem clear_bits")));
+        }
+    };
+    Ok(FieldDef {
+        id: raw.id,
+        name,
+        category,
+        description: raw.description,
+        object: raw.object,
+        object_class: raw.object_class,
+        rule,
+    })
+}
+
 fn parse_toml<T: for<'de> Deserialize<'de>>(file: &str, text: &str) -> Result<T> {
     toml::from_str(text).map_err(|e| sig_err(file, "toml", e.to_string()))
 }
@@ -491,6 +1052,22 @@ impl Signatures {
             .iter()
             .map(|r| build(GENERIC_FILE, r.clone()))
             .collect::<Result<Vec<_>>>()?;
+        let ue = parsed
+            .ue
+            .map(|block| build_generic_ue(GENERIC_FILE, block))
+            .transpose()?;
+        // O `id` é único entre `[[patch]]` e `[[field]]`: `seen` já tem os dos patches.
+        let mut fields = Vec::new();
+        for f in parsed.field {
+            if !seen.insert(f.id.clone()) {
+                return Err(sig_err(
+                    GENERIC_FILE,
+                    "id",
+                    format!("`{}` repetido entre [[patch]] e [[field]]", f.id),
+                ));
+            }
+            fields.push(build_field(GENERIC_FILE, f)?);
+        }
 
         let mut versions = BTreeMap::new();
         for (name, text) in version_files {
@@ -546,12 +1123,31 @@ impl Signatures {
                 .into_iter()
                 .map(|r| build(name, r))
                 .collect::<Result<Vec<_>>>()?;
+            let version_ue = match file.ue {
+                None => None,
+                Some(_) if ue.is_none() => {
+                    return Err(sig_err(
+                        name,
+                        "ue",
+                        format!("sem bloco [ue] em {GENERIC_FILE}"),
+                    ));
+                }
+                Some(block) => Some(VersionUe {
+                    gobjects_rva: block.gobjects_rva,
+                    names_rva: block.names_rva,
+                    layout: block
+                        .layout
+                        .map(|layout| build_layout(name, layout))
+                        .transpose()?,
+                }),
+            };
             if versions
                 .insert(
                     key.to_string(),
                     VersionSigs {
                         product_version: file.product_version,
                         defs,
+                        ue: version_ue,
                     },
                 )
                 .is_some()
@@ -559,7 +1155,12 @@ impl Signatures {
                 return Err(sig_err(name, "arquivo", "repetido"));
             }
         }
-        Ok(Signatures { generic, versions })
+        Ok(Signatures {
+            generic,
+            versions,
+            ue,
+            fields,
+        })
     }
 
     /// Carrega os arquivos de `signatures/` embutidos no binário.
@@ -589,6 +1190,30 @@ impl Signatures {
     /// Os `id` do genérico, na ordem do arquivo.
     pub fn ids(&self) -> Vec<&str> {
         self.generic.iter().map(|d| d.id.as_str()).collect()
+    }
+
+    /// Bloco `[ue]` para a versão: o genérico com o `rva` e o layout do arquivo dela, se houver.
+    /// `None` quando o `generic.toml` não tem `[ue]`.
+    pub fn ue_for_version(&self, key: &str) -> Option<UeSigs> {
+        let generic = self.ue.as_ref()?;
+        let version = self.versions.get(key).and_then(|v| v.ue.as_ref());
+        Some(UeSigs {
+            layout: version.and_then(|v| v.layout).unwrap_or(generic.layout),
+            gobjects: GlobalDef {
+                pattern: generic.gobjects.clone(),
+                rva: version.and_then(|v| v.gobjects_rva),
+            },
+            names: GlobalDef {
+                pattern: generic.names.clone(),
+                rva: version.and_then(|v| v.names_rva),
+            },
+            player: generic.player.clone(),
+        })
+    }
+
+    /// Os cheats de valor (`[[field]]`), na ordem do arquivo. Valem para qualquer versão.
+    pub fn fields(&self) -> &[FieldDef] {
+        &self.fields
     }
 }
 
@@ -849,6 +1474,9 @@ offset = 3
         assert_eq!(test_patch.name, "Patch de teste");
         assert_eq!(test_patch.category, Category::Diagnostico);
         assert_eq!(test_patch.value, None);
+        // Fase 5: o `[ue]` carrega nas duas formas (genérico e versão verificada).
+        assert!(sigs.ue_for_version("c935e799-0b27c000").is_some());
+        assert!(sigs.ue_for_version("cccc-dddd").is_some());
         // O genérico (versão sem arquivo) também carrega nome e categoria.
         assert!(
             sigs.for_version("cccc-dddd")
@@ -1325,5 +1953,594 @@ offset = 3
                 assert!(!overlaps(a, b), "{a:x?} e {b:x?} se sobrepõem");
             }
         }
+    }
+
+    // ---- Fase 5: `[ue]` e `[[field]]` ----
+
+    const UE_PATTERNS: &str = r#"
+[ue]
+gobjects = { pattern = "48 8b 05 ?? ?? ?? ?? 48 8b 0c c8 48 8d 04 d1", disp_offset = 3, insn_end = 7, adjust = 0 }
+names = { pattern = "74 09 ?? 8d ?? ?? ?? ?? ?? eb ?? 48 8d 0d ?? ?? ?? ?? e8", disp_offset = 14, insn_end = 18, adjust = 0x10 }
+"#;
+
+    const UE_LAYOUT: &str = r#"
+[ue.layout.objects]
+chunks = 0x0
+max_elements = 0x10
+num_elements = 0x14
+max_chunks = 0x18
+num_chunks = 0x1c
+items_per_chunk = 65536
+item_size = 24
+item_object = 0x8
+
+[ue.layout.uobject]
+flags = 0x8
+index = 0xc
+class = 0x10
+name = 0x18
+outer = 0x20
+cdo_flag = 0x10
+
+[ue.layout.ustruct]
+super_struct = 0x40
+child_properties = 0x50
+properties_size = 0x58
+
+[ue.layout.ffield]
+class_private = 0x8
+class_name = 0x0
+next = 0x18
+name = 0x20
+
+[ue.layout.fprop]
+element_size = 0x34
+offset = 0x44
+
+[ue.layout.fbool]
+field_size = 0x70
+byte_offset = 0x71
+byte_mask = 0x72
+field_mask = 0x73
+"#;
+
+    const UE_PLAYER: &str = r#"
+[ue.player]
+controller_class = "/Script/Maine.SurvivalPlayerController"
+pawn_field = "Pawn"
+pawn_class = "/Script/Maine.SurvivalPlayerCharacter"
+alt_pawn_fields = []
+"#;
+
+    fn ue_generic() -> String {
+        format!("{GENERIC}{UE_PATTERNS}{UE_LAYOUT}{UE_PLAYER}")
+    }
+
+    /// Erro de carga: (arquivo, campo).
+    fn load_err(files: &[(&str, &str)]) -> (String, String) {
+        match parse(files) {
+            Err(Error::Signature {
+                file,
+                field,
+                reason,
+            }) => {
+                assert!(!reason.is_empty());
+                (file, field)
+            }
+            other => panic!("esperava Error::Signature, veio {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ue_block_loads_and_version_rva() {
+        let version =
+            "version = \"aaaa-bbbb\"\n[ue]\ngobjects_rva = 0xa53bc30\nnames_rva = 0xa499e50\n";
+        let generic = ue_generic();
+        let sigs = parse(&[("generic.toml", &generic), ("aaaa-bbbb.toml", version)]).unwrap();
+
+        let ue = sigs.ue_for_version("cccc-dddd").unwrap();
+        assert_eq!(ue.layout, gt_ue::UeLayout::observed());
+        assert_eq!(ue.gobjects.rva, None);
+        assert_eq!(ue.names.rva, None);
+        assert_eq!(ue.gobjects.pattern.disp_offset, 3);
+        assert_eq!(ue.gobjects.pattern.insn_end, 7);
+        assert_eq!(ue.gobjects.pattern.adjust, 0);
+        assert_eq!(ue.gobjects.pattern.pattern.len(), 15);
+        assert_eq!(ue.names.pattern.disp_offset, 14);
+        assert_eq!(ue.names.pattern.insn_end, 18);
+        assert_eq!(ue.names.pattern.adjust, 0x10);
+        assert_eq!(ue.names.pattern.pattern.len(), 19);
+        assert_eq!(
+            ue.player,
+            PlayerCfg {
+                controller_class: "/Script/Maine.SurvivalPlayerController".into(),
+                pawn_field: "Pawn".into(),
+                pawn_class: "/Script/Maine.SurvivalPlayerCharacter".into(),
+                alt_pawn_fields: vec![],
+            }
+        );
+
+        let versioned = sigs.ue_for_version("aaaa-bbbb").unwrap();
+        assert_eq!(versioned.gobjects.rva, Some(0xa53bc30));
+        assert_eq!(versioned.names.rva, Some(0xa499e50));
+        assert_eq!(versioned.gobjects.pattern, ue.gobjects.pattern);
+        assert_eq!(versioned.layout, ue.layout);
+
+        // `[ue]` da versão com só uma global: a outra fica sem `rva`.
+        let partial = "version = \"eeee-ffff\"\n[ue]\nnames_rva = 0x10\n";
+        let sigs = parse(&[("generic.toml", &generic), ("eeee-ffff.toml", partial)]).unwrap();
+        let ue = sigs.ue_for_version("eeee-ffff").unwrap();
+        assert_eq!((ue.gobjects.rva, ue.names.rva), (None, Some(0x10)));
+
+        // Sem `[ue]` no genérico não há reflexão.
+        let sigs = parse(&[("generic.toml", GENERIC)]).unwrap();
+        assert!(sigs.ue_for_version("aaaa-bbbb").is_none());
+        // Versão sem bloco `[ue]` usa o genérico.
+        let plain = "version = \"gggg-hhhh\"\n";
+        let sigs = parse(&[("generic.toml", &generic), ("gggg-hhhh.toml", plain)]).unwrap();
+        assert_eq!(sigs.ue_for_version("gggg-hhhh").unwrap().gobjects.rva, None);
+    }
+
+    #[test]
+    fn ue_layout_override_replaces_block() {
+        let generic = ue_generic();
+        let layout = UE_LAYOUT
+            .replace(
+                "[ue.layout.uobject]\nflags = 0x8",
+                "[ue.layout.uobject]\nflags = 0x9",
+            )
+            .replace("item_size = 24", "item_size = 32");
+        let version = format!("version = \"aaaa-bbbb\"\n[ue]\ngobjects_rva = 1\n{layout}");
+        let sigs = parse(&[("generic.toml", &generic), ("aaaa-bbbb.toml", &version)]).unwrap();
+        let ue = sigs.ue_for_version("aaaa-bbbb").unwrap();
+        assert_eq!(ue.layout.uobject.flags, 0x9);
+        assert_eq!(ue.layout.objects.item_size, 32);
+        assert_eq!(ue.gobjects.rva, Some(1));
+        // Outras versões continuam com o genérico.
+        let other = sigs.ue_for_version("outra").unwrap();
+        assert_eq!(other.layout, gt_ue::UeLayout::observed());
+
+        // O bloco substitui inteiro: tabela faltando na versão é erro, não herança.
+        let partial = "version = \"aaaa-bbbb\"\n[ue.layout.objects]\nchunks = 0\nmax_elements = 0x10\n\
+                       num_elements = 0x14\nmax_chunks = 0x18\nnum_chunks = 0x1c\n\
+                       items_per_chunk = 65536\nitem_size = 24\nitem_object = 8\n";
+        let (file, _) = load_err(&[("generic.toml", &generic), ("aaaa-bbbb.toml", partial)]);
+        assert_eq!(file, "aaaa-bbbb.toml");
+    }
+
+    #[test]
+    fn ue_load_errors() {
+        let generic_ok = ue_generic();
+        let gen_with = |ue: String| format!("{GENERIC}{ue}{UE_LAYOUT}{UE_PLAYER}");
+        let bad_patterns = |from: &str, to: &str| gen_with(UE_PATTERNS.replace(from, to));
+        type Case<'a> = (&'a str, Vec<(&'a str, String)>, &'a str, &'a str);
+        let cases: Vec<Case> = vec![
+            (
+                "padrão inválido",
+                vec![("generic.toml", bad_patterns("48 8b 05 ??", "48 8b 0g ??"))],
+                "generic.toml",
+                "ue.gobjects.pattern",
+            ),
+            (
+                "disp fora do padrão",
+                vec![(
+                    "generic.toml",
+                    bad_patterns("disp_offset = 14", "disp_offset = 17"),
+                )],
+                "generic.toml",
+                "ue.names.disp_offset",
+            ),
+            (
+                "fim da instrução depois do padrão",
+                vec![(
+                    "generic.toml",
+                    bad_patterns("insn_end = 18", "insn_end = 20"),
+                )],
+                "generic.toml",
+                "ue.names.insn_end",
+            ),
+            (
+                "fim da instrução antes do disp",
+                vec![("generic.toml", bad_patterns("insn_end = 7", "insn_end = 6"))],
+                "generic.toml",
+                "ue.gobjects.insn_end",
+            ),
+            (
+                "chave desconhecida",
+                vec![(
+                    "generic.toml",
+                    bad_patterns("adjust = 0 }", "adjust = 0, x = 1 }"),
+                )],
+                "generic.toml",
+                "toml",
+            ),
+            (
+                "layout sem tabela",
+                vec![("generic.toml", format!("{GENERIC}{UE_PATTERNS}{UE_PLAYER}"))],
+                "generic.toml",
+                "toml",
+            ),
+            (
+                "classe sem pacote",
+                vec![(
+                    "generic.toml",
+                    generic_ok.replace(
+                        "/Script/Maine.SurvivalPlayerController",
+                        "SurvivalPlayerController",
+                    ),
+                )],
+                "generic.toml",
+                "ue.player.controller_class",
+            ),
+            (
+                "campo do pawn vazio",
+                vec![(
+                    "generic.toml",
+                    generic_ok.replace("pawn_field = \"Pawn\"", "pawn_field = \" \""),
+                )],
+                "generic.toml",
+                "ue.player.pawn_field",
+            ),
+            (
+                "tamanho de item zero",
+                vec![(
+                    "generic.toml",
+                    generic_ok.replace("item_size = 24", "item_size = 0"),
+                )],
+                "generic.toml",
+                "ue.layout.objects.item_size",
+            ),
+            (
+                "[ue] da versão sem [ue] no genérico",
+                vec![
+                    ("generic.toml", GENERIC.to_string()),
+                    (
+                        "aaaa-bbbb.toml",
+                        "version = \"aaaa-bbbb\"\n[ue]\nnames_rva = 1\n".to_string(),
+                    ),
+                ],
+                "aaaa-bbbb.toml",
+                "ue",
+            ),
+        ];
+        for (what, files, file, field) in cases {
+            let borrowed: Vec<(&str, &str)> = files.iter().map(|(n, c)| (*n, c.as_str())).collect();
+            let (f, fl) = load_err(&borrowed);
+            assert_eq!((f.as_str(), fl.as_str()), (file, field), "caso: {what}");
+        }
+    }
+
+    const LOCK_FIELD: &str = r#"
+[[field]]
+id = "stamina-infinita"
+name = "Stamina infinita"
+category = "sobrevivencia"
+description = "A stamina não acaba"
+object = "StaminaComponent"
+object_class = "/Script/Maine.StaminaComponent"
+rule = "lock"
+field = "CurrentStamina"
+kind = "float"
+mode = "raise"
+target_field = "MaxStamina"
+min = 0
+max = 10000.0
+"#;
+
+    const BITS_FIELD: &str = r#"
+[[field]]
+id = "nao-morrer"
+name = "Não morrer"
+category = "sobrevivencia"
+description = "Não morre"
+object = "HealthComponent"
+object_class = "/Script/Maine.HealthComponent"
+rule = "clear_bits"
+fields = ["bCanDieFromDamage", "bCanDieEver"]
+kind = "bool"
+"#;
+
+    #[test]
+    fn field_block_lock_and_bits() {
+        let const_lock = LOCK_FIELD
+            .replace("stamina-infinita", "vida-infinita")
+            .replace("target_field = \"MaxStamina\"", "target = 0")
+            .replace("mode = \"raise\"", "mode = \"exact\"")
+            .replace("object = \"StaminaComponent\"", "object = \"pawn\"");
+        let generic = format!("{GENERIC}{LOCK_FIELD}{BITS_FIELD}{const_lock}");
+        let sigs = parse(&[("generic.toml", &generic)]).unwrap();
+        let fields = sigs.fields();
+        assert_eq!(
+            fields.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+            vec!["stamina-infinita", "nao-morrer", "vida-infinita"]
+        );
+        assert_eq!(
+            fields[0],
+            FieldDef {
+                id: "stamina-infinita".into(),
+                name: "Stamina infinita".into(),
+                category: Category::Sobrevivencia,
+                description: "A stamina não acaba".into(),
+                object: "StaminaComponent".into(),
+                object_class: "/Script/Maine.StaminaComponent".into(),
+                rule: FieldRule::Lock {
+                    field: "CurrentStamina".into(),
+                    mode: LockMode::Raise,
+                    target: LockTarget::Field("MaxStamina".into()),
+                    min: 0.0,
+                    max: 10000.0,
+                },
+            }
+        );
+        assert_eq!(
+            fields[1].rule,
+            FieldRule::ClearBits {
+                fields: vec!["bCanDieFromDamage".into(), "bCanDieEver".into()]
+            }
+        );
+        assert_eq!(fields[2].object, "pawn");
+        assert!(matches!(
+            fields[2].rule,
+            FieldRule::Lock { mode: LockMode::Exact, target: LockTarget::Const(t), .. } if t == 0.0
+        ));
+        // Os `[[field]]` não entram nos patches.
+        assert_eq!(sigs.ids(), vec!["teste-codificacao", "outro"]);
+        assert_eq!(sigs.for_version("x").len(), 2);
+        // Os modos `lower` e `raise` carregam.
+        let lower = LOCK_FIELD.replace("raise", "lower");
+        let sigs = parse(&[("generic.toml", &lower)]).unwrap();
+        assert!(matches!(
+            sigs.fields()[0].rule,
+            FieldRule::Lock {
+                mode: LockMode::Lower,
+                ..
+            }
+        ));
+        // Sem nenhum `[[field]]` a lista é vazia.
+        assert!(
+            parse(&[("generic.toml", GENERIC)])
+                .unwrap()
+                .fields()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn field_id_collides_with_patch() {
+        let generic = format!(
+            "{GENERIC}{}",
+            LOCK_FIELD.replace("stamina-infinita", "outro")
+        );
+        assert_eq!(
+            load_err(&[("generic.toml", &generic)]),
+            ("generic.toml".into(), "id".into())
+        );
+        // Entre dois `[[field]]` também.
+        let generic = format!("{LOCK_FIELD}{LOCK_FIELD}");
+        assert_eq!(
+            load_err(&[("generic.toml", &generic)]),
+            ("generic.toml".into(), "id".into())
+        );
+    }
+
+    #[test]
+    fn field_target_and_target_field_both_is_error() {
+        let both = LOCK_FIELD.replace("min = 0", "target = 5\nmin = 0");
+        assert_eq!(
+            load_err(&[("generic.toml", &both)]),
+            ("generic.toml".into(), "target".into())
+        );
+        let none = LOCK_FIELD.replace("target_field = \"MaxStamina\"\n", "");
+        assert_eq!(
+            load_err(&[("generic.toml", &none)]),
+            ("generic.toml".into(), "target".into())
+        );
+    }
+
+    #[test]
+    fn field_min_gt_max_is_error() {
+        let bad = LOCK_FIELD.replace("min = 0", "min = 20000");
+        assert_eq!(
+            load_err(&[("generic.toml", &bad)]),
+            ("generic.toml".into(), "max".into())
+        );
+    }
+
+    #[test]
+    fn unknown_field_key_is_error() {
+        let bad = format!("{LOCK_FIELD}extra = 1\n");
+        assert_eq!(
+            load_err(&[("generic.toml", &bad)]),
+            ("generic.toml".into(), "toml".into())
+        );
+    }
+
+    #[test]
+    fn field_load_rule_errors() {
+        let cases: Vec<(&str, String, &str)> = vec![
+            (
+                "sem name",
+                LOCK_FIELD.replace("name = \"Stamina infinita\"\n", ""),
+                "name",
+            ),
+            (
+                "name vazio",
+                LOCK_FIELD.replace("\"Stamina infinita\"", "\" \""),
+                "name",
+            ),
+            (
+                "sem category",
+                LOCK_FIELD.replace("category = \"sobrevivencia\"\n", ""),
+                "category",
+            ),
+            (
+                "category inválida",
+                LOCK_FIELD.replace("\"sobrevivencia\"", "\"extras\""),
+                "category",
+            ),
+            (
+                "rule desconhecida",
+                LOCK_FIELD.replace("\"lock\"", "\"set\""),
+                "rule",
+            ),
+            (
+                "object vazio",
+                LOCK_FIELD.replace("object = \"StaminaComponent\"", "object = \"\""),
+                "object",
+            ),
+            (
+                "object_class sem pacote",
+                LOCK_FIELD.replace("/Script/Maine.StaminaComponent", "StaminaComponent"),
+                "object_class",
+            ),
+            (
+                "lock sem field",
+                LOCK_FIELD.replace("field = \"CurrentStamina\"\n", ""),
+                "field",
+            ),
+            (
+                "lock sem kind",
+                LOCK_FIELD.replace("kind = \"float\"\n", ""),
+                "kind",
+            ),
+            (
+                "lock com kind bool",
+                LOCK_FIELD.replace("\"float\"", "\"bool\""),
+                "kind",
+            ),
+            (
+                "lock sem mode",
+                LOCK_FIELD.replace("mode = \"raise\"\n", ""),
+                "mode",
+            ),
+            (
+                "mode inválido",
+                LOCK_FIELD.replace("\"raise\"", "\"set\""),
+                "mode",
+            ),
+            ("lock sem min", LOCK_FIELD.replace("min = 0\n", ""), "min"),
+            (
+                "lock sem max",
+                LOCK_FIELD.replace("max = 10000.0\n", ""),
+                "max",
+            ),
+            (
+                "min não finito",
+                LOCK_FIELD.replace("min = 0", "min = nan"),
+                "min",
+            ),
+            (
+                "max infinito",
+                LOCK_FIELD.replace("max = 10000.0", "max = inf"),
+                "max",
+            ),
+            (
+                "max texto",
+                LOCK_FIELD.replace("max = 10000.0", "max = \"x\""),
+                "max",
+            ),
+            (
+                "target não finito",
+                LOCK_FIELD.replace("target_field = \"MaxStamina\"", "target = nan"),
+                "target",
+            ),
+            (
+                "target fora da faixa",
+                LOCK_FIELD.replace("target_field = \"MaxStamina\"", "target = 20000"),
+                "target",
+            ),
+            (
+                "target_field vazio",
+                LOCK_FIELD.replace("\"MaxStamina\"", "\"\""),
+                "target_field",
+            ),
+            (
+                "lock com fields",
+                LOCK_FIELD.replace("min = 0", "fields = [\"a\"]\nmin = 0"),
+                "fields",
+            ),
+            (
+                "bits sem fields",
+                BITS_FIELD.replace("fields = [\"bCanDieFromDamage\", \"bCanDieEver\"]\n", ""),
+                "fields",
+            ),
+            (
+                "bits com fields vazio",
+                BITS_FIELD.replace("[\"bCanDieFromDamage\", \"bCanDieEver\"]", "[]"),
+                "fields",
+            ),
+            (
+                "bits com campo vazio",
+                BITS_FIELD.replace("\"bCanDieEver\"", "\"\""),
+                "fields",
+            ),
+            (
+                "bits com campo repetido",
+                BITS_FIELD.replace("\"bCanDieEver\"", "\"bCanDieFromDamage\""),
+                "fields",
+            ),
+            (
+                "bits sem kind",
+                BITS_FIELD.replace("kind = \"bool\"\n", ""),
+                "kind",
+            ),
+            (
+                "bits com kind float",
+                BITS_FIELD.replace("\"bool\"", "\"float\""),
+                "kind",
+            ),
+            (
+                "bits com mode",
+                format!("{BITS_FIELD}mode = \"raise\"\n"),
+                "mode",
+            ),
+            ("bits com min", format!("{BITS_FIELD}min = 0\n"), "min"),
+            (
+                "bits com target",
+                format!("{BITS_FIELD}target = 0\n"),
+                "target",
+            ),
+            (
+                "bits com field",
+                format!("{BITS_FIELD}field = \"x\"\n"),
+                "field",
+            ),
+        ];
+        for (what, text, field) in cases {
+            let (file, got) = load_err(&[("generic.toml", &text)]);
+            assert_eq!(
+                (file.as_str(), got.as_str()),
+                ("generic.toml", field),
+                "caso: {what}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_files_ue_block() {
+        let sigs = Signatures::embedded().unwrap();
+        // Genérico (versão sem arquivo): layout, padrões e jogador; sem `rva`.
+        let ue = sigs.ue_for_version("cccc-dddd").unwrap();
+        assert_eq!(ue.layout, gt_ue::UeLayout::observed());
+        assert_eq!((ue.gobjects.rva, ue.names.rva), (None, None));
+        assert_eq!(ue.gobjects.pattern.disp_offset, 3);
+        assert_eq!(ue.gobjects.pattern.insn_end, 7);
+        assert_eq!(ue.names.pattern.disp_offset, 14);
+        assert_eq!(ue.names.pattern.insn_end, 18);
+        assert_eq!(ue.names.pattern.adjust, 0x10);
+        assert_eq!(
+            ue.player.controller_class,
+            "/Script/Maine.SurvivalPlayerController"
+        );
+        assert_eq!(ue.player.pawn_field, "Pawn");
+        assert_eq!(
+            ue.player.pawn_class,
+            "/Script/Maine.SurvivalPlayerCharacter"
+        );
+        assert!(ue.player.alt_pawn_fields.is_empty());
+        // Build verificada: o `rva` é o da global resolvida (depois do `adjust`).
+        let ue = sigs.ue_for_version("c935e799-0b27c000").unwrap();
+        assert_eq!(ue.gobjects.rva, Some(0xa53bc30));
+        assert_eq!(ue.names.rva, Some(0xa499e50));
     }
 }

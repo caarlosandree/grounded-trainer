@@ -626,6 +626,7 @@ name = "gt-grounded2"
 version = "0.1.0"
 dependencies = [
  "gt-core",
+ "gt-ue",
  "serde",
  "tempfile",
  "thiserror 2.0.21",

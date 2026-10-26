@@ -36,6 +36,10 @@ pub enum Error {
     #[error("patch desconhecido: {id}")]
     UnknownPatch { id: String },
 
+    /// `id` de um cheat de valor (`[[field]]`) pedido onde só vale patch.
+    #[error("{id} é um cheat de valor; use o gt-tui")]
+    FieldCheat { id: String },
+
     /// `id` pedido cujo estado não permite aplicar.
     #[error("patch {id} indisponível: {state}")]
     Unavailable { id: String, state: String },

@@ -4,6 +4,8 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use gt_core::session::{ToggleReport, toggle};
+use gt_grounded2::Error;
+use gt_grounded2::signatures::Signatures;
 
 use super::{
     begin_and_show, open_catalog, open_engine, report_unrestored, select_patches, warn_unverified,
@@ -33,7 +35,17 @@ pub fn toggle_report_text(report: &ToggleReport) -> String {
     text
 }
 
+/// Recusa o `id` de um cheat de valor (`[[field]]`): ele só vale na TUI, não é um patch de bytes.
+pub fn refuse_field_cheat(sigs: &Signatures, id: &str) -> Result<(), Error> {
+    if sigs.fields().iter().any(|f| f.id == id) {
+        return Err(Error::FieldCheat { id: id.to_string() });
+    }
+    Ok(())
+}
+
 pub fn run(pid: Option<i32>, id: &str, times: u32, interval_ms: u64) -> anyhow::Result<()> {
+    // Antes de abrir o jogo ou a sessão: a recusa não depende deles.
+    refuse_field_cheat(&Signatures::embedded()?, id)?;
     let session = begin_and_show()?;
     let (target, scan) = open_catalog(pid)?;
     let mut selected = select_patches(&scan, &[id.to_string()])?;
@@ -67,5 +79,51 @@ pub fn run(pid: Option<i32>, id: &str, times: u32, interval_ms: u64) -> anyhow::
             }
             Err(err.into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GENERIC: &str = r#"
+[[patch]]
+id = "p"
+name = "Patch"
+category = "itens"
+description = "d"
+pattern = "48 8B F9"
+offset = 0
+expected = "48 8B F9"
+replacement = "48 89 CF"
+
+[[field]]
+id = "vida-infinita"
+name = "Vida infinita"
+category = "sobrevivencia"
+description = "d"
+object = "pawn"
+object_class = "/Script/Maine.SurvivalPlayerCharacter"
+rule = "lock"
+field = "CurrentDamage"
+kind = "float"
+mode = "lower"
+target = 0
+min = 0
+max = 10000
+"#;
+
+    #[test]
+    fn field_id_is_refused_and_patch_id_is_not() {
+        let sigs = Signatures::parse(&[("generic.toml", GENERIC)]).unwrap();
+        let err = refuse_field_cheat(&sigs, "vida-infinita").unwrap_err();
+        assert!(matches!(&err, Error::FieldCheat { id } if id == "vida-infinita"));
+        assert_eq!(
+            err.to_string(),
+            "vida-infinita é um cheat de valor; use o gt-tui"
+        );
+        assert!(refuse_field_cheat(&sigs, "p").is_ok());
+        // Id desconhecido segue para o erro de sempre (patch desconhecido), depois de abrir o jogo.
+        assert!(refuse_field_cheat(&sigs, "nao-existe").is_ok());
     }
 }
