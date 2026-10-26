@@ -169,6 +169,11 @@ impl ReflectionIndex {
         Ok(index)
     }
 
+    /// Layout usado na montagem do índice.
+    pub fn layout(&self) -> &UeLayout {
+        &self.layout
+    }
+
     /// Endereço da âncora (`/Script/CoreUObject.Class`).
     pub fn anchor(&self) -> u64 {
         self.anchor

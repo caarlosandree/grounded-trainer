@@ -115,6 +115,16 @@ impl JournalEntry {
     }
 }
 
+/// Trecho de um objeto do jogo conferido imediatamente antes de uma escrita em dados (vtable,
+/// `InternalIndex`, `ClassPrivate`): se os bytes mudaram, o objeto não é mais o mesmo.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct GuardBytes {
+    #[serde(with = "hex_addr")]
+    pub addr: u64,
+    #[serde(with = "hex_bytes")]
+    pub bytes: Vec<u8>,
+}
+
 /// Conteúdo do diário: identidade do processo e os patches ativos.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Journal {

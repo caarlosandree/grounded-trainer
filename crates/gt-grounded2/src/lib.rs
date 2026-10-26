@@ -5,6 +5,7 @@ pub mod error;
 pub mod fling;
 #[cfg(feature = "write")]
 pub mod patching;
+pub mod player;
 pub mod policy;
 pub mod profile;
 pub mod resolve;
