@@ -71,6 +71,7 @@ pub fn run(pid: Option<i32>, samples: u32, interval_ms: u64) -> anyhow::Result<(
         version_key: mem_headers.version_key(),
         paused_by_us: false,
         entries: Vec::new(),
+        data: Vec::new(),
     };
     let pcs = sample_pcs(
         &pidfd,

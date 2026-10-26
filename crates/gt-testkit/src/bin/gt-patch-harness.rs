@@ -6,10 +6,16 @@
 //!
 //! ```text
 //! gt-patch-harness --journal-dir D [--pid P --allow START:LEN]
-//!     [--hook panic-in-pause|kill-in-pause|sigint-in-pause|panic-after-apply]
+//!     [--hook panic-in-pause|kill-in-pause|sigint-in-pause|panic-after-apply|panic-after-bits]
 //!     [--hook-pause N] [--fault cont-always|cont-once|write]
-//!     (run --addr A --expected HEX --replacement HEX [--set-value HEX] | restore)
+//!     (run --addr A --expected HEX --replacement HEX [--set-value HEX]
+//!      | set-bits --id ID --addr A --mask M --guard A:HEX [--guard A:HEX ...]
+//!      | restore)
 //! ```
+//!
+//! `set-bits` (spec 005, 6.6) abre o motor com a política de dados "qualquer região `rw`",
+//! limpa os bits e fica no laço do `run` (imprime `ativo`); na saída por sinal, desfaz e
+//! imprime `restaurado`. `--hook panic-after-bits` entra em pânico logo depois do `set_bits`.
 //!
 //! `run` imprime `ativo` depois de aplicar, `valor trocado` depois de `--set-value` (que
 //! troca o `replacement` do patch ativo e segue no laço do `run`) e `restaurado` (ou
@@ -24,7 +30,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use gt_core::engine::{Engine, EngineOptions, PolicyFn};
-use gt_core::journal::{DiscardReason, JournalStore};
+use gt_core::journal::{DiscardReason, GuardBytes, JournalStore};
 use gt_core::patch::{PatchSpec, WritePolicy, validate};
 use gt_core::procinfo::identity;
 use gt_core::recovery::{RecoveryReport, recover};
@@ -45,6 +51,12 @@ enum Cmd {
         replacement: Vec<u8>,
         set_value: Option<Vec<u8>>,
     },
+    SetBits {
+        id: String,
+        addr: u64,
+        mask: u8,
+        guard: Vec<GuardBytes>,
+    },
     Restore,
 }
 
@@ -53,6 +65,8 @@ struct Args {
     pid: Option<i32>,
     allow: Option<Range<u64>>,
     hook: Option<fn(HookPoint)>,
+    /// `--hook panic-after-bits`: pânico do próprio harness logo depois do `set_bits`.
+    panic_after_bits: bool,
     hook_pause: Option<u32>,
     fault: Option<Fault>,
     cmd: Cmd,
@@ -117,6 +131,17 @@ fn parse_allow(s: &str) -> Result<Range<u64>> {
     Ok(start..end)
 }
 
+/// `A:HEX`: endereço e bytes esperados de uma guarda.
+fn parse_guard(s: &str) -> Result<GuardBytes> {
+    let (addr, bytes) = s
+        .split_once(':')
+        .with_context(|| format!("--guard espera A:HEX, veio {s}"))?;
+    Ok(GuardBytes {
+        addr: parse_num(addr)?,
+        bytes: parse_hex(bytes)?,
+    })
+}
+
 fn parse_hook(s: &str) -> Result<fn(HookPoint)> {
     Ok(match s {
         "panic-in-pause" => panic_in_pause,
@@ -143,6 +168,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
     };
     let (mut journal_dir, mut pid, mut allow, mut hook) = (None, None, None, None);
     let (mut hook_pause, mut fault) = (None, None);
+    let mut panic_after_bits = false;
     let cmd = loop {
         let Some(arg) = it.next() else {
             bail!("falta o subcomando (run ou restore)");
@@ -154,7 +180,14 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
                 pid = Some(v.parse().with_context(|| format!("PID inválido: {v}"))?);
             }
             "--allow" => allow = Some(parse_allow(&value(&mut it, &arg)?)?),
-            "--hook" => hook = Some(parse_hook(&value(&mut it, &arg)?)?),
+            "--hook" => {
+                let v = value(&mut it, &arg)?;
+                if v == "panic-after-bits" {
+                    panic_after_bits = true;
+                } else {
+                    hook = Some(parse_hook(&v)?);
+                }
+            }
             "--hook-pause" => {
                 let v = value(&mut it, &arg)?;
                 hook_pause = Some(
@@ -164,6 +197,31 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
             }
             "--fault" => fault = Some(parse_fault(&value(&mut it, &arg)?)?),
             "restore" => break Cmd::Restore,
+            "set-bits" => {
+                let (mut id, mut addr, mut mask) = (None, None, None);
+                let mut guard = Vec::new();
+                while let Some(flag) = it.next() {
+                    let v = value(&mut it, &flag)?;
+                    match flag.as_str() {
+                        "--id" => id = Some(v),
+                        "--addr" => addr = Some(parse_num(&v)?),
+                        "--mask" => {
+                            mask = Some(
+                                u8::try_from(parse_num(&v)?)
+                                    .with_context(|| format!("--mask passa de um byte: {v}"))?,
+                            );
+                        }
+                        "--guard" => guard.push(parse_guard(&v)?),
+                        other => bail!("opção desconhecida do set-bits: {other}"),
+                    }
+                }
+                break Cmd::SetBits {
+                    id: id.context("set-bits sem --id")?,
+                    addr: addr.context("set-bits sem --addr")?,
+                    mask: mask.context("set-bits sem --mask")?,
+                    guard,
+                };
+            }
             "run" => {
                 let (mut addr, mut expected, mut replacement) = (None, None, None);
                 let mut set_value = None;
@@ -195,6 +253,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
         pid,
         allow,
         hook,
+        panic_after_bits,
         hook_pause,
         fault,
         cmd,
@@ -259,7 +318,11 @@ fn restore(args: Args) -> Result<()> {
     if args.pid.is_some() || args.allow.is_some() {
         bail!("restore não aceita --pid nem --allow");
     }
-    if args.hook.is_some() || args.hook_pause.is_some() || args.fault.is_some() {
+    if args.hook.is_some()
+        || args.panic_after_bits
+        || args.hook_pause.is_some()
+        || args.fault.is_some()
+    {
         bail!("restore não aceita --hook, --hook-pause nem --fault");
     }
     let store = JournalStore::new(args.journal_dir);
@@ -326,6 +389,11 @@ fn run(
         out.flush()?;
     }
     let end = run_until_shutdown(&mut engine, &shutdown, TICK)?;
+    finish_run(&mut engine, end)
+}
+
+/// Fim do laço do `run`: desfaz tudo e diz como terminou.
+fn finish_run(engine: &mut Engine, end: RunEnd) -> Result<()> {
     // Daqui em diante o terminal pode ter fechado: falha de saída não interrompe nada.
     let undone = engine.undo_all();
     let mut out = std::io::stdout().lock();
@@ -342,6 +410,48 @@ fn run(
     Ok(())
 }
 
+fn set_bits(args: Args, id: String, addr: u64, mask: u8, guard: Vec<GuardBytes>) -> Result<()> {
+    let pid = args.pid.context("set-bits exige --pid")?;
+    if args.allow.is_some() || args.hook.is_some() || args.fault.is_some() {
+        bail!("set-bits não aceita --allow, --fault nem ganchos de pausa");
+    }
+    let shutdown = Shutdown::install()?;
+    let store = JournalStore::new(args.journal_dir);
+    let lock = store.lock()?;
+    let report = recover(&store, &lock, &PauseConfig::default())?;
+    if !report.is_empty() {
+        print_recovery(&mut std::io::stdout().lock(), &report)?;
+    }
+    ensure_recovered(&report)?;
+    let target_id = identity(pid)?;
+    let policy: PolicyFn = Box::new(|_maps| WritePolicy::new(Vec::new()));
+    let opts = EngineOptions {
+        version_key: "harness".into(),
+        pause: PauseConfig::default(),
+    };
+    let mut engine = Engine::open(pid, Some(&target_id), store.clone(), &lock, policy, opts)?;
+    // Qualquer região `rw` do processo.
+    engine.set_data_policy(Box::new(|maps| {
+        WritePolicy::new(
+            maps.iter()
+                .filter(|r| r.perms.read && r.perms.write)
+                .map(|r| r.start..r.end)
+                .collect(),
+        )
+    }));
+    engine.set_bits(&id, addr, mask, &guard)?;
+    if args.panic_after_bits {
+        panic!("pânico de teste depois de limpar os bits");
+    }
+    {
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "ativo")?;
+        out.flush()?;
+    }
+    let end = run_until_shutdown(&mut engine, &shutdown, TICK)?;
+    finish_run(&mut engine, end)
+}
+
 fn main() -> Result<()> {
     let mut args = parse_args(std::env::args().skip(1))?;
     match std::mem::replace(&mut args.cmd, Cmd::Restore) {
@@ -352,6 +462,12 @@ fn main() -> Result<()> {
             replacement,
             set_value,
         } => run(args, addr, expected, replacement, set_value),
+        Cmd::SetBits {
+            id,
+            addr,
+            mask,
+            guard,
+        } => set_bits(args, id, addr, mask, guard),
     }
 }
 

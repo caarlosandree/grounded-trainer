@@ -34,13 +34,25 @@
 //!   execução) resolvê-la.
 //! - **Jogo fechou**: `Err(ProcessGone)`; o motor já descartou ativos, pendentes e o
 //!   diário sem escrever. Sem rodar operação, [`Engine::discard_gone`] faz o mesmo.
+//!
+//! # Escrita em dados (spec 005, 6.6)
+//!
+//! Um segundo tipo de escrita, **sem pausa**: campos de dados do jogo, numa região permitida
+//! pela política de dados ([`Engine::set_data_policy`]), sempre depois de conferir a
+//! identidade do objeto (bytes de guarda relidos imediatamente antes). [`Engine::write_data`]
+//! não vai ao diário (barras: não há original a restaurar). [`Engine::set_bits`] limpa bits
+//! e grava a entrada no diário **antes** de escrever; [`Engine::restore_bits`], o `undo_all`,
+//! o `Drop` e a recuperação devolvem só os bits da máscara ao original ([`decide_data`]).
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use nix::sys::signal::Signal;
 
-use crate::journal::{EntryAction, Journal, JournalEntry, JournalLock, JournalStore, decide_entry};
+use crate::journal::{
+    DataAction, DataEntry, EntryAction, GuardBytes, Journal, JournalEntry, JournalLock,
+    JournalStore, decide_data, decide_entry,
+};
 use crate::maps::{MapRegion, read_maps};
 use crate::mem::{MemWriter, Pidfd};
 use crate::patch::{
@@ -54,6 +66,13 @@ use crate::{Error, Result};
 
 /// Política de escrita calculada a partir do `maps` atual (relido antes de cada lote).
 pub type PolicyFn = Box<dyn FnMut(&[MapRegion]) -> WritePolicy>;
+
+/// Política das escritas em dados, calculada a partir do `maps`. Fica em cache: o `maps` só é
+/// relido em [`Engine::refresh_data_maps`] e depois de uma escrita em dados que falhou.
+pub type DataPolicyFn = Box<dyn FnMut(&[MapRegion]) -> WritePolicy>;
+
+/// Maior escrita em dados aceita, em bytes.
+const MAX_DATA_WRITE: usize = 8;
 
 /// Parâmetros do motor.
 #[derive(Debug, Clone)]
@@ -280,6 +299,14 @@ pub struct Engine {
     stuck: bool,
     /// A falha injetada `ContFailsOnce` já disparou neste motor.
     cont_fault_fired: bool,
+    /// Política das escritas em dados; sem ela, `write_data` e `set_bits` recusam.
+    data_policy: Option<DataPolicyFn>,
+    /// Política de dados calculada do último `maps` lido.
+    data_maps: Option<WritePolicy>,
+    /// Bits limpos e confirmados (uma entrada por `id` e byte).
+    data: Vec<DataEntry>,
+    /// Entradas de dados não resolvidas: restos de uma falha e as vindas da recuperação.
+    data_pending: Vec<DataEntry>,
 }
 
 impl Engine {
@@ -325,6 +352,10 @@ impl Engine {
             in_drop: false,
             stuck: false,
             cont_fault_fired: false,
+            data_policy: None,
+            data_maps: None,
+            data: Vec::new(),
+            data_pending: Vec::new(),
         })
     }
 
@@ -342,11 +373,96 @@ impl Engine {
         self.finish(result)
     }
 
-    /// Desfaz todos os patches ativos.
+    /// Desfaz todos os patches ativos e restaura os bits de todas as entradas de dados (os
+    /// restaurados e os já originais vão em `restored`; os descartados, em `foreign`). As
+    /// duas partes são tentadas mesmo que a primeira falhe; o primeiro erro volta.
     pub fn undo_all(&mut self) -> Result<BatchReport> {
         self.retry_resume()?;
         let result = self.undo_inner(|_| true);
+        let patches = self.finish(result);
+        if matches!(patches, Err(Error::ProcessGone { .. })) {
+            return patches;
+        }
+        let data = if self.data.is_empty() && self.data_pending.is_empty() {
+            Ok(RestoreReport::default())
+        } else {
+            let result = self.restore_data_inner(|_| true);
+            self.finish(result)
+        };
+        let mut report = patches?;
+        let data = data?;
+        report.restored.extend(data.restored);
+        report.restored.extend(data.dropped);
+        report.foreign.extend(data.foreign);
+        Ok(report)
+    }
+
+    /// Define a política das escritas em dados (e esquece a calculada antes).
+    pub fn set_data_policy(&mut self, policy: DataPolicyFn) {
+        self.data_policy = Some(policy);
+        self.data_maps = None;
+    }
+
+    /// Relê o `maps` e recalcula a política de dados. Sem política, não faz nada.
+    pub fn refresh_data_maps(&mut self) -> Result<()> {
+        self.data_maps = None;
+        if self.data_policy.is_some() {
+            self.current_data_policy()?;
+        }
+        Ok(())
+    }
+
+    /// Escreve `bytes` (1 a 8) em dados do jogo, sem pausa e sem diário: identidade do
+    /// processo → política de dados ([`Error::DataOutsidePolicy`]) → guarda relida
+    /// imediatamente antes ([`Error::GuardMismatch`]) → escrita e releitura.
+    pub fn write_data(&mut self, addr: u64, bytes: &[u8], guard: &[GuardBytes]) -> Result<()> {
+        self.retry_resume()?;
+        let result = self.write_data_inner(addr, bytes, guard);
         self.finish(result)
+    }
+
+    /// Limpa os bits `mask` do byte em `addr` e registra o original no diário antes de
+    /// escrever. Com a entrada (`id`, `addr`) já viva, é a manutenção: se algum bit da máscara
+    /// voltou a ligar, limpa de novo (o original continua o do primeiro registro). Bits já
+    /// limpos e sem entrada: nada é escrito nem registrado. Recusa se o `id` tem entrada de
+    /// dados pendente ([`Error::DataPending`]).
+    pub fn set_bits(&mut self, id: &str, addr: u64, mask: u8, guard: &[GuardBytes]) -> Result<()> {
+        self.retry_resume()?;
+        let result = self.set_bits_inner(id, addr, mask, guard);
+        self.finish(result)
+    }
+
+    /// Restaura os bits de todas as entradas de dados do `id` (vivas e pendentes), pela regra
+    /// de [`decide_data`]: restauradas e já originais em `restored`, descartadas em `foreign`.
+    pub fn restore_bits(&mut self, id: &str) -> Result<BatchReport> {
+        self.retry_resume()?;
+        let result = self.restore_data_inner(|e| e.id == id);
+        let data = self.finish(result)?;
+        let mut restored = data.restored;
+        restored.extend(data.dropped);
+        Ok(BatchReport {
+            restored,
+            foreign: data.foreign,
+            ..BatchReport::default()
+        })
+    }
+
+    /// Resolve entradas de dados vindas de fora (a recuperação): entram como pendentes e são
+    /// restauradas pela regra de [`decide_data`]. Uma escrita que falha mantém a entrada.
+    pub fn restore_data(&mut self, entries: Vec<DataEntry>) -> Result<RestoreReport> {
+        self.retry_resume()?;
+        for e in &entries {
+            if !self.data.contains(e) && !self.data_pending.contains(e) {
+                self.data_pending.push(e.clone());
+            }
+        }
+        let result = self.restore_data_inner(|e| entries.contains(e));
+        self.finish(result)
+    }
+
+    /// Entradas de dados vivas (bits limpos e confirmados).
+    pub fn data_entries(&self) -> &[DataEntry] {
+        &self.data
     }
 
     /// Troca os bytes do patch ativo `id` por `new` numa pausa (spec 003 6.7).
@@ -380,12 +496,25 @@ impl Engine {
     /// não escreve nada (o SIGCONT que falhou ainda é tentado antes).
     pub fn restore_pending(&mut self) -> Result<RestoreReport> {
         let entries = self.pending.clone();
-        self.restore_entries(entries)
+        let mut report = self.restore_entries(entries)?;
+        let data = self.data_pending.clone();
+        if !data.is_empty() {
+            let r = self.restore_data(data)?;
+            report.restored.extend(r.restored);
+            report.dropped.extend(r.dropped);
+            report.foreign.extend(r.foreign);
+        }
+        Ok(report)
     }
 
-    /// `id` das entradas pendentes: restos de uma falha e intenções não resolvidas.
+    /// `id` das entradas pendentes: restos de uma falha e intenções não resolvidas, de
+    /// patches e de dados.
     pub fn pending_ids(&self) -> Vec<String> {
-        self.pending.iter().map(|e| e.id.clone()).collect()
+        self.pending
+            .iter()
+            .map(|e| e.id.clone())
+            .chain(self.data_pending.iter().map(|e| e.id.clone()))
+            .collect()
     }
 
     /// Se o jogo já terminou, descarta o registro sem escrever (zera ativos, pendentes e
@@ -464,18 +593,231 @@ impl Engine {
         self.save_logged(true);
     }
 
+    /// Põe uma entrada de dados como pendente e grava o diário (só para testes).
+    #[doc(hidden)]
+    pub fn force_data_pending_for_test(&mut self, entry: DataEntry) {
+        self.data_pending.push(entry);
+        self.save_final();
+    }
+
     /// `ProcessGone` descarta o registro e limpa o diário (sem escrever nada).
     fn finish<T>(&mut self, result: Result<T>) -> Result<T> {
         if let Err(Error::ProcessGone { pid }) = &result {
             tracing::warn!(pid, "o jogo fechou; patches descartados sem escrever");
             self.active.clear();
             self.pending.clear();
+            self.data.clear();
+            self.data_pending.clear();
             self.stuck = false;
             if let Err(e) = self.store.clear() {
                 tracing::error!(erro = %e, "falha ao limpar o diário");
             }
         }
         result
+    }
+
+    /// Política de dados em cache (calculada do `maps` na primeira vez).
+    fn current_data_policy(&mut self) -> Result<&WritePolicy> {
+        let Some(policy) = self.data_policy.as_mut() else {
+            return Err(Error::NoDataPolicy);
+        };
+        if self.data_maps.is_none() {
+            let maps = read_maps(self.pid)?;
+            self.data_maps = Some(policy(&maps));
+        }
+        self.data_maps.as_ref().ok_or(Error::NoDataPolicy)
+    }
+
+    /// Confere a guarda do objeto: cada trecho relido tem de ser igual ao esperado. Trecho
+    /// ilegível conta como objeto trocado.
+    fn guard_ok(&self, guard: &[GuardBytes]) -> Result<bool> {
+        for g in guard {
+            let mut now = vec![0u8; g.bytes.len()];
+            match self.writer.read_exact(g.addr, &mut now) {
+                Ok(()) if now == g.bytes => {}
+                Ok(()) | Err(Error::Unmapped { .. }) => return Ok(false),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
+
+    /// Byte em `addr`; `None` se ilegível.
+    fn read_byte(&self, addr: u64) -> Result<Option<u8>> {
+        let mut b = [0u8; 1];
+        match self.writer.read_exact(addr, &mut b) {
+            Ok(()) => Ok(Some(b[0])),
+            Err(Error::Unmapped { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Identidade do processo, política de dados e guarda, nesta ordem.
+    fn check_data_write(&mut self, addr: u64, len: usize, guard: &[GuardBytes]) -> Result<()> {
+        check_alive(&self.identity)?;
+        let end = addr
+            .checked_add(len as u64)
+            .ok_or(Error::DataOutsidePolicy { addr })?;
+        if !self.current_data_policy()?.allows(&(addr..end)) {
+            return Err(Error::DataOutsidePolicy { addr });
+        }
+        if !self.guard_ok(guard)? {
+            return Err(Error::GuardMismatch { addr });
+        }
+        Ok(())
+    }
+
+    /// Escrita em dados conferida; na falha, o `maps` é relido na próxima.
+    fn write_data_verified(&mut self, id: &str, addr: u64, bytes: &[u8]) -> Result<()> {
+        let result = self.write_verified(id, addr, bytes);
+        if result.is_err() {
+            self.data_maps = None;
+        }
+        result
+    }
+
+    fn write_data_inner(&mut self, addr: u64, bytes: &[u8], guard: &[GuardBytes]) -> Result<()> {
+        if bytes.is_empty() || bytes.len() > MAX_DATA_WRITE {
+            return Err(Error::BadPatch {
+                id: "dados".to_owned(),
+                reason: format!(
+                    "escrita em dados de {} bytes (1 a {MAX_DATA_WRITE})",
+                    bytes.len()
+                ),
+            });
+        }
+        self.check_data_write(addr, bytes.len(), guard)?;
+        self.write_data_verified("dados", addr, bytes)
+    }
+
+    fn set_bits_inner(
+        &mut self,
+        id: &str,
+        addr: u64,
+        mask: u8,
+        guard: &[GuardBytes],
+    ) -> Result<()> {
+        if self.data_pending.iter().any(|e| e.id == id) {
+            return Err(Error::DataPending { id: id.to_owned() });
+        }
+        if mask == 0 {
+            return Err(Error::BadPatch {
+                id: id.to_owned(),
+                reason: "máscara vazia".to_owned(),
+            });
+        }
+        self.check_data_write(addr, 1, guard)?;
+        let unreadable = || Error::Unmapped { addr, len: 1 };
+
+        // Manutenção: a entrada já existe; só limpa de novo o que o jogo religou.
+        if self.data.iter().any(|e| e.id == id && e.addr == addr) {
+            let now = self.read_byte(addr)?.ok_or_else(unreadable)?;
+            if now & mask == 0 {
+                return Ok(());
+            }
+            tracing::debug!(id, addr, "bits religados pelo jogo; limpando de novo");
+            return self.write_data_verified(id, addr, &[now & !mask]);
+        }
+
+        let before = self.read_byte(addr)?.ok_or_else(unreadable)?;
+        if before & mask == 0 {
+            // Já limpos: nada a escrever, e nenhum original a guardar.
+            return Ok(());
+        }
+        let entry = DataEntry {
+            id: id.to_owned(),
+            addr,
+            original: before,
+            written: before & !mask,
+            mask,
+            guard: guard.to_vec(),
+        };
+        // O diário recebe a entrada antes da escrita.
+        self.data.push(entry.clone());
+        if let Err(e) = self.save_journal(false) {
+            self.data.retain(|d| *d != entry);
+            return Err(e);
+        }
+        // O byte é recalculado de uma leitura imediatamente anterior à escrita.
+        let written = match self.read_byte(addr) {
+            Ok(Some(now)) => self.write_data_verified(id, addr, &[now & !mask]),
+            Ok(None) => Err(unreadable()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = written {
+            if matches!(e, Error::ProcessGone { .. }) {
+                return Err(e);
+            }
+            self.data.retain(|d| *d != entry);
+            // Se os bits continuam os originais, nada ficou escrito; senão, sobra pendente.
+            match self.read_byte(addr) {
+                Ok(Some(now)) if now & mask == before & mask => {}
+                _ => self.data_pending.push(entry),
+            }
+            self.save_final();
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Restaura as entradas de dados escolhidas (vivas e pendentes) pela regra de
+    /// [`decide_data`], com a guarda relida e o `maps` atual. Uma escrita que falha deixa a
+    /// entrada pendente; as outras seguem, e o primeiro erro volta no fim.
+    fn restore_data_inner(&mut self, select: impl Fn(&DataEntry) -> bool) -> Result<RestoreReport> {
+        let chosen: Vec<DataEntry> = self
+            .data
+            .iter()
+            .chain(self.data_pending.iter())
+            .filter(|e| select(e))
+            .cloned()
+            .collect();
+        if chosen.is_empty() {
+            return Ok(RestoreReport::default());
+        }
+        check_alive(&self.identity)?;
+        let maps = read_maps(self.pid)?;
+        let mut report = RestoreReport::default();
+        let mut failed: Option<Error> = None;
+        for e in chosen {
+            let current = self.read_byte(e.addr)?;
+            let guard_ok = self.guard_ok(&e.guard)?;
+            let writable = maps
+                .iter()
+                .any(|r| r.perms.read && r.perms.write && r.start <= e.addr && e.addr < r.end);
+            match decide_data(&e, current, guard_ok, writable) {
+                DataAction::Drop => report.dropped.push(e.id.clone()),
+                DataAction::Discard => {
+                    tracing::warn!(
+                        id = %e.id,
+                        addr = e.addr,
+                        "objeto trocado ou bits de outro; entrada de dados descartada sem escrever"
+                    );
+                    report.foreign.push(e.id.clone());
+                }
+                DataAction::Restore(byte) => {
+                    if let Err(err) = self.write_verified(&e.id, e.addr, &[byte]) {
+                        if matches!(err, Error::ProcessGone { .. }) {
+                            return Err(err);
+                        }
+                        tracing::error!(id = %e.id, erro = %err, "falha ao restaurar os bits");
+                        self.data.retain(|d| *d != e);
+                        if !self.data_pending.contains(&e) {
+                            self.data_pending.push(e);
+                        }
+                        failed.get_or_insert(err);
+                        continue;
+                    }
+                    report.restored.push(e.id.clone());
+                }
+            }
+            self.data.retain(|d| *d != e);
+            self.data_pending.retain(|d| *d != e);
+        }
+        self.save_final();
+        match failed {
+            Some(err) => Err(err),
+            None => Ok(report),
+        }
     }
 
     fn apply_inner(&mut self, batch: Vec<Validated>) -> Result<BatchReport> {
@@ -1116,7 +1458,13 @@ impl Engine {
         // `stuck` mantém o marcador em toda gravação, até um SIGCONT bem-sucedido.
         let paused_by_us = paused_by_us || self.stuck;
         let entries = self.journal_entries();
-        if entries.is_empty() && !paused_by_us {
+        let data: Vec<DataEntry> = self
+            .data
+            .iter()
+            .chain(self.data_pending.iter())
+            .cloned()
+            .collect();
+        if entries.is_empty() && data.is_empty() && !paused_by_us {
             return self.store.clear();
         }
         self.store.save(&Journal {
@@ -1126,6 +1474,7 @@ impl Engine {
             version_key: self.version_key.clone(),
             paused_by_us,
             entries,
+            data,
         })
     }
 
@@ -1163,7 +1512,7 @@ impl Drop for Engine {
             Err(Error::ProcessGone { .. }) => return,
             Err(e) => tracing::error!(erro = %e, "falha ao retomar o jogo na saída"),
         }
-        if !self.active.is_empty() {
+        if !self.active.is_empty() || !self.data.is_empty() {
             match self.undo_all() {
                 Ok(_) => {}
                 Err(Error::ProcessGone { .. }) => return,
@@ -1171,15 +1520,22 @@ impl Drop for Engine {
             }
         }
         let rest = self.journal_entries();
-        if rest.is_empty() {
-            return;
+        if !rest.is_empty() {
+            match self.restore_entries(rest) {
+                Ok(_) => {}
+                Err(Error::ProcessGone { .. }) => return,
+                Err(e) => tracing::error!(erro = %e, "falha ao restaurar as entradas do diário"),
+            }
         }
-        match self.restore_entries(rest) {
-            Ok(_) => {}
-            Err(Error::ProcessGone { .. }) => return,
-            Err(e) => tracing::error!(erro = %e, "falha ao restaurar as entradas do diário"),
+        let data = self.data_pending.clone();
+        if !data.is_empty() {
+            match self.restore_data(data) {
+                Ok(_) => {}
+                Err(Error::ProcessGone { .. }) => return,
+                Err(e) => tracing::error!(erro = %e, "falha ao restaurar os bits do diário"),
+            }
         }
-        if !self.journal_entries().is_empty() {
+        if !self.journal_entries().is_empty() || !self.data_pending.is_empty() {
             tracing::error!(
                 "alguns patches não puderam ser restaurados; a próxima execução do trainer vai restaurar"
             );

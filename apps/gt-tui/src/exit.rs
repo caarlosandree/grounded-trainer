@@ -96,6 +96,7 @@ mod tests {
             version_key: "v1".into(),
             paused_by_us,
             entries,
+            data: Vec::new(),
         }
     }
 

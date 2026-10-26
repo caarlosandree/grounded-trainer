@@ -91,6 +91,7 @@ fn restore_discards_dead_process_journal() {
                 replacement: vec![0x48, 0x89, 0xCF],
                 next: None,
             }],
+            data: Vec::new(),
         })
         .unwrap();
     let out = gt_patch(state.path(), &["restore"]);

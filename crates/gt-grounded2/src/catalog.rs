@@ -516,6 +516,7 @@ rva = 0x1000
                 replacement: NEW.to_vec(),
                 next: None,
             }],
+            data: Vec::new(),
         }
     }
 

@@ -7,6 +7,10 @@
 //! escreve onde cada byte é o original ou o nosso; por isso a política de escrita é
 //! só "a entrada cabe inteira em memória executável do `maps` atual e tem no máximo
 //! [`MAX_PATCH_LEN`] bytes". Entrada fora disso é de outro: não é tocada e sai do diário.
+//!
+//! As entradas de dados (bits, spec 005 6.6) não passam por essa política: cada uma é
+//! decidida por [`crate::journal::decide_data`], com a guarda do objeto relida e o byte numa
+//! região `rw` do `maps` atual.
 
 use std::ops::Range;
 use std::path::PathBuf;
@@ -151,7 +155,7 @@ pub fn recover(
         );
         report.foreign.push(e.id);
     }
-    if eligible.is_empty() {
+    if eligible.is_empty() && journal.data.is_empty() {
         store.clear()?;
         return Ok(report);
     }
@@ -186,7 +190,8 @@ pub fn recover(
         Err(e) => return Err(e),
     };
     // O motor regrava o diário só com as entradas que ainda não resolveu (as de fora
-    // de memória executável já saíram) e o apaga quando não sobra nenhuma.
+    // de memória executável já saíram) e o apaga quando não sobra nenhuma. As de dados
+    // entram como pendentes do motor e saem quando resolvidas.
     match engine.restore_entries(eligible) {
         Ok(r) => {
             report.restored = r.restored;
@@ -196,8 +201,27 @@ pub fn recover(
         }
         Err(Error::ProcessGone { .. }) => {
             report.discarded = Some(DiscardReason::ProcessGone);
+            return Ok(report);
         }
         Err(e) => return Err(e),
+    }
+    if !journal.data.is_empty() {
+        match engine.restore_data(journal.data.clone()) {
+            Ok(r) => {
+                report.restored.extend(r.restored);
+                report.dropped.extend(r.dropped);
+                report.foreign.extend(r.foreign);
+            }
+            Err(Error::ProcessGone { .. }) => {
+                report.discarded = Some(DiscardReason::ProcessGone);
+                return Ok(report);
+            }
+            // A escrita de um bit falhou: a entrada continua no diário para a próxima execução.
+            Err(e) => {
+                tracing::warn!(erro = %e, "bits não restaurados agora");
+                report.kept.extend(engine.pending_ids());
+            }
+        }
     }
     if !report.kept.is_empty() {
         tracing::warn!(
