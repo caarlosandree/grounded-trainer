@@ -143,8 +143,10 @@ Sem `VirtualAllocEx` de fora do processo, existem duas estratégias:
 As instruções originais copiadas para a cave passam por relocação (endereços relativos ao RIP são recalculados com `iced-x86`).
 
 ### 5.6 Valores via Unreal Engine (Fase 5)
-- Offsets das classes vêm de um dump do **Dumper-7** (rodado no prefixo do jogo, uma vez por atualização), convertidos para um `offsets/<chave>.toml`.
-- `GNames`/`GObjects`/`GWorld` são resolvidos por assinatura AOB.
+- Offsets das classes vêm da **reflexão do jogo em execução**: `GUObjectArray` e `FNamePool` resolvidos por assinatura
+  AOB, classes achadas pelo nome e propriedades lidas da lista `FProperty` (nome, tipo, `Offset_Internal`). Não há
+  SDK gerado nem arquivo de offsets por versão. Layout observado no build atual em `RESEARCH.md`; detalhes na spec
+  da Fase 5.
 - "Congelar" valores = um laço de ~10 Hz que reescreve o campo. Ele roda numa thread do trainer, nunca dentro do jogo.
 
 ### 5.7 Interface
@@ -206,3 +208,5 @@ As instruções originais copiadas para a cave passam por relocação (endereço
 | 2026-10-25 | Código de terceiros pode ser desmontado e decompilado para entender o que faz; copiar ou redistribuir continua proibido | Entender as caves do FLiNG acelera a pesquisa; a implementação segue nossa, sem código deles (decisão do dono, `AGENTS.md` 3) |
 | 2026-10-26 | Teclas lidas numa thread própria (`gt-keys`) e hangup conferido com `poll(2)` no `stdin` | A leitura do `crossterm` repete `EIO` sem parar num terminal fechado e nunca devolveria o controle ao laço |
 | 2026-10-26 | Teste do binário em pseudo-terminal (`openpty` do `nix`, sem `unsafe`), com `--pid` de um processo já terminado nos testes de sinal e restauração | Roda mesmo com o jogo aberto; só o teste de `aguardando o jogo` pula quando ele está aberto |
+| 2026-10-26 | Fases 4–6 reorganizadas: Fase 4 só com trocas de bytes do mesmo tamanho (durabilidade, energia, recarga); valores na Fase 5; desvios na Fase 6 | A análise do FLiNG mostrou que os cheats da Fase 4 antiga precisam do pawn do jogador ou de código novo (decisão do dono) |
+| 2026-10-26 | Offsets da Fase 5 lidos da reflexão do jogo em execução, sem Dumper-7 | Não depende de regenerar SDK a cada atualização; `GUObjectArray`, `FNamePool` e o layout de `FProperty` já foram localizados (decisão do dono) |
