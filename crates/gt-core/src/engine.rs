@@ -10,7 +10,27 @@
 //! O diário em disco espelha o que o motor guarda em memória: os patches ativos e as
 //! entradas ainda não resolvidas (intenções de um lote em curso, entradas vindas da
 //! recuperação, restos de uma falha). O `Drop` desfaz os ativos e tenta resolver o resto.
+//!
+//! # Desfechos de uma operação
+//!
+//! Não há enum de desfecho: quem chama classifica pelo resultado e pelo estado do motor.
+//!
+//! - **Sucesso**: `Ok(report)` com o `id` em `report.restored`.
+//! - **Bytes de outro**: `Ok(report)` com o `id` em `report.foreign`; o patch sai do
+//!   registro e nada é escrito.
+//! - **Recusa limpa**: qualquer outro `Err` com o `id` **fora** de [`Engine::pending_ids`]
+//!   (`ThreadsInPatch`, `PauseTimeout`, `BytesMismatch`, `Journal`, `Io`, `WriteRefused`,
+//!   `OutsidePolicy`, `Overlap` e, a partir da troca de valor, `NotActive` e
+//!   `BoundariesChanged`). Nada ficou escrito pela operação.
+//! - **SIGCONT que falhou**: depois de **qualquer** operação, [`Engine::is_stuck`] diz se
+//!   o jogo pode ter ficado parado por nós; isso pode acontecer sem restos.
+//! - **Restos**: `Err(_)` com o `id` em [`Engine::pending_ids`]; a entrada fica no diário
+//!   e bloqueia o trecho até [`Engine::restore_pending`] (ou o `Drop`, ou a próxima
+//!   execução) resolvê-la.
+//! - **Jogo fechou**: `Err(ProcessGone)`; o motor já descartou ativos, pendentes e o
+//!   diário sem escrever. Sem rodar operação, [`Engine::discard_gone`] faz o mesmo.
 
+use std::cell::Cell;
 use std::ops::Range;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -249,6 +269,9 @@ pub struct Engine {
     stuck: bool,
     /// A falha injetada `ContFailsOnce` já disparou neste motor.
     cont_fault_fired: bool,
+    /// A falha injetada `WriteAndRollbackFail` já disparou neste motor (`write_plan` é
+    /// `&self`, por isso `Cell`).
+    write_fault_fired: Cell<bool>,
 }
 
 impl Engine {
@@ -294,6 +317,7 @@ impl Engine {
             in_drop: false,
             stuck: false,
             cont_fault_fired: false,
+            write_fault_fired: Cell::new(false),
         })
     }
 
@@ -326,6 +350,28 @@ impl Engine {
         self.retry_resume()?;
         let result = self.restore_inner(entries);
         self.finish(result)
+    }
+
+    /// Restaura as entradas pendentes (restos de uma falha e intenções não resolvidas),
+    /// como na recuperação: é [`Engine::restore_entries`] com todas elas. Sem pendentes,
+    /// não escreve nada (o SIGCONT que falhou ainda é tentado antes).
+    pub fn restore_pending(&mut self) -> Result<RestoreReport> {
+        let entries = self.pending.clone();
+        self.restore_entries(entries)
+    }
+
+    /// `id` das entradas pendentes: restos de uma falha e intenções não resolvidas.
+    pub fn pending_ids(&self) -> Vec<String> {
+        self.pending.iter().map(|e| e.id.clone()).collect()
+    }
+
+    /// Se o jogo já terminou, descarta o registro sem escrever (zera ativos, pendentes e
+    /// `stuck`, limpa o diário), como o fim de uma operação com [`Error::ProcessGone`].
+    /// Com o jogo vivo, ou se não deu para saber, não faz nada.
+    pub fn discard_gone(&mut self) {
+        if let Err(e @ Error::ProcessGone { .. }) = check_alive(&self.identity) {
+            let _ = self.finish::<()>(Err(e));
+        }
     }
 
     /// Patches ativos.
@@ -828,6 +874,22 @@ impl Engine {
                 Decision::Write(bytes) => bytes,
             };
             let addr = op.v.spec.addr;
+            if self.pause_cfg.fault == Some(Fault::WriteAndRollbackFail)
+                && !self.write_fault_fired.replace(true)
+            {
+                // Falha injetada (testes): os bytes novos ficam no jogo e o desfazer
+                // "também falha", deixando restos.
+                if let Err(error @ Error::ProcessGone { .. }) =
+                    self.write_verified(&op.v.spec.id, addr, &bytes)
+                {
+                    return Err(Failure::clean(error));
+                }
+                return Err(Failure {
+                    error: Error::Io(std::io::Error::other("falha de escrita simulada")),
+                    dirty: true,
+                    stuck: false,
+                });
+            }
             if let Err(error) = self.write_verified(&op.v.spec.id, addr, &bytes) {
                 if matches!(error, Error::ProcessGone { .. }) {
                     return Err(Failure::clean(error));

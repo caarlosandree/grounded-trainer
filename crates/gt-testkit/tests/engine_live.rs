@@ -1017,3 +1017,150 @@ fn drop_with_stuck_and_dead_target_clears_journal() {
     drop(engine);
     assert!(missing(&env));
 }
+
+// ---------------------------------------------------------------------------
+// Restos de uma falha e descarte quando o jogo fecha (plano 003, tarefa 2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dirty_failure_leaves_pending_and_blocks_range() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let mut engine = open_engine_with(
+        t.pid,
+        &env,
+        vec![exec2_range(&t)],
+        fault_cfg(Fault::WriteAndRollbackFail),
+    );
+    let err = engine
+        .apply(vec![patch("A", t.exec2, &NOP3, &NOP2_NOP)])
+        .unwrap_err();
+    assert!(matches!(err, Error::Io(_)), "{err:?}");
+    assert!(!engine.is_stuck());
+    assert_eq!(engine.pending_ids(), vec!["A".to_string()]);
+    assert!(engine.active().is_empty());
+    // Os bytes novos ficaram no jogo.
+    assert_eq!(bytes_at(t.pid, t.exec2, 3), NOP2_NOP);
+    let j = journal_now(&env);
+    assert_eq!(j.entries.len(), 1);
+    assert_eq!(j.entries[0].id, "A");
+    assert!(!j.paused_by_us);
+
+    // O trecho fica bloqueado para novos patches.
+    let err = engine
+        .apply(vec![patch("A", t.exec2, &NOP3, &NOP2_NOP)])
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Overlap { id } if id == "A"),
+        "{err:?}"
+    );
+
+    // Um patch em outro endereço aplica normalmente (a falha só dispara uma vez).
+    engine
+        .apply(vec![patch("B", t.exec2 + 64, &NOP3, &NOP2_NOP)])
+        .unwrap();
+    assert_eq!(engine.active().len(), 1);
+    assert_eq!(engine.pending_ids(), vec!["A".to_string()]);
+    assert_eq!(bytes_at(t.pid, t.exec2 + 64, 3), NOP2_NOP);
+    let ids: Vec<String> = journal_now(&env)
+        .entries
+        .into_iter()
+        .map(|e| e.id)
+        .collect();
+    assert!(ids.contains(&"A".to_string()), "{ids:?}");
+}
+
+#[test]
+fn restore_pending_returns_originals() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let mut engine = open_engine_with(
+        t.pid,
+        &env,
+        vec![exec2_range(&t)],
+        fault_cfg(Fault::WriteAndRollbackFail),
+    );
+    engine
+        .apply(vec![patch("A", t.exec2, &NOP3, &NOP2_NOP)])
+        .unwrap_err();
+    assert_eq!(engine.pending_ids(), vec!["A".to_string()]);
+
+    let report = engine.restore_pending().unwrap();
+    assert_eq!(report.restored, vec!["A".to_string()]);
+    assert_eq!(bytes_at(t.pid, t.exec2, 3), NOP3);
+    assert!(engine.pending_ids().is_empty());
+    assert!(missing(&env));
+
+    // Sem restos, não faz nada.
+    let report = engine.restore_pending().unwrap();
+    assert_eq!(report, gt_core::engine::RestoreReport::default());
+}
+
+#[test]
+fn restore_pending_retries_stuck_resume_first() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let counter = Arc::new(AtomicU32::new(0));
+    let mut engine = open_engine_with(
+        t.pid,
+        &env,
+        vec![exec2_range(&t)],
+        PauseConfig {
+            fault: Some(Fault::ContFailsAlways),
+            resume_counter: Some(counter.clone()),
+            ..PauseConfig::default()
+        },
+    );
+    engine.force_stuck_for_test();
+    // Sem restos, ainda assim tenta o SIGCONT antes de qualquer retorno antecipado.
+    let err = engine.restore_pending().unwrap_err();
+    assert!(matches!(err, Error::Io(_)), "{err:?}");
+    assert_eq!(counter.load(Ordering::SeqCst), 1);
+    assert!(engine.is_stuck());
+}
+
+#[test]
+fn discard_gone_after_target_exit() {
+    let mut t = TestTarget::spawn();
+    let env = env();
+    let mut engine = open_engine(t.pid, &env, vec![exec2_range(&t)], None);
+    engine
+        .apply(vec![patch("p", t.exec2, &NOP3, &NOP2_NOP)])
+        .unwrap();
+    assert!(!missing(&env));
+    // Com o alvo vivo, não faz nada.
+    engine.discard_gone();
+    assert_eq!(engine.active().len(), 1);
+    assert!(!missing(&env));
+
+    t.child.kill().unwrap();
+    t.child.wait().unwrap();
+    engine.discard_gone();
+    assert!(engine.active().is_empty());
+    assert!(engine.pending_ids().is_empty());
+    assert!(!engine.is_stuck());
+    assert!(missing(&env));
+}
+
+#[test]
+fn discard_gone_clears_stuck_and_pending() {
+    let mut t = TestTarget::spawn();
+    let env = env();
+    let mut engine = open_engine_with(
+        t.pid,
+        &env,
+        vec![exec2_range(&t)],
+        fault_cfg(Fault::WriteAndRollbackFail),
+    );
+    engine
+        .apply(vec![patch("A", t.exec2, &NOP3, &NOP2_NOP)])
+        .unwrap_err();
+    engine.force_stuck_for_test();
+    assert_eq!(engine.pending_ids().len(), 1);
+    t.child.kill().unwrap();
+    t.child.wait().unwrap();
+    engine.discard_gone();
+    assert!(engine.pending_ids().is_empty());
+    assert!(!engine.is_stuck());
+    assert!(missing(&env));
+}
