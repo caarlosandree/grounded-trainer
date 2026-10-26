@@ -120,9 +120,136 @@ byte_offset = 0x71
 byte_mask = 0x72
 field_mask = 0x73
 
+# Ponteiro da UScriptStruct numa FStructProperty: os alvos `Struct.Campo` (ex.: HungerSettings.MaxValue).
+[ue.layout.fstruct]
+struct_ptr = 0x70
+
 # Caminho até o personagem (spec 005, 6.3): o controller aponta para o pawn por um campo da reflexão.
 [ue.player]
 controller_class = "/Script/Maine.SurvivalPlayerController"
 pawn_field = "Pawn"
 pawn_class = "/Script/Maine.SurvivalPlayerCharacter"
-alt_pawn_fields = []
+# Montado, Pawn/Character/AcknowledgedPawn apontam para a montaria; este campo continua no personagem (P7,
+# RESEARCH.md 2026-10-26, Fase 5).
+alt_pawn_fields = ["CachedSurvivalPlayerCharacter"]
+
+# Fase 5 (spec 005, 6.5): cheats de valor, na ordem da spec. Campos e alvos por NOME da reflexão (P2–P8 em
+# RESEARCH.md, 2026-10-26). As faixas sãs têm folga para upgrades; alvo fora delas não é escrito.
+
+# Vida = MaxHealth − CurrentDamage: zera o dano acumulado.
+[[field]]
+id = "vida-infinita"
+name = "Vida infinita"
+category = "sobrevivencia"
+description = "Zera o dano recebido a cada instante (um golpe maior que a vida inteira ainda mata)"
+object = "HealthComponent"
+object_class = "/Script/Maine.HealthComponent"
+rule = "lock"
+field = "CurrentDamage"
+kind = "float"
+mode = "lower"
+target = 0
+min = 0
+max = 100000
+
+# O jogo deixa a stamina passar de MaxStamina (vimos 120 com MaxStamina 100, P3); a trava nunca baixa o excedente.
+[[field]]
+id = "stamina-infinita"
+name = "Stamina infinita"
+category = "sobrevivencia"
+description = "A stamina não fica abaixo do máximo"
+object = "StaminaComponent"
+object_class = "/Script/Maine.StaminaComponent"
+rule = "lock"
+field = "CurrentStamina"
+kind = "float"
+mode = "raise"
+target_field = "MaxStamina"
+min = 1
+max = 100000
+
+# O máximo é o MaxValue da struct de configuração (100 no save da pesquisa, P2).
+[[field]]
+id = "comida-infinita"
+name = "Comida infinita"
+category = "sobrevivencia"
+description = "A fome fica sempre cheia"
+object = "SurvivalComponent"
+object_class = "/Script/Maine.SurvivalComponent"
+rule = "lock"
+field = "CurrentFood"
+kind = "float"
+mode = "raise"
+target_field = "HungerSettings.MaxValue"
+min = 1
+max = 100000
+
+[[field]]
+id = "agua-infinita"
+name = "Água infinita"
+category = "sobrevivencia"
+description = "A sede fica sempre cheia"
+object = "SurvivalComponent"
+object_class = "/Script/Maine.SurvivalComponent"
+rule = "lock"
+field = "CurrentWater"
+kind = "float"
+mode = "raise"
+target_field = "ThirstSettings.MaxValue"
+min = 1
+max = 100000
+
+[[field]]
+id = "oxigenio-infinito"
+name = "Oxigênio infinito"
+category = "sobrevivencia"
+description = "O fôlego embaixo d'água não acaba"
+object = "SurvivalComponent"
+object_class = "/Script/Maine.SurvivalComponent"
+rule = "lock"
+field = "CurrentBreath"
+kind = "float"
+mode = "raise"
+target_field = "BreathSettings.MaxValue"
+min = 1
+max = 100000
+
+# Neutro = 0; o frio vai a −100 (MaxChill) e o calor a +100 (MaxSizzle) (P4). Sem campo de neutro: constante.
+[[field]]
+id = "temperatura-estavel"
+name = "Temperatura estável"
+category = "sobrevivencia"
+description = "Sem frio nem calor: a temperatura do corpo fica no neutro"
+object = "BodyTemperatureComponent"
+object_class = "/Script/Maine.BodyTemperatureComponent"
+rule = "lock"
+field = "CurrentBodyTemperature"
+kind = "float"
+mode = "exact"
+target = 0
+min = -1
+max = 1
+
+# bool nativo no SurvivalCharacter (P5); o jogo consulta o campo (P9) e tem um setter que o religa (P6).
+[[field]]
+id = "sem-dano-queda"
+name = "Sem dano de queda"
+category = "sobrevivencia"
+description = "Quedas não tiram vida"
+object = "pawn"
+object_class = "/Script/Maine.SurvivalCharacter"
+rule = "clear_bits"
+fields = ["bTakeFallDamage"]
+kind = "bool"
+
+# Os dois bits ficam no mesmo byte do HealthComponent (P5). Tentativa: ver spec 6.5.2.
+[[field]]
+id = "nao-morrer"
+name = "Não morrer"
+category = "sobrevivencia"
+description = "A vida cai, mas o personagem não morre (experimental)"
+object = "HealthComponent"
+object_class = "/Script/Maine.HealthComponent"
+rule = "clear_bits"
+fields = ["bCanDieFromDamage", "bCanDieEver"]
+kind = "bool"

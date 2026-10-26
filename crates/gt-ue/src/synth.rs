@@ -147,6 +147,10 @@ pub struct SynthUe {
     /// Tamanho da instância de cada classe.
     instance_sizes: HashMap<u64, u32>,
     field_classes: HashMap<&'static str, u64>,
+    /// `FField` de cada campo, por (classe ou struct, nome).
+    field_addrs: HashMap<(u64, &'static str), u64>,
+    /// Classe das structs (`ScriptStruct`), criada na primeira [`SynthUe::add_struct`].
+    script_struct_class: u64,
     /// `/Script/CoreUObject`.
     pub core_package: u64,
     /// `/Script/Engine`.
@@ -176,6 +180,8 @@ impl SynthUe {
             gobjects: 0,
             instance_sizes: HashMap::new(),
             field_classes: HashMap::new(),
+            field_addrs: HashMap::new(),
+            script_struct_class: 0,
             core_package: 0,
             engine_package: 0,
             package_class: 0,
@@ -232,7 +238,7 @@ impl SynthUe {
             size: 8,
             bool_mask: None,
         }];
-        let first = s.build_fields(&root);
+        let first = s.build_fields(actor_c, &root);
         s.init_struct(actor_c, Some(object_c), first, ACTOR_PROPS_SIZE);
 
         s.instance_sizes.insert(pkg_c, header);
@@ -319,11 +325,37 @@ impl SynthUe {
         let class_size = self.class_size();
         let addr = self.alloc(u64::from(class_size), 16);
         self.init_object(addr, meta_class, class_size, name, pkg);
-        let first = self.build_fields(fields);
+        let first = self.build_fields(addr, fields);
         self.init_struct(addr, super_class, first, props_size);
         self.instance_sizes
             .insert(addr, props_size.max(self.header_size()));
         addr
+    }
+
+    /// Cria uma `UScriptStruct` em `pkg` com os campos dados (offsets relativos ao início da
+    /// struct). Ela não é uma classe: não entra no índice, só é alcançada por uma `StructProperty`
+    /// ligada com [`SynthUe::link_struct`].
+    pub fn add_struct(&mut self, pkg: u64, name: &str, size: u32, fields: &[SynthField]) -> u64 {
+        if self.script_struct_class == 0 {
+            let (core, object) = (self.core_package, self.object_class);
+            self.script_struct_class =
+                self.add_class(core, "ScriptStruct", Some(object), self.class_size(), &[]);
+        }
+        let class_size = self.class_size();
+        let addr = self.alloc(u64::from(class_size), 16);
+        self.init_object(addr, self.script_struct_class, class_size, name, pkg);
+        let first = self.build_fields(addr, fields);
+        self.init_struct(addr, None, first, size);
+        addr
+    }
+
+    /// Liga a `StructProperty` `field` de `owner` (classe ou struct) à struct `strukt`.
+    pub fn link_struct(&mut self, owner: u64, field: &'static str, strukt: u64) {
+        let Some(&addr) = self.field_addrs.get(&(owner, field)) else {
+            panic!("campo sintético {field} inexistente");
+        };
+        let at = addr + u64::from(self.layout.fstruct.struct_ptr);
+        self.write_u64(at, strukt);
     }
 
     /// Cria uma instância de `class`, zerada, com o cabeçalho preenchido.
@@ -449,7 +481,8 @@ impl SynthUe {
                 .max(b.field_size + 1)
                 .max(b.byte_offset + 1)
                 .max(b.byte_mask + 1)
-                .max(b.field_mask + 1),
+                .max(b.field_mask + 1)
+                .max(self.layout.fstruct.struct_ptr + 8),
         )
     }
 
@@ -501,10 +534,13 @@ impl SynthUe {
         addr
     }
 
-    /// Monta a lista encadeada de `FField`; devolve o primeiro (ou 0 sem campos).
-    fn build_fields(&mut self, fields: &[SynthField]) -> u64 {
+    /// Monta a lista encadeada de `FField` de `owner`; devolve o primeiro (ou 0 sem campos).
+    fn build_fields(&mut self, owner: u64, fields: &[SynthField]) -> u64 {
         let size = u64::from(self.field_size());
         let addrs: Vec<u64> = fields.iter().map(|_| self.alloc(size, 16)).collect();
+        for (field, &addr) in fields.iter().zip(&addrs) {
+            self.field_addrs.insert((owner, field.name), addr);
+        }
         let (f, p, b) = (self.layout.ffield, self.layout.fprop, self.layout.fbool);
         for (i, field) in fields.iter().enumerate() {
             let addr = addrs[i];

@@ -847,3 +847,84 @@ fn describe_class_ambiguous_lists_paths() {
     ));
     assert_eq!(index.classes_named("Twin").len(), 2);
 }
+
+#[test]
+fn field_path_through_struct() {
+    let mut s = synth();
+    let (engine, object) = (s.engine_package, s.object_class);
+    let settings = s.add_struct(
+        engine,
+        "TraitSettings",
+        0x10,
+        &[
+            SynthField {
+                name: "MaxValue",
+                kind: "FloatProperty",
+                offset: 0x0,
+                size: 4,
+                bool_mask: None,
+            },
+            SynthField {
+                name: "Enabled",
+                kind: "BoolProperty",
+                offset: 0x8,
+                size: 1,
+                bool_mask: Some((0, 0x02)),
+            },
+        ],
+    );
+    let comp = s.add_class(
+        engine,
+        "Comp",
+        Some(object),
+        0x80,
+        &[
+            SynthField {
+                name: "Hunger",
+                kind: "StructProperty",
+                offset: 0x40,
+                size: 0x10,
+                bool_mask: None,
+            },
+            SynthField {
+                name: "Current",
+                kind: "FloatProperty",
+                offset: 0x50,
+                size: 4,
+                bool_mask: None,
+            },
+        ],
+    );
+    s.link_struct(comp, "Hunger", settings);
+    let (mem, _image, index) = indexed(s);
+
+    let max = index
+        .find_field_path(&mem, comp, "Hunger.MaxValue")
+        .unwrap();
+    assert_eq!((max.offset, max.kind.as_str()), (0x40, "FloatProperty"));
+    assert_eq!(max.name, "Hunger.MaxValue");
+    let flag = index.find_field_path(&mem, comp, "Hunger.Enabled").unwrap();
+    assert_eq!(
+        flag.bits,
+        Some(BoolBits {
+            byte: 0x48,
+            mask: 0x02
+        })
+    );
+    // Sem ponto, o mesmo que `find_field`.
+    assert_eq!(
+        index.find_field_path(&mem, comp, "Current").unwrap(),
+        index.find_field(&mem, comp, "Current").unwrap()
+    );
+    assert!(matches!(
+        index.find_field_path(&mem, comp, "Hunger.Nope"),
+        Err(UeError::NotFound(_))
+    ));
+    // Parte do meio que não é struct.
+    assert!(matches!(
+        index.find_field_path(&mem, comp, "Current.MaxValue"),
+        Err(UeError::Malformed(_))
+    ));
+    // A struct não é uma classe: não entra no índice.
+    assert!(index.find_class("/Script/Engine", "TraitSettings").is_err());
+}

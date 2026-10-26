@@ -19,7 +19,8 @@ pub use dump::{ClassDump, ClassQuery, describe_class};
 pub use error::UeError;
 pub use index::{BoolBits, Field, ReflectionIndex, is_object_family};
 pub use layout::{
-    FBoolLayout, FFieldLayout, FPropLayout, ObjectsLayout, UObjectLayout, UStructLayout, UeLayout,
+    FBoolLayout, FFieldLayout, FPropLayout, FStructLayout, ObjectsLayout, UObjectLayout,
+    UStructLayout, UeLayout,
 };
 pub use names::{Names, decode_entry};
 pub use objects::{ObjHeader, ObjectArray, ScanBudget, ScanEnd};

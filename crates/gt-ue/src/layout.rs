@@ -67,6 +67,13 @@ pub struct FBoolLayout {
     pub field_mask: u32,
 }
 
+/// `FStructProperty`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FStructLayout {
+    /// Offset do ponteiro para a `UScriptStruct` do campo.
+    pub struct_ptr: u32,
+}
+
 /// Layout completo da reflexão.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UeLayout {
@@ -76,6 +83,7 @@ pub struct UeLayout {
     pub ffield: FFieldLayout,
     pub fprop: FPropLayout,
     pub fbool: FBoolLayout,
+    pub fstruct: FStructLayout,
 }
 
 #[cfg(feature = "synth")]
@@ -122,6 +130,7 @@ impl UeLayout {
                 byte_mask: 0x72,
                 field_mask: 0x73,
             },
+            fstruct: FStructLayout { struct_ptr: 0x70 },
         }
     }
 }

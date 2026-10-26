@@ -221,14 +221,20 @@ fn object_field<M: ReadMem + ?Sized>(
     }
 }
 
-/// Campo `float` de 4 bytes.
+/// Campo `float` de 4 bytes; `name` aceita caminho com ponto (`HungerSettings.MaxValue`).
 fn float_field<M: ReadMem + ?Sized>(
     index: &ReflectionIndex,
     mem: &M,
     class: u64,
     name: &str,
 ) -> Result<Field, String> {
-    let field = find_field(index, mem, class, name)?;
+    let field = index.find_field_path(mem, class, name).map_err(|e| {
+        tracing::debug!("campo {name}: {e}");
+        match e {
+            UeError::NotFound(_) => format!("campo {name} não encontrado"),
+            _ => INCOHERENT.to_string(),
+        }
+    })?;
     if field.kind == "FloatProperty" && field.size == 4 {
         Ok(field)
     } else {

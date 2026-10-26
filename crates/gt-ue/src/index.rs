@@ -301,13 +301,14 @@ impl ReflectionIndex {
         Ok(out)
     }
 
-    /// O campo `name` de `class`, subindo pela `SuperStruct` (o mais derivado primeiro).
-    pub fn find_field<M: ReadMem + ?Sized>(
+    /// Struct e endereço do `FField` chamado `name` em `class` ou nas superclasses (o mais
+    /// derivado primeiro); `None` se não existe.
+    fn locate_field<M: ReadMem + ?Sized>(
         &self,
         mem: &M,
         class: u64,
         name: &str,
-    ) -> Result<Field, UeError> {
+    ) -> Result<Option<(u64, u64)>, UeError> {
         let mut found = None;
         self.walk_supers(mem, class, |strukt| {
             self.walk_fields(mem, strukt, |field, field_name| {
@@ -324,14 +325,78 @@ impl ReflectionIndex {
                 ControlFlow::Continue(())
             })
         })?;
-        match found {
+        Ok(found)
+    }
+
+    fn field_not_found<M: ReadMem + ?Sized>(&self, mem: &M, class: u64, name: &str) -> UeError {
+        UeError::NotFound(format!(
+            "campo {name} em {} ou nas superclasses",
+            self.object_name(mem, class)
+                .unwrap_or_else(|_| format!("{class:#x}"))
+        ))
+    }
+
+    /// O campo `name` de `class`, subindo pela `SuperStruct` (o mais derivado primeiro).
+    pub fn find_field<M: ReadMem + ?Sized>(
+        &self,
+        mem: &M,
+        class: u64,
+        name: &str,
+    ) -> Result<Field, UeError> {
+        match self.locate_field(mem, class, name)? {
             Some((strukt, field)) => self.read_field(mem, strukt, field, name),
-            None => Err(UeError::NotFound(format!(
-                "campo {name} em {} ou nas superclasses",
-                self.object_name(mem, class)
-                    .unwrap_or_else(|_| format!("{class:#x}"))
-            ))),
+            None => Err(self.field_not_found(mem, class, name)),
         }
+    }
+
+    /// Campo por caminho com ponto (`HungerSettings.MaxValue`): cada parte antes da última é uma
+    /// `StructProperty`, e o campo seguinte é procurado na `UScriptStruct` dela. O `offset` (e o
+    /// `byte` dos bits) devolvido é relativo ao objeto de `class`, e o `name` é o caminho inteiro.
+    /// Sem ponto, é o mesmo que [`ReflectionIndex::find_field`].
+    pub fn find_field_path<M: ReadMem + ?Sized>(
+        &self,
+        mem: &M,
+        class: u64,
+        path: &str,
+    ) -> Result<Field, UeError> {
+        let mut parts = path.split('.');
+        let mut name = parts.next().unwrap_or_default();
+        let (mut strukt, mut field) = self
+            .locate_field(mem, class, name)?
+            .ok_or_else(|| self.field_not_found(mem, class, name))?;
+        let mut base = 0u32;
+        for next in parts {
+            let outer = self.read_field(mem, strukt, field, name)?;
+            if outer.kind != "StructProperty" {
+                return Err(UeError::Malformed(format!(
+                    "{name} é {}, esperado StructProperty no caminho {path}",
+                    outer.kind
+                )));
+            }
+            base = base.checked_add(outer.offset).ok_or_else(|| {
+                UeError::Malformed(format!("offset do caminho {path} estoura 32 bits"))
+            })?;
+            let at = field + u64::from(self.layout.fstruct.struct_ptr);
+            let inner = self.read_link(mem, at)?.ok_or_else(|| {
+                UeError::Malformed(format!("a StructProperty {name} não tem UScriptStruct"))
+            })?;
+            (strukt, field) = self
+                .locate_field(mem, inner, next)?
+                .ok_or_else(|| self.field_not_found(mem, inner, next))?;
+            name = next;
+        }
+        let mut out = self.read_field(mem, strukt, field, name)?;
+        let shift = |v: u32| {
+            v.checked_add(base).ok_or_else(|| {
+                UeError::Malformed(format!("offset do caminho {path} estoura 32 bits"))
+            })
+        };
+        out.offset = shift(out.offset)?;
+        if let Some(bits) = out.bits.as_mut() {
+            bits.byte = shift(bits.byte)?;
+        }
+        out.name = path.to_string();
+        Ok(out)
     }
 
     /// Todos os campos de `class` e das superclasses (a classe primeiro), na ordem da reflexão.

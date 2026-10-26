@@ -70,7 +70,12 @@ const DIE_BYTE: u32 = 0x38;
 const CUR_STAMINA: u32 = 0x30;
 const MAX_STAMINA: u32 = 0x34;
 const CUR_FOOD: u32 = 0x30;
-const MAX_FOOD: u32 = 0x34;
+/// `SurvivalComponent.HungerSettings`; o máximo é `MaxValue` (`+0x0`) da struct, como no jogo.
+const HUNGER_OFF: u32 = 0x50;
+const THIRST_OFF: u32 = 0x60;
+const BREATH_OFF: u32 = 0x70;
+/// `SurvivalPlayerController.CachedSurvivalPlayerCharacter` (aponta para o personagem montado).
+const CACHED_OFF: u32 = 0x78;
 const CUR_TEMP: u32 = 0x30;
 const NEUTRAL_TEMP: f32 = 37.0;
 
@@ -135,7 +140,7 @@ fn cfg() -> PlayerCfg {
         controller_class: format!("{MAINE}.SurvivalPlayerController"),
         pawn_field: "Pawn".into(),
         pawn_class: format!("{MAINE}.SurvivalPlayerCharacter"),
-        alt_pawn_fields: Vec::new(),
+        alt_pawn_fields: vec!["CachedSurvivalPlayerCharacter".into()],
     }
 }
 
@@ -204,7 +209,7 @@ fn defs() -> Vec<FieldDef> {
             "SurvivalComponent",
             "CurrentFood",
             LockMode::Raise,
-            max("MaxFood"),
+            max("HungerSettings.MaxValue"),
         ),
         lock(
             "agua-infinita",
@@ -212,7 +217,7 @@ fn defs() -> Vec<FieldDef> {
             "SurvivalComponent",
             "CurrentWater",
             LockMode::Raise,
-            max("MaxWater"),
+            max("ThirstSettings.MaxValue"),
         ),
         lock(
             "oxigenio-infinito",
@@ -220,7 +225,7 @@ fn defs() -> Vec<FieldDef> {
             "SurvivalComponent",
             "CurrentBreath",
             LockMode::Raise,
-            max("MaxBreath"),
+            max("BreathSettings.MaxValue"),
         ),
         lock(
             "temperatura-estavel",
@@ -279,7 +284,7 @@ fn world(omit: &[&str]) -> World {
         "SurvivalPlayerController",
         Some(player_controller_c),
         0x80,
-        &[],
+        &keep(vec![object("CachedSurvivalPlayerCharacter", CACHED_OFF)]),
     );
     let character_c = s.add_class(
         maine,
@@ -323,20 +328,49 @@ fn world(omit: &[&str]) -> World {
             float("MaxStamina", MAX_STAMINA),
         ]),
     );
+    let trait_settings = s.add_struct(
+        maine,
+        "SurvivalTraitSettings",
+        0x10,
+        &keep(vec![float("MaxValue", 0x0), float("InitialValue", 0x4)]),
+    );
+    let breath_settings = s.add_struct(
+        maine,
+        "BreathSettings",
+        0x8,
+        &keep(vec![float("MaxValue", 0x0)]),
+    );
+    let settings = |name: &'static str, offset: u32| SynthField {
+        name,
+        kind: "StructProperty",
+        offset,
+        size: 0x10,
+        bool_mask: None,
+    };
+    let survival_fields = keep(vec![
+        float("CurrentFood", CUR_FOOD),
+        float("CurrentWater", 0x38),
+        float("CurrentBreath", 0x40),
+        settings("HungerSettings", HUNGER_OFF),
+        settings("ThirstSettings", THIRST_OFF),
+        settings("BreathSettings", BREATH_OFF),
+    ]);
     let survival_c = s.add_class(
         maine,
         "SurvivalComponent",
         Some(object_c),
-        0x48,
-        &keep(vec![
-            float("CurrentFood", CUR_FOOD),
-            float("MaxFood", MAX_FOOD),
-            float("CurrentWater", 0x38),
-            float("MaxWater", 0x3c),
-            float("CurrentBreath", 0x40),
-            float("MaxBreath", 0x44),
-        ]),
+        0x80,
+        &survival_fields,
     );
+    for (field, strukt) in [
+        ("HungerSettings", trait_settings),
+        ("ThirstSettings", trait_settings),
+        ("BreathSettings", breath_settings),
+    ] {
+        if survival_fields.iter().any(|f| f.name == field) {
+            s.link_struct(survival_c, field, strukt);
+        }
+    }
     let temp_c = s.add_class(
         maine,
         "BodyTemperatureComponent",
@@ -391,9 +425,8 @@ fn world(omit: &[&str]) -> World {
     // Valores iniciais: tudo cheio, sem dano, temperatura neutra e bits ligados como no jogo.
     w.write_f32(stamina + u64::from(CUR_STAMINA), 100.0);
     w.write_f32(stamina + u64::from(MAX_STAMINA), 100.0);
-    for off in [0x30u32, 0x38, 0x40] {
+    for off in [CUR_FOOD, 0x38, 0x40, HUNGER_OFF, THIRST_OFF, BREATH_OFF] {
         w.write_f32(survival + u64::from(off), 100.0);
-        w.write_f32(survival + u64::from(off + 4), 100.0);
     }
     w.write_f32(temperature + u64::from(CUR_TEMP), NEUTRAL_TEMP);
     w
@@ -501,7 +534,40 @@ fn controller_replaced_in_table_is_invalid() {
 fn mount_in_pawn_never_targeted() {
     let w = world(&[]);
     w.write_u64(w.controller + u64::from(PAWN_OFF), w.creature);
+    // Sem o campo alternativo apontando para o personagem, nada é lido.
     assert_eq!(w.read(), Err(Absent::PawnWrongClass));
+    // Montado, como no jogo: o campo alternativo leva ao personagem, e a criatura nunca é alvo.
+    w.write_u64(w.controller + u64::from(CACHED_OFF), w.pawn);
+    let snap = w.read().unwrap();
+    assert_eq!(snap.pawn, w.pawn);
+    assert!(snap.objects.iter().all(|o| o.addr != w.creature));
+    // O campo alternativo apontando para outra coisa que não o personagem também não serve.
+    w.write_u64(w.controller + u64::from(CACHED_OFF), w.creature);
+    assert_eq!(w.read(), Err(Absent::PawnWrongClass));
+}
+
+#[test]
+fn food_target_comes_from_struct_member() {
+    let w = world(&[]);
+    let Some(Ok(food)) = w.catalog.get("comida-infinita") else {
+        panic!("comida não resolvida");
+    };
+    let ResolvedRule::Lock { target, .. } = &food.rule else {
+        panic!("comida não é trava");
+    };
+    assert!(matches!(target, ResolvedTarget::Field(f) if f.offset == HUNGER_OFF));
+    // O máximo sobe (upgrade): a trava acompanha.
+    w.write_f32(w.survival + u64::from(HUNGER_OFF), 150.0);
+    assert!(matches!(
+        w.plan(&["comida-infinita"]).as_slice(),
+        [FieldAction::WriteF32 { value, .. }] if *value == 150.0
+    ));
+    // Sem o membro da struct, o motivo cita o caminho.
+    let w = world(&["InitialValue", "MaxValue"]);
+    assert_eq!(
+        w.catalog.avail("comida-infinita"),
+        Err("campo HungerSettings.MaxValue não encontrado".to_string())
+    );
 }
 
 #[test]

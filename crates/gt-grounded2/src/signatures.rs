@@ -14,7 +14,8 @@ use gt_core::global::GlobalPattern;
 use gt_core::scan::Pattern;
 use gt_core::value::{ValueSpec, ValueType};
 use gt_ue::{
-    FBoolLayout, FFieldLayout, FPropLayout, ObjectsLayout, UObjectLayout, UStructLayout, UeLayout,
+    FBoolLayout, FFieldLayout, FPropLayout, FStructLayout, ObjectsLayout, UObjectLayout,
+    UStructLayout, UeLayout,
 };
 use serde::Deserialize;
 
@@ -266,6 +267,7 @@ struct LayoutBlock {
     ffield: FFieldBlock,
     fprop: FPropBlock,
     fbool: FBoolBlock,
+    fstruct: FStructBlock,
 }
 
 #[derive(Deserialize)]
@@ -323,6 +325,12 @@ struct FBoolBlock {
     byte_offset: u32,
     byte_mask: u32,
     field_mask: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FStructBlock {
+    struct_ptr: u32,
 }
 
 /// Bloco `[[field]]`. Os números ficam como `toml::Value` porque `f32` direto recusa inteiro TOML.
@@ -838,6 +846,9 @@ fn build_layout(file: &str, block: LayoutBlock) -> Result<UeLayout> {
             byte_offset: b.byte_offset,
             byte_mask: b.byte_mask,
             field_mask: b.field_mask,
+        },
+        fstruct: FStructLayout {
+            struct_ptr: block.fstruct.struct_ptr,
         },
     })
 }
@@ -1477,6 +1488,31 @@ offset = 3
         // Fase 5: o `[ue]` carrega nas duas formas (genérico e versão verificada).
         assert!(sigs.ue_for_version("c935e799-0b27c000").is_some());
         assert!(sigs.ue_for_version("cccc-dddd").is_some());
+        // Fase 5, Tarefa 10: os oito cheats de valor na ordem da spec 6.5, todos em sobrevivência.
+        let ids: Vec<&str> = sigs.fields().iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "vida-infinita",
+                "stamina-infinita",
+                "comida-infinita",
+                "agua-infinita",
+                "oxigenio-infinito",
+                "temperatura-estavel",
+                "sem-dano-queda",
+                "nao-morrer",
+            ]
+        );
+        assert!(
+            sigs.fields()
+                .iter()
+                .all(|f| f.category == Category::Sobrevivencia)
+        );
+        let player = sigs.ue_for_version("c935e799-0b27c000").unwrap().player;
+        assert_eq!(
+            player.alt_pawn_fields,
+            vec!["CachedSurvivalPlayerCharacter"]
+        );
         // O genérico (versão sem arquivo) também carrega nome e categoria.
         assert!(
             sigs.for_version("cccc-dddd")
@@ -2002,6 +2038,9 @@ field_size = 0x70
 byte_offset = 0x71
 byte_mask = 0x72
 field_mask = 0x73
+
+[ue.layout.fstruct]
+struct_ptr = 0x70
 "#;
 
     const UE_PLAYER: &str = r#"
@@ -2537,7 +2576,11 @@ kind = "bool"
             ue.player.pawn_class,
             "/Script/Maine.SurvivalPlayerCharacter"
         );
-        assert!(ue.player.alt_pawn_fields.is_empty());
+        // Montado, o `Pawn` é a montaria (P7): o campo alternativo leva ao personagem.
+        assert_eq!(
+            ue.player.alt_pawn_fields,
+            vec!["CachedSurvivalPlayerCharacter"]
+        );
         // Build verificada: o `rva` é o da global resolvida (depois do `adjust`).
         let ue = sigs.ue_for_version("c935e799-0b27c000").unwrap();
         assert_eq!(ue.gobjects.rva, Some(0xa53bc30));

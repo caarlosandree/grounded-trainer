@@ -125,5 +125,11 @@ max = 10000
         assert!(refuse_field_cheat(&sigs, "p").is_ok());
         // Id desconhecido segue para o erro de sempre (patch desconhecido), depois de abrir o jogo.
         assert!(refuse_field_cheat(&sigs, "nao-existe").is_ok());
+        // As assinaturas embutidas: os oito cheats de valor são recusados; os patches, não.
+        let embedded = Signatures::embedded().unwrap();
+        for f in embedded.fields() {
+            assert!(refuse_field_cheat(&embedded, &f.id).is_err(), "{}", f.id);
+        }
+        assert!(refuse_field_cheat(&embedded, "durabilidade-infinita").is_ok());
     }
 }
