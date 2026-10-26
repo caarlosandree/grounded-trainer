@@ -77,7 +77,7 @@ use std::time::{Duration, Instant};
 use gt_core::journal::Loaded;
 use gt_tui::backend::{JobKind, ReflectionJob};
 
-const FIELDS: [&str; 11] = [
+const FIELDS: [&str; 17] = [
     "vida-infinita",
     "stamina-infinita",
     "comida-infinita",
@@ -89,6 +89,12 @@ const FIELDS: [&str; 11] = [
     "pet-vida-infinita",
     "pet-nao-morre",
     "pet-stamina-infinita",
+    "carga",
+    "dano",
+    "somar-ciencia",
+    "velocidade",
+    "pulos-infinitos",
+    "gravidade",
 ];
 
 /// Roda um trabalho da tarefa de reflexão nesta thread e junta o resultado na sessão.
@@ -185,6 +191,89 @@ fn game_bits_round_trip() {
         let off = session.field_off(id);
         assert!(matches!(off, OpOutcome::Done(_)), "{id}: {off:?}");
         assert_eq!(read(addr) & mask, original & mask, "{id}: bits de volta");
+    }
+    assert!(session.pending_ids().is_empty());
+    assert_eq!(store.peek().unwrap(), Loaded::Missing);
+}
+
+/// Ajustes `set` da spec 006: liga cada um com o valor padrão da grade (ou o `target`), confere o
+/// valor no jogo pelo diário e, ao desligar, que o original voltou (spec 006, 6.4 e 6.8).
+#[test]
+#[ignore = "exige o jogo aberto e escreve nele (faça o backup do save antes)"]
+fn game_set_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JournalStore::new(dir.path().to_path_buf());
+    let lock = Arc::new(store.lock().unwrap());
+    let mut backend = GameBackend::new(None, store.clone(), lock);
+    let Find::Found(pid) = backend.find() else {
+        panic!("o jogo está aberto?");
+    };
+    let search = (backend.search_fn())(pid, None, None).unwrap();
+    if search.version_key != KNOWN_BUILD {
+        eprintln!("pulado: build diferente ({})", search.version_key);
+        return;
+    }
+    let defaults: Vec<(String, u64)> = search
+        .cheats
+        .iter()
+        .map(|c| (c.id.clone(), c.value.as_ref().map_or(0, |g| g.default_k)))
+        .collect();
+    assert!(matches!(backend.recover(), Recovered::Clean { .. }));
+    let mut session = backend.open(search, true).unwrap();
+    assert!(session.has_engine());
+    run_job(&mut session, JobKind::Index);
+    run_job(&mut session, JobKind::Controller);
+
+    let read = |addr: u64, len: usize| {
+        let mut b = vec![0u8; len];
+        MemReader::new(pid).read_exact(addr, &mut b).unwrap();
+        b
+    };
+    for id in [
+        "carga",
+        "dano",
+        "velocidade",
+        "pulos-infinitos",
+        "gravidade",
+    ] {
+        let k = defaults
+            .iter()
+            .find(|(d, _)| d == id)
+            .map_or(0, |(_, k)| *k);
+        let on = session.field_on(id, k);
+        assert!(matches!(on, OpOutcome::Done(_)), "{id}: {on:?}");
+        let report = session.field_tick(&[id.to_string()], Instant::now());
+        assert!(report.notes.is_empty(), "{id}: {:?}", report.notes);
+        let Loaded::Ok(journal) = store.peek().unwrap() else {
+            panic!("{id}: o diário devia ter a entrada do ajuste");
+        };
+        let entries: Vec<_> = journal
+            .data
+            .iter()
+            .filter(|e| e.id == id)
+            .cloned()
+            .collect();
+        assert!(!entries.is_empty(), "{id}: sem entrada no diário");
+        for e in &entries {
+            eprintln!(
+                "{id}: {:#x} original {:02x?} escrito {:02x?}",
+                e.addr, e.original, e.written
+            );
+            assert_eq!(
+                read(e.addr, e.written.len()),
+                e.written,
+                "{id}: valor no jogo"
+            );
+        }
+        let off = session.field_off(id);
+        assert!(matches!(off, OpOutcome::Done(_)), "{id}: {off:?}");
+        for e in &entries {
+            assert_eq!(
+                read(e.addr, e.original.len()),
+                e.original,
+                "{id}: original de volta"
+            );
+        }
     }
     assert!(session.pending_ids().is_empty());
     assert_eq!(store.peek().unwrap(), Loaded::Missing);
