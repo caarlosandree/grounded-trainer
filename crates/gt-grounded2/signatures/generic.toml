@@ -40,7 +40,7 @@ replacement = "0f 1f 44 00 00"
 # limitado ao total do item. Sem a soma a energia gasta não aumenta e o `je` do jogo pula a gravação.
 [[patch]]
 id = "energia-infinita"
-name = "Energia infinita"
+name = "Tocha infinita"
 category = "itens"
 description = "A tocha e os outros itens com energia não gastam energia"
 pattern = "f3 0f 10 81 50 02 00 00 0f 28 c8 f3 0f 58 cb f3 0f 5d ca 0f 2e c8 74"

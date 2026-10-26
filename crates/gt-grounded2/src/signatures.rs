@@ -1241,7 +1241,7 @@ offset = 3
         ),
         (
             "energia-infinita",
-            "Energia infinita",
+            "Tocha infinita",
             0x5a5744b,
             "f3 0f 58 cb",
             "0f 1f 40 00",
