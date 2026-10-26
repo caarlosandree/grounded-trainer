@@ -523,6 +523,25 @@ Build `c935e799-0b27c000` (`Augusta-CL-3207493`). Save de teste, FLiNG fechado, 
   voltaram ligados e funcionando.
 - **Saída:** `q` na TUI; `gt diff` mostrou `nenhuma alteração`. Jogo estável o tempo todo (relato do dono).
 
+## Sessão de 2026-10-26 (Fase 5): globais do Unreal por padrão
+
+Build `c935e799-0b27c000` (`Augusta-CL-3207493`), jogo aberto no menu, FLiNG fechado. **Só leitura.** Os padrões
+foram contados no executável em disco (`scratch/fling/tools/globals.py`, que lê só o arquivo) e conferidos na memória
+com `gt scan` (mesmas contagens). Plano 005, Tarefa 1; regra de aceitação da spec 005 6.2 (uma ocorrência, ou várias
+que resolvem todas para o mesmo endereço).
+
+| Global | Padrão | `disp_offset` | `insn_end` | `adjust` | Ocorrências | Alvo resolvido | Endereço usado |
+|---|---|---|---|---|---|---|---|
+| `GUObjectArray` | `48 8b 05 ?? ?? ?? ?? 48 8b 0c c8 48 8d 04 d1` (`mov rax,[rip+X]; mov rcx,[rax+rcx*8]; lea rax,[rcx+rdx*8]`) | 3 | 7 | 0 | 281 (disco e memória) | `+a53bc30` em todas | `+a53bc30` |
+| `FNamePool` | `74 09 ?? 8d ?? ?? ?? ?? ?? eb ?? 48 8d 0d ?? ?? ?? ?? e8` (inicialização preguiçosa: `je +9; lea reg,[pool]; jmp; lea rcx,[pool]; call construtor`) | 14 | 18 | `0x10` | 19 (disco e memória) | `+a499e40` em todas | `+a499e50` (blocos) |
+
+- O `FNamePool` começa em `+a499e40`: o código referencia `+a499e40` (a estrutura, 43 vezes), `+a499e48` (1 vez) e
+  `+a499e50` (os blocos, 3 vezes, ex.: `+12ed080` `lea rax,[+a499e50]; ret`). Os blocos ficam em `+0x10` da
+  estrutura, daí o `adjust = 0x10`.
+- **Descartados:** `4c 8d 3d ?? ?? ?? ?? eb ?? 48 8d 0d ?? ?? ?? ?? e8` (1 ocorrência, mas preso ao registrador
+  `r15`, frágil); o mesmo sem o `74 09` inicial (28 ocorrências com 8 alvos diferentes: ambíguo, pega outras
+  inicializações preguiçosas); o getter `48 8d 05 ?? ?? ?? ?? c3` (comum a muitas globais).
+
 ## Hipóteses descartadas
 
 - (2026-10-25) "Os patches em `+57BD6D0`/`+5BBFE8C` indicam que as opções de cargas e arrastar item estavam
