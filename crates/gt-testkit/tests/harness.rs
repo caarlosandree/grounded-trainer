@@ -332,7 +332,7 @@ fn second_instance_is_refused() {
     assert!(!out.status.success(), "{out:?}");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("outro gt-patch já está em execução"),
+        stderr.contains("outro gt-patch ou gt-tui já está em execução"),
         "{stderr}"
     );
     // O primeiro continua ativo e restaura normalmente.

@@ -119,6 +119,7 @@ fn hint(err: &anyhow::Error) -> Option<String> {
     match core_error(err)? {
         Error::PermissionDenied { ptrace_scope, .. } => {
             Some(gt_grounded2::resolve::permission_hint(
+                "gt",
                 gt_core::process::ptrace_scope().or(*ptrace_scope),
             ))
         }

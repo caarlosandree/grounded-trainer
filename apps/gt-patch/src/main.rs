@@ -91,15 +91,14 @@ fn hint(err: &anyhow::Error) -> Option<String> {
     match core_error(err)? {
         Error::PermissionDenied { ptrace_scope, .. } => {
             Some(gt_grounded2::resolve::permission_hint(
+                "gt-patch",
                 gt_core::process::ptrace_scope().or(*ptrace_scope),
             ))
         }
         Error::ProcessGone { .. } => {
             Some("o jogo fechou; abra-o de novo e tente outra vez.".to_string())
         }
-        Error::AlreadyRunning => {
-            Some("feche o outro gt-patch (Ctrl+C) ou espere ele terminar.".to_string())
-        }
+        Error::AlreadyRunning => Some("feche o outro programa antes.".to_string()),
         Error::WriteRefused { .. } => Some(
             "escrever em código depende de o kernel permitir escrita forçada em \
              /proc/<pid>/mem (CONFIG_PROC_MEM_ALWAYS_FORCE=y ou proc_mem.force_override=always); \
@@ -221,7 +220,7 @@ mod tests {
     #[test]
     fn hint_for_already_running_and_direct_core_errors() {
         let err = anyhow::Error::from(gt_core::Error::AlreadyRunning);
-        assert!(hint(&err).is_some_and(|h| h.contains("outro gt-patch")));
+        assert!(hint(&err).is_some_and(|h| h.contains("feche o outro programa antes")));
         let err = anyhow::Error::from(gt_core::Error::WriteRefused { addr: 0x1000 });
         assert!(hint(&err).is_some_and(|h| h.contains("proc_mem.force_override")));
     }

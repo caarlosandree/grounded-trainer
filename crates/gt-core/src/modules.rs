@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{LazyLock, Mutex, PoisonError};
 
 use crate::error::{Error, Result};
 use crate::maps::{MapPath, MapRegion};
@@ -143,24 +144,62 @@ pub fn open_in_root(root: &Path, path: &Path) -> Result<PeHeaders> {
     })
 }
 
+/// Avisos já emitidos, por `(tipo, caminho)`: o primeiro de cada par sai em `warn`, os demais em
+/// `debug`. Sem isso, cada descoberta de módulos (a cada busca do jogo) repetiria o mesmo aviso.
+#[derive(Debug, Default)]
+struct WarnOnce {
+    seen: HashSet<(&'static str, PathBuf)>,
+}
+
+impl WarnOnce {
+    /// `true` só na primeira vez que o par `(kind, path)` aparece.
+    fn first(&mut self, kind: &'static str, path: &Path) -> bool {
+        self.seen.insert((kind, path.to_path_buf()))
+    }
+}
+
+/// Avisos de módulo já emitidos neste processo.
+static WARNED: LazyLock<Mutex<WarnOnce>> = LazyLock::new(|| Mutex::new(WarnOnce::default()));
+
+/// Marca `(kind, path)` como avisado e diz se é a primeira vez. Mutex envenenado não impede o
+/// aviso: a informação de "já avisado" continua valendo.
+fn warn_first(kind: &'static str, path: &Path) -> bool {
+    let mut warned = WARNED.lock().unwrap_or_else(PoisonError::into_inner);
+    warned.first(kind, path)
+}
+
 /// Extensão de um módulo confiável: `(size, disk_size)` a partir do `SizeOfImage` da memória e do
-/// que o disco informa. Diferença entre os dois sai como aviso (spec 002, 6.12).
+/// que o disco informa. Diferença entre os dois sai como aviso (spec 002, 6.12), uma vez por
+/// módulo.
 fn trusted_extent(name: &str, path: &Path, memory: u64, root: &Path) -> (u64, Option<u64>) {
     match open_in_root(root, path) {
         Ok(disk) => {
             let disk = u64::from(disk.size_of_image);
             if disk != memory {
-                tracing::warn!(
-                    module = name,
-                    memory,
-                    disk,
-                    "SizeOfImage difere entre a memória e o disco"
-                );
+                if warn_first("size_of_image", path) {
+                    tracing::warn!(
+                        module = name,
+                        memory,
+                        disk,
+                        "SizeOfImage difere entre a memória e o disco"
+                    );
+                } else {
+                    tracing::debug!(
+                        module = name,
+                        memory,
+                        disk,
+                        "SizeOfImage difere entre a memória e o disco"
+                    );
+                }
             }
             (memory.min(disk), Some(disk))
         }
         Err(err) => {
-            tracing::warn!(module = name, error = %err, "extensão do módulo não conferida com o disco");
+            if warn_first("extensão", path) {
+                tracing::warn!(module = name, error = %err, "extensão do módulo não conferida com o disco");
+            } else {
+                tracing::debug!(module = name, error = %err, "extensão do módulo não conferida com o disco");
+            }
             (memory, None)
         }
     }
@@ -354,6 +393,21 @@ mod tests {
         .unwrap();
         let set = verified_non_pe(&maps, root);
         assert_eq!(set, HashSet::from([PathBuf::from("/lib/libx.so")]));
+    }
+
+    #[test]
+    fn warn_once_per_path() {
+        let mut warned = WarnOnce::default();
+        let a = Path::new("/opt/trusted/a.dll");
+        let b = Path::new("/opt/trusted/b.dll");
+        assert!(warned.first("extensão", a));
+        assert!(!warned.first("extensão", a));
+        // Outro tipo de aviso para o mesmo caminho é outro par.
+        assert!(warned.first("size_of_image", a));
+        assert!(!warned.first("size_of_image", a));
+        // Outro caminho com o mesmo tipo também é outro par.
+        assert!(warned.first("extensão", b));
+        assert!(!warned.first("extensão", b));
     }
 
     #[test]

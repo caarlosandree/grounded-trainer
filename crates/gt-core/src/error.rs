@@ -106,7 +106,7 @@ pub enum Error {
     BoundariesChanged { id: String },
 
     /// Outro `gt-patch` já segura a trava do diário.
-    #[error("outro gt-patch já está em execução")]
+    #[error("outro gt-patch ou gt-tui já está em execução")]
     AlreadyRunning,
 
     /// Falha do diário: gravação (com o caminho), serialização ou trava.

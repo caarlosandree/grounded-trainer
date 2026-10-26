@@ -366,7 +366,9 @@ impl Engine {
     /// Resolve entradas do diário: reescreve os originais onde cada byte é o original ou
     /// o nosso, esquece as que já estão originais e não toca nas de outro.
     ///
-    /// Falha por perigo ou prazo mantém as entradas no diário.
+    /// Falha por perigo ou prazo mantém as entradas no diário. Entradas fora da política de
+    /// escrita vão para `outside_policy`: não são tocadas e continuam no diário, porque os bytes
+    /// podem ser nossos e a próxima execução precisa vê-las.
     pub fn restore_entries(&mut self, entries: Vec<JournalEntry>) -> Result<RestoreReport> {
         self.retry_resume()?;
         let result = self.restore_inner(entries);

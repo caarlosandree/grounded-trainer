@@ -8,6 +8,7 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use gt_core::journal::Journal;
+use gt_core::procinfo::Identity;
 use gt_core::suspend::{PauseConfig, open_checked, sample_pcs};
 use gt_grounded2::GAME_EXE;
 use gt_grounded2::profile::{FunctionHits, aggregate};
@@ -17,6 +18,12 @@ use super::{begin_and_show, location};
 
 /// Quantas funções aparecem no resultado.
 const TOP: usize = 20;
+
+/// `true` se `a` e `b` são o mesmo processo (mesmo PID, horário de início e boot). Se o jogo
+/// reiniciou entre a leitura do alvo e a abertura do `pidfd`, as funções e o mapa são de outro.
+fn same_process(a: &Identity, b: &Identity) -> bool {
+    a == b
+}
 
 /// Texto das funções mais amostradas: `módulo+início-fim  N amostras` e, abaixo, cada `pc`.
 fn write_profile(
@@ -53,6 +60,9 @@ pub fn run(pid: Option<i32>, samples: u32, interval_ms: u64) -> anyhow::Result<(
     let (module, mem_headers) = target.module(GAME_EXE)?;
     let functions = target.open_disk(module, &mem_headers)?.functions()?;
     let (pidfd, identity) = open_checked(target.pid)?;
+    if !same_process(&target.identity, &identity) {
+        anyhow::bail!("o jogo reiniciou enquanto o perfil era preparado; rode o profile de novo");
+    }
 
     let base = Journal {
         boot_id: identity.boot_id,
@@ -92,6 +102,26 @@ pub fn run(pid: Option<i32>, samples: u32, interval_ms: u64) -> anyhow::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_refuses_other_identity() {
+        let id = Identity {
+            pid: 42,
+            start_time: 1000,
+            boot_id: "boot".to_string(),
+        };
+        assert!(same_process(&id, &id.clone()));
+        let reborn = Identity {
+            start_time: 1001,
+            ..id.clone()
+        };
+        assert!(!same_process(&id, &reborn));
+        let other_boot = Identity {
+            boot_id: "outro".to_string(),
+            ..id.clone()
+        };
+        assert!(!same_process(&id, &other_boot));
+    }
 
     #[test]
     fn write_profile_lists_functions_and_pcs_with_counts() {

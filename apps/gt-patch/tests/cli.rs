@@ -146,7 +146,7 @@ fn restore_refused_while_locked() {
     let out = gt_patch(state.path(), &["restore"]);
     assert!(!out.status.success());
     assert!(
-        stderr(&out).contains("outro gt-patch já está em execução"),
+        stderr(&out).contains("outro gt-patch ou gt-tui já está em execução"),
         "{}",
         stderr(&out)
     );
