@@ -209,19 +209,49 @@ fn raw_merge_search_updates_only_listed() {
     {
         let mut c = e.control.lock().unwrap();
         c.defs[0].replacement = vec![0x48, 0x89, 0xCF];
-        c.defs[1].replacement = vec![0xB8, 0x44, 0x44, 0x44, 0x44];
+        // O `ValueSpec` sobrescreve o slot (bytes 1..5); o primeiro byte ele não mascara.
+        c.defs[1].replacement = vec![0xB9, 0x44, 0x44, 0x44, 0x44];
     }
-    let again = (e.backend.search_fn())(t.pid, Some(vec![TOGGLE.into()]), Some(identity)).unwrap();
-    assert_eq!(again.ids, Some(vec![TOGGLE.to_string()]));
-    assert_eq!(again.cheats.len(), 1);
-    assert_eq!(again.cheats[0].id, TOGGLE);
+    let listed =
+        (e.backend.search_fn())(t.pid, Some(vec![TOGGLE.into()]), Some(identity.clone())).unwrap();
+    assert_eq!(listed.ids, Some(vec![TOGGLE.to_string()]));
+    assert_eq!(listed.cheats.len(), 1);
+    assert_eq!(listed.cheats[0].id, TOGGLE);
+    // O `merge_search` precisa respeitar `ids` por conta própria: este resultado leva as duas
+    // definições novas no `payload`, mas lista só o `toggle` em `ids`.
+    let mut again = (e.backend.search_fn())(t.pid, None, Some(identity)).unwrap();
+    assert_eq!(again.payload.len(), 2);
+    again.ids = listed.ids;
     assert!(s.merge_search(again));
 
     assert!(is_done(&s.apply(&[(TOGGLE.into(), 0)])));
     assert_eq!(read(t.pid, t.spin_page, 3), [0x48, 0x89, 0xCF]);
     assert!(is_done(&s.apply(&[(VALUE.into(), 2)])));
-    // O `value` não foi listado: continua com a substituição da primeira busca.
+    // O `value` não foi listado: continua com a definição da primeira busca (`B8`, não `B9`).
     assert_eq!(read(t.pid, t.value_page, 5), [0xB8, 0x22, 0x22, 0x22, 0x22]);
+}
+
+#[test]
+fn raw_merge_search_keeps_active_definition() {
+    let mut e = env();
+    let t = &e.target;
+    let first = (e.backend.search_fn())(t.pid, None, None).unwrap();
+    let identity = first.identity.clone();
+    let mut s = e.backend.open(first, true).unwrap();
+    assert!(is_done(&s.apply(&[(TOGGLE.into(), 0)])));
+    assert_eq!(read(t.pid, t.spin_page, 3), [0x48, 0x89, 0xCF]);
+
+    // Uma busca lista o `toggle`, que está ativo, com uma substituição nova.
+    e.control.lock().unwrap().defs[0].replacement = vec![0x48, 0x89, 0xF9];
+    let again = (e.backend.search_fn())(t.pid, Some(vec![TOGGLE.into()]), Some(identity)).unwrap();
+    assert!(s.merge_search(again));
+
+    // O ativo não é tocado: o `undo` restaura os bytes certos...
+    assert!(is_done(&s.undo(TOGGLE)));
+    assert_eq!(read(t.pid, t.spin_page, 3), [0x48, 0x8B, 0xF9]);
+    // ...e a definição guardada continua a antiga (ligar de novo escreve `48 89 CF`).
+    assert!(is_done(&s.apply(&[(TOGGLE.into(), 0)])));
+    assert_eq!(read(t.pid, t.spin_page, 3), [0x48, 0x89, 0xCF]);
 }
 
 #[test]
@@ -336,4 +366,27 @@ fn raw_backend_takes_the_journal_lock() {
     // Uma segunda instância no mesmo diretório recusa.
     let second = RawBackend::new(e.control.clone(), e._dir.path().to_path_buf());
     assert!(matches!(second, Err(gt_core::Error::AlreadyRunning)));
+}
+
+#[test]
+fn raw_drop_order_keeps_the_lock_until_the_session_falls() {
+    let mut e = env();
+    let t = &e.target;
+    let search = (e.backend.search_fn())(t.pid, None, None).unwrap();
+    let mut s = e.backend.open(search, true).unwrap();
+    assert!(is_done(&s.apply(&[(TOGGLE.into(), 0)])));
+    assert_eq!(read(t.pid, t.spin_page, 3), [0x48, 0x89, 0xCF]);
+
+    // Sem o backend, a sessão ainda segura a trava (o `Arc`).
+    drop(e.backend);
+    let second = RawBackend::new(e.control.clone(), e._dir.path().to_path_buf());
+    assert!(matches!(second, Err(gt_core::Error::AlreadyRunning)));
+
+    // A sessão cai: o motor restaura o patch e só depois a trava é solta.
+    drop(s);
+    assert_eq!(
+        read(e.target.pid, e.target.spin_page, 3),
+        [0x48, 0x8B, 0xF9]
+    );
+    assert!(RawBackend::new(e.control.clone(), e._dir.path().to_path_buf()).is_ok());
 }
