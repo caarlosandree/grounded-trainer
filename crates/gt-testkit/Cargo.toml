@@ -11,6 +11,9 @@ anyhow.workspace = true
 # Os binários de `src/bin/` não enxergam dev-dependencies; por isso `write` e
 # `test-support` ficam nas dependências normais.
 gt-core = { workspace = true, features = ["write", "test-support"] }
+# Cena de reflexão sintética do `gt-testtarget --ue` e as definições que casam com ela.
+gt-grounded2.workspace = true
+gt-ue = { workspace = true, features = ["synth"] }
 nix = { workspace = true, features = ["signal"] }
 serde_json.workspace = true
 

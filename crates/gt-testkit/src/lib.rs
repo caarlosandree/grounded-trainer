@@ -5,6 +5,10 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
+pub mod ue;
+
+pub use ue::{UeAddrs, synth_signatures};
+
 /// Caminho de um binário deste crate (ex. `gt-testtarget`) em `target/<perfil>/`.
 ///
 /// Sobe a partir do executável de teste até o diretório que contém `deps`. Entra em
@@ -50,6 +54,8 @@ pub struct TestTarget {
     pub ro_shared: u64,
     /// Tamanho da página do sistema, informado pelo alvo.
     pub page: u64,
+    /// Reflexão sintética (só com `ue`).
+    pub ue: Option<UeAddrs>,
 }
 
 /// Opções de [`TestTarget::spawn_with`].
@@ -59,6 +65,8 @@ pub struct TargetOpts {
     pub spin: bool,
     /// Cria uma thread no laço de valor em `value_page` (consome uma CPU).
     pub spin_value: bool,
+    /// Monta a reflexão sintética de [`ue::build`] numa arena da própria memória.
+    pub ue: bool,
 }
 
 fn parse_hex(v: &serde_json::Value) -> u64 {
@@ -80,6 +88,9 @@ impl TestTarget {
         }
         if opts.spin_value {
             cmd.arg("--spin-value");
+        }
+        if opts.ue {
+            cmd.arg("--ue");
         }
         let mut child = cmd
             .stdin(Stdio::piped())
@@ -106,6 +117,16 @@ impl TestTarget {
             big_len: v["big_len"].as_u64().unwrap() as usize,
             ro_shared: parse_hex(&v["ro_shared"]),
             page: v["page"].as_u64().unwrap(),
+            ue: v.get("ue").map(|u| UeAddrs {
+                gobjects: parse_hex(&u["gobjects"]),
+                names: parse_hex(&u["names"]),
+                controller: parse_hex(&u["controller"]),
+                pawn: parse_hex(&u["pawn"]),
+                creature: parse_hex(&u["creature"]),
+                pawn_field_addr: parse_hex(&u["pawn_field_addr"]),
+                health: parse_hex(&u["health"]),
+                alt_pawn: parse_hex(&u["alt_pawn"]),
+            }),
             child,
         }
     }

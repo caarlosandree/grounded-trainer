@@ -656,6 +656,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "gt-core",
+ "gt-grounded2",
+ "gt-ue",
  "nix 0.31.3",
  "serde_json",
  "tempfile",
