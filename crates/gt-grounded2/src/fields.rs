@@ -7,6 +7,7 @@
 //! diário nunca guarda duas entradas vivas do mesmo cheat.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 use gt_core::Error as CoreError;
@@ -47,7 +48,7 @@ pub struct TickReport {
 
 /// Estado dos cheats de valor de uma conexão.
 pub struct FieldRuntime {
-    catalog: FieldCatalog,
+    catalog: Arc<FieldCatalog>,
     /// Pawn do último ciclo com o personagem achado.
     last_pawn: Option<u64>,
     /// O personagem estava achado no último ciclo (`None` antes do primeiro).
@@ -63,9 +64,10 @@ fn owner(guard: &[GuardBytes]) -> Option<u64> {
 }
 
 impl FieldRuntime {
-    pub fn new(catalog: FieldCatalog) -> Self {
+    /// O catálogo pode vir num `Arc`, para ser lido também pela procura do controller.
+    pub fn new(catalog: impl Into<Arc<FieldCatalog>>) -> Self {
         Self {
-            catalog,
+            catalog: catalog.into(),
             last_pawn: None,
             found: None,
             invalid: HashSet::new(),
@@ -203,17 +205,24 @@ impl FieldRuntime {
         engine.set_bits(id, addr, mask, guard)
     }
 
-    /// Desliga o cheat `id`: uma trava só para; os bits voltam ao original (spec 6.5).
+    /// Desliga o cheat `id`: uma trava só para; os bits voltam ao original (spec 6.5). Bits
+    /// de um objeto que não existe mais são descartados sem escrever e o desligar conta como
+    /// feito (spec 6.7), com uma linha no log; o `id` vem sempre em `restored`.
     pub fn turn_off(&mut self, engine: &mut Engine, id: &str) -> gt_core::Result<BatchReport> {
         self.invalid.remove(id);
+        let done = BatchReport {
+            restored: vec![id.to_string()],
+            ..BatchReport::default()
+        };
         match self.catalog.get(id) {
             Some(Ok(resolved)) if matches!(resolved.rule, ResolvedRule::ClearBits { .. }) => {
-                engine.restore_bits(id)
+                let r = engine.restore_bits(id)?;
+                if !r.foreign.is_empty() {
+                    tracing::info!(id, "bits de um objeto que não existe mais; nada escrito");
+                }
+                Ok(done)
             }
-            Some(_) => Ok(BatchReport {
-                restored: vec![id.to_string()],
-                ..BatchReport::default()
-            }),
+            Some(_) => Ok(done),
             None => Err(CoreError::NotActive { id: id.to_string() }),
         }
     }

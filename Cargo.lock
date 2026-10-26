@@ -675,6 +675,7 @@ dependencies = [
  "gt-grounded2",
  "gt-testkit",
  "gt-tui",
+ "gt-ue",
  "nix 0.31.3",
  "ratatui",
  "serde_json",

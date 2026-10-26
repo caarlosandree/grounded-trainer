@@ -4,15 +4,19 @@
 //! Também mora aqui a classificação pura dos desfechos de uma operação ([`outcome_of`]) e do
 //! relatório de recuperação ([`recovery_outcome`]), usada pelas duas implementações.
 
+use std::any::Any;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gt_core::engine::{BatchReport, RestoreReport};
 use gt_core::journal::DiscardReason;
 use gt_core::procinfo::Identity;
 use gt_core::recovery::RecoveryReport;
 use gt_core::value::ValueSpec;
+use gt_grounded2::fields::{PlayerState, TickReport};
+use gt_grounded2::player::Absent;
 use gt_grounded2::signatures::Category;
 
 use crate::model::Avail;
@@ -222,6 +226,52 @@ pub fn restore_outcome(res: gt_core::Result<RestoreReport>, pending: &[String]) 
     }
 }
 
+/// Trabalho da tarefa de reflexão (spec 005, 6.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JobKind {
+    /// Índice das classes e campos, e o catálogo dos cheats de valor.
+    Index,
+    /// Procura do controller do jogador.
+    Controller,
+}
+
+/// Um trabalho pronto para rodar na thread da tarefa de reflexão. Ele captura cópias do que
+/// precisa (leitor, globais, catálogo): nada da sessão é emprestado.
+pub struct ReflectionJob {
+    pub kind: JobKind,
+    pub run: Box<dyn FnOnce() -> ReflectionOutcome + Send>,
+}
+
+/// Resultado de um trabalho, que volta por canal ao laço principal.
+pub struct ReflectionOutcome {
+    pub kind: JobKind,
+    /// Quanto o trabalho levou (o intervalo da tarefa é `max(10 s, 2 × took)`).
+    pub took: Duration,
+    /// Dados próprios da implementação, que só a sessão que criou o trabalho entende.
+    pub data: Box<dyn Any + Send>,
+}
+
+/// O que um resultado da tarefa de reflexão mudou na sessão.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReflectionNews {
+    /// A sessão tem um índice bom (depois deste resultado).
+    pub index_ok: bool,
+    /// O motivo de agora pede nova tentativa no intervalo da tarefa.
+    pub retry: bool,
+    /// A procura do controller mudou o estado do personagem.
+    pub player_changed: Option<PlayerState>,
+}
+
+/// Relatório de um ciclo sem manutenção (sem cheats de valor, sem motor ou com o motor parado).
+pub fn idle_tick() -> TickReport {
+    TickReport {
+        player: PlayerState::Absent(Absent::NoController),
+        notes: HashMap::new(),
+        events: Vec::new(),
+        pawn_null_since: None,
+    }
+}
+
 /// Sessão com um alvo conectado: o monitor de fechamento e, se houver, o motor.
 ///
 /// A trava do diário é um `Arc<JournalLock>` compartilhado com o backend; a implementação
@@ -255,8 +305,50 @@ pub trait Session<P> {
     fn pending_ids(&self) -> Vec<String>;
     /// Se o jogo fechou, descarta o registro sem escrever.
     fn discard_gone(&mut self);
-    /// Desfaz tudo; devolve (restaurados, alterados por outro).
+    /// Desfaz tudo; devolve (restaurados, alterados por outro). Os bits dos cheats de valor
+    /// também voltam (o `undo_all` do motor os restaura).
     fn undo_all(&mut self) -> (Vec<String>, Vec<String>);
+
+    // ---- cheats de valor (spec 005); o padrão é "sem cheats de valor" ----
+
+    /// O trabalho `kind` da tarefa de reflexão, ou `None` se não há o que fazer (globais
+    /// indisponíveis, índice que ainda não chegou para procurar o controller...).
+    fn reflection_job(&self, _kind: JobKind) -> Option<ReflectionJob> {
+        None
+    }
+
+    /// Junta o resultado de um trabalho (o controlador já descartou os de outra conexão).
+    fn merge_reflection(&mut self, _out: ReflectionOutcome) -> ReflectionNews {
+        ReflectionNews::default()
+    }
+
+    /// Disponibilidade de cada cheat de valor: disco, globais e conferência barata da busca, e
+    /// o índice da reflexão (`Checking` até o primeiro índice).
+    fn field_avail(&self) -> Vec<(String, Avail)> {
+        Vec::new()
+    }
+
+    /// O controller tem de ser procurado: não há um válido, ou o `Pawn` dele está nulo há mais
+    /// de 30 s.
+    fn needs_controller(&self, _now: Instant) -> bool {
+        false
+    }
+
+    /// Liga um cheat de valor: a trava é aceita sempre; os bits escrevem já se o personagem
+    /// estiver presente.
+    fn field_on(&mut self, id: &str) -> OpOutcome {
+        OpOutcome::Refused(format!("{id} não é um cheat de valor"))
+    }
+
+    /// Desliga um cheat de valor: a trava só para; os bits voltam ao original.
+    fn field_off(&mut self, id: &str) -> OpOutcome {
+        OpOutcome::Refused(format!("{id} não é um cheat de valor"))
+    }
+
+    /// Manutenção de ~10 Hz dos cheats de valor ligados (`on`).
+    fn field_tick(&mut self, _on: &[String], _now: Instant) -> TickReport {
+        idle_tick()
+    }
 }
 
 /// O alvo: achar o processo, recuperar o diário, buscar o catálogo e abrir a sessão.
