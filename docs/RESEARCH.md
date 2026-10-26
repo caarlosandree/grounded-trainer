@@ -572,6 +572,26 @@ em `/Script/Maine`).
   `bAllowCurrentWaterDecrease` (`+0x29c`), `bool` nativos. Limpá-los faria a comida e a água não caírem sem reescrever
   o valor. Não usado: mudaria como os cheats funcionam (spec 6.5.1).
 
+## Sessão de 2026-10-26 (Fase 5): critério de pronto da spec 005 no jogo
+
+Build `c935e799-0b27c000`, backup do save feito pelo dono, FLiNG fechado. Plano 005, Tarefa 19.
+
+- Testes `#[ignore]` em `apps/gt-tui/tests/game.rs`: `game_globals_layout_and_fields_available` (busca de patches e
+  globais 1,5 s, índice 1,05 s, controller 0,97 s; os oito disponíveis e verificados) e `game_bits_round_trip`
+  (`sem-dano-queda`: byte `+0x1619` do pawn, original `0x01`, máscara `0xff`; `nao-morrer`: byte `+0x11d` do
+  `HealthComponent`, original `0x06`, máscara `0x06`; os dois voltaram ao original e o diário ficou vazio).
+- Critério 1–11 pela TUI com o dono: **tudo funcionou**, inclusive "Não morrer" e "Sem dano de queda", menos a
+  stamina na primeira rodada. A trava segurava `CurrentStamina` em 100, mas o jogo considera cheia em 120 (bônus sobre
+  `MaxStamina`), então a barra parecia não encher. Correção: as travas de subir miram o maior valor já visto naquele
+  objeto com o cheat ligado (nunca menos que o campo de alvo); na segunda rodada, a stamina ficou cheia. O dono lembra
+  que vida e stamina crescem com a progressão: a vida segue `MaxHealth − CurrentDamage` e a stamina, o `MaxStamina`
+  relido a cada ciclo mais o máximo aprendido.
+- Montado, os cheats seguem no personagem (`CachedSurvivalPlayerCharacter`); o `Pawn` alterna entre o personagem e a
+  montaria durante o jogo, sem efeito nos cheats.
+- Pet (para uma spec futura): o `PetMasterComponent` do personagem (`+0x14b0`) tem `CurrentPetFull` (`+0x170`,
+  nulo nesta leitura), `bBuggyGodModeActive` (`+0x180`, `bool` nativo, `0x00`), `CurrentPetMaxHealth` (`+0x1c4`, 220)
+  e `CurrentPetDamage` (`+0x1c8`, 13,4).
+
 ## Hipóteses descartadas
 
 - (2026-10-25) "Os patches em `+57BD6D0`/`+5BBFE8C` indicam que as opções de cargas e arrastar item estavam
