@@ -329,7 +329,7 @@ ou ao religar, 6.2).
 | Tecla | Ação |
 |---|---|
 | `↑`/`↓` (ou `k`/`j`) | Mover a seleção |
-| `espaço` ou `Enter` | Ligar/desligar o cheat selecionado. Num indisponível ou em `erro`, escreve o motivo no registro de eventos e, se ele tiver a marca de religar pendente, tira dos desejados (6.2) |
+| `espaço` ou `Enter` | Ligar/desligar o cheat selecionado. Num indisponível, escreve o motivo no registro de eventos e, se ele tiver a marca de religar pendente, tira dos desejados (6.2). Num cheat em `erro`, pede a restauração dos restos (6.8) |
 | `←`/`→` (ou `h`/`l`) | Diminuir/aumentar o valor em um `step`, até `min`/`max` |
 | `r` | Ver abaixo |
 | `q`, `Esc` ou `Ctrl+C` | Sair (6.8), sem pedir confirmação (decisão do dono) |
