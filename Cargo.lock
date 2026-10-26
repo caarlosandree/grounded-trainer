@@ -683,6 +683,12 @@ dependencies = [
 [[package]]
 name = "gt-ue"
 version = "0.1.0"
+dependencies = [
+ "gt-core",
+ "gt-ue",
+ "thiserror 2.0.21",
+ "tracing",
+]
 
 [[package]]
 name = "hashbrown"
