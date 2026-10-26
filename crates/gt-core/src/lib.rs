@@ -6,6 +6,7 @@ pub mod diff;
 #[cfg(feature = "write")]
 pub mod engine;
 pub mod error;
+pub mod global;
 pub mod guard;
 pub mod journal;
 pub mod maps;
