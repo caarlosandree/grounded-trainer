@@ -8,7 +8,7 @@ use gt_ue::synth::{SparseMem, SynthField, SynthUe};
 use gt_ue::{Names, ObjectArray, ReflectionIndex, ScanBudget, UeLayout};
 
 use super::*;
-use crate::signatures::Category;
+use crate::signatures::{Category, FieldRoot};
 
 const ARENA: u64 = 0x1000_0000;
 const ARENA_LEN: usize = 64 << 20;
@@ -147,6 +147,7 @@ fn cfg() -> PlayerCfg {
         pawn_field: "Pawn".into(),
         pawn_class: format!("{MAINE}.SurvivalPlayerCharacter"),
         alt_pawn_fields: vec!["CachedSurvivalPlayerCharacter".into()],
+        game_state: None,
     }
 }
 
@@ -165,6 +166,8 @@ fn lock(
         description: String::new(),
         object: object.into(),
         object_class: format!("{MAINE}.{class}"),
+        root: FieldRoot::Pawn,
+        value: None,
         rule: FieldRule::Lock {
             field: field.into(),
             mode,
@@ -183,6 +186,8 @@ fn bits(id: &str, object: &str, class: &str, fields: &[&str]) -> FieldDef {
         description: String::new(),
         object: object.into(),
         object_class: format!("{MAINE}.{class}"),
+        root: FieldRoot::Pawn,
+        value: None,
         rule: FieldRule::ClearBits {
             fields: fields.iter().map(|s| s.to_string()).collect(),
         },

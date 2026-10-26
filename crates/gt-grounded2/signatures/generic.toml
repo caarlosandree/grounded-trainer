@@ -132,6 +132,13 @@ pawn_class = "/Script/Maine.SurvivalPlayerCharacter"
 # Montado, Pawn/Character/AcknowledgedPawn apontam para a montaria; este campo continua no personagem (P7,
 # RESEARCH.md 2026-10-26, Fase 5).
 alt_pawn_fields = ["CachedSurvivalPlayerCharacter"]
+# Caminho até o GameState (spec 006, 6.3): controller -> Outer (Level) -> OwningWorld -> GameState. O Outer é
+# o cabeçalho do UObject (layout), não um campo da reflexão. Os cinco campos vêm juntos.
+level_class = "/Script/Engine.Level"
+world_field = "OwningWorld"
+world_class = "/Script/Engine.World"
+game_state_field = "GameState"
+game_state_class = "/Script/Maine.InGameGameState"
 
 # Fase 5 (spec 005, 6.5): cheats de valor, na ordem da spec. Campos e alvos por NOME da reflexão (P2–P8 em
 # RESEARCH.md, 2026-10-26). As faixas sãs têm folga para upgrades; alvo fora delas não é escrito.
@@ -297,3 +304,117 @@ mode = "raise"
 target_field = "MaxStamina"
 min = 1
 max = 100000
+
+# Fase 6 (spec 006, 6.7): carga, dano, ciência, velocidade, pulos e gravidade. Campos por NOME da reflexão.
+[[field]]
+id = "carga"
+name = "Capacidade de carga"
+category = "itens"
+description = "Aumenta quantos itens o personagem carrega; o valor original volta ao desligar"
+object = "HaulingComponent"
+object_class = "/Script/Maine.HaulingComponent"
+rule = "set"
+fields = ["Capacity"]
+kind = "int"
+
+[field.value]
+type = "i32"
+min = 1
+max = 100
+step = 1
+default = 20
+
+[[field]]
+id = "dano"
+name = "Multiplicador de dano"
+category = "progressao"
+description = "Multiplica o dano que o personagem causa; o valor original volta ao desligar"
+object = "pawn"
+object_class = "/Script/Maine.SurvivalCharacter"
+rule = "set"
+fields = ["CustomDamageMultiplier"]
+kind = "float"
+
+[field.value]
+type = "f32"
+min = 1
+max = 100
+step = 1
+default = 10
+unit = "x"
+decimals = 0
+
+# Ação: soma a quantidade à ciência do GameState, uma execução por tecla, sem diário nem desfazer (6.6).
+[[field]]
+id = "somar-ciencia"
+name = "Somar ciência"
+category = "progressao"
+description = "Soma ciência de uma vez; vai para o save e não tem desfazer"
+object = "PartyComponent"
+object_class = "/Script/Maine.PartyComponent"
+root = "game_state"
+rule = "add"
+field = "ScienceFound"
+kind = "int"
+result_max = 100000
+
+[field.value]
+type = "i32"
+min = 100
+max = 10000
+step = 100
+default = 1000
+
+[[field]]
+id = "velocidade"
+name = "Velocidade"
+category = "movimento"
+description = "Multiplica a velocidade de caminhada e de nado do personagem; o original volta ao desligar"
+object = "CharacterMovement"
+object_class = "/Script/Maine.MaineCharMovementComponent"
+rule = "set"
+fields = ["CustomGroundSpeedMultiplier", "CustomSwimSpeedMultiplier"]
+kind = "float"
+
+[field.value]
+type = "f32"
+min = 0.5
+max = 4
+step = 0.25
+default = 2
+unit = "x"
+decimals = 2
+
+[[field]]
+id = "pulos-infinitos"
+name = "Pulos infinitos"
+category = "movimento"
+description = "Permite pular de novo no ar; o valor original volta ao desligar"
+object = "pawn"
+object_class = "/Script/Engine.Character"
+rule = "set"
+fields = ["JumpMaxCount"]
+kind = "int"
+target = 1000
+min = 1
+max = 1000
+
+[[field]]
+id = "gravidade"
+name = "Gravidade"
+category = "movimento"
+description = "Ajusta a escala de gravidade do personagem; o original volta ao desligar"
+object = "CharacterMovement"
+object_class = "/Script/Maine.MaineCharMovementComponent"
+rule = "set"
+fields = ["GravityScale"]
+kind = "float"
+
+[field.value]
+type = "f32"
+min = 0.1
+max = 2
+step = 0.1
+default = 0.5
+unit = "x"
+decimals = 1

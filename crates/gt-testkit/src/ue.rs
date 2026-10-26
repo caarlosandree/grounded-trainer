@@ -8,7 +8,7 @@
 use gt_core::global::GlobalPattern;
 use gt_core::scan::Pattern;
 use gt_grounded2::signatures::{
-    Category, FieldDef, FieldRule, GlobalDef, LockMode, LockTarget, PlayerCfg, UeSigs,
+    Category, FieldDef, FieldRoot, FieldRule, GlobalDef, LockMode, LockTarget, PlayerCfg, UeSigs,
 };
 use gt_ue::UeLayout;
 use gt_ue::synth::{SynthField, SynthImage, SynthUe};
@@ -253,6 +253,8 @@ fn lock(
         description: String::new(),
         object: object.into(),
         object_class: format!("{MAINE}.{object}"),
+        root: FieldRoot::Pawn,
+        value: None,
         rule: FieldRule::Lock {
             field: field.into(),
             mode,
@@ -271,6 +273,8 @@ fn clear_bits(id: &str, object: &str, class: &str, fields: &[&str]) -> FieldDef 
         description: String::new(),
         object: object.into(),
         object_class: format!("{MAINE}.{class}"),
+        root: FieldRoot::Pawn,
+        value: None,
         rule: FieldRule::ClearBits {
             fields: fields.iter().map(|f| f.to_string()).collect(),
         },
@@ -298,6 +302,7 @@ pub fn synth_signatures() -> (UeSigs, Vec<FieldDef>) {
             pawn_field: "Pawn".into(),
             pawn_class: format!("{MAINE}.SurvivalPlayerCharacter"),
             alt_pawn_fields: vec!["CachedSurvivalPlayerCharacter".into()],
+            game_state: None,
         },
     };
     let bar = (0.0, 10_000.0);

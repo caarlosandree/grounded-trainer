@@ -14,7 +14,7 @@ use gt_ue::read::{read_u8, read_u32, read_u64, read_vec};
 use gt_ue::{Field, ObjectArray, ReflectionIndex, ScanBudget, UeError, UeLayout, is_object_family};
 use serde::Serialize;
 
-use crate::signatures::{FieldDef, FieldRule, LockMode, LockTarget, PlayerCfg};
+use crate::signatures::{FieldDef, FieldRoot, FieldRule, LockMode, LockTarget, PlayerCfg};
 
 /// Com o `Pawn` nulo há mais que isto, o controller guardado é procurado de novo (spec 6.3).
 const PAWN_NULL_RESEARCH: Duration = Duration::from_secs(30);
@@ -323,12 +323,19 @@ fn resolve_path<M: ReadMem + ?Sized>(
     })
 }
 
+/// Motivo de indisponível das regras e raízes ainda sem resolução (Tarefa 5 do plano 006).
+const UNSUPPORTED_RULE: &str = "regra ainda não suportada";
+
 fn resolve_field<M: ReadMem + ?Sized>(
     index: &ReflectionIndex,
     mem: &M,
     pawn_class: u64,
     def: &FieldDef,
 ) -> Result<ResolvedField, String> {
+    // TODO(Tarefa 5): raiz `game_state` e regras `set`/`add`; por ora esses cheats ficam indisponíveis.
+    if def.root != FieldRoot::Pawn {
+        return Err(UNSUPPORTED_RULE.to_string());
+    }
     let object_class = find_class(index, &def.object_class)?;
     let mut object_path = Vec::new();
     if def.object != PAWN_OBJECT {
@@ -380,6 +387,9 @@ fn resolve_field<M: ReadMem + ?Sized>(
                 .map(|name| bool_field(index, mem, object_class, name))
                 .collect::<Result<_, _>>()?,
         },
+        FieldRule::Set { .. } | FieldRule::Add { .. } => {
+            return Err(UNSUPPORTED_RULE.to_string());
+        }
     };
     Ok(ResolvedField {
         object_path,
