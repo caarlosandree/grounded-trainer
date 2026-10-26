@@ -148,6 +148,11 @@ pub fn wants_ue(ids: Option<&[String]>) -> bool {
     ids.is_none_or(|ids| ids.iter().any(|id| id == UE_ID))
 }
 
+/// A busca em disco é necessária: algum patch ou alguma global pedida não tem `rva`.
+fn needs_disk(defs: &[PatchDef], globals: &[&GlobalDef]) -> bool {
+    defs.iter().any(|d| d.rva.is_none()) || globals.iter().any(|g| g.rva.is_none())
+}
+
 fn scan_defs(
     target: &Target,
     sigs: &Signatures,
@@ -243,8 +248,8 @@ fn scan_defs(
                 scan_memory(&target.reader, &ranges, &patterns)?
             };
             let global_mem = mem.split_off(defs.len());
-            // O disco só é lido se algum patch não tem `rva`; senão a memória vale sozinha.
-            let disk_scan = if defs.iter().any(|d| d.rva.is_none()) {
+            // O disco só é lido se algum patch ou global não tem `rva`; senão a memória vale sozinha.
+            let disk_scan = if needs_disk(&defs, &globals) {
                 disk_hits(target, module, &mem_headers, &defs, &globals, &ranges).map(Some)
             } else {
                 Ok(None)
@@ -668,6 +673,33 @@ rva = 0x1000
             .unwrap()
             .for_version("x");
         assert!(select_defs(defs, Some(&ids(&["@ue"]))).is_empty());
+    }
+
+    #[test]
+    fn disk_is_read_when_a_patch_or_a_global_lacks_rva() {
+        let global = |rva| GlobalDef {
+            pattern: gt_core::global::GlobalPattern {
+                pattern: Pattern::parse("48 8b 05 ?? ?? ?? ??").unwrap(),
+                disp_offset: 3,
+                insn_end: 7,
+                adjust: 0,
+            },
+            rva,
+        };
+        // Uma global sem `rva`: o disco é lido, mesmo sem patches na seleção.
+        assert!(needs_disk(&[], &[&global(None), &global(Some(0x20))]));
+        // Tudo com `rva`: a memória vale sozinha.
+        let (gobjects, names) = (global(Some(0x10)), global(Some(0x20)));
+        assert!(!needs_disk(&[], &[&gobjects, &names]));
+        // Um patch sem `rva` basta, com ou sem globais.
+        let sigs =
+            Signatures::parse(&[("generic.toml", GENERIC), ("aaaa-bbbb.toml", VERSION)]).unwrap();
+        let defs = sigs.for_version("aaaa-bbbb");
+        assert!(defs.iter().any(|d| d.rva.is_none()));
+        assert!(needs_disk(&defs, &[&gobjects, &names]));
+        assert!(needs_disk(&defs, &[]));
+        // Sem nada pedido, nada a ler.
+        assert!(!needs_disk(&[], &[]));
     }
 
     #[test]
