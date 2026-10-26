@@ -59,6 +59,8 @@ pub enum ActionOutcome {
     Done { before: i32, after: i32 },
     /// Recusada nos passos 1 a 4, com o texto para o registro.
     Refused(String),
+    /// Recusada depois de ler o jogo (passos 3 a 5): conta como operação, mas não abre a janela.
+    RefusedAfterRead(String),
     /// O controller está ausente ou inválido: quem chama pede a procura.
     NeedsController,
     /// A releitura não bateu: o jogo mudou o valor durante a escrita (valor lido). Sem nova tentativa.
@@ -582,27 +584,27 @@ impl FieldRuntime {
             }
         }
         let Ok(raw) = read_u32(mem, addr) else {
-            return ActionOutcome::Refused("valor atual ilegível".to_string());
+            return ActionOutcome::RefusedAfterRead("valor atual ilegível".to_string());
         };
         let before = raw as i32;
         let after = match plan_add(before, amount, result_max) {
             Ok(v) => v,
             Err(AddRefusal::OutOfRange) => {
-                return ActionOutcome::Refused("valor atual fora da faixa".to_string());
+                return ActionOutcome::RefusedAfterRead("valor atual fora da faixa".to_string());
             }
             Err(AddRefusal::WouldExceed) => {
-                return ActionOutcome::Refused("passaria do máximo".to_string());
+                return ActionOutcome::RefusedAfterRead("passaria do máximo".to_string());
             }
         };
         match engine.write_data(addr, &after.to_le_bytes(), &guard) {
             Ok(()) => ActionOutcome::Done { before, after },
             Err(CoreError::BytesMismatch { .. }) => match read_u32(mem, addr) {
                 Ok(read) => ActionOutcome::Raced { read: read as i32 },
-                Err(_) => ActionOutcome::Refused("valor atual ilegível".to_string()),
+                Err(_) => ActionOutcome::RefusedAfterRead("valor atual ilegível".to_string()),
             },
             Err(e) => {
                 tracing::debug!(id, "escrita da ação recusada: {e}");
-                ActionOutcome::Refused("escrita recusada".to_string())
+                ActionOutcome::RefusedAfterRead("escrita recusada".to_string())
             }
         }
     }

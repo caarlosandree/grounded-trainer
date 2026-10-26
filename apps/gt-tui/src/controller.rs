@@ -208,8 +208,6 @@ pub struct Controller<B: Backend> {
     next_controller: Option<Instant>,
     /// O personagem estava achado no último ciclo de manutenção (`None`: ninguém procurou).
     player_found: Option<bool>,
-    /// A linha `personagem:` vem de uma procura pedida pela ação, não de cheat ligado.
-    action_player: bool,
     /// Quando cada ação escreveu pela última vez (a janela de 1 s; zera ao reconectar).
     action_last: HashMap<String, Instant>,
     /// Quando cada motivo de recusa da ação foi ao registro pela última vez (por ação).
@@ -248,7 +246,6 @@ impl<B: Backend> Controller<B> {
             next_index: None,
             next_controller: None,
             player_found: None,
-            action_player: false,
             action_last: HashMap::new(),
             refusal_last: HashMap::new(),
         }
@@ -806,7 +803,6 @@ impl<B: Backend> Controller<B> {
         self.next_index = None;
         self.next_controller = None;
         self.player_found = None;
-        self.action_player = false;
         self.action_last.clear();
         self.refusal_last.clear();
         self.model.player = PlayerLine::Idle;
@@ -1034,7 +1030,6 @@ impl<B: Backend> Controller<B> {
         let Some(found) = self.session_call(|s| s.take_controller_news()).flatten() else {
             return;
         };
-        self.action_player = true;
         self.player_found = Some(found);
         self.model.player = if found {
             PlayerLine::Found
@@ -1053,17 +1048,12 @@ impl<B: Backend> Controller<B> {
     /// com o jogo possivelmente parado por nós.
     fn maintain_fields(&mut self, now: Instant) {
         if !self.fields_wanted() {
-            // A linha que vem de uma procura da ação segue o controller guardado.
-            if !self.action_player {
-                self.model.player = PlayerLine::Idle;
-                self.player_found = None;
-            }
+            // A linha `personagem:` segue o controller guardado: nada a zerar sem cheat ligado.
             for row in self.model.cheats.iter_mut().filter(|r| r.field) {
                 row.note = None;
             }
             return;
         }
-        self.action_player = false;
         let engine = matches!(self.model.conn, Conn::Connected { engine: true, .. });
         let stuck = self.session.as_ref().is_some_and(|s| s.is_stuck());
         if !engine || stuck || !self.diary_resolved() {
@@ -1442,6 +1432,12 @@ impl<B: Backend> Controller<B> {
                 self.throttled_event(id, &reason, format!("{name}: {reason}"), now);
                 false
             }
+            // Leu o jogo: é operação (descarta teclas), mas não escreveu e não abre a janela.
+            ActionOutcome::RefusedAfterRead(reason) => {
+                self.note_op(id);
+                self.throttled_event(id, &reason, format!("{name}: {reason}"), now);
+                true
+            }
             ActionOutcome::NeedsController => {
                 // A procura segue o intervalo da tarefa de reflexão: dispara agora se já pode.
                 self.maybe_spawn_job(now);
@@ -1451,6 +1447,11 @@ impl<B: Backend> Controller<B> {
                 } else {
                     WAIT_SEARCH
                 };
+                // O controller guardado caiu: a linha `personagem:` deixa de dizer `encontrado`.
+                if self.player_found.is_some() {
+                    self.player_found = Some(false);
+                    self.model.player = PlayerLine::NotFound;
+                }
                 self.throttled_event(id, why, format!("{name}: {why}"), now);
                 false
             }
@@ -4514,9 +4515,9 @@ mod tests {
         assert!(!h.row("f").on);
         assert_eq!(h.row("f").note, None);
         assert!(!h.c.desired().contains_key("f"));
-        // Nada ligado: a linha do personagem volta a `—`.
+        // Nada ligado: a linha segue o controller guardado (o último ciclo não o achou).
         h.tick(400);
-        assert_eq!(h.c.model.player, PlayerLine::Idle);
+        assert_eq!(h.c.model.player, PlayerLine::NotFound);
     }
 
     // ---- Tarefa 10 do plano 006: valor ajustável nos cheats de valor ----
@@ -4813,14 +4814,25 @@ mod tests {
     #[test]
     fn action_refusal_does_not_open_window() {
         let mut h = with_action();
-        h.ctl
-            .push_action(ActionOutcome::Refused("passaria do máximo".to_string()));
-        assert!(!press(&mut h, 100));
+        h.ctl.push_action(ActionOutcome::RefusedAfterRead(
+            "passaria do máximo".to_string(),
+        ));
+        // Leu o jogo: é operação (descarta teclas), mas não abre a janela.
+        assert!(press(&mut h, 100));
         assert_eq!(event_count(&h, "Somar ciência: passaria do máximo"), 1);
-        // A recusa não abre a janela: a tecla seguinte executa.
+        assert_eq!(h.c.op_counts.get("ciencia"), Some(&1));
         assert!(press(&mut h, 200));
         assert_eq!(h.ctl.actions(), 2);
+        assert_eq!(h.c.op_counts.get("ciencia"), Some(&2));
         assert_eq!(event_count(&h, "Somar ciência: aguarde"), 0);
+
+        // Recusa dos passos 1 e 2: não é operação.
+        let mut h = with_action();
+        h.ctl
+            .push_action(ActionOutcome::Refused("estado do jogo ausente".to_string()));
+        assert!(!press(&mut h, 100));
+        assert_eq!(event_count(&h, "Somar ciência: estado do jogo ausente"), 1);
+        assert_eq!(h.c.op_counts.get("ciencia"), None);
     }
 
     #[test]
@@ -4923,18 +4935,61 @@ mod tests {
         assert!(matches!(&h.c.job, Some(j) if j.kind == JobKind::Controller));
         assert!(h.wait_job(100));
         assert_eq!(h.ctl.job_runs(JobKind::Controller), 1);
-        // Dentro do intervalo: não dispara nada novo.
+        // Procura terminada: nenhuma nova roda sem nova tecla, mesmo passado o intervalo.
+        h.tick(5_000);
+        h.tick(10_200);
+        h.tick(20_000);
+        assert!(h.c.job.is_none());
+        assert_eq!(h.ctl.job_runs(JobKind::Controller), 1);
+        // Uma nova tecla, já fora do intervalo, procura de novo.
+        h.ctl.push_action(ActionOutcome::NeedsController);
+        assert!(!press(&mut h, 20_100));
+        assert!(h.wait_job(20_100));
+        assert_eq!(h.ctl.job_runs(JobKind::Controller), 2);
+    }
+
+    #[test]
+    fn action_within_interval_says_wait() {
+        let mut h = with_action_search();
+        h.ctl.push_action(ActionOutcome::NeedsController);
+        press(&mut h, 100);
+        assert!(h.wait_job(100));
         h.ctl.push_action(ActionOutcome::NeedsController);
         assert!(!press(&mut h, 200));
         assert_eq!(event_count(&h, "Somar ciência: aguarde a procura"), 1);
         assert!(h.c.job.is_none());
-        h.tick(5_000);
-        assert!(h.c.job.is_none());
         assert_eq!(h.ctl.job_runs(JobKind::Controller), 1);
-        // Passado o intervalo, a ação ainda pendente repete a procura.
-        h.tick(10_200);
-        assert!(h.wait_job(10_200));
-        assert_eq!(h.ctl.job_runs(JobKind::Controller), 2);
+    }
+
+    #[test]
+    fn player_line_follows_stored_controller() {
+        let mut h = with_action_search();
+        assert_eq!(h.c.model.player, PlayerLine::Idle);
+        h.ctl.push_action(ActionOutcome::NeedsController);
+        press(&mut h, 100);
+        assert!(h.wait_job(100));
+        h.ctl.set_controller_news(Some(true));
+        h.tick(200);
+        assert_eq!(h.c.model.player, PlayerLine::Found);
+        // O controller guardado caiu: a ação pede a procura e a linha passa a `não encontrado`.
+        h.ctl.push_action(ActionOutcome::NeedsController);
+        press(&mut h, 300);
+        assert_eq!(h.c.model.player, PlayerLine::NotFound);
+        h.tick(400);
+        assert_eq!(h.c.model.player, PlayerLine::NotFound);
+    }
+
+    #[test]
+    fn player_line_after_last_cheat_off_follows_stored_controller() {
+        let mut h = with_field();
+        assert!(h.toggle("f", 100));
+        h.ctl.push_tick(report(PlayerState::Found, &[]));
+        h.tick(200);
+        assert_eq!(h.c.model.player, PlayerLine::Found);
+        assert!(h.toggle("f", 300));
+        h.tick(400);
+        h.tick(500);
+        assert_eq!(h.c.model.player, PlayerLine::Found);
     }
 
     #[test]

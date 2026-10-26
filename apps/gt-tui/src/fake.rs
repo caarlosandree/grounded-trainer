@@ -750,6 +750,10 @@ impl Session<()> for FakeSession {
             kind: out.kind,
             session,
         });
+        // Como a sessão real: toda procura terminada limpa o pedido da ação, com ou sem notícia.
+        if out.kind == JobKind::Controller {
+            s.action_wants = false;
+        }
         s.news.pop_front().unwrap_or(ReflectionNews {
             index_ok: true,
             retry: false,

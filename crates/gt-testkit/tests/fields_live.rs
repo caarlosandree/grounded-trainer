@@ -770,12 +770,14 @@ fn action_refusals() {
     let mut s = scene();
     let c = Some(s.ue.controller);
     let refused = |text: &str| ActionOutcome::Refused(text.to_string());
+    // Depois de ler o jogo (passos 3 a 5): a recusa diz que leu.
+    let after_read = |text: &str| ActionOutcome::RefusedAfterRead(text.to_string());
     s.poke(s.science(), &(-5i32).to_le_bytes());
-    assert_eq!(s.action(c, 1000), refused("valor atual fora da faixa"));
+    assert_eq!(s.action(c, 1000), after_read("valor atual fora da faixa"));
     s.poke(s.science(), &100_001i32.to_le_bytes());
-    assert_eq!(s.action(c, 1000), refused("valor atual fora da faixa"));
+    assert_eq!(s.action(c, 1000), after_read("valor atual fora da faixa"));
     s.poke(s.science(), &99_500i32.to_le_bytes());
-    assert_eq!(s.action(c, 1000), refused("passaria do máximo"));
+    assert_eq!(s.action(c, 1000), after_read("passaria do máximo"));
     assert_eq!(s.i32_at(s.science()), 99_500);
     // Sem controller, ou com um que não é mais válido: pede a procura.
     assert_eq!(s.action(None, 1000), ActionOutcome::NeedsController);
