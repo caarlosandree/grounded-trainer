@@ -224,6 +224,77 @@ pub fn disassemble_around(
     all[lo..hi].to_vec()
 }
 
+/// Um imediato (ou deslocamento relativo de desvio) dentro de uma instrução decodificada.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImmSlot {
+    /// Offset do imediato desde o início dos bytes passados a [`immediate_slot`].
+    pub offset: usize,
+    /// Tamanho do imediato em bytes.
+    pub size: usize,
+    /// O imediato é estendido com sinal até 64 bits (ex.: `mov rax, imm32`).
+    pub sign_extended_to_64: bool,
+    /// A instrução é um desvio relativo e o item é o deslocamento dele, não um valor.
+    pub is_branch: bool,
+}
+
+/// Imediatos de cada instrução de `code` (em `ip`), segundo os `ConstantOffsets` do `iced-x86`.
+///
+/// Dá um item por imediato (a quase totalidade das instruções tem um só; `enter` tem dois) e um
+/// para o deslocamento relativo de desvios, com `is_branch = true`. Para na primeira instrução
+/// inválida.
+pub fn immediate_slot(code: &[u8], ip: u64) -> Vec<ImmSlot> {
+    let mut decoder = Decoder::with_ip(64, code, ip, DecoderOptions::NONE);
+    let mut out = Vec::new();
+    let mut insn = Instruction::default();
+    while decoder.can_decode() {
+        let pos = decoder.position();
+        decoder.decode_out(&mut insn);
+        if insn.is_invalid() {
+            break;
+        }
+        // Os offsets valem para a instrução recém-decodificada: pegar antes da próxima.
+        let offsets = decoder.get_constant_offsets(&insn);
+        let kinds: Vec<OpKind> = (0..insn.op_count()).map(|i| insn.op_kind(i)).collect();
+        // O `iced-x86` 1.21 informa o deslocamento de um `jmp`/`call`/`jcc` relativo como imediato.
+        let is_branch = kinds.iter().any(|k| {
+            matches!(
+                k,
+                OpKind::NearBranch16
+                    | OpKind::NearBranch32
+                    | OpKind::NearBranch64
+                    | OpKind::FarBranch16
+                    | OpKind::FarBranch32
+            )
+        });
+        let sign_extended_to_64 = kinds
+            .iter()
+            .any(|k| matches!(k, OpKind::Immediate32to64 | OpKind::Immediate8to64));
+        let found = [
+            (
+                offsets.has_immediate(),
+                offsets.immediate_offset(),
+                offsets.immediate_size(),
+            ),
+            (
+                offsets.has_immediate2(),
+                offsets.immediate_offset2(),
+                offsets.immediate_size2(),
+            ),
+        ];
+        for (present, offset, size) in found {
+            if present {
+                out.push(ImmSlot {
+                    offset: pos + offset,
+                    size,
+                    sign_extended_to_64,
+                    is_branch,
+                });
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,5 +395,55 @@ mod tests {
         assert_eq!(out.first().map(|i| i.addr), Some(start - 3));
         assert_eq!(out.len(), 3 + 1);
         assert_eq!(out.last().map(|i| i.addr), Some(start));
+    }
+
+    #[test]
+    fn immediate_slot_of_mov_eax_imm32() {
+        // mov eax, 0x3FC00000 ; nop ; mov rax, imm32 (estendido com sinal)
+        let code = [
+            0xB8, 0x00, 0x00, 0xC0, 0x3F, 0x90, 0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(
+            immediate_slot(&code, 0x1000),
+            vec![
+                ImmSlot {
+                    offset: 1,
+                    size: 4,
+                    sign_extended_to_64: false,
+                    is_branch: false
+                },
+                ImmSlot {
+                    offset: 9,
+                    size: 4,
+                    sign_extended_to_64: true,
+                    is_branch: false
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn immediate_slot_marks_branches_and_small_immediates() {
+        // jmp rel32 ; push imm8 ; je rel8
+        let code = [0xE9, 0x10, 0x00, 0x00, 0x00, 0x6A, 0x05, 0x74, 0x02];
+        let slots = immediate_slot(&code, 0x1000);
+        assert_eq!(slots.len(), 3);
+        assert_eq!(
+            (slots[0].offset, slots[0].size, slots[0].is_branch),
+            (1, 4, true)
+        );
+        assert_eq!(
+            (slots[1].offset, slots[1].size, slots[1].is_branch),
+            (6, 1, false)
+        );
+        assert_eq!(
+            (slots[2].offset, slots[2].size, slots[2].is_branch),
+            (8, 1, true)
+        );
+    }
+
+    #[test]
+    fn immediate_slot_ignores_instructions_without_immediate() {
+        assert!(immediate_slot(&[0x90, 0x48, 0x89, 0xCF, 0xC3], 0).is_empty());
     }
 }
