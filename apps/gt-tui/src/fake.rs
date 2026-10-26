@@ -124,6 +124,8 @@ pub(crate) struct FakeState {
     pub search_delay: Duration,
     pub search_hold: bool,
     pub search_panics: bool,
+    /// `apply` entra em pânico (a sessão falsa de um teste de pânico no laço).
+    pub apply_panics: bool,
     /// Início do processo falso: muda para simular um processo novo no mesmo PID.
     pub start_time: u64,
     pub open_error: Option<String>,
@@ -193,6 +195,10 @@ impl FakeCtl {
 
     pub fn set_search_panics(&self, panics: bool) {
         self.state().search_panics = panics;
+    }
+
+    pub fn set_apply_panics(&self, panics: bool) {
+        self.state().apply_panics = panics;
     }
 
     /// Prende as buscas que começarem até [`FakeCtl::release_search`].
@@ -317,6 +323,7 @@ impl FakeBackend {
             search_delay: Duration::ZERO,
             search_hold: false,
             search_panics: false,
+            apply_panics: false,
             start_time: 1,
             open_error: None,
             open_engine_error: None,
@@ -508,6 +515,9 @@ impl Session<()> for FakeSession {
     }
 
     fn apply(&mut self, items: &[(String, u64)]) -> OpOutcome {
+        if self.ctl.state().apply_panics {
+            panic!("pânico de teste no apply");
+        }
         self.op(|busy| Call::Apply {
             items: items.to_vec(),
             busy,

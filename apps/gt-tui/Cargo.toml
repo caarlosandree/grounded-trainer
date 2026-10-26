@@ -21,6 +21,7 @@ clap.workspace = true
 crossterm.workspace = true
 gt-core = { workspace = true, features = ["write"] }
 gt-grounded2 = { workspace = true, features = ["write"] }
+nix.workspace = true
 ratatui.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
