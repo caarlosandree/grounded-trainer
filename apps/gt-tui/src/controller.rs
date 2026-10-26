@@ -7,13 +7,16 @@
 //! Os campos `session` e `backend` seguem esta ordem de propósito: a sessão (e o motor dela)
 //! cai antes da trava do diário, que mora no backend.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
 use gt_core::procinfo::Identity;
 
-use crate::backend::{Backend, CheatInfo, Find, Recovered, Search, SearchError, Session};
+use crate::backend::{
+    Backend, CheatInfo, Find, OpOutcome, Recovered, Search, SearchError, Session,
+};
+use crate::keys::Action;
 use crate::model::{Avail, CheatRow, Conn, Model};
 
 /// Devolve a hora do registro de eventos como `HH:MM`.
@@ -36,6 +39,26 @@ const NOT_FOUND: &str = "não encontrado";
 const INCONCLUSIVE: &str = "inconclusivo";
 
 type SearchResult<P> = Result<Search<P>, SearchError>;
+
+/// O que o dono quer ligado depois de reconectar (spec 6.2): o valor escolhido e a chave de
+/// versão da conexão em que ele ligou o cheat. O mapa `id → Desired` é a fonte da verdade;
+/// `CheatRow::desired` é só o espelho para a tela.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Desired {
+    /// Índice na grade do valor com que o dono ligou.
+    pub k: u64,
+    /// Chave de versão do jogo da conexão em que o dono ligou.
+    pub version_key: String,
+}
+
+/// Avisos do registro de eventos que valem uma vez por cheat em cada conexão.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Note {
+    /// Desejado que a religação não conseguiu religar.
+    NotReapplied,
+    /// Desejado de outra versão do jogo.
+    NewVersion,
+}
 
 /// Para que a busca em andamento foi pedida.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,8 +122,18 @@ pub struct Controller<B: Backend> {
     pid_fixed: bool,
     /// Muda a cada conexão nova e a cada fechamento do jogo.
     conn_no: u64,
-    /// Operações por cheat (a Tarefa 12 chama `note_op` em toda operação).
+    /// Operações por cheat (`note_op` é chamado em toda operação num cheat).
     op_counts: HashMap<String, u64>,
+    /// Cheats que o dono quer ligados (religar depois de reconectar).
+    desired: HashMap<String, Desired>,
+    /// Há religação a fazer no próximo `tick` (o `tick` recebe o `draw`; o `wait_search`, não).
+    reapply_pending: bool,
+    /// Avisos de religação já dados nesta conexão.
+    notes: HashSet<(String, Note)>,
+    /// Cheats não verificados já avisados nesta conexão.
+    warned_unverified: HashSet<String>,
+    /// O dono pediu para sair.
+    quit: bool,
     search: Option<InFlight<B::Payload>>,
     search_panicked: bool,
     /// Identidade do processo da conexão atual.
@@ -126,6 +159,11 @@ impl<B: Backend> Controller<B> {
             pid_fixed,
             conn_no: 0,
             op_counts: HashMap::new(),
+            desired: HashMap::new(),
+            reapply_pending: false,
+            notes: HashSet::new(),
+            warned_unverified: HashSet::new(),
+            quit: false,
             search: None,
             search_panicked: false,
             identity: None,
@@ -149,8 +187,19 @@ impl<B: Backend> Controller<B> {
         if self.session.is_none() {
             self.poll_find(now, draw);
         } else {
+            self.run_reapply(now, draw);
             self.maybe_auto_search(now);
         }
+    }
+
+    /// O dono pediu para sair (`q`, `Esc` ou Ctrl+C): o laço encerra.
+    pub fn quit_requested(&self) -> bool {
+        self.quit
+    }
+
+    /// Os cheats desejados (fonte da verdade; `CheatRow::desired` é o espelho).
+    pub fn desired(&self) -> &HashMap<String, Desired> {
+        &self.desired
     }
 
     /// Conta uma operação no cheat `id`: o resultado de uma busca que começou antes dela
@@ -288,6 +337,8 @@ impl<B: Backend> Controller<B> {
     fn begin_connection(&mut self, pid: i32, now: Instant, draw: &mut dyn FnMut(&Model)) {
         self.recover_diary(draw);
         self.conn_no += 1;
+        self.notes.clear();
+        self.warned_unverified.clear();
         self.model.conn = Conn::Connecting;
         if let Err(e) = self.spawn_search(SearchKind::Connect, pid, None, None, now) {
             self.model.conn = Conn::Error(format!("não foi possível iniciar a busca: {e}"));
@@ -403,6 +454,7 @@ impl<B: Backend> Controller<B> {
         self.event(format!(
             "conectado ao jogo (PID {pid}, versão {version_key})"
         ));
+        self.schedule_reapply();
     }
 
     /// Junta o catálogo da busca de conexão na lista: as linhas que já existiam (de uma conexão
@@ -496,6 +548,7 @@ impl<B: Backend> Controller<B> {
             self.open_engine_if_possible();
         }
         self.schedule_auto(inflight.started, took, now);
+        self.schedule_reapply();
     }
 
     /// Se o resultado da nova busca vale para `id`: a linha (se houver) continua desligada e o
@@ -536,7 +589,7 @@ impl<B: Backend> Controller<B> {
     }
 
     /// O jogo fechou: a sessão descarta o diário sem escrever e cai; a lista perde o que estava
-    /// ligado (os desejados da Tarefa 12 ficam) e a conexão volta a esperar.
+    /// ligado (os desejados ficam) e a conexão volta a esperar.
     fn on_game_closed(&mut self, now: Instant) {
         self.session_call(|s| s.discard_gone());
         self.session = None;
@@ -544,6 +597,9 @@ impl<B: Backend> Controller<B> {
         self.identity = None;
         self.auto_until = None;
         self.next_auto = None;
+        self.reapply_pending = false;
+        self.notes.clear();
+        self.warned_unverified.clear();
         self.last_find = Some(now);
         self.model.busy = None;
         self.model.banners.stuck = None;
@@ -571,12 +627,19 @@ impl<B: Backend> Controller<B> {
         self.next_auto = Some((started + auto_interval(took)).max(now));
     }
 
-    /// Há cheat mostrado que as buscas automáticas ainda tentam resolver.
+    /// Há cheat que as buscas automáticas ainda tentam resolver: um mostrado como
+    /// `não encontrado` ou `inconclusivo`, ou um desejado indisponível (spec 6.2).
     fn wants_auto_search(&self) -> bool {
-        self.model.visible().iter().any(|r| {
+        let missing = self.model.visible().iter().any(|r| {
             !r.on
                 && matches!(&r.avail, Avail::Unavailable(t) if t == NOT_FOUND || t == INCONCLUSIVE)
-        })
+        });
+        missing
+            || self.model.cheats.iter().any(|r| {
+                !r.on
+                    && self.desired.contains_key(&r.id)
+                    && matches!(r.avail, Avail::Unavailable(_))
+            })
     }
 
     fn maybe_auto_search(&mut self, now: Instant) {
@@ -586,20 +649,21 @@ impl<B: Backend> Controller<B> {
         let (Some(until), Some(next)) = (self.auto_until, self.next_auto) else {
             return;
         };
+        // `disco ilegível` não muda sozinho: só o `r` refaz a busca (spec 6.2).
+        if matches!(&self.model.conn, Conn::Connected { disk, .. } if disk.is_err()) {
+            return;
+        }
         if now >= until || now < next || !self.wants_auto_search() {
             return;
         }
         self.start_refresh(now);
     }
 
-    /// Inicia a busca dos cheats desligados (só com a conexão aberta e o disco lido).
+    /// Inicia a busca dos cheats desligados (só com a conexão aberta).
     fn start_refresh(&mut self, now: Instant) -> bool {
-        let Conn::Connected { pid, disk, .. } = &self.model.conn else {
+        let Conn::Connected { pid, .. } = &self.model.conn else {
             return false;
         };
-        if disk.is_err() {
-            return false;
-        }
         let pid = *pid;
         let ids: Vec<String> = self
             .model
@@ -621,10 +685,493 @@ impl<B: Backend> Controller<B> {
     }
 }
 
+// ---- teclas, operações e religação ----
+
+/// Milissegundos da pausa, para o registro de eventos.
+fn ms(pause: Duration) -> u128 {
+    pause.as_millis()
+}
+
+impl<B: Backend> Controller<B> {
+    /// Atende uma ação do dono. Devolve `true` se chamou a sessão (o laço então descarta as
+    /// teclas que chegaram durante a chamada). Com o terminal pequeno só `Quit` e `Retry` valem.
+    pub fn handle(&mut self, action: Action, now: Instant, draw: &mut dyn FnMut(&Model)) -> bool {
+        if action == Action::Quit {
+            self.quit = true;
+            return false;
+        }
+        if self.model.too_small && action != Action::Retry {
+            return false;
+        }
+        match action {
+            Action::Up => {
+                self.model.move_selection(-1);
+                false
+            }
+            Action::Down => {
+                self.model.move_selection(1);
+                false
+            }
+            Action::Toggle => self.toggle(now, draw),
+            // Troca de valor: Tarefa 14.
+            Action::Dec | Action::Inc => false,
+            Action::Retry => self.retry(now, draw),
+            Action::Quit => false,
+        }
+    }
+
+    /// `r`: com o jogo conectado, refaz a busca dos cheats desligados (e reinicia o prazo das
+    /// buscas automáticas); sem conexão, procura o jogo na hora. Em `conectando`, `o processo
+    /// terminou` ou durante uma operação, não faz nada.
+    fn retry(&mut self, now: Instant, draw: &mut dyn FnMut(&Model)) -> bool {
+        if self.model.busy.is_some() {
+            return false;
+        }
+        match &self.model.conn {
+            Conn::Connecting | Conn::PidGone => {}
+            Conn::Connected { .. } => {
+                self.auto_until = Some(now + AUTO_WINDOW);
+                if !self.search_live() {
+                    self.start_refresh(now);
+                }
+            }
+            Conn::Waiting | Conn::NoAccess(_) | Conn::Many(_) | Conn::Error(_) => {
+                self.last_find = None;
+                self.poll_find(now, draw);
+            }
+        }
+        false
+    }
+
+    // ---- desejados ----
+
+    /// Põe (ou tira, com `None`) o cheat dos desejados e atualiza o espelho da linha.
+    fn set_desired(&mut self, id: &str, desired: Option<Desired>) {
+        match desired {
+            Some(d) => {
+                self.desired.insert(id.to_string(), d);
+            }
+            None => {
+                self.desired.remove(id);
+            }
+        }
+        let wanted = self.desired.contains_key(id);
+        if let Some(row) = self.model.cheats.iter_mut().find(|r| r.id == id) {
+            row.desired = wanted;
+        }
+    }
+
+    /// Pede a religação no próximo `tick`, se houver desejados.
+    fn schedule_reapply(&mut self) {
+        if !self.desired.is_empty() {
+            self.reapply_pending = true;
+        }
+    }
+
+    /// Chave de versão da conexão atual.
+    fn current_version(&self) -> Option<String> {
+        match &self.model.conn {
+            Conn::Connected { version_key, .. } => Some(version_key.clone()),
+            _ => None,
+        }
+    }
+
+    /// Por que não se pode escrever no jogo agora, se não se pode.
+    fn write_block(&self) -> Option<&'static str> {
+        if !self.diary_resolved() {
+            return Some("diário com entradas não restauradas; aperte r");
+        }
+        match &self.model.conn {
+            Conn::Connected { engine: true, .. } => None,
+            _ => Some("o motor não está aberto"),
+        }
+    }
+
+    // ---- ligar e desligar pela tecla ----
+
+    /// Espaço/Enter no cheat selecionado.
+    fn toggle(&mut self, now: Instant, draw: &mut dyn FnMut(&Model)) -> bool {
+        let Some(id) = self.model.selected_id().map(str::to_string) else {
+            return false;
+        };
+        let Some(row) = self.model.cheats.iter().find(|r| r.id == id).cloned() else {
+            return false;
+        };
+        match &self.model.conn {
+            Conn::Connecting => {
+                self.event("aguarde: conectando ao jogo");
+                return false;
+            }
+            Conn::Connected { .. } => {}
+            _ => {
+                self.toggle_unavailable(&row, "jogo não conectado");
+                return false;
+            }
+        }
+        if row.residue {
+            // Pedir a restauração dos restos é da Tarefa 13.
+            return false;
+        }
+        if row.on {
+            return self.turn_off(&row, now, draw);
+        }
+        match &row.avail {
+            Avail::Unavailable(reason) => {
+                self.toggle_unavailable(&row, reason);
+                false
+            }
+            Avail::Available { .. } => self.turn_on(&row, now, draw),
+        }
+    }
+
+    /// Espaço num cheat indisponível: escreve o motivo e, com a marca de religar pendente, tira
+    /// o cheat dos desejados.
+    fn toggle_unavailable(&mut self, row: &CheatRow, reason: &str) {
+        self.event(format!("{}: indisponível ({reason})", row.name));
+        if self.desired.contains_key(&row.id) {
+            self.set_desired(&row.id, None);
+            self.event(format!("{}: não será mais religado", row.name));
+        }
+    }
+
+    /// O `k` com que um cheat é ligado: o valor mostrado, dentro da grade.
+    fn shown_k(row: &CheatRow) -> u64 {
+        row.value.as_ref().map_or(0, |v| row.k.min(v.steps()))
+    }
+
+    /// Mostra `busy`, chama a sessão e limpa o `busy` (a mensagem fica na tela durante toda a
+    /// operação). `None` sem sessão.
+    fn run_op(
+        &mut self,
+        busy: String,
+        draw: &mut dyn FnMut(&Model),
+        f: impl FnOnce(&mut B::Session) -> OpOutcome,
+    ) -> Option<OpOutcome> {
+        self.session.as_ref()?;
+        self.model.busy = Some(busy);
+        draw(&self.model);
+        let out = self.session_call(f);
+        self.model.busy = None;
+        out
+    }
+
+    fn turn_on(&mut self, row: &CheatRow, now: Instant, draw: &mut dyn FnMut(&Model)) -> bool {
+        if let Some(why) = self.write_block() {
+            self.event(format!("{}: não foi possível ligar ({why})", row.name));
+            return false;
+        }
+        let Some(version_key) = self.current_version() else {
+            return false;
+        };
+        let k = Self::shown_k(row);
+        self.note_op(&row.id);
+        let busy = format!("ligando {}…", row.name);
+        let id = row.id.clone();
+        let Some(outcome) = self.run_op(busy, draw, |s| s.apply(&[(id, k)])) else {
+            return false;
+        };
+        match outcome {
+            OpOutcome::Done(pause) => {
+                self.mark_on(&row.id, k);
+                self.set_desired(&row.id, Some(Desired { k, version_key }));
+                self.event(format!("{} ligado (pausa {} ms)", row.name, ms(pause)));
+                self.warn_unverified(&row.id);
+            }
+            OpOutcome::Refused(reason) => self.event(format!("{}: {reason}", row.name)),
+            OpOutcome::Foreign => self.mark_foreign(&row.id),
+            OpOutcome::Residue(cause) => {
+                self.mark_residue(std::slice::from_ref(&row.id));
+                self.event(format!(
+                    "{}: falhou deixando restos no jogo ({cause})",
+                    row.name
+                ));
+            }
+            OpOutcome::Gone => self.on_game_closed(now),
+        }
+        true
+    }
+
+    fn turn_off(&mut self, row: &CheatRow, now: Instant, draw: &mut dyn FnMut(&Model)) -> bool {
+        self.note_op(&row.id);
+        let busy = format!("desligando {}…", row.name);
+        let id = row.id.clone();
+        let Some(outcome) = self.run_op(busy, draw, |s| s.undo(&id)) else {
+            return false;
+        };
+        match outcome {
+            OpOutcome::Done(pause) => {
+                self.mark_off(&row.id);
+                self.set_desired(&row.id, None);
+                self.event(format!("{} desligado (pausa {} ms)", row.name, ms(pause)));
+            }
+            // Recusa limpa: continua ligado e desejado; o dono pode tentar de novo.
+            OpOutcome::Refused(reason) => self.event(format!("{}: {reason}", row.name)),
+            OpOutcome::Foreign => self.mark_foreign(&row.id),
+            OpOutcome::Residue(cause) => {
+                self.mark_residue(std::slice::from_ref(&row.id));
+                self.event(format!(
+                    "{}: falhou deixando restos no jogo ({cause})",
+                    row.name
+                ));
+            }
+            OpOutcome::Gone => {
+                // Desligar interrompido: a intenção do dono era desligar.
+                self.set_desired(&row.id, None);
+                self.on_game_closed(now);
+            }
+        }
+        true
+    }
+
+    // ---- efeitos dos desfechos na linha ----
+
+    fn mark_on(&mut self, id: &str, k: u64) {
+        if let Some(row) = self.model.cheats.iter_mut().find(|r| r.id == id) {
+            row.on = true;
+            row.residue = false;
+            row.applied_k = row.value.is_some().then_some(k);
+        }
+    }
+
+    fn mark_off(&mut self, id: &str) {
+        if let Some(row) = self.model.cheats.iter_mut().find(|r| r.id == id) {
+            row.on = false;
+            row.applied_k = None;
+        }
+    }
+
+    /// Os bytes eram de outro: o patch saiu do registro sem escrita (spec 6.7).
+    fn mark_foreign(&mut self, id: &str) {
+        let mut name = id.to_string();
+        if let Some(row) = self.model.cheats.iter_mut().find(|r| r.id == id) {
+            row.on = false;
+            row.applied_k = None;
+            row.avail = Avail::Unavailable("alterado por outro".to_string());
+            name = row.name.clone();
+        }
+        self.set_desired(id, None);
+        self.event(format!(
+            "{name}: alterado por outro; o patch saiu do registro, nada foi escrito"
+        ));
+    }
+
+    /// Restos no jogo: a linha vira `erro`, sai dos desejados e o aviso fixo aparece.
+    fn mark_residue(&mut self, ids: &[String]) {
+        for id in ids {
+            if let Some(row) = self.model.cheats.iter_mut().find(|r| &r.id == id) {
+                row.on = false;
+                row.applied_k = None;
+                row.residue = true;
+            }
+            self.set_desired(id, None);
+        }
+        let names: Vec<&str> = self
+            .model
+            .cheats
+            .iter()
+            .filter(|r| r.residue)
+            .map(|r| r.name.as_str())
+            .collect();
+        self.model.banners.residue = (!names.is_empty()).then(|| {
+            format!(
+                "restos de uma falha no jogo ({}); aperte r para restaurar",
+                names.join(", ")
+            )
+        });
+    }
+
+    /// Uma vez por cheat e por conexão, avisa que um cheat não verificado foi ligado.
+    fn warn_unverified(&mut self, id: &str) {
+        let Some(row) = self.model.cheats.iter().find(|r| r.id == id) else {
+            return;
+        };
+        if row.avail != (Avail::Available { verified: false }) {
+            return;
+        }
+        let name = row.name.clone();
+        if self.warned_unverified.insert(id.to_string()) {
+            self.event(format!(
+                "aviso: a versão do jogo não tem assinaturas conferidas; {name} foi ligado como \
+                 não verificado"
+            ));
+        }
+    }
+
+    // ---- religar depois de reconectar ----
+
+    /// Dá o aviso `text` uma vez por cheat e por conexão.
+    fn note_once(&mut self, id: &str, note: Note, text: String) {
+        if self.notes.insert((id.to_string(), note)) {
+            self.event(text);
+        }
+    }
+
+    /// Religa os desejados disponíveis da mesma versão (spec 6.2). Roda no `tick` seguinte ao
+    /// fim de uma busca, porque só o `tick` recebe o `draw` que mostra `religando…` antes da
+    /// chamada à sessão.
+    fn run_reapply(&mut self, now: Instant, draw: &mut dyn FnMut(&Model)) {
+        if !std::mem::take(&mut self.reapply_pending) || self.desired.is_empty() {
+            return;
+        }
+        let Conn::Connected { version_key, .. } = &self.model.conn else {
+            return;
+        };
+        let version_key = version_key.clone();
+        let blocked = self.write_block();
+
+        let rows: Vec<CheatRow> = self
+            .model
+            .cheats
+            .iter()
+            .filter(|r| self.desired.contains_key(&r.id))
+            .cloned()
+            .collect();
+        let mut batch: Vec<(String, u64)> = Vec::new();
+        for row in rows {
+            let Some(wanted) = self.desired.get(&row.id).cloned() else {
+                continue;
+            };
+            if row.on || row.residue {
+                continue;
+            }
+            match &row.avail {
+                Avail::Unavailable(reason) => self.note_once(
+                    &row.id,
+                    Note::NotReapplied,
+                    format!("{}: não foi religado (indisponível: {reason})", row.name),
+                ),
+                Avail::Available { .. } if wanted.version_key != version_key => self.note_once(
+                    &row.id,
+                    Note::NewVersion,
+                    format!("{}: versão nova; aperte espaço para ligar", row.name),
+                ),
+                Avail::Available { .. } => match blocked {
+                    Some(why) => self.note_once(
+                        &row.id,
+                        Note::NotReapplied,
+                        format!("{}: não foi religado ({why})", row.name),
+                    ),
+                    None => batch.push((row.id.clone(), Self::shown_k(&row))),
+                },
+            }
+        }
+        if batch.is_empty() {
+            return;
+        }
+        for (id, _) in &batch {
+            self.note_op(id);
+        }
+        let items = batch.clone();
+        let Some(outcome) = self.run_op("religando…".to_string(), draw, |s| s.apply(&items))
+        else {
+            return;
+        };
+        match outcome {
+            OpOutcome::Done(pause) => {
+                for (id, k) in &batch {
+                    self.reapplied(id, *k, &version_key, pause);
+                }
+            }
+            // Religar interrompido não muda nada.
+            OpOutcome::Gone => self.on_game_closed(now),
+            // O motor deixa o lote inteiro pendente: não tenta um a um.
+            OpOutcome::Residue(cause) => {
+                let pending = self.session_call(|s| s.pending_ids()).unwrap_or_default();
+                self.mark_residue(&pending);
+                self.event(format!(
+                    "religar falhou deixando restos no jogo: {} ({cause})",
+                    pending.join(", ")
+                ));
+            }
+            outcome @ (OpOutcome::Refused(_) | OpOutcome::Foreign) => {
+                if let [(id, k)] = batch.as_slice() {
+                    self.finish_reapply_one(id, *k, outcome, &version_key, now);
+                } else {
+                    self.reapply_one_by_one(&batch, &version_key, now, draw);
+                }
+            }
+        }
+    }
+
+    /// O lote foi recusado: cada desejado é tentado sozinho, para que um patch com problema
+    /// não impeça os outros.
+    fn reapply_one_by_one(
+        &mut self,
+        batch: &[(String, u64)],
+        version_key: &str,
+        now: Instant,
+        draw: &mut dyn FnMut(&Model),
+    ) {
+        for (id, k) in batch {
+            let item = [(id.clone(), *k)];
+            let Some(outcome) = self.run_op("religando…".to_string(), draw, |s| s.apply(&item))
+            else {
+                return;
+            };
+            if !self.finish_reapply_one(id, *k, outcome, version_key, now) {
+                return;
+            }
+        }
+    }
+
+    /// Efeito do desfecho do religar de um cheat sozinho. `false` se o jogo fechou (a
+    /// religação para).
+    fn finish_reapply_one(
+        &mut self,
+        id: &str,
+        k: u64,
+        outcome: OpOutcome,
+        version_key: &str,
+        now: Instant,
+    ) -> bool {
+        let name = self.name_of(id);
+        match outcome {
+            OpOutcome::Done(pause) => self.reapplied(id, k, version_key, pause),
+            OpOutcome::Refused(reason) => {
+                self.event(format!("{name}: não foi religado ({reason})"));
+            }
+            OpOutcome::Foreign => self.mark_foreign(id),
+            OpOutcome::Residue(cause) => {
+                self.mark_residue(&[id.to_string()]);
+                self.event(format!("{name}: falhou deixando restos no jogo ({cause})"));
+            }
+            OpOutcome::Gone => {
+                self.on_game_closed(now);
+                return false;
+            }
+        }
+        true
+    }
+
+    fn reapplied(&mut self, id: &str, k: u64, version_key: &str, pause: Duration) {
+        let name = self.name_of(id);
+        self.mark_on(id, k);
+        self.set_desired(
+            id,
+            Some(Desired {
+                k,
+                version_key: version_key.to_string(),
+            }),
+        );
+        self.event(format!("{name} religado (pausa {} ms)", ms(pause)));
+        self.warn_unverified(id);
+    }
+
+    fn name_of(&self, id: &str) -> String {
+        self.model
+            .cheats
+            .iter()
+            .find(|r| r.id == id)
+            .map_or_else(|| id.to_string(), |r| r.name.clone())
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::path::PathBuf;
+
+    use gt_core::value::{ValueSpec, ValueType};
 
     use super::*;
     use crate::backend::SearchError;
@@ -687,12 +1234,73 @@ mod tests {
             self.c.search.is_some()
         }
 
+        /// Aperta `action` em `ms`; devolve se a sessão foi chamada.
+        fn key(&mut self, action: Action, ms: u64) -> bool {
+            let now = self.at(ms);
+            self.c.handle(action, now, &mut *self.draw)
+        }
+
+        /// Põe a seleção no cheat `id`.
+        fn sel(&mut self, id: &str) {
+            let index = self
+                .c
+                .model
+                .visible()
+                .iter()
+                .position(|r| r.id == id)
+                .unwrap();
+            self.c.model.selected = index;
+        }
+
+        /// Seleciona `id` e aperta espaço.
+        fn toggle(&mut self, id: &str, ms: u64) -> bool {
+            self.sel(id);
+            self.key(Action::Toggle, ms)
+        }
+
+        /// O jogo fecha em `close_ms` e reabre em `open_ms` (a busca de conexão termina; a
+        /// religação fica para o `tick` seguinte).
+        fn reopen(&mut self, close_ms: u64, open_ms: u64) {
+            self.ctl.set_exited(true);
+            self.tick(close_ms);
+            self.ctl.set_exited(false);
+            self.connect(open_ms);
+        }
+
+        fn applies(&self) -> Vec<Call> {
+            self.ctl
+                .calls()
+                .into_iter()
+                .filter(|c| matches!(c, Call::Apply { .. }))
+                .collect()
+        }
+
         fn row(&self, id: &str) -> &CheatRow {
             self.c.model.cheats.iter().find(|r| r.id == id).unwrap()
         }
 
         fn events(&self) -> Vec<&str> {
             self.c.model.events.iter().map(String::as_str).collect()
+        }
+    }
+
+    fn grid() -> ValueSpec {
+        ValueSpec {
+            ty: ValueType::U32,
+            slot: 1,
+            min: 0.0,
+            max: 10.0,
+            step: 1.0,
+            default_k: 2,
+            unit: None,
+            decimals: 0,
+        }
+    }
+
+    fn apply_call(items: &[(&str, u64)], busy: &str) -> Call {
+        Call::Apply {
+            items: items.iter().map(|(id, k)| (id.to_string(), *k)).collect(),
+            busy: Some(busy.to_string()),
         }
     }
 
@@ -939,22 +1547,25 @@ mod tests {
     fn op_during_search_drops_that_cheat_result() {
         let mut h = H::new();
         h.ctl
-            .set_catalog(vec![cheat("a", not_found()), cheat("b", not_found())]);
+            .set_catalog(vec![cheat("a", available()), cheat("b", not_found())]);
         h.connect(0);
 
         h.ctl.push_search(Ok(SearchSpec::new(vec![
-            cheat("a", available()),
+            cheat("a", unavailable("bytes diferentes")),
             cheat("b", available()),
         ])));
         h.ctl.hold_search();
         h.tick(5_000);
-        // Uma operação em `a` enquanto a busca roda.
-        h.c.note_op("a");
+        // Ligar e desligar `a` enquanto a busca roda: o cheat termina como começou, mas passou
+        // por operações, e o resultado dele deixa de valer.
+        assert!(h.toggle("a", 5_010));
+        assert!(h.toggle("a", 5_020));
+        assert!(!h.row("a").on);
         h.ctl.release_search();
         assert!(h.wait(5_100));
         assert_eq!(
             h.row("a").avail,
-            not_found(),
+            available(),
             "o resultado de `a` foi descartado"
         );
         assert_eq!(h.row("b").avail, available());
@@ -1458,7 +2069,13 @@ mod tests {
         h.ctl.set_catalog(vec![cheat("a", available())]);
         h.connect(0);
         h.c.model.cheats[0].k = 3;
-        h.c.model.cheats[0].desired = true;
+        h.c.set_desired(
+            "a",
+            Some(Desired {
+                k: 3,
+                version_key: "v1".to_string(),
+            }),
+        );
         h.ctl.set_exited(true);
         h.tick(100);
         h.ctl.set_exited(false);
@@ -1467,5 +2084,572 @@ mod tests {
         assert_eq!(h.c.model.cheats.len(), 1);
         assert!(h.row("a").desired);
         assert_eq!(h.row("a").avail, not_found(), "conexão nova: estado novo");
+    }
+
+    // ---- Tarefa 12: desejados, ligar/desligar e religação ----
+
+    fn desired_of(k: u64, version: &str) -> Desired {
+        Desired {
+            k,
+            version_key: version.to_string(),
+        }
+    }
+
+    fn event_count(h: &H, needle: &str) -> usize {
+        h.events().iter().filter(|e| e.contains(needle)).count()
+    }
+
+    #[test]
+    fn toggle_on_adds_desired_and_off_removes() {
+        let mut h = H::new();
+        let mut v = cheat("v", available());
+        v.value = Some(grid());
+        h.ctl.set_catalog(vec![cheat("a", available()), v]);
+        h.connect(0);
+        h.c.model.cheats[1].k = 3;
+
+        assert!(h.toggle("a", 100));
+        assert!(h.row("a").on);
+        assert!(h.row("a").desired);
+        assert_eq!(h.c.desired().get("a"), Some(&desired_of(0, "v1")));
+        assert_eq!(h.events().last(), Some(&"12:00 a ligado (pausa 1 ms)"));
+
+        // Cheat com valor: liga com o valor mostrado, que vai para os desejados.
+        assert!(h.toggle("v", 200));
+        assert_eq!(h.row("v").applied_k, Some(3));
+        assert_eq!(h.c.desired().get("v"), Some(&desired_of(3, "v1")));
+        assert!(h.applies().contains(&apply_call(&[("v", 3)], "ligando v…")));
+
+        assert!(h.toggle("a", 300));
+        assert!(!h.row("a").on);
+        assert!(!h.row("a").desired);
+        assert_eq!(h.c.desired().get("a"), None);
+        assert_eq!(h.events().last(), Some(&"12:00 a desligado (pausa 1 ms)"));
+        assert!(h.row("v").on, "o outro cheat não muda");
+    }
+
+    #[test]
+    fn failed_toggle_not_desired() {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![cheat("a", available())]);
+        h.connect(0);
+        h.ctl
+            .push_outcome(OpOutcome::Refused("threads no trecho".to_string()));
+        assert!(h.toggle("a", 100));
+        assert!(!h.row("a").on);
+        assert!(!h.row("a").desired);
+        assert!(h.c.desired().is_empty());
+        assert_eq!(h.events().last(), Some(&"12:00 a: threads no trecho"));
+        assert_eq!(h.c.model.busy, None);
+    }
+
+    #[test]
+    fn busy_drawn_before_session_call() {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![cheat("a", available())]);
+        h.connect(0);
+        h.toggle("a", 100);
+        h.toggle("a", 200);
+        // O alvo falso registra o `busy` do último `Model` desenhado quando recebe a chamada.
+        let calls = h.ctl.calls();
+        assert!(calls.contains(&apply_call(&[("a", 0)], "ligando a…")));
+        assert!(calls.contains(&Call::Undo {
+            id: "a".to_string(),
+            busy: Some("desligando a…".to_string())
+        }));
+        // Depois da operação a mensagem some do modelo.
+        assert_eq!(h.c.model.busy, None);
+    }
+
+    #[test]
+    fn toggles_blocked_while_connecting() {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![cheat("a", available())]);
+        h.connect(0);
+        h.ctl.set_exited(true);
+        h.tick(100);
+        h.ctl.set_exited(false);
+        h.ctl.hold_search();
+        h.tick(3_000);
+        assert_eq!(h.c.model.conn, Conn::Connecting);
+        assert!(!h.toggle("a", 3_100));
+        assert!(h.applies().is_empty());
+        assert!(!h.row("a").on);
+        assert!(h.events().last().is_some_and(|e| e.contains("aguarde")));
+        h.ctl.release_search();
+        assert!(h.wait(3_200));
+
+        // Diário não resolvido: conectado, mas sem escrever.
+        let mut b = H::new();
+        b.ctl.push_recover(blocked("não foi possível restaurar x"));
+        b.ctl.set_catalog(vec![cheat("a", available())]);
+        b.connect(0);
+        assert!(!b.toggle("a", 100));
+        assert!(b.applies().is_empty());
+        assert!(!b.row("a").on);
+        assert!(
+            b.events()
+                .last()
+                .is_some_and(|e| e.contains("diário com entradas não restauradas"))
+        );
+    }
+
+    #[test]
+    fn game_close_keeps_desired_and_reconnect_reapplies() {
+        let mut h = H::new();
+        h.ctl
+            .set_catalog(vec![cheat("a", available()), cheat("b", available())]);
+        h.connect(0);
+        assert!(h.toggle("a", 100));
+        h.ctl.clear_calls();
+
+        h.reopen(1_000, 4_000);
+        // O jogo fechou: sai o `ligado`, ficam os desejados.
+        assert!(!h.row("a").on);
+        assert!(h.row("a").desired);
+        // `wait_search` não religa (não tem `draw`): a religação é do `tick` seguinte.
+        assert!(h.applies().is_empty());
+        h.tick(4_100);
+        assert_eq!(h.applies(), [apply_call(&[("a", 0)], "religando…")]);
+        assert!(h.row("a").on);
+        assert!(!h.row("b").on, "só o desejado é religado");
+        assert!(event_count(&h, "a religado (pausa 1 ms)") == 1);
+        assert_eq!(h.c.model.busy, None);
+
+        // Nada mais a religar: outra volta não chama a sessão.
+        h.tick(4_200);
+        assert_eq!(h.applies().len(), 1);
+    }
+
+    #[test]
+    fn reapply_batch_then_one_by_one() {
+        fn three() -> H {
+            let mut h = H::new();
+            h.ctl.set_catalog(vec![
+                cheat("a", available()),
+                cheat("b", available()),
+                cheat("c", available()),
+            ]);
+            h.connect(0);
+            for id in ["a", "b", "c"] {
+                assert!(h.toggle(id, 100));
+            }
+            h.ctl.clear_calls();
+            h
+        }
+        let batch = apply_call(&[("a", 0), ("b", 0), ("c", 0)], "religando…");
+
+        // Lote recusado: cada um sozinho; um recusado não impede os outros.
+        let mut h = three();
+        h.ctl.push_outcome(OpOutcome::Refused("lote".to_string()));
+        h.ctl.push_outcome(OpOutcome::Done(Duration::ZERO));
+        h.ctl
+            .push_outcome(OpOutcome::Refused("não deu".to_string()));
+        h.ctl.push_outcome(OpOutcome::Done(Duration::ZERO));
+        h.reopen(1_000, 4_000);
+        h.tick(4_100);
+        assert_eq!(
+            h.applies(),
+            [
+                batch.clone(),
+                apply_call(&[("a", 0)], "religando…"),
+                apply_call(&[("b", 0)], "religando…"),
+                apply_call(&[("c", 0)], "religando…"),
+            ]
+        );
+        assert!(h.row("a").on && !h.row("b").on && h.row("c").on);
+        assert!(h.row("b").desired, "continua desejado");
+        assert!(event_count(&h, "b: não foi religado (não deu)") == 1);
+
+        // Lote com `Gone`: para.
+        let mut h = three();
+        h.ctl.push_outcome(OpOutcome::Gone);
+        h.reopen(1_000, 4_000);
+        h.tick(4_100);
+        assert_eq!(h.applies(), std::slice::from_ref(&batch));
+        assert_eq!(h.c.model.conn, Conn::Waiting);
+        assert_eq!(h.c.desired().len(), 3, "religar interrompido não muda nada");
+        assert!(h.row("a").desired && !h.row("a").on);
+
+        // Lote com restos: todos os pendentes em `erro`, sem tentar um a um.
+        let mut h = three();
+        h.ctl.set_pending(&["a", "b", "c"]);
+        h.ctl
+            .push_outcome(OpOutcome::Residue("escrita".to_string()));
+        h.reopen(1_000, 4_000);
+        h.tick(4_100);
+        assert_eq!(h.applies(), std::slice::from_ref(&batch));
+        for id in ["a", "b", "c"] {
+            let row = h.row(id);
+            assert!(row.residue && !row.on && !row.desired, "{id}");
+            assert_eq!(
+                row.status(&h.c.model.conn),
+                crate::model::CheatStatus::Residue
+            );
+        }
+        assert!(h.c.desired().is_empty());
+        assert!(h.c.model.banners.residue.is_some());
+
+        // Restos num dos um a um: marca aquele e segue com os demais.
+        let mut h = three();
+        h.ctl.push_outcome(OpOutcome::Refused("lote".to_string()));
+        h.ctl
+            .push_outcome(OpOutcome::Residue("escrita".to_string()));
+        h.ctl.push_outcome(OpOutcome::Done(Duration::ZERO));
+        h.ctl.push_outcome(OpOutcome::Done(Duration::ZERO));
+        h.reopen(1_000, 4_000);
+        h.tick(4_100);
+        assert_eq!(h.applies().len(), 4);
+        assert!(h.row("a").residue && !h.row("a").on);
+        assert!(h.row("b").on && h.row("c").on);
+        assert!(!h.c.desired().contains_key("a"));
+    }
+
+    #[test]
+    fn reapply_only_same_version() {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![cheat("a", available())]);
+        h.connect(0);
+        assert!(h.toggle("a", 100));
+
+        // O jogo atualizou: a chave de versão mudou.
+        let mut spec = SearchSpec::new(vec![cheat("a", available())]);
+        spec.version_key = "v2".to_string();
+        h.ctl.set_default_search(spec);
+        h.ctl.clear_calls();
+        h.reopen(1_000, 4_000);
+        h.tick(4_100);
+        h.tick(4_200);
+        assert!(h.applies().is_empty(), "outra versão não religa sozinho");
+        assert!(h.row("a").desired && !h.row("a").on);
+        assert_eq!(
+            event_count(&h, "a: versão nova; aperte espaço para ligar"),
+            1,
+            "avisa uma vez por conexão"
+        );
+
+        // O espaço liga e atualiza a versão guardada.
+        assert!(h.toggle("a", 4_300));
+        assert!(h.row("a").on);
+        assert_eq!(h.c.desired().get("a"), Some(&desired_of(0, "v2")));
+
+        // Na próxima reconexão (ainda v2) religa sozinho.
+        h.ctl.clear_calls();
+        h.reopen(5_000, 8_000);
+        h.tick(8_100);
+        assert_eq!(h.applies().len(), 1);
+        assert!(h.row("a").on);
+    }
+
+    #[test]
+    fn close_during_off_removes_desired() {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![cheat("a", available())]);
+        h.connect(0);
+        assert!(h.toggle("a", 100));
+        h.ctl.push_outcome(OpOutcome::Gone);
+        assert!(h.toggle("a", 200));
+        assert_eq!(h.c.model.conn, Conn::Waiting);
+        assert!(h.c.desired().is_empty());
+        assert!(!h.row("a").desired);
+        assert!(!h.row("a").on);
+        assert_eq!(h.events().last(), Some(&"12:00 o jogo fechou"));
+        assert_eq!(h.c.model.busy, None);
+    }
+
+    #[test]
+    fn close_during_on_does_not_add() {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![cheat("a", available())]);
+        h.connect(0);
+        h.ctl.push_outcome(OpOutcome::Gone);
+        assert!(h.toggle("a", 100));
+        assert_eq!(h.c.model.conn, Conn::Waiting);
+        assert!(h.c.desired().is_empty());
+        assert!(!h.row("a").desired && !h.row("a").on);
+        assert_eq!(h.events().last(), Some(&"12:00 o jogo fechou"));
+    }
+
+    #[test]
+    fn undo_failures_follow_table() {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![
+            cheat("a", available()),
+            cheat("b", available()),
+            cheat("c", available()),
+        ]);
+        h.connect(0);
+        for id in ["a", "b", "c"] {
+            assert!(h.toggle(id, 100));
+        }
+
+        // Recusa limpa: continua ligado e desejado.
+        h.ctl
+            .push_outcome(OpOutcome::Refused("threads no trecho".to_string()));
+        assert!(h.toggle("a", 200));
+        assert!(h.row("a").on && h.row("a").desired);
+        assert!(h.c.desired().contains_key("a"));
+        assert_eq!(h.events().last(), Some(&"12:00 a: threads no trecho"));
+
+        // Bytes de outro: indisponível e fora dos desejados.
+        h.ctl.push_outcome(OpOutcome::Foreign);
+        assert!(h.toggle("b", 300));
+        let b = h.row("b");
+        assert!(!b.on && !b.desired);
+        assert_eq!(
+            b.status(&h.c.model.conn),
+            crate::model::CheatStatus::Unavailable("alterado por outro".to_string())
+        );
+        assert!(!h.c.desired().contains_key("b"));
+
+        // Restos: `erro`, aviso fixo e fora dos desejados.
+        h.ctl
+            .push_outcome(OpOutcome::Residue("escrita".to_string()));
+        assert!(h.toggle("c", 400));
+        let c = h.row("c");
+        assert!(c.residue && !c.on && !c.desired);
+        assert_eq!(
+            c.status(&h.c.model.conn),
+            crate::model::CheatStatus::Residue
+        );
+        assert!(!h.c.desired().contains_key("c"));
+        assert!(
+            h.c.model
+                .banners
+                .residue
+                .as_deref()
+                .is_some_and(|t| t.contains('c'))
+        );
+    }
+
+    #[test]
+    fn space_on_marked_unavailable_clears_desired() {
+        let mut h = H::new();
+        h.ctl
+            .set_catalog(vec![cheat("a", available()), cheat("b", available())]);
+        h.connect(0);
+        assert!(h.toggle("a", 100));
+        h.ctl
+            .set_catalog(vec![cheat("a", not_found()), cheat("b", not_found())]);
+        h.ctl.clear_calls();
+        h.reopen(1_000, 4_000);
+        h.tick(4_100);
+        assert!(h.applies().is_empty());
+        assert!(h.row("a").desired);
+        assert!(event_count(&h, "a: não foi religado (indisponível: não encontrado)") == 1);
+
+        // Sem a marca: só escreve o motivo.
+        assert!(!h.toggle("b", 4_200));
+        assert_eq!(
+            h.events().last(),
+            Some(&"12:00 b: indisponível (não encontrado)")
+        );
+        assert_eq!(event_count(&h, "não será mais religado"), 0);
+
+        // Com a marca: tira dos desejados e confirma.
+        assert!(!h.toggle("a", 4_300));
+        assert!(!h.row("a").desired);
+        assert!(h.c.desired().is_empty());
+        assert_eq!(h.events().last(), Some(&"12:00 a: não será mais religado"));
+        assert!(h.applies().is_empty());
+    }
+
+    #[test]
+    fn auto_search_stops_without_pending_desired() {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![cheat("a", available())]);
+        h.connect(0);
+        assert!(h.toggle("a", 100));
+        // `ambíguo` não dispara busca sozinho; o desejado indisponível dispara.
+        h.ctl.set_catalog(vec![cheat("a", unavailable("ambíguo"))]);
+        h.reopen(1_000, 4_000);
+        h.tick(4_100);
+        h.tick(8_900);
+        assert!(!h.searching());
+        h.tick(9_000);
+        assert!(h.searching());
+        assert!(h.wait(9_000));
+
+        // O dono tira o desejado: acabam as buscas automáticas.
+        assert!(!h.toggle("a", 9_100));
+        assert!(h.c.desired().is_empty());
+        let searches = h.ctl.search_calls();
+        for t in 3..30 {
+            h.tick(t * 5_000);
+            assert!(!h.searching());
+        }
+        assert_eq!(h.ctl.search_calls(), searches);
+    }
+
+    #[test]
+    fn auto_search_reapplies_found_desired() {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![cheat("a", available())]);
+        h.connect(0);
+        assert!(h.toggle("a", 100));
+        // O jogo reabre ainda carregando: o cheat não aparece.
+        h.ctl.set_catalog(vec![cheat("a", not_found())]);
+        h.ctl.clear_calls();
+        h.reopen(1_000, 4_000);
+        h.tick(4_100);
+        assert!(h.applies().is_empty());
+
+        // A busca automática o acha; a religação vem no `tick` seguinte.
+        h.ctl
+            .push_search(Ok(SearchSpec::new(vec![cheat("a", available())])));
+        h.tick(9_000);
+        assert!(h.searching());
+        assert!(h.wait(9_000));
+        assert_eq!(h.row("a").avail, available());
+        assert!(h.applies().is_empty());
+        h.tick(9_100);
+        assert_eq!(h.applies(), [apply_call(&[("a", 0)], "religando…")]);
+        assert!(h.row("a").on);
+        assert_eq!(event_count(&h, "a religado"), 1);
+        // Já religado e sem nada faltando: o desejado não mantém a busca.
+        h.tick(20_000);
+        assert!(!h.searching());
+    }
+
+    #[test]
+    fn unverified_warning_once_per_connection() {
+        let warning = "aviso: a versão do jogo não tem assinaturas conferidas; a foi ligado como \
+                       não verificado";
+        let mut h = H::new();
+        h.ctl
+            .set_catalog(vec![cheat("a", Avail::Available { verified: false })]);
+        h.connect(0);
+        assert!(h.toggle("a", 100));
+        assert!(h.toggle("a", 200));
+        assert!(h.toggle("a", 300));
+        assert_eq!(event_count(&h, warning), 1);
+
+        // Na conexão nova, ao religar, avisa de novo.
+        h.reopen(1_000, 4_000);
+        h.tick(4_100);
+        assert!(h.row("a").on);
+        assert_eq!(event_count(&h, warning), 2);
+    }
+
+    #[test]
+    fn too_small_only_quit_and_retry() {
+        let mut h = H::new();
+        h.ctl
+            .set_catalog(vec![cheat("a", available()), cheat("b", available())]);
+        h.connect(0);
+        h.c.model.too_small = true;
+        for action in [
+            Action::Toggle,
+            Action::Down,
+            Action::Up,
+            Action::Dec,
+            Action::Inc,
+        ] {
+            assert!(!h.key(action, 100));
+        }
+        assert_eq!(h.c.model.selected, 0);
+        assert!(h.applies().is_empty());
+        assert!(!h.c.quit_requested());
+        assert!(!h.key(Action::Quit, 200));
+        assert!(h.c.quit_requested());
+
+        // `r` funciona: sem conexão, procura na hora, sem esperar os 2 s.
+        let mut w = H::new();
+        w.c.model.too_small = true;
+        w.key(Action::Retry, 0);
+        w.key(Action::Retry, 10);
+        assert_eq!(w.ctl.find_calls(), 2);
+    }
+
+    #[test]
+    fn selection_keys_move_over_visible() {
+        let mut h = H::new();
+        h.ctl
+            .set_catalog(vec![cheat("a", available()), cheat("b", available())]);
+        h.connect(0);
+        assert!(!h.key(Action::Down, 100));
+        assert_eq!(h.c.model.selected_id(), Some("b"));
+        h.key(Action::Down, 110);
+        assert_eq!(h.c.model.selected_id(), Some("b"));
+        h.key(Action::Up, 120);
+        assert_eq!(h.c.model.selected_id(), Some("a"));
+    }
+
+    #[test]
+    fn retry_noop_states() {
+        // Conectando: nada.
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![cheat("a", available())]);
+        h.ctl.set_find(Find::Found(100));
+        h.ctl.hold_search();
+        h.tick(0);
+        assert_eq!(h.c.model.conn, Conn::Connecting);
+        let (finds, searches) = (h.ctl.find_calls(), h.ctl.search_calls());
+        assert!(!h.key(Action::Retry, 3_000));
+        assert_eq!(h.c.model.conn, Conn::Connecting);
+        assert_eq!(
+            (h.ctl.find_calls(), h.ctl.search_calls()),
+            (finds, searches)
+        );
+        h.ctl.release_search();
+        assert!(h.wait(3_100));
+
+        // O processo terminou (com `--pid`): nada.
+        let mut p = H::pid_fixed();
+        p.ctl.set_catalog(vec![cheat("a", available())]);
+        p.connect(0);
+        p.ctl.set_exited(true);
+        p.tick(100);
+        assert_eq!(p.c.model.conn, Conn::PidGone);
+        let finds = p.ctl.find_calls();
+        p.key(Action::Retry, 10_000);
+        assert_eq!(p.c.model.conn, Conn::PidGone);
+        assert_eq!(p.ctl.find_calls(), finds);
+
+        // Durante uma operação: nada.
+        let mut w = H::new();
+        w.c.model.busy = Some("ligando a…".to_string());
+        w.key(Action::Retry, 0);
+        assert_eq!(w.ctl.find_calls(), 0);
+    }
+
+    #[test]
+    fn retry_waiting_looks_now_and_connected_searches_again() {
+        // Sem conexão: procura na hora, mesmo dentro do intervalo de 2 s.
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![cheat("a", not_found())]);
+        h.tick(0);
+        assert_eq!(h.ctl.find_calls(), 1);
+        h.ctl.set_find(Find::Found(100));
+        h.key(Action::Retry, 100);
+        assert_eq!(h.c.model.conn, Conn::Connecting);
+        assert!(h.wait(100));
+
+        // Conectado e com o prazo de 120 s esgotado: o `r` refaz a busca e reinicia o prazo.
+        h.tick(130_000);
+        assert!(!h.searching());
+        assert!(!h.key(Action::Retry, 130_000));
+        assert!(h.searching());
+        assert!(h.wait(130_000));
+        h.tick(135_000);
+        assert!(h.searching(), "o prazo recomeçou");
+    }
+
+    #[test]
+    fn retry_connected_refreshes_even_with_unreadable_disk() {
+        let mut h = H::new();
+        let mut bad = SearchSpec::new(vec![cheat("a", unavailable("disco ilegível"))]);
+        bad.disk = Err("sem cabeçalho".to_string());
+        h.ctl.set_default_search(bad);
+        h.connect(0);
+        let searches = h.ctl.search_calls();
+        // Só o `r` refaz a busca com o disco ilegível.
+        h.ctl
+            .push_search(Ok(SearchSpec::new(vec![cheat("a", available())])));
+        h.key(Action::Retry, 1_000);
+        assert!(h.wait(1_000));
+        assert_eq!(h.ctl.search_calls(), searches + 1);
+        assert_eq!(connected(&h.c), (100, "v1".to_string(), true, true));
+        assert_eq!(h.row("a").avail, available());
     }
 }

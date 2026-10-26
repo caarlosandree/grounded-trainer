@@ -6,6 +6,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use gt_core::journal::{JournalStore, Loaded};
 use gt_core::mem::{MemReader, MemWriter};
 use gt_core::procinfo::identity;
 use gt_core::value::{ValueSpec, ValueType};
@@ -13,6 +14,7 @@ use gt_grounded2::signatures::Category;
 use gt_testkit::{TargetOpts, TestTarget};
 use gt_tui::backend::{Backend, Find, OpOutcome, Recovered, Session};
 use gt_tui::controller::Controller;
+use gt_tui::keys::Action;
 use gt_tui::model::{Avail, Conn, Model};
 use gt_tui::raw::{RawBackend, RawControl, RawDef};
 
@@ -393,7 +395,6 @@ fn raw_drop_order_keeps_the_lock_until_the_session_falls() {
 }
 
 #[test]
-#[ignore = "Tarefa 12"]
 fn raw_slow_search_responsive() {
     let e = env();
     e.control.lock().unwrap().search_delay = Duration::from_secs(3);
@@ -415,7 +416,16 @@ fn raw_slow_search_responsive() {
             started.elapsed()
         );
         assert_eq!(c.model.conn, Conn::Connecting);
-        // Tarefa 12: o mesmo para `c.handle(Action::Quit, ..)`.
+        // O mesmo para as teclas: `q` durante a busca é atendido na hora.
+        let started = Instant::now();
+        let called = c.handle(Action::Quit, t0 + Duration::from_millis(100 * i), &mut draw);
+        assert!(!called, "sair não chama a sessão");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "handle(Quit) demorou {:?} durante a busca",
+            started.elapsed()
+        );
+        assert!(c.quit_requested());
         std::thread::sleep(Duration::from_millis(100));
     }
 
@@ -465,4 +475,118 @@ fn raw_controller_connects_and_detects_close() {
             .back()
             .is_some_and(|l| l.ends_with("o jogo fechou"))
     );
+}
+
+/// Posição do cheat `id` na lista mostrada.
+fn select(c: &mut Controller<RawBackend>, id: &str) {
+    c.model.selected = c.model.visible().iter().position(|r| r.id == id).unwrap();
+}
+
+#[test]
+fn raw_connect_toggle_reconnect() {
+    let e = env();
+    let control = e.control.clone();
+    let mut old = e.target;
+    let old_pid = old.pid;
+    let old_spin = old.spin_page;
+    let mut c = Controller::new(e.backend, Box::new(|| "00:00".to_string()), false, false);
+    let mut draw = |_: &Model| {};
+    let t0 = Instant::now();
+    c.start(&mut draw);
+    c.tick(t0, &mut draw);
+    assert!(c.wait_search(t0, Duration::from_secs(10)));
+    assert!(matches!(c.model.conn, Conn::Connected { engine: true, .. }));
+
+    // Liga o cheat de alternância: os bytes mudam no alvo e ele vira desejado.
+    select(&mut c, TOGGLE);
+    assert!(c.handle(Action::Toggle, t0, &mut draw));
+    assert_eq!(read(old_pid, old_spin, 3), [0x48, 0x89, 0xCF]);
+    assert!(c.model.cheats.iter().any(|r| r.id == TOGGLE && r.on));
+    assert!(c.desired().contains_key(TOGGLE));
+
+    // O alvo morre: "o jogo fechou", sem erro de escrita, e o cheat continua desejado.
+    old.child.kill().unwrap();
+    old.child.wait().unwrap();
+    let end = Instant::now() + Duration::from_secs(5);
+    let mut now = t0;
+    while !matches!(c.model.conn, Conn::Waiting) && Instant::now() < end {
+        now += Duration::from_millis(100);
+        c.tick(now, &mut draw);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(c.model.conn, Conn::Waiting);
+    assert!(
+        c.model
+            .events
+            .back()
+            .is_some_and(|l| l.ends_with("o jogo fechou"))
+    );
+    assert!(c.desired().contains_key(TOGGLE));
+    assert!(c.model.cheats.iter().all(|r| !r.on));
+
+    // Um alvo novo (outros endereços): o teste troca o PID e as definições.
+    let new = TestTarget::spawn_with(TargetOpts {
+        spin_value: true,
+        ..Default::default()
+    });
+    {
+        let mut ctl = control.lock().unwrap();
+        ctl.pid = Some(new.pid);
+        ctl.defs = defs_of(&new);
+    }
+    now += Duration::from_secs(3);
+    c.tick(now, &mut draw);
+    assert!(c.wait_search(now, Duration::from_secs(10)));
+    assert!(matches!(c.model.conn, Conn::Connected { engine: true, .. }));
+    // A religação vem no `tick` seguinte (é ele que recebe o `draw` do `religando…`).
+    now += Duration::from_millis(100);
+    c.tick(now, &mut draw);
+    assert_eq!(read(new.pid, new.spin_page, 3), [0x48, 0x89, 0xCF]);
+    assert!(c.model.cheats.iter().any(|r| r.id == TOGGLE && r.on));
+    assert!(
+        c.model
+            .events
+            .iter()
+            .any(|l| l.contains("Alternar religado (pausa"))
+    );
+
+    // Sair restaura o alvo novo.
+    drop(c);
+    assert_eq!(read(new.pid, new.spin_page, 3), [0x48, 0x8B, 0xF9]);
+}
+
+#[test]
+fn raw_panic_in_main_loop_restores() {
+    let e = env();
+    let pid = e.target.pid;
+    let (spin_page, value_page) = (e.target.spin_page, e.target.value_page);
+    let dir = e._dir.path().to_path_buf();
+    let backend = e.backend;
+
+    // Um pânico no laço principal, com dois cheats ligados: o `Drop` do controlador (e da
+    // sessão, e do motor) desfaz tudo no desenrolar.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let mut c = Controller::new(backend, Box::new(|| "00:00".to_string()), false, false);
+        let mut draw = |_: &Model| {};
+        let t0 = Instant::now();
+        c.start(&mut draw);
+        c.tick(t0, &mut draw);
+        assert!(c.wait_search(t0, Duration::from_secs(10)));
+        for id in [TOGGLE, VALUE] {
+            select(&mut c, id);
+            assert!(c.handle(Action::Toggle, t0, &mut draw));
+        }
+        assert!(c.model.cheats.iter().all(|r| r.on));
+        panic!("pânico de teste no laço principal");
+    }));
+    assert!(result.is_err());
+
+    assert_eq!(read(pid, spin_page, 3), [0x48, 0x8B, 0xF9]);
+    assert_eq!(read(pid, value_page, 5), [0xB8, 0x11, 0x11, 0x11, 0x11]);
+    // Diário vazio: nada ficou registrado.
+    match JournalStore::new(dir).peek().unwrap() {
+        Loaded::Missing => {}
+        Loaded::Ok(j) => assert!(j.entries.is_empty(), "restou: {:?}", j.entries),
+        other => panic!("diário inesperado: {other:?}"),
+    }
 }
