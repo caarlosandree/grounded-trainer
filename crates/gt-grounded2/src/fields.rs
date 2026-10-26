@@ -16,7 +16,11 @@ use gt_core::journal::GuardBytes;
 use gt_core::mem::ReadMem;
 use gt_ue::{ObjectArray, ReflectionIndex};
 
-use crate::player::{Absent, FieldAction, FieldCatalog, ResolvedRule, plan_tick, read_player};
+use crate::player::{
+    Absent, FieldAction, FieldCatalog, FieldValues, PlayerSnapshot, ResolvedRule, plan_tick,
+    read_player,
+};
+use crate::signatures::LockMode;
 
 /// Onde está o personagem neste ciclo.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +60,9 @@ pub struct FieldRuntime {
     /// `id` com o alvo inválido no último ciclo.
     invalid: HashSet<String>,
     pawn_null_since: Option<Instant>,
+    /// Maior valor visto de cada trava de subir, por `id` e objeto, enquanto ligada: o máximo
+    /// efetivo que o próprio jogo alcança (a stamina regenera até 120 com `MaxStamina` 100).
+    learned: HashMap<(String, u64), f32>,
 }
 
 /// Objeto dono de uma guarda (o primeiro trecho é a vtable, em `+0`).
@@ -72,6 +79,46 @@ impl FieldRuntime {
             found: None,
             invalid: HashSet::new(),
             pawn_null_since: None,
+            learned: HashMap::new(),
+        }
+    }
+
+    /// Nas travas de subir, o alvo nunca é menor que o maior valor já visto naquele objeto com o
+    /// cheat ligado (o máximo efetivo, spec 005 6.5.1 e P3). Valor não finito ou fora da faixa
+    /// sã não ensina nada.
+    fn learn_targets(&mut self, snapshot: &mut PlayerSnapshot, on: &[String]) {
+        self.learned.retain(|(id, _), _| on.contains(id));
+        for (id, values) in snapshot.values.iter_mut() {
+            if !on.contains(id) {
+                continue;
+            }
+            let Some(Ok(resolved)) = self.catalog.get(id) else {
+                continue;
+            };
+            let ResolvedRule::Lock {
+                mode: LockMode::Raise,
+                max,
+                ..
+            } = resolved.rule
+            else {
+                continue;
+            };
+            let FieldValues::Lock {
+                obj,
+                current,
+                target,
+                ..
+            } = values
+            else {
+                continue;
+            };
+            let best = self.learned.entry((id.clone(), *obj)).or_insert(f32::MIN);
+            if current.is_finite() && *current <= max {
+                *best = best.max(*current);
+            }
+            if target.is_finite() && *best > *target {
+                *target = *best;
+            }
         }
     }
 
@@ -103,7 +150,7 @@ impl FieldRuntime {
             pawn_null_since: None,
         };
 
-        let snapshot = match read_player(mem, index, &self.catalog, objects, controller) {
+        let mut snapshot = match read_player(mem, index, &self.catalog, objects, controller) {
             Ok(s) => s,
             Err(absent) => {
                 if absent == Absent::PawnNull {
@@ -140,6 +187,7 @@ impl FieldRuntime {
         }
 
         let mut invalid_now = HashSet::new();
+        self.learn_targets(&mut snapshot, &on);
         for action in plan_tick(&snapshot, &self.catalog, &on) {
             match action {
                 FieldAction::WriteF32 {
@@ -210,6 +258,7 @@ impl FieldRuntime {
     /// feito (spec 6.7), com uma linha no log; o `id` vem sempre em `restored`.
     pub fn turn_off(&mut self, engine: &mut Engine, id: &str) -> gt_core::Result<BatchReport> {
         self.invalid.remove(id);
+        self.learned.retain(|(learned, _), _| learned != id);
         let done = BatchReport {
             restored: vec![id.to_string()],
             ..BatchReport::default()

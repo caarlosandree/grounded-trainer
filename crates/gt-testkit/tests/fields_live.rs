@@ -322,3 +322,30 @@ fn region_not_rw_refused() {
     let err = s.engine.write_data(s.t.exec_page, &[0], &[]).unwrap_err();
     assert!(matches!(err, Error::DataOutsidePolicy { .. }), "{err:?}");
 }
+
+#[test]
+fn raise_target_learns_effective_max() {
+    let mut s = scene();
+    let (stamina, target) = s.lock_addr("stamina-infinita");
+    assert_eq!(target, 100.0);
+    s.tick(&["stamina-infinita"]);
+    // O jogo regenera acima de `MaxStamina` (bônus): a trava aprende esse máximo.
+    s.poke(stamina, &120f32.to_le_bytes());
+    s.tick(&["stamina-infinita"]);
+    s.poke(stamina, &40f32.to_le_bytes());
+    s.tick(&["stamina-infinita"]);
+    assert_eq!(s.f32_at(stamina), 120.0);
+    // Valor absurdo (fora da faixa sã) não ensina.
+    s.poke(stamina, &1.0e9f32.to_le_bytes());
+    s.tick(&["stamina-infinita"]);
+    s.poke(stamina, &40f32.to_le_bytes());
+    s.tick(&["stamina-infinita"]);
+    assert_eq!(s.f32_at(stamina), 120.0);
+    // Desligar esquece o aprendido.
+    s.runtime
+        .turn_off(&mut s.engine, "stamina-infinita")
+        .unwrap();
+    s.poke(stamina, &40f32.to_le_bytes());
+    s.tick(&["stamina-infinita"]);
+    assert_eq!(s.f32_at(stamina), 100.0);
+}
