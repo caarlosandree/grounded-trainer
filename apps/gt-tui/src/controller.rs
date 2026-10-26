@@ -432,7 +432,7 @@ impl<B: Backend> Controller<B> {
         inflight: &InFlight<B::Payload>,
         now: Instant,
     ) {
-        let search = match res {
+        let mut search = match res {
             Ok(search) => search,
             Err(SearchError::Gone) => return self.on_game_closed(now),
             Err(e) => {
@@ -443,17 +443,31 @@ impl<B: Backend> Controller<B> {
         let took = search.took;
         let disk = search.disk.clone();
         let version_key = search.version_key.clone();
-        let cheats = search.cheats.clone();
+        let has_version_file = search.has_version_file;
+        // O resultado só vale para os cheats que continuam desligados e sem operação desde o
+        // início da busca (spec 6.2). A sessão e o modelo usam o mesmo conjunto.
+        let accepted: Vec<String> = search
+            .cheats
+            .iter()
+            .filter(|c| search.ids.as_ref().is_none_or(|ids| ids.contains(&c.id)))
+            .filter(|c| self.refresh_applies(&c.id, inflight))
+            .map(|c| c.id.clone())
+            .collect();
+        search.ids = Some(accepted.clone());
+        let cheats: Vec<CheatInfo> = search
+            .cheats
+            .iter()
+            .filter(|c| accepted.contains(&c.id))
+            .cloned()
+            .collect();
         if self.session_call(|s| s.merge_search(search)) != Some(true) {
             // Outro processo (ou nenhuma sessão): a conexão acabou.
             return self.on_game_closed(now);
         }
         for c in cheats {
-            let ops_now = self.op_counts.get(&c.id).copied().unwrap_or(0);
-            let ops_then = inflight.ops.get(&c.id).copied().unwrap_or(0);
             match self.model.cheats.iter_mut().find(|r| r.id == c.id) {
                 Some(row) => {
-                    if row.on || ops_now != ops_then || keeps_state(&row.avail, &c.avail) {
+                    if keeps_state(&row.avail, &c.avail) {
                         continue;
                     }
                     row.avail = c.avail;
@@ -469,17 +483,28 @@ impl<B: Backend> Controller<B> {
         let disk_now_ok = disk.is_ok();
         if let Conn::Connected {
             version_key: vk,
+            has_version_file: hvf,
             disk: d,
             ..
         } = &mut self.model.conn
         {
             *vk = version_key;
+            *hvf = has_version_file;
             *d = disk;
         }
         if disk_was_unreadable && disk_now_ok {
             self.open_engine_if_possible();
         }
         self.schedule_auto(inflight.started, took, now);
+    }
+
+    /// Se o resultado da nova busca vale para `id`: a linha (se houver) continua desligada e o
+    /// contador de operações é o mesmo de quando a busca começou.
+    fn refresh_applies(&self, id: &str, inflight: &InFlight<B::Payload>) -> bool {
+        let ops_now = self.op_counts.get(id).copied().unwrap_or(0);
+        let ops_then = inflight.ops.get(id).copied().unwrap_or(0);
+        let on = self.model.cheats.iter().any(|r| r.id == id && r.on);
+        !on && ops_now == ops_then
     }
 
     /// Abre o motor quando o diário está resolvido e o disco foi lido.
@@ -588,6 +613,8 @@ impl<B: Backend> Controller<B> {
             Ok(()) => true,
             Err(e) => {
                 tracing::warn!(erro = %e, "não foi possível iniciar a nova busca");
+                // Sem isso, a próxima volta tentaria (e avisaria) de novo.
+                self.next_auto = Some(now + auto_interval(self.last_took));
                 false
             }
         }
@@ -931,6 +958,63 @@ mod tests {
             "o resultado de `a` foi descartado"
         );
         assert_eq!(h.row("b").avail, available());
+        // A sessão também recebe só `b`.
+        assert_eq!(h.ctl.merge_ids(), [Some(vec!["b".to_string()])]);
+    }
+
+    #[test]
+    fn on_during_search_drops_that_cheat_result_in_session() {
+        let mut h = H::new();
+        h.ctl
+            .set_catalog(vec![cheat("a", available()), cheat("b", not_found())]);
+        h.connect(0);
+        h.ctl.push_search(Ok(SearchSpec::new(vec![
+            cheat("a", unavailable("bytes diferentes")),
+            cheat("b", available()),
+        ])));
+        h.ctl.hold_search();
+        h.tick(5_000);
+        // `a` foi ligado durante a busca e continua ligado.
+        h.c.note_op("a");
+        h.c.model.cheats[0].on = true;
+        h.ctl.release_search();
+        assert!(h.wait(5_100));
+        assert_eq!(h.row("a").avail, available());
+        assert_eq!(h.row("b").avail, available());
+        assert_eq!(h.ctl.merge_ids(), [Some(vec!["b".to_string()])]);
+    }
+
+    #[test]
+    fn on_without_op_count_is_also_dropped() {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![cheat("a", available())]);
+        h.connect(0);
+        h.c.model.cheats[0].on = true;
+        h.ctl
+            .push_search(Ok(SearchSpec::new(vec![cheat("a", not_found())])));
+        // `a` está ligado: nem entra na busca; o `FakeSession` não recebe nada dele.
+        assert!(h.c.start_refresh(h.at(5_000)));
+        assert!(h.wait(5_000));
+        assert_eq!(h.ctl.merge_ids(), [Some(Vec::<String>::new())]);
+    }
+
+    #[test]
+    fn refresh_updates_has_version_file() {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![cheat("a", not_found())]);
+        h.connect(0);
+        let mut spec = SearchSpec::new(vec![cheat("a", available())]);
+        spec.has_version_file = false;
+        h.ctl.push_search(Ok(spec));
+        h.tick(5_000);
+        assert!(h.wait(5_000));
+        let Conn::Connected {
+            has_version_file, ..
+        } = &h.c.model.conn
+        else {
+            panic!("esperava conectado");
+        };
+        assert!(!has_version_file);
     }
 
     #[test]

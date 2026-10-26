@@ -272,6 +272,18 @@ impl FakeCtl {
             .collect()
     }
 
+    /// `ids` de cada `merge_search` da sessão, na ordem.
+    pub fn merge_ids(&self) -> Vec<Option<Vec<String>>> {
+        self.state()
+            .calls
+            .iter()
+            .filter_map(|c| match c {
+                Call::MergeSearch { ids } => Some(ids.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn clear_calls(&self) {
         self.state().calls.clear();
     }
