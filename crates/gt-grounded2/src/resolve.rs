@@ -148,6 +148,23 @@ impl Target {
     }
 }
 
+/// Acha o PID do jogo sem abrir o alvo (a casca pública da busca que o [`Target::open`] faz).
+///
+/// Sem `pid`, varre `/proc` com a mesma regra do [`Target::open`] e devolve também os processos
+/// descartados (os que citam o jogo mas não são ele); [`Error::GameNotFound`] e
+/// [`Error::ManyCandidates`] como lá. Com `Some(pid)`, só confere que o processo existe e está
+/// vivo ([`gt_core::Error::ProcessGone`], dentro de [`Error::Core`], se não) e devolve a lista
+/// de descartados vazia.
+pub fn find_pid(pid: Option<i32>) -> Result<(i32, Vec<(i32, String)>)> {
+    match pid {
+        Some(pid) => {
+            identity(pid)?;
+            Ok((pid, Vec::new()))
+        }
+        None => find_game(),
+    }
+}
+
 /// Procura o jogo em `/proc`. Erro se não houver nenhum candidato ou houver mais de um.
 fn find_game() -> Result<(i32, Vec<(i32, String)>)> {
     let own = i32::try_from(std::process::id()).ok();
@@ -205,8 +222,20 @@ pub fn permission_hint(program: &str, ptrace_scope: Option<u8>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::permission_hint;
+    use super::{find_pid, permission_hint};
     use crate::Error;
+
+    #[test]
+    fn find_pid_with_pid_only_checks_existence() {
+        let own = i32::try_from(std::process::id()).unwrap();
+        let (pid, discarded) = find_pid(Some(own)).unwrap();
+        assert_eq!(pid, own);
+        assert!(discarded.is_empty());
+        assert!(matches!(
+            find_pid(Some(i32::MAX)),
+            Err(Error::Core(gt_core::Error::ProcessGone { .. }))
+        ));
+    }
 
     #[test]
     fn permission_hint_mentions_scope_and_value_without_sudo_first() {
