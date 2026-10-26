@@ -3,7 +3,7 @@
 //! A cada ciclo (~10 Hz), [`FieldRuntime::tick`] revalida o caminho até o personagem
 //! ([`read_player`]), planeja as escritas ([`plan_tick`]) e as executa no motor: travas com
 //! [`Engine::write_data`] e bits com [`Engine::set_bits`]. Antes de tocar os bits de um objeto
-//! novo (outro pawn), a entrada do antigo é resolvida com [`Engine::restore_bits`], então o
+//! novo (outro pawn), a entrada do antigo é resolvida com [`Engine::restore_field`], então o
 //! diário nunca guarda duas entradas vivas do mesmo cheat.
 
 use std::collections::{HashMap, HashSet, VecDeque};

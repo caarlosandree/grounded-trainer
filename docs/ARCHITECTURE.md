@@ -252,6 +252,14 @@ As instruções originais copiadas para a cave passam por relocação (endereço
 | 2026-10-26 | Raízes independentes (pawn e `game_state`), cada uma com leitura própria; isolamento por cheat para todo componente; `root = "game_state"` só com `add` | IA, spec 006 6.3 |
 | 2026-10-26 | Velocidade pelos multiplicadores do próprio jogo (`CustomGroundSpeedMultiplier`/`CustomSwimSpeedMultiplier`), não pelo `MaxWalkSpeed`; pulos por `JumpMaxCount = 1000` | IA, spec 006 6.1 e 6.7.3: o `MaxWalkSpeed` não é a velocidade de corrida |
 | 2026-10-26 | Ressalvas novas no `AGENTS.md` 3 (ação sem desfazer, `set` sem bytes esperados) e valores acima da faixa normal do jogo nos `set` (dano ×100, carga 100, `JumpMaxCount` 1000) | IA, aprovada pelo dono, spec 006 4 e 7: o original volta ao desligar |
+| 2026-10-26 | Carga baixada abaixo dos itens carregados enquanto ligado: risco aceito de o jogo soltar ou perder itens (o teste anota); carga com grade a partir de 1 | IA, aprovada pelo dono, spec 006 6.7.2 |
+| 2026-10-26 | Teto da ciência (`result_max`) em 100000 | IA, aprovada pelo dono, spec 006 7 |
+| 2026-10-26 | Faixas e padrões: carga 1–100 (20), dano ×1–×100 (×10), ciência +100–+10000 (+1000), velocidade ×0,5–×4 (×2), gravidade ×0,1–×2 (×0,5) | IA, aprovada pelo dono, spec 006 6.7 |
+| 2026-10-26 | Dano, velocidade, gravidade e carga com valor ajustável pelas setas; ao desligar volta o original do jogo | Dono, spec 006 11 |
+| 2026-10-26 | `o jogo não deixa`: o cheat para de escrever naquele objeto até mudar o objeto ou desligar e ligar, sem nova tentativa por tempo | IA, aprovada pelo dono, spec 006 6.4 |
+| 2026-10-26 | Pulos infinitos por `JumpMaxCount = 1000`, sem valor ajustável | IA, spec 006 6.7.3 |
+| 2026-10-26 | Ciência pelo `GameState` (`root = "game_state"`), com cada salto conferido por classe | IA, spec 006 6.3: o `CachedPartyComponent` é nulo |
+| 2026-10-26 | Montado: cheats de movimento só do personagem, sem efeito na montaria | IA, aprovada pelo dono, spec 006 6.7.3 |
 | 2026-10-25 | `name` e `category` obrigatórios nas assinaturas; bloco `value` sobrescrito inteiro por versão | Lista agrupada e sem campos pela metade (spec 003, 6.3) |
 | 2026-10-25 | Núcleo da TUI testável por uma interface de alvo (jogo, crua e falsa) e por uma interface de terminal com versão falsa | Testar conexão, reconexão, sinais e restauração sem o jogo |
 | 2026-10-25 | `stuck` mantido até um `SIGCONT` bem-sucedido, com nova tentativa antes de cada operação; restos de falha viram `erro` e só a recuperação (`r`) resolve | Nunca deixar o jogo parado sem aviso (spec 003, 6.8) |
