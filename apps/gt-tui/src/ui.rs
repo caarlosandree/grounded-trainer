@@ -19,6 +19,10 @@ pub const MIN_HEIGHT: u16 = 15;
 
 /// Menor número de linhas do registro de eventos.
 const MIN_EVENT_LINES: usize = 3;
+/// Largura do marcador `> ` das linhas de cheat.
+const MARKER_WIDTH: usize = 2;
+/// Espaço entre o nome e o estado.
+const STATE_GAP: usize = 2;
 /// Teclas do rodapé.
 const FOOTER: &str = "↑↓ mover  espaço liga/desliga  ◀▶ valor  r rebuscar  q sair";
 /// Mensagem da lista vazia (spec 6.5).
@@ -262,6 +266,7 @@ fn list_lines(model: &Model, width: usize) -> ListLines {
             &model.conn,
             index == model.selected,
             name_width,
+            width,
         ));
         out.is_header.push(false);
     }
@@ -269,7 +274,13 @@ fn list_lines(model: &Model, width: usize) -> ListLines {
 }
 
 /// `> nome  estado  [valor ◀ ▶]`.
-fn cheat_line(row: &CheatRow, conn: &Conn, selected: bool, name_width: usize) -> Line<'static> {
+fn cheat_line(
+    row: &CheatRow,
+    conn: &Conn,
+    selected: bool,
+    name_width: usize,
+    width: usize,
+) -> Line<'static> {
     let status = row.status(conn);
     let marker = if selected { "> " } else { "  " };
     let unverified = matches!(row.avail, Avail::Available { verified: false });
@@ -289,11 +300,29 @@ fn cheat_line(row: &CheatRow, conn: &Conn, selected: bool, name_width: usize) ->
             Style::new(),
             true,
         ),
-        CheatStatus::Unavailable(reason) => (
-            format!("indisponível ({reason}){}", again_mark.trim_end()),
-            Style::new().fg(Color::DarkGray),
-            false,
-        ),
+        CheatStatus::Unavailable(reason) => {
+            let again = again_mark.trim_end();
+            // O valor vale quando o cheat voltar a ligar (e é o que o religar usa): sempre
+            // aparece. Quando falta espaço, o motivo é que perde caracteres.
+            let reason = match &row.value {
+                Some(value) => {
+                    let fixed = MARKER_WIDTH
+                        + name_width
+                        + STATE_GAP
+                        + "indisponível ()".chars().count()
+                        + again.chars().count()
+                        + 1
+                        + value_text(value, row.k).chars().count();
+                    truncate(reason, width.saturating_sub(fixed))
+                }
+                None => reason.clone(),
+            };
+            (
+                format!("indisponível ({reason}){again}"),
+                Style::new().fg(Color::DarkGray),
+                true,
+            )
+        }
         CheatStatus::Residue => (
             format!("erro {unverified_mark}{again_mark}"),
             Style::new().fg(Color::Red),
@@ -308,13 +337,26 @@ fn cheat_line(row: &CheatRow, conn: &Conn, selected: bool, name_width: usize) ->
     let mut spans = vec![
         Span::raw(marker),
         Span::styled(format!("{:<name_width$}", row.name), name_style),
-        Span::raw("  "),
+        Span::raw(" ".repeat(STATE_GAP)),
         Span::styled(state, style),
     ];
     if has_value && let Some(value) = &row.value {
         spans.push(Span::raw(format!(" {}", value_text(value, row.k))));
     }
     Line::from(spans)
+}
+
+/// Corta `text` em `max` colunas, com `…` no fim quando perde caracteres.
+fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    let mut out: String = text.chars().take(keep).collect();
+    if max > 0 {
+        out.push('…');
+    }
+    out
 }
 
 /// `1.5x ◀ ▶`.
@@ -330,6 +372,19 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     let mut used = 0;
     for word in text.split_whitespace() {
         let len = word.chars().count();
+        if len > width {
+            // Palavra maior que a linha (ex.: um caminho): divide em pedaços, sem perder o fim.
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            let chars: Vec<char> = word.chars().collect();
+            let mut chunks = chars.chunks(width);
+            let last = chunks.next_back();
+            lines.extend(chunks.map(|c| c.iter().collect::<String>()));
+            current = last.map(|c| c.iter().collect()).unwrap_or_default();
+            used = current.chars().count();
+            continue;
+        }
         if used > 0 && used + 1 + len > width {
             lines.push(std::mem::take(&mut current));
             used = 0;
@@ -589,6 +644,82 @@ mod tests {
         let lines = screen(&m);
         line_with(&lines, "diário corrompido movido para /x/journal.bad");
         line_with(&lines, "kill -CONT 4123");
+    }
+
+    #[test]
+    fn renders_banner_long_path() {
+        let path = "/home/caarlosandree/.local/state/grounded-trainer/journal.json.bad";
+        let mut m = Model::new(false);
+        m.conn = connected();
+        m.banners.corrupt = Some(format!(
+            "diário corrompido movido para {path}; o jogo pode ter patches sem registro, confira com gt diff"
+        ));
+        let lines = draw(&m, 60, 20);
+        // O caminho pode quebrar em várias linhas, mas aparece inteiro.
+        assert!(
+            flat(&lines).replace(' ', "").contains(path),
+            "{}",
+            lines.join("\n")
+        );
+        line_with(&lines, "confira com gt diff");
+    }
+
+    #[test]
+    fn wrap_splits_words_longer_than_the_line() {
+        assert_eq!(wrap("ab cdefghij k", 4), ["ab", "cdef", "ghij", "k"]);
+        assert_eq!(wrap("abcdefgh", 4), ["abcd", "efgh"]);
+        assert_eq!(wrap("a bb ccc", 5), ["a bb", "ccc"]);
+        assert!(wrap("", 4).is_empty());
+    }
+
+    #[test]
+    fn renders_value_on_unavailable_rows() {
+        let mut m = Model::new(false);
+        m.conn = connected();
+        let mut missing = row(
+            "Velocidade",
+            Category::Movimento,
+            Avail::Unavailable("não encontrado".into()),
+        );
+        missing.value = Some(speed());
+        missing.k = 2;
+        m.cheats = vec![missing];
+        let lines = screen(&m);
+        let line = line_with(&lines, "Velocidade");
+        assert!(line.contains("indisponível (não encontrado)"), "{line}");
+        assert!(line.contains("1.5x ◀ ▶"), "{line}");
+
+        // Desejado e sem o jogo: valor e `↻`.
+        let mut m = Model::new(false);
+        let mut pending = row("Velocidade", Category::Movimento, ok());
+        pending.value = Some(speed());
+        pending.k = 2;
+        pending.desired = true;
+        m.cheats = vec![pending];
+        let lines = screen(&m);
+        let line = line_with(&lines, "Velocidade");
+        assert!(line.contains("jogo não conectado"), "{line}");
+        assert!(line.contains('↻') && line.contains("1.5x ◀ ▶"), "{line}");
+    }
+
+    #[test]
+    fn narrow_terminal_truncates_reason_not_value() {
+        let mut m = Model::new(false);
+        m.conn = connected();
+        let mut long = row(
+            "Velocidade do personagem",
+            Category::Movimento,
+            Avail::Unavailable("bytes diferentes do esperado no endereço".into()),
+        );
+        long.value = Some(speed());
+        long.k = 2;
+        long.desired = true;
+        m.cheats = vec![long];
+        let lines = draw(&m, MIN_WIDTH, MIN_HEIGHT);
+        let line = line_with(&lines, "Velocidade do personagem");
+        assert!(line.contains("1.5x ◀ ▶"), "{line}");
+        assert!(line.contains('↻'), "{line}");
+        assert!(line.contains('…'), "{line}");
     }
 
     #[test]
