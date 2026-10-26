@@ -73,9 +73,9 @@ Cada fase só começa quando a anterior cumpre seu critério de pronto. Cada fun
 
 **Pronto quando:** dá para ligar e desligar os cheats existentes só pela TUI.
 **Você faz:** opinar sobre usabilidade e layout.
-**Status:** em validação no jogo (spec e plano `003-interface-tui`; binário `gt-tui`). Código e testes automáticos
-prontos (núcleo, alvo de teste e binário em pseudo-terminal); falta a validação no jogo com o dono. O controle de
-valor foi provado só contra o alvo de teste, porque ainda não há cheat real com valor (Fase 4).
+**Status:** ✅ concluída em 2026-10-26 (spec e plano `003-interface-tui`; binário `gt-tui`). Critério de pronto
+aprovado no jogo pelo dono com o patch de teste. O controle de valor foi provado só contra o alvo de teste, porque
+ainda não há cheat real com valor (Fase 4).
 
 ---
 

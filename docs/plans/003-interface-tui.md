@@ -581,8 +581,8 @@ Spec 8 (integração do binário), 10.
 
 Spec 9. **Não delegar.**
 
-- [ ] **Passo 1:** pedir ao dono o **backup do save** e esperar a confirmação. Jogo fechado, FLiNG fechado.
-- [ ] **Passo 2:** critério 9.1 a 9.5 com o dono, um passo por vez, conferindo com `gt diff` e `gt-patch list` num segundo terminal. Anotar quando a religação aconteceu no passo 5 e o tempo da busca (`gt-tui.log`, linha `busca dos padrões` com `duracao_ms`).
-- [ ] **Passo 3:** `cargo test --workspace -- --ignored` com o jogo aberto (inclui `apps/gt-patch/tests/game.rs`, `apps/gt-tui/tests/game.rs` e `game_fd.rs`). Falha → causa no `RESEARCH.md` e voltar ao dono.
-- [ ] **Passo 4:** o dono usa a TUI por alguns minutos e opina; ajustes pequenos de texto/layout entram aqui; mudança de comportamento vira emenda à spec.
-- [ ] **Passo 5:** `RESEARCH.md` (tempo da busca, momento da religação, testes `#[ignore]`), `ROADMAP.md` (Fase 3 ✅ com a nota do valor provado só contra o alvo de teste), memória do projeto atualizada; commit `docs: fechamento da fase 3`.
+- [x] **Passo 1:** pedir ao dono o **backup do save** e esperar a confirmação. Jogo fechado, FLiNG fechado.
+- [x] **Passo 2:** critério 9.1 a 9.5 com o dono, um passo por vez, conferindo com `gt diff` e `gt-patch list` num segundo terminal. Anotar quando a religação aconteceu no passo 5 e o tempo da busca (`gt-tui.log`, linha `busca dos padrões` com `duracao_ms`).
+- [x] **Passo 3:** `cargo test --workspace -- --ignored` com o jogo aberto (inclui `apps/gt-patch/tests/game.rs`, `apps/gt-tui/tests/game.rs` e `game_fd.rs`). Falha → causa no `RESEARCH.md` e voltar ao dono.
+- [x] **Passo 4:** o dono usa a TUI por alguns minutos e opina; ajustes pequenos de texto/layout entram aqui; mudança de comportamento vira emenda à spec.
+- [x] **Passo 5:** `RESEARCH.md` (tempo da busca, momento da religação, testes `#[ignore]`), `ROADMAP.md` (Fase 3 ✅ com a nota do valor provado só contra o alvo de teste), memória do projeto atualizada; commit `docs: fechamento da fase 3`.

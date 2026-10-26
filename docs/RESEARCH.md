@@ -460,6 +460,32 @@ sem depender de padrões que quebram a cada atualização. Os offsets vêm da re
 layout. Patches e caves ficam para o que muda lógica: god mode, defesa, Brain Power, hora do dia, construção e
 analisador.
 
+## Sessão de 2026-10-26 (Fase 3): critério de pronto do `gt-tui` no jogo
+
+Build `c935e799-0b27c000` (`Augusta-CL-3207493`). Save de teste, FLiNG fechado, backup do save feito pelo dono.
+Binário `target/debug/gt-tui --diagnostico`; conferência por `gt diff` e `gt-patch list` num segundo terminal.
+
+- **Conexão:** com a TUI aberta antes do jogo, ela passou de `aguardando o jogo` a `conectado` sozinha, versão `com
+  assinaturas`, `teste-codificacao` em `[OFF]`.
+- **Busca dos padrões (`catalog::scan` sobre a `.text` de ~128 MB):** 8,9 s a 11,4 s por busca (log `busca dos
+  padrões duracao_ms=…`, seis medições). Bem acima dos ~2 s imaginados, mas a busca roda numa thread separada e a tela
+  continuou respondendo. Consequência: a cadência das buscas automáticas é `max(5 s, 2 × duração)` ≈ 20 s.
+- **Ligar/desligar:** pausa de 11–15 ms por troca. `gt diff` mostrou `+112c469` `0b c2` → `09 d0` ligado (o `48` do
+  início da instrução não muda) e "nenhuma alteração" desligado; `gt-patch list` mostrou `ativo` com a TUI segurando.
+- **Saídas:** `q`, fechar a janela do terminal (SIGHUP) e `kill` (SIGTERM) restauraram na hora (`restaurado:
+  teste-codificacao` no log; `gt diff` limpo). `kill -9` deixou o patch e o `journal.json`; o `gt-patch list` mostrou
+  `pendente`; o `gt-tui` aberto de novo recuperou sozinho e apagou o diário.
+- **Reconexão:** com o patch ligado, o jogo fechado deu `o jogo fechou` (motor descartou sem escrever). Jogo aberto de
+  novo (PID novo): a TUI reconectou na primeira busca (~34 s depois de fechar, incluindo o carregamento do jogo) e
+  religou o patch **já na partida** (relato do dono), sem precisar das buscas automáticas. A pausa com o jogo ainda
+  carregando não chegou a ser exercitada.
+- **Testes `#[ignore]` com o jogo aberto:** 11 passaram, inclusive os de `apps/gt-patch/tests/game.rs` que estavam
+  pendentes da Fase 2 e o `game_backend_reopen_50_times_no_fd_leak` (527 s: 50 buscas de ~10 s).
+- **Processo solto achado na sessão:** um `gt-tui` aberto às 00:06 num teste manual da Tarefa 15, antes da correção do
+  terminal fechado, girava a 99% de CPU com o pty apagado (laço de `EIO` do crossterm, que a thread `gt-keys` corrige).
+  Sem diário nem motor; encerrado à mão.
+- **Opinião do dono sobre a TUI:** "achei bom".
+
 ## Hipóteses descartadas
 
 - (2026-10-25) "Os patches em `+57BD6D0`/`+5BBFE8C` indicam que as opções de cargas e arrastar item estavam
