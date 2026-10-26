@@ -304,7 +304,166 @@ mesmos **11** endereços do `symbols.ini`, o que confirma a leitura dos scripts.
 Os offsets "`[x+0x20]` é o jogador" sugerem que esses objetos são componentes cujo dono (`Outer`/`Owner`) fica em
 `+0x20`. Não verificado.
 
+## Sessão de 2026-10-26 (Fase 3): o pawn do jogador e as tabelas do Unreal
+
+Mesmo build (`c935e799-0b27c000`). Jogo aberto, FLiNG **fechado** (`gt diff`: nenhuma alteração), dono num save.
+Tudo **só leitura** (`gt scan`/`gt disasm` e scripts em `scratch/` que leem `/proc/<pid>/mem`).
+
+**O jogo crashou uma vez** logo depois de uma varredura de ~6 GB de regiões anônimas `rw` (37 s lendo
+`/proc/<pid>/mem` em blocos de 16 MB). Nenhum OOM ou segfault no kernel e nenhum coredump do jogo; a causa não foi
+determinada (ler `/proc/<pid>/mem` não altera o processo). As varreduras seguintes, com blocos de 1 MB, `nice 19` e
+1 ms de pausa entre regiões, rodaram 5 vezes sem problema. Manter esse cuidado.
+
+### Substituto do `aobplayerpawn`
+
+- `Grounded2Steam-Win64-Shipping.exe+3e078fe`: `41 8b 87 c8 02 00 00` `mov eax, [r15+0x2c8]` / `c1 e8 04`
+  `shr eax, 4` / `a8 01` `test al, 1` / `0f 84 …` `je`. Mesma forma da segunda variante do FLiNG; o padrão deles
+  quebrou porque o compilador pôs `mov [rsp+0x98], r12` logo depois de `mov rbx, [r15+0x180]`.
+- Função: `+3e07870` (entrada na `.pdata`; os fragmentos `+3e0787b` e `+3e07889` são *chained unwind*). É método
+  virtual, sem `call` direto, no slot 460 da vtable `+9051a80` de `BP_SurvivalPlayerController_Augusta_C`.
+- `rcx` = o controller; `r15 = [controller+0x318]` (ou `[controller+0x6e8]` se o byte em `+a538889` for ≠ 0; com o
+  jogo rodando ele vale 0). **`[controller+0x318]` é o pawn do jogador**: com o dono no save, apontava para
+  `BP_SurvivalPlayerCharacter_Gellarde_C`, e `[pawn+0x2c8] = 0x52` (bit 4 ligado, passa no teste).
+- Outros campos do controller que apontam para o pawn: `+0x328`, `+0x380`, `+0xfb8`. O pawn aponta de volta para o
+  controller em `+0x160`, `+0x2f0`, `+0x2f8`. Nomes dos campos (`Pawn`, `Character`, `AcknowledgedPawn`…) não
+  verificados; virão da reflexão.
+- Não medido: com que frequência `+3e07870` roda (se por quadro, serve como ponto de captura).
+
+### Tabelas globais do Unreal (achadas na memória)
+
+| Global | Endereço | Como foi achado |
+|---|---|---|
+| `GUObjectArray` | `+a53bc30` | `InternalIndex` de um CDO levou ao bloco 0; a lista de blocos é lida no padrão de acesso `48 8b 05 ?? ?? ?? ?? 48 8b 0c c8 48 8d 04 d1` (281 ocorrências na `.text`, ex.: `+1374f1e`) |
+| `FNamePool` (blocos) | `+a499e50` | Busca de `?? 01 "None" ?? 03 "ByteProperty"` no heap (bloco 0) e do ponteiro para ele na `.data` |
+
+- `GUObjectArray`: `+0x0` ponteiro para a lista de blocos, `+0x8` pré-alocado, `+0x10` `MaxElements` (`0x250000`),
+  `+0x14` `NumElements` (~506 mil), `+0x18` `MaxChunks` (`0x25`), `+0x1c` `NumChunks` (10). Blocos de 65.536 itens
+  de **24 bytes**; o ponteiro do objeto fica em **`+0x8` do item**.
+- `UObject`: `+0x0` vtable, `+0x8` `ObjectFlags` (`0x10` = CDO), `+0xC` `InternalIndex`, `+0x10` `ClassPrivate`,
+  `+0x18` `NamePrivate` (`ComparisonIndex`, `Number`).
+- `FNamePool`: `+0x0` (antes dos blocos) `CurrentBlock = 0x72`, `CurrentByteCursor = 0xc4b6`; cada bloco é uma
+  sequência de entradas alinhadas a 2 bytes; cabeçalho `u16`: tamanho `>> 6`, bit 0 = UTF-16, bits 1–5 = hash.
+  Índice → bloco `idx >> 16`, deslocamento `(idx & 0xffff) * 2`.
+- Percorrendo a tabela com o dono no save: `BP_SurvivalPlayerController_Augusta_C` e
+  `BP_SurvivalPlayerCharacter_Gellarde_C` (instâncias únicas), além de um `PlayerCharacterLODActor`.
+- Consequência: o pawn do jogador pode ser obtido **sem hook**, procurando a instância do controller na
+  `GUObjectArray` e lendo `+0x318`. Para o god mode, que precisa comparar dentro do código do jogo, o trainer pode
+  escrever esse endereço numa variável da cave (Fase 6).
+
+## Sessão de 2026-10-26 (Fase 3): catálogo de todos os cheats do FLiNG
+
+Mesmo build (`c935e799-0b27c000`), jogo aberto, FLiNG fechado, só leitura. Offsets lidos da **reflexão do jogo em
+execução** (`scratch/fling/tools/ue_props.py`), não de SDK gerado.
+
+### Layout da reflexão (UE5, este build)
+
+| Estrutura | Campo | Offset |
+|---|---|---|
+| `UStruct` | `SuperStruct` / `Children` (funções) / `ChildProperties` / `PropertiesSize` | `+0x40` / `+0x48` / `+0x50` / `+0x58` |
+| `FField` | `ClassPrivate` (`FFieldClass*`, nome em `+0`) / `Next` / `NamePrivate` | `+0x08` / `+0x18` / `+0x20` |
+| `FProperty` | `ArrayDim` / `ElementSize` / `PropertyFlags` / `Offset_Internal` | `+0x30` / `+0x34` / `+0x38` / `+0x44` |
+| `UFunction` | ponteiro nativo (`Func`) | `+0xd8` |
+
+### Offsets dos campos usados (lidos da reflexão)
+
+| Classe | Campos |
+|---|---|
+| `Actor` | `CustomTimeDilation +0x70`, `RootComponent +0x1c0` |
+| `Controller` | `Pawn +0x318`, `Character +0x328`; `PlayerController.AcknowledgedPawn +0x380` |
+| `SurvivalPlayerController` | `ItemUseCooldownRemaining +0xb90`, `CachedPartyComponent +0xfa8` |
+| `Character` | `CharacterMovement +0x348`, `JumpMaxCount +0x488`, `JumpCurrentCount +0x48c` |
+| `CharacterMovementComponent` | `GravityScale +0x1b8`, `JumpZVelocity +0x1c0`, `MovementMode +0x251`, `MaxWalkSpeed +0x298`, `bCheatFlying +0x585` |
+| `SceneComponent` | `RelativeLocation +0x150`; posição no mundo em `+0x210` (3 `double`, lida pelo jogo em `+35fb645`) |
+| `SurvivalCharacter` | componentes `Health +0x13b8`, `Block +0x13c0`, `Reaction +0x13c8`, `Stamina +0x13d0`, `BodyTemperature +0x1420`, `Hauling +0x14d8`, `Survival +0x14e0`; `CustomDamageMultiplier +0x1330`; `bTakeFallDamage +0x1619` |
+| `HealthComponent` | `MaxHealth +0x330`, `CurrentDamage +0x334` (vida = máx − dano); `bCanDieFromDamage`/`bCanDieEver` (bits em `+0x11d`) |
+| `StaminaComponent` | `CurrentStamina +0x100`, `MaxStamina +0x104` |
+| `BlockComponent` | `PerfectBlockWindow +0x14c`, `PerfectBlockWindowMounted +0x150` |
+| `ReactionComponent` | `CurrentStunValue +0xf8`, `MaxStunValue +0xfc` |
+| `BodyTemperatureComponent` | `CurrentBodyTemperature +0x134` |
+| `HaulingComponent` | `Capacity +0xf4` |
+| `SurvivalComponent` | `CurrentFood +0x290`, `bAllowCurrentFoodDecrease +0x294`, `CurrentWater +0x298`, `bAllowCurrentWaterDecrease +0x29c`, `CurrentBreath +0x2a0` |
+| `Item` | `StackSize +0x198`, `PowerUsed +0x250`, `DurabilityRemaining +0x298` |
+| `PartyComponent` | `ScienceFound +0x510`, `ResearchPoints +0x514`, `PartyUpgradePoints +0x51c`, `PersonalUpgradePoints +0x520` |
+| `SurvivalGameModeSettings` | `bAutoCompleteBuildings +0x3b`, `bRecipesRequireIngredients +0x3d`, `bCreaturesIgnorePlayers +0x3f`, `FallDamageMultiplier +0x94` |
+| `ResourceAnalyzerBuilding` | `MaxPowerCapacity +0x980` |
+
+- A instância viva das configurações de modo é `BP_NormalModeSettings_C` (`outer = Augusta_Main`); os CDOs dos
+  modos Criativo mostram `bAutoCompleteBuildings = 1` e `bRecipesRequireIngredients = 0`. **Risco:** essas
+  configurações podem ir para o save; ao desligar, restaurar o valor original e testar com backup.
+- `SurvivalCharacter.CustomDamageMultiplier` vale `1.0` no jogador; `GetCustomDamageMultiplier` (`+5646bb0`) só o
+  devolve. Não verificado se afeta o dano causado ou o recebido. `GetPlayerDamageMultiplier` (usada pelo FLiNG) não
+  existe mais como `UFunction` neste build.
+
+### Pontos novos (padrão do FLiNG quebrado, código equivalente achado)
+
+| Script FLiNG | Ponto atual | Instrução | Por que o padrão quebrou |
+|---|---|---|---|
+| `aobplayerpawn` | `+3e078fe` (função `+3e07870`) | `mov eax,[r15+0x2c8]; shr eax,4; test al,1` | instrução nova (`mov [rsp+0x98],r12`) no meio |
+| `aobitemcd` | `+5c3bbff` | `subss xmm0,xmm6; comiss xmm0,xmm1; movss [rbx+0xb90],xmm0; ja` | registrador `xmm8` → `xmm6` |
+| `aobresearchlevelup` | `+5970f18` | `cmp eax,[rbx+0x514]; jle` (laço com `add r14,0x30`) | registrador base `r14`/`rsi` → `rbx` |
+| `aobgravity` | `+57bcb2b` e `+57c0431` | `mulss xmm0,[rbx+0x1b8]` (`GravityScale`) | contexto mudou; 2 ocorrências |
+
+Não achados ainda: `aobitemdurability` (a única escrita em `+0x298` com `minss`/`maxss`, `+39073a0`, é de outra
+estrutura: grava `+0x298` e `+0x29c` juntos), `aobdmg`/`aobdmgmul`, `aobplayerstats` (desnecessário, ver abaixo).
+
+### Partes nativas do trainer (REA/Ghidra)
+
+- **Teleporte** (`FUN_140088cb0`, `FUN_1400788a0`): descritor `{tem_z, endereço, tipo (0 = float, 1 = double)}`. O
+  endereço é o `player_location` capturado em `+35fb632`. Salvar e desfazer leem 3 `double` com
+  `ReadProcessMemory`; teleportar escreve `x + dx, y + dy, z + dz` com `WriteProcessMemory` direto na posição do
+  `RootComponent` (`+0x210`). Para o Grounded 2, `dz = 100.0` (folga de altura). Locais salvos em `locations.txt`.
+- **Velocidade do jogo:** `TrSpeedHack_x64.dll` (embutida no exe em `0x199100`) intercepta `QueryPerformanceCounter`,
+  `GetTickCount`, `GetTickCount64` e `timeGetTime`; sem exports nomeados.
+- `instant_item_cooldown`, `infinite_equipment_durability` e `infinite_torch_duration` são registrados em
+  `FUN_140089080` na mesma ordem dos três scripts sem variável de controle (`aobitemcd`, `aobitemdurability`,
+  `aobitempower`): **`aobitempower` (zerar `Item.PowerUsed`) é a tocha infinita**.
+
+### Catálogo: as 36 opções do menu
+
+Caminho proposto para o nosso trainer: **V** = escrita de valor no objeto (Fase 5, sem patch de código);
+**P** = patch simples (Fase 4); **C** = desvio com cave (Fase 6); **D** = DLL (Fase 7).
+
+| Tecla | Opção | Como o FLiNG faz | Estado no build | Nosso caminho |
+|---|---|---|---|---|
+| Num 1 | God Mode | `+56fc11c`: golpe no jogador é tratado como alvo sem componente | ponto ok, falta `player` | C (com o pawn escrito na cave); testar antes V com `bCanDieEver` |
+| Num 2 | Vida infinita | `CurrentDamage = -9999` no hook `aobplayerstats` | padrão quebrado | V: `CurrentDamage = 0` |
+| Num 3 | Stamina infinita | `CurrentStamina = 999999` | quebrado | V |
+| Num 5/6/7 | Comida / água / oxigênio | `CurrentFood/Water/Breath = 999999` | quebrado | V; comida e água também por `bAllow…Decrease = 0` |
+| Num 8 | Temperatura estável | `CurrentBodyTemperature = 0` | quebrado | V |
+| Num 9 | Furtividade | `bCreaturesIgnorePlayers = 1` (hook `+593af1c`) | ok | V nas configurações de modo (risco de save) |
+| Num 0 | Dano máximo | multiplicador do dano em `xmm7` = 9999 | quebrado | V `CustomDamageMultiplier` (a confirmar) |
+| Num . | Multiplicador de dano | idem, × valor | quebrado | V (a confirmar) |
+| Num + | Multiplicador de defesa | divide o dano recebido em `+5943ec8` | ponto ok, falta `player` | C |
+| Ctrl+Num 1 | Editar ciência | `ScienceFound` no hook `aobpartycomponent` | quebrado | V (`CachedPartyComponent` do controller) |
+| Ctrl+Num 4 | Quantidade ao arrastar | `Item.StackSize` no hook `+5bbfe8c` | ok | C, ou V se acharmos o item arrastado |
+| Ctrl+Num 6 | Recarga instantânea | zera a subtração em `aobitemcd` | ponto novo `+5c3bbff` | V `ItemUseCooldownRemaining = 0` ou P |
+| Ctrl+Num 7 | Durabilidade infinita | força o novo valor ao máximo | não achado | a investigar (`Item.DurabilityRemaining`) |
+| Ctrl+Num 0 | Sem requisitos de receita | `bRecipesRequireIngredients = 0` | ok | V (risco de save) |
+| Ctrl+Num . | Sem requisitos de construção | troca `UnderConstruction` por `Built` em `+57689db` | ok | C, ou V com `bAutoCompleteBuildings` |
+| Alt+Num 1 | Brain Power rápido | iguala `ResearchPoints` ao limite do nível | ponto novo `+5970f18` | C |
+| Alt+Num 2/3 | Editar vida / stamina máximas | `MaxHealth`, `MaxStamina` | quebrado | V |
+| Alt+Num 4 | Velocidade de movimento | multiplica o retorno de `call [rax+0x500]` em `+37eee9b` | ponto ok, falta `player` | V `MaxWalkSpeed` ou C |
+| Alt+Num 5/6 | Velocidade do jogador / da IA | `[ator+0x68]` em `+3785df2` | **offset mudou para `0x70`** (o FLiNG recusa) | V `CustomTimeDilation` |
+| Alt+Num 7 | Velocidade do jogo | DLL speedhack | — | D (ou outra técnica no Linux) |
+| Alt+Num 8 | Pulos infinitos | zera `JumpCurrentCount`, `JumpMaxCount ≥ 2` | ponto ok, falta `player` | V (os dois campos) |
+| Alt+Num 9 | Sem dano de queda | `FallDamageMultiplier = 0` | ok | V `bTakeFallDamage = 0` no personagem (sem tocar no modo) |
+| Alt+Num 0 | Gravidade | multiplica em `aobgravity` | pontos novos | V `GravityScale` |
+| Alt+Num . / + | Congelar hora / velocidade do tempo | multiplica ou zera o incremento em `+58c8a2a` | ok | C |
+| Alt+Num / * - | Salvar local / teleporte / desfazer | captura a posição em `+35fb632` e escreve 3 `double` | ponto ok, falta `player` | V (posição do `RootComponent` do pawn) |
+| — | Capacidade de carga (`hauling_capacity`) | `HaulingComponent.Capacity` | quebrado | V |
+| — | Bloqueio perfeito, sem atordoamento | soma 10000 à janela; `CurrentStunValue = -9999` | quebrado | V |
+| — | Cargas infinitas do analisador | copia `MaxPowerCapacity` para as cargas em `+57bd6d0` | ok | C |
+| — | Tocha infinita | zera `Item.PowerUsed` (`aobitempower`) | não achado | V no item equipado ou P (8 escritas em `+0x250`) |
+
+**Conclusão:** cerca de 20 das opções viram **escrita de valor** a partir do pawn do jogador, sem patch de código e
+sem depender de padrões que quebram a cada atualização. Os offsets vêm da reflexão, então sobrevivem a mudanças de
+layout. Patches e caves ficam para o que muda lógica: god mode, defesa, Brain Power, hora do dia, construção e
+analisador.
+
 ## Hipóteses descartadas
 
 - (2026-10-25) "Os patches em `+57BD6D0`/`+5BBFE8C` indicam que as opções de cargas e arrastar item estavam
   ligadas no FLiNG": os desvios aparecem com todas as opções desligadas.
+- (2026-10-26) "A função `+3e07870` não roda no solo porque só existem CDOs das classes dela": erro de método. A busca
+  pelo início da vtable recuou 5 entradas além do começo real (`+9051a58` em vez de `+9051a80`), e as instâncias
+  foram procuradas pela vtable errada. A função é do controller do jogador.
