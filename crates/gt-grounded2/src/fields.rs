@@ -238,6 +238,12 @@ impl FieldRuntime {
         self.desired.insert(id.to_string(), value);
     }
 
+    /// Os valores desejados pedidos até agora, por `id` (para levá-los a um runtime novo quando
+    /// um índice melhor troca o catálogo).
+    pub fn desired_values(&self) -> &HashMap<String, f64> {
+        &self.desired
+    }
+
     /// Valor desejado do `set` `id`: o `target` (cheat só liga/desliga, spec 6.4), senão o
     /// pedido, senão o padrão da grade.
     fn desired_value(&self, id: &str, target: Option<f64>) -> Option<f64> {

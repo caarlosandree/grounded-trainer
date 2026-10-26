@@ -140,7 +140,7 @@ pub struct ValueCheats {
 }
 
 /// Motivo de a ação recusar com o motor parado (o SIGCONT que falhou).
-const STUCK_REFUSAL: &str = "o jogo pode ter ficado parado; aperte r";
+pub const STUCK_REFUSAL: &str = "o jogo pode ter ficado parado; aperte r";
 
 impl ValueCheats {
     pub fn new(reader: MemReader, defs: Vec<FieldDef>, globals: Result<Globals, String>) -> Self {
@@ -328,9 +328,18 @@ impl ValueCheats {
                             .is_none_or(|old| resolved > old.resolved(&self.defs));
                         if better {
                             let catalog = Arc::new(catalog);
+                            let mut runtime = FieldRuntime::new(catalog.clone());
+                            // Os valores desejados do runtime velho continuam valendo: sem
+                            // isso, uma linha ligada com `k` diferente do padrão passaria a
+                            // escrever o padrão enquanto a tela mostra o `k`.
+                            if let Some(old) = &self.reflection {
+                                for (id, value) in old.runtime.desired_values() {
+                                    runtime.set_desired(id, *value);
+                                }
+                            }
                             self.reflection = Some(Reflection {
                                 index: Arc::new(index),
-                                runtime: FieldRuntime::new(catalog.clone()),
+                                runtime,
                                 catalog,
                             });
                             self.index_failure = None;
@@ -610,6 +619,40 @@ mod tests {
         let news = v.merge(outcome(Err(REFLECTION_INCOHERENT.to_string())));
         assert!(news.index_ok && !news.retry);
         assert_eq!(available_count(&v), defs.len());
+    }
+
+    #[test]
+    fn better_index_keeps_desired_values() {
+        let mut v = cheats();
+        let (_, defs) = synth_signatures();
+        // Primeiro um índice parcial (um `Lock` quebrado); `carga` resolve.
+        let mut partial = defs.clone();
+        let broken = partial
+            .iter_mut()
+            .find_map(|d| match &mut d.rule {
+                FieldRule::Lock { field, .. } => Some(field),
+                _ => None,
+            })
+            .unwrap();
+        *broken = "NaoExiste".into();
+        v.merge(outcome(index_data(&partial)));
+        let grid = defs
+            .iter()
+            .find(|d| d.id == "carga")
+            .and_then(|d| d.value.clone())
+            .unwrap();
+        let k = grid.default_k.saturating_add(1).min(grid.steps());
+        assert!(matches!(v.set_value("carga", k), OpOutcome::Done(_)));
+        let wanted = grid.value(k);
+        assert_ne!(wanted, grid.value(grid.default_k));
+        // Chega o índice completo (melhor): o valor desejado continua o mostrado.
+        v.merge(outcome(index_data(&defs)));
+        assert_eq!(available_count(&v), defs.len());
+        let kept = v
+            .reflection
+            .as_ref()
+            .and_then(|r| r.runtime.desired_values().get("carga").copied());
+        assert_eq!(kept, Some(wanted));
     }
 
     #[test]
