@@ -485,6 +485,9 @@ pub fn decide_data(
     guard_ok: bool,
     writable: bool,
 ) -> DataAction {
+    if !well_formed(e) {
+        return DataAction::Discard;
+    }
     let Some(current) = current else {
         return DataAction::Discard;
     };
@@ -499,6 +502,21 @@ pub fn decide_data(
             } else {
                 DataAction::Drop
             }
+        }
+    }
+}
+
+/// Tamanhos coerentes: o serde do diário não valida, e uma entrada malformada nunca pode
+/// virar escrita. `Whole`: `original` e `written` com o mesmo tamanho, de 1 a 8 bytes, e o
+/// `next` (se houver) também. `Bits`: `original` e `written` com 1 byte.
+fn well_formed(e: &DataEntry) -> bool {
+    match e.mode {
+        DataMode::Bits => e.original.len() == 1 && e.written.len() == 1,
+        DataMode::Whole => {
+            let len = e.original.len();
+            (1..=8).contains(&len)
+                && e.written.len() == len
+                && e.next.as_ref().is_none_or(|n| n.len() == len)
         }
     }
 }
@@ -1100,6 +1118,59 @@ mod tests {
             let json = serde_json::to_string(&e).unwrap();
             assert_eq!(serde_json::from_str::<DataEntry>(&json).unwrap(), e);
         }
+    }
+
+    #[test]
+    fn decide_malformed_entry_discards() {
+        let cur4 = [0x10, 0x11, 0x12, 0x13];
+        // Whole: original e written de tamanhos diferentes.
+        let mut e = whole_entry(4);
+        e.written.pop();
+        assert_eq!(
+            decide_data(&e, Some(&cur4), true, true),
+            DataAction::Discard
+        );
+        // Whole: tamanho 0 e maior que 8.
+        for len in [0usize, 9] {
+            let mut e = whole_entry(4);
+            e.original = vec![1; len];
+            e.written = vec![2; len];
+            assert_eq!(
+                decide_data(&e, Some(&vec![2; len]), true, true),
+                DataAction::Discard,
+                "tamanho {len}"
+            );
+        }
+        // Whole: `next` de outro tamanho.
+        let mut e = whole_entry(4);
+        e.next = Some(vec![0xaa; 2]);
+        assert_eq!(
+            decide_data(&e, Some(&[0xaa; 2]), true, true),
+            DataAction::Discard
+        );
+        assert_eq!(
+            decide_data(&e, Some(&cur4), true, true),
+            DataAction::Discard
+        );
+        // Bits: original ou written com tamanho diferente de 1.
+        let mut e = data_entry(0x07, 0x01, 0x06);
+        e.original = vec![0x07, 0x00];
+        assert_eq!(
+            decide_data(&e, Some(&[0x01]), true, true),
+            DataAction::Discard
+        );
+        let mut e = data_entry(0x07, 0x01, 0x06);
+        e.written = Vec::new();
+        assert_eq!(
+            decide_data(&e, Some(&[0x01]), true, true),
+            DataAction::Discard
+        );
+        // Entrada sã continua restaurando.
+        let e = whole_entry(4);
+        assert!(matches!(
+            decide_data(&e, Some(&cur4), true, true),
+            DataAction::Restore(_)
+        ));
     }
 
     #[test]

@@ -20,6 +20,9 @@ pub enum HookPoint {
     InPause,
     /// Logo depois de aplicar o lote, já com o alvo retomado (disparado pelo motor).
     AfterApply,
+    /// Numa troca de valor de dados, depois de gravar o `next` no diário e antes de escrever o
+    /// valor novo (disparado pelo motor).
+    AfterNext,
 }
 
 /// Falhas injetadas pelos testes do motor (só para testes).

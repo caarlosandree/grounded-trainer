@@ -247,7 +247,7 @@ impl FieldRuntime {
             .iter()
             .any(|e| e.id == id && owner(&e.guard) != obj);
         if stale {
-            let r = engine.restore_bits(id)?;
+            let r = engine.restore_field(id)?;
             tracing::info!(
                 id,
                 restaurados = r.restored.len(),
@@ -270,7 +270,7 @@ impl FieldRuntime {
         };
         match self.catalog.get(id) {
             Some(Ok(resolved)) if matches!(resolved.rule, ResolvedRule::ClearBits { .. }) => {
-                let r = engine.restore_bits(id)?;
+                let r = engine.restore_field(id)?;
                 if !r.foreign.is_empty() {
                     tracing::info!(id, "bits de um objeto que não existe mais; nada escrito");
                 }
