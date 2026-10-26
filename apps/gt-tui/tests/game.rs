@@ -179,7 +179,7 @@ fn game_bits_round_trip() {
             .iter()
             .find(|e| e.id == id)
             .unwrap_or_else(|| panic!("{id}: sem entrada (os bits já estavam limpos?)"));
-        let (addr, original, mask) = (entry.addr, entry.original, entry.mask);
+        let (addr, original, mask) = (entry.addr, entry.original[0], entry.mask);
         eprintln!("{id}: byte {addr:#x} original {original:#04x} máscara {mask:#04x}");
         assert_eq!(read(addr) & mask, 0, "{id}: bits limpos");
         let off = session.field_off(id);

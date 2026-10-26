@@ -593,7 +593,10 @@ fn set_bits_sigkill_then_recover() {
         Loaded::Ok(j) => {
             assert!(j.entries.is_empty());
             assert_eq!(j.data.len(), 1);
-            assert_eq!((j.data[0].original, j.data[0].mask), (0x07, 0x06));
+            assert_eq!(
+                (j.data[0].original.as_slice(), j.data[0].mask),
+                ([0x07].as_slice(), 0x06)
+            );
         }
         other => panic!("diário inesperado: {other:?}"),
     }

@@ -724,14 +724,7 @@ impl Engine {
             // Já limpos: nada a escrever, e nenhum original a guardar.
             return Ok(());
         }
-        let entry = DataEntry {
-            id: id.to_owned(),
-            addr,
-            original: before,
-            written: before & !mask,
-            mask,
-            guard: guard.to_vec(),
-        };
+        let entry = DataEntry::bits(id, addr, before, before & !mask, mask, guard.to_vec());
         // O diário recebe a entrada antes da escrita.
         self.data.push(entry.clone());
         if let Err(e) = self.save_journal(false) {
@@ -779,12 +772,17 @@ impl Engine {
         let mut report = RestoreReport::default();
         let mut failed: Option<Error> = None;
         for e in chosen {
-            let current = self.read_byte(e.addr)?;
+            let current = self.read_byte(e.addr)?.map(|b| [b]);
             let guard_ok = self.guard_ok(&e.guard)?;
             let writable = maps
                 .iter()
                 .any(|r| r.perms.read && r.perms.write && r.start <= e.addr && e.addr < r.end);
-            match decide_data(&e, current, guard_ok, writable) {
+            match decide_data(
+                &e,
+                current.as_ref().map(|b| b.as_slice()),
+                guard_ok,
+                writable,
+            ) {
                 DataAction::Drop => report.dropped.push(e.id.clone()),
                 DataAction::Discard => {
                     tracing::warn!(
@@ -794,8 +792,8 @@ impl Engine {
                     );
                     report.foreign.push(e.id.clone());
                 }
-                DataAction::Restore(byte) => {
-                    if let Err(err) = self.write_verified(&e.id, e.addr, &[byte]) {
+                DataAction::Restore(bytes) => {
+                    if let Err(err) = self.write_verified(&e.id, e.addr, &bytes) {
                         if matches!(err, Error::ProcessGone { .. }) {
                             return Err(err);
                         }

@@ -288,14 +288,14 @@ fn invalid_target_note_and_resume() {
 fn pending_id_skipped() {
     let mut s = scene();
     let die = s.health_of(s.ue.pawn) + u64::from(DIE_BYTE);
-    s.engine.force_data_pending_for_test(DataEntry {
-        id: "nao-morrer".into(),
-        addr: die,
-        original: 0x03,
-        written: 0x00,
-        mask: 0x03,
-        guard: Vec::new(),
-    });
+    s.engine.force_data_pending_for_test(DataEntry::bits(
+        "nao-morrer",
+        die,
+        0x03,
+        0x00,
+        0x03,
+        Vec::new(),
+    ));
     let report = s.tick(&["nao-morrer"]);
     assert!(!report.notes.contains_key("nao-morrer"));
     assert_eq!(s.u8_at(die), 0x03);

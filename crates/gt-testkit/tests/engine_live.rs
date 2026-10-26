@@ -1691,8 +1691,20 @@ fn set_bits_journals_before_write() {
         panic!("esperada uma entrada de dados: {:?}", j.data);
     };
     assert_eq!(
-        (e.id.as_str(), e.addr, e.original, e.written, e.mask),
-        ("nao-morrer", obj.byte, 0x07, 0x01, 0x06)
+        (
+            e.id.as_str(),
+            e.addr,
+            e.original.as_slice(),
+            e.written.as_slice(),
+            e.mask
+        ),
+        (
+            "nao-morrer",
+            obj.byte,
+            [0x07].as_slice(),
+            [0x01].as_slice(),
+            0x06
+        )
     );
     assert_eq!(e.guard, obj.guard);
     assert_eq!(engine.data_entries().len(), 1);
@@ -1715,7 +1727,7 @@ fn set_bits_maintenance_reclears() {
     assert_eq!(byte_at(&t, obj.byte), 0x01);
     let j = journal_now(&env);
     assert_eq!(j.data.len(), 1);
-    assert_eq!(j.data[0].original, 0x07);
+    assert_eq!(j.data[0].original, vec![0x07]);
     // Bits já limpos: nada muda.
     engine
         .set_bits("queda", obj.byte, 0x06, &obj.guard)
@@ -1789,14 +1801,14 @@ fn set_bits_refused_with_pending() {
     let env = env();
     let obj = data_obj(&t);
     let mut engine = data_engine(&t, &env, &obj);
-    engine.force_data_pending_for_test(gt_core::journal::DataEntry {
-        id: "nao-morrer".into(),
-        addr: obj.byte,
-        original: 0x07,
-        written: 0x01,
-        mask: 0x06,
-        guard: obj.guard.clone(),
-    });
+    engine.force_data_pending_for_test(gt_core::journal::DataEntry::bits(
+        "nao-morrer",
+        obj.byte,
+        0x07,
+        0x01,
+        0x06,
+        obj.guard.clone(),
+    ));
     assert_eq!(engine.pending_ids(), vec!["nao-morrer"]);
     let err = engine
         .set_bits("nao-morrer", obj.byte, 0x06, &obj.guard)
