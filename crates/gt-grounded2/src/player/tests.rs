@@ -1,6 +1,7 @@
 //! Testes do caminho até o personagem sobre a reflexão sintética. Os offsets daqui são arbitrários
 //! (de propósito, diferentes dos do jogo): os campos vêm da reflexão, por nome.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use gt_ue::synth::{SparseMem, SynthField, SynthUe};
@@ -89,6 +90,7 @@ struct World {
     survival: u64,
     temperature: u64,
     health_class: u64,
+    gobjects: u64,
 }
 
 impl World {
@@ -384,6 +386,7 @@ fn world(omit: &[&str]) -> World {
         survival,
         temperature,
         health_class: health_c,
+        gobjects: image.gobjects,
     };
     // Valores iniciais: tudo cheio, sem dano, temperatura neutra e bits ligados como no jogo.
     w.write_f32(stamina + u64::from(CUR_STAMINA), 100.0);
@@ -679,4 +682,131 @@ fn controller_needs_search_after_30s_null() {
     assert!(!controller_needs_search(true, Some(since), now));
     let since = now - Duration::from_secs(31);
     assert!(controller_needs_search(true, Some(since), now));
+}
+
+/// Leitor que conta as leituras em lote: só a varredura da tabela usa esse caminho.
+struct Counting<'a> {
+    inner: &'a SparseMem,
+    batches: AtomicUsize,
+}
+
+impl ReadMem for Counting<'_> {
+    fn read_exact(&self, addr: u64, buf: &mut [u8]) -> gt_core::Result<()> {
+        self.inner.read_exact(addr, buf)
+    }
+
+    fn read_many(&self, reqs: &[(u64, usize)]) -> gt_core::Result<Vec<Option<Vec<u8>>>> {
+        self.batches.fetch_add(1, Ordering::Relaxed);
+        self.inner.read_many(reqs)
+    }
+}
+
+fn watch(
+    w: &World,
+    mem: &Counting<'_>,
+    controller: Option<u64>,
+    rounds: u32,
+    mut between: impl FnMut(u32),
+) -> Vec<Result<PlayerReport, Absent>> {
+    let opts = WatchOpts {
+        controller,
+        every: Duration::from_secs(2),
+        rounds: Some(rounds),
+        budget: budget(),
+    };
+    let mut seen = Vec::new();
+    let mut sleeps = 0u32;
+    let mut sleep = |d: Duration| {
+        assert_eq!(d, Duration::from_secs(2));
+        sleeps += 1;
+        between(sleeps);
+    };
+    watch_player(
+        mem,
+        &w.index,
+        &w.catalog,
+        w.gobjects,
+        &opts,
+        &mut sleep,
+        &mut |r| {
+            seen.push(r.cloned().map_err(Clone::clone));
+        },
+    )
+    .unwrap();
+    seen
+}
+
+#[test]
+fn watch_player_rounds_without_rescan() {
+    let w = world(&[]);
+    let mem = Counting {
+        inner: &w.mem,
+        batches: AtomicUsize::new(0),
+    };
+    let mut after_first = None;
+    let seen = watch(&w, &mem, None, 3, |_| {
+        after_first.get_or_insert(mem.batches.load(Ordering::Relaxed));
+    });
+    assert_eq!(seen.len(), 3);
+    assert!(
+        seen.iter()
+            .all(|r| r.as_ref().is_ok_and(|r| r.controller == w.controller))
+    );
+    // A varredura aconteceu na primeira rodada, e nada mais foi lido em lote depois dela.
+    let first = after_first.unwrap();
+    assert!(first > 0);
+    assert_eq!(mem.batches.load(Ordering::Relaxed), first);
+
+    // Com o controller dado, nenhuma varredura.
+    let mem = Counting {
+        inner: &w.mem,
+        batches: AtomicUsize::new(0),
+    };
+    let seen = watch(&w, &mem, Some(w.controller), 2, |_| {});
+    assert!(seen.iter().all(Result::is_ok));
+    assert_eq!(mem.batches.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn watch_player_rescans_when_controller_invalid() {
+    let w = world(&[]);
+    let mem = Counting {
+        inner: &w.mem,
+        batches: AtomicUsize::new(0),
+    };
+    // Depois da primeira rodada, o pawn passa para o segundo controller e o primeiro some da
+    // tabela (o item dele passa a apontar para o segundo).
+    let seen = watch(&w, &mem, Some(w.controller), 3, |n| {
+        if n == 1 {
+            let u = w.layout.uobject;
+            let index = gt_ue::read::read_u32(&w.mem, w.controller + u64::from(u.index)).unwrap();
+            let per = u64::from(w.layout.objects.items_per_chunk);
+            let item = w.objects.chunks[(u64::from(index) / per) as usize]
+                + (u64::from(index) % per) * u64::from(w.layout.objects.item_size);
+            w.write_u64(
+                item + u64::from(w.layout.objects.item_object),
+                w.second_controller,
+            );
+            w.write_u64(w.second_controller + u64::from(PAWN_OFF), w.pawn);
+        }
+    });
+    let controllers: Vec<u64> = seen
+        .iter()
+        .map(|r| r.as_ref().unwrap().controller)
+        .collect();
+    assert_eq!(
+        controllers,
+        vec![w.controller, w.second_controller, w.second_controller]
+    );
+    assert!(mem.batches.load(Ordering::Relaxed) > 0);
+
+    // Sem nenhum controller na tabela, a rodada diz por quê e segue.
+    let w = world(&[]);
+    w.write_u64(w.controller + u64::from(PAWN_OFF), 0);
+    let mem = Counting {
+        inner: &w.mem,
+        batches: AtomicUsize::new(0),
+    };
+    let seen = watch(&w, &mem, None, 1, |_| {});
+    assert_eq!(seen, vec![Err(Absent::ControllerAmbiguous)]);
 }

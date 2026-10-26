@@ -350,7 +350,10 @@ pub fn find_controller<M: ReadMem + ?Sized>(
     let Ok(path) = &catalog.path else {
         return Ok(ControllerFind::Absent);
     };
-    let found = index.instances_of(mem, objects, path.controller_class, budget)?;
+    let mut found = index.instances_of(mem, objects, path.controller_class, budget)?;
+    // O mesmo objeto em dois itens da tabela (um item reaproveitado no meio da varredura) conta uma vez.
+    found.sort_unstable();
+    found.dedup();
     Ok(match found.as_slice() {
         [] => ControllerFind::Absent,
         [only] => ControllerFind::Found(*only),
@@ -381,6 +384,8 @@ pub fn find_controller<M: ReadMem + ?Sized>(
 pub enum Absent {
     #[error("controller não encontrado")]
     NoController,
+    #[error("controller ambíguo (mais de um candidato)")]
+    ControllerAmbiguous,
     #[error("o controller guardado não é mais válido")]
     ControllerInvalid,
     #[error("Pawn nulo")]
@@ -848,6 +853,83 @@ fn report_value(snapshot: &PlayerSnapshot, entry: &CatalogEntry) -> FieldReportV
             reason: INCOHERENT.to_string(),
         },
     }
+}
+
+/// Opções do [`watch_player`].
+#[derive(Debug, Clone, Copy)]
+pub struct WatchOpts {
+    /// Controller dado pelo usuário; sem ele, a primeira rodada varre a tabela.
+    pub controller: Option<u64>,
+    /// Intervalo entre as rodadas.
+    pub every: Duration,
+    /// Quantidade de rodadas; `None` repete até o processo sumir.
+    pub rounds: Option<u32>,
+    pub budget: ScanBudget,
+}
+
+/// Procura o controller e o converte no resultado de uma rodada.
+fn search<M: ReadMem + ?Sized>(
+    index: &ReflectionIndex,
+    mem: &M,
+    objects: &ObjectArray,
+    catalog: &FieldCatalog,
+    budget: &ScanBudget,
+) -> Result<Result<u64, Absent>, UeError> {
+    Ok(
+        match find_controller(index, mem, objects, catalog, budget)? {
+            ControllerFind::Found(c) => Ok(c),
+            ControllerFind::Absent => Err(Absent::NoController),
+            ControllerFind::Ambiguous => Err(Absent::ControllerAmbiguous),
+        },
+    )
+}
+
+/// Lê o personagem em rodadas, para o `gt ue player --watch` (spec 6.8). A varredura do
+/// controller só acontece na primeira rodada sem `opts.controller`, e de novo quando o controller
+/// guardado deixa de ser válido. `out` recebe o relatório de cada rodada, ou por que o personagem
+/// está ausente. Erro de leitura das globais (processo encerrado) interrompe.
+pub fn watch_player<M: ReadMem + ?Sized>(
+    mem: &M,
+    index: &ReflectionIndex,
+    catalog: &FieldCatalog,
+    gobjects: u64,
+    opts: &WatchOpts,
+    sleep: &mut dyn FnMut(Duration),
+    out: &mut dyn FnMut(Result<&PlayerReport, &Absent>),
+) -> Result<(), UeError> {
+    let mut controller = opts.controller;
+    let mut round = 0u32;
+    while opts.rounds.is_none_or(|n| round < n) {
+        if round > 0 {
+            sleep(opts.every);
+        }
+        round += 1;
+        // O cabeçalho da tabela é relido a cada rodada: ela cresce com o jogo rodando.
+        let objects = ObjectArray::read(mem, &catalog.layout, gobjects)?;
+        let mut rescanned = false;
+        let result = loop {
+            let current = match controller {
+                Some(c) => c,
+                None => {
+                    rescanned = true;
+                    match search(index, mem, &objects, catalog, &opts.budget)? {
+                        Ok(c) => {
+                            controller = Some(c);
+                            c
+                        }
+                        Err(absent) => break Err(absent),
+                    }
+                }
+            };
+            match player_report(mem, index, catalog, &objects, current) {
+                // Controller guardado que deixou de valer: uma nova varredura, na mesma rodada.
+                Err(Absent::ControllerInvalid) if !rescanned => controller = None,
+                other => break other,
+            }
+        };
+        out(result.as_ref());
+    }
+    Ok(())
 }
 
 /// `true` se o controller tem de ser procurado de novo: o guardado não é válido, ou o `Pawn` dele
