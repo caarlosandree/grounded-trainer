@@ -328,15 +328,12 @@ impl ValueCheats {
                             .is_none_or(|old| resolved > old.resolved(&self.defs));
                         if better {
                             let catalog = Arc::new(catalog);
-                            let mut runtime = FieldRuntime::new(catalog.clone());
-                            // Os valores desejados do runtime velho continuam valendo: sem
-                            // isso, uma linha ligada com `k` diferente do padrão passaria a
-                            // escrever o padrão enquanto a tela mostra o `k`.
-                            if let Some(old) = &self.reflection {
-                                for (id, value) in old.runtime.desired_values() {
-                                    runtime.set_desired(id, *value);
-                                }
-                            }
+                            // O estado do runtime velho (desejados, "o jogo não deixa", valor
+                            // inválido, aprendizado) continua valendo; só o catálogo troca.
+                            let runtime = match self.reflection.take() {
+                                Some(old) => old.runtime.with_catalog(catalog.clone()),
+                                None => FieldRuntime::new(catalog.clone()),
+                            };
                             self.reflection = Some(Reflection {
                                 index: Arc::new(index),
                                 runtime,

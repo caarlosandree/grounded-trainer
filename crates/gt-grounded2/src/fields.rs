@@ -205,8 +205,9 @@ impl FieldRuntime {
         }
     }
 
-    /// Define o valor desejado de um `set` com `[field.value]` (a grade manda; o `target`, se
-    /// houver, é só o padrão). O próximo ciclo troca o valor nos campos.
+    /// Define o valor desejado de um `set` com `[field.value]` (a grade manda). Se o `set`
+    /// tiver `target`, o `target` sempre vence em `desired_value` (spec 6.4) e este pedido
+    /// não vale. O próximo ciclo troca o valor nos campos.
     pub fn set_desired(&mut self, id: &str, value: f64) {
         self.desired.insert(id.to_string(), value);
     }
@@ -266,6 +267,14 @@ impl FieldRuntime {
 
     pub fn catalog(&self) -> &FieldCatalog {
         &self.catalog
+    }
+
+    /// Troca só o catálogo e mantém o resto do estado (desejados, bloqueio "o jogo não deixa",
+    /// valor do jogo inválido, aprendizado das travas): um índice melhor não zera nada disso
+    /// (spec 6.4).
+    pub fn with_catalog(mut self, catalog: Arc<FieldCatalog>) -> Self {
+        self.catalog = catalog;
+        self
     }
 
     /// Um ciclo: lê o personagem pelo `controller` e escreve o que os cheats `on` pedem. Um
@@ -411,6 +420,12 @@ impl FieldRuntime {
         let mut fight = self.fights.remove(id).unwrap_or_default();
         if fight.obj != obj {
             // Objeto novo: a janela e o bloqueio do anterior não valem mais.
+            if fight.blocked {
+                let name = self.catalog.name(id).unwrap_or(id);
+                report
+                    .events
+                    .push(format!("{name}: o jogo voltou a deixar"));
+            }
             fight = Fight::new(obj);
         }
         let outcome = self.run_set_fields(engine, snapshot, job, &mut fight, now, report);

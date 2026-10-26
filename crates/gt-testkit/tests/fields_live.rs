@@ -611,8 +611,37 @@ fn set_game_fights_blocks_after_five() {
     s.swap_pawn(s.ue.alt_pawn);
     let swapped = s.tick(&["carga"]);
     assert!(swapped.notes.is_empty(), "{:?}", swapped.notes);
+    // A volta ao normal gera uma linha, só na transição.
+    assert_eq!(
+        swapped.events,
+        vec!["carga: o jogo voltou a deixar".to_string()]
+    );
     assert_eq!(s.i32_at(alt_cap), 20);
     assert_eq!(s.i32_at(s.cap()), 36);
+    let after = s.tick(&["carga"]);
+    assert!(after.events.is_empty(), "{:?}", after.events);
+}
+
+#[test]
+fn set_block_survives_a_better_index() {
+    let mut s = scene();
+    provoke_block(&mut s);
+    // Um índice melhor troca só o catálogo: o "o jogo não deixa" continua.
+    let (sigs, defs) = synth_signatures();
+    let catalog = std::sync::Arc::new(FieldCatalog::resolve(
+        &s.index,
+        &s.reader,
+        &sigs.player,
+        &defs,
+    ));
+    let runtime = std::mem::replace(&mut s.runtime, FieldRuntime::new(catalog.clone()));
+    s.runtime = runtime.with_catalog(catalog);
+    s.game_sets_capacity(60);
+    let report = s.tick(&["carga"]);
+    assert_eq!(report.notes["carga"], Note::GameRefuses);
+    assert!(report.events.is_empty(), "{:?}", report.events);
+    assert_eq!(s.i32_at(s.cap()), 60);
+    assert_eq!(journal_data_len(&s), 0);
 }
 
 #[test]

@@ -305,7 +305,7 @@ target_field = "MaxStamina"
 min = 1
 max = 100000
 
-# Fase 6 (spec 006, 6.7): carga, dano, ciência, velocidade, pulos e gravidade. Campos por NOME da reflexão.
+# Fase 5 (spec 006, 6.7): carga, dano, ciência, velocidade, pulos e gravidade. Campos por NOME da reflexão.
 [[field]]
 id = "carga"
 name = "Capacidade de carga"

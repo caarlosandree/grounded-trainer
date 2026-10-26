@@ -1069,9 +1069,10 @@ impl Engine {
         for e in chosen {
             let current = self.read_entry_bytes(&e)?;
             let guard_ok = self.guard_ok(&e.guard)?;
+            let end = e.addr.saturating_add(e.original.len() as u64);
             let writable = maps
                 .iter()
-                .any(|r| r.perms.read && r.perms.write && r.start <= e.addr && e.addr < r.end);
+                .any(|r| r.perms.read && r.perms.write && r.start <= e.addr && end <= r.end);
             match decide_data(&e, current.as_deref(), guard_ok, writable) {
                 DataAction::Drop => report.dropped.push(e.id.clone()),
                 DataAction::Discard => {
