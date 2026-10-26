@@ -10,11 +10,11 @@ use std::time::{Duration, Instant};
 
 use gt_core::engine::Engine;
 use gt_core::mem::MemReader;
-use gt_grounded2::fields::{FieldRuntime, PlayerState, TickReport};
+use gt_grounded2::fields::{ActionOutcome, FieldRuntime, PlayerState, TickReport};
 use gt_grounded2::player::{
     Absent, ControllerFind, FieldCatalog, controller_needs_search, find_controller,
 };
-use gt_grounded2::signatures::{FieldDef, UeSigs};
+use gt_grounded2::signatures::{FieldDef, FieldRule, UeSigs};
 use gt_grounded2::ue::{DISK_UNREADABLE, GlobalState, UeScan};
 use gt_ue::{Names, ObjectArray, ReflectionIndex, ScanBudget, UeError};
 
@@ -85,10 +85,10 @@ pub fn field_infos(defs: &[FieldDef], avail: &Avail) -> Vec<CheatInfo> {
             id: d.id.clone(),
             name: d.name.clone(),
             category: d.category,
-            value: None,
+            value: d.value.clone(),
             avail: avail.clone(),
             field: true,
-            action: false,
+            action: matches!(d.rule, FieldRule::Add { .. }),
         })
         .collect()
 }
@@ -133,7 +133,14 @@ pub struct ValueCheats {
     index_failure: Option<String>,
     controller: Option<u64>,
     pawn_null_since: Option<Instant>,
+    /// Uma ação pediu a procura do controller e ela ainda não voltou.
+    action_search: bool,
+    /// Resultado da procura pedida pela ação, até o controlador buscar.
+    controller_news: Option<bool>,
 }
+
+/// Motivo de a ação recusar com o motor parado (o SIGCONT que falhou).
+const STUCK_REFUSAL: &str = "o jogo pode ter ficado parado; aperte r";
 
 impl ValueCheats {
     pub fn new(reader: MemReader, defs: Vec<FieldDef>, globals: Result<Globals, String>) -> Self {
@@ -145,7 +152,105 @@ impl ValueCheats {
             index_failure: None,
             controller: None,
             pawn_null_since: None,
+            action_search: false,
+            controller_news: None,
         }
+    }
+
+    /// A definição do cheat de valor `id`.
+    fn def(&self, id: &str) -> Option<&FieldDef> {
+        self.defs.iter().find(|d| d.id == id)
+    }
+
+    /// Se `id` é um cheat de valor desta sessão.
+    pub fn is_field(&self, id: &str) -> bool {
+        self.def(id).is_some()
+    }
+
+    /// Passa o ponto `k` da grade de `id` para o valor desejado do motor de execução.
+    fn desire(&mut self, id: &str, k: u64) {
+        let Some(grid) = self.def(id).and_then(|d| d.value.clone()) else {
+            return;
+        };
+        if let Some(r) = self.reflection.as_mut() {
+            r.runtime.set_desired(id, grid.value(k));
+        }
+    }
+
+    /// Troca o valor de um cheat de valor com grade: só muda o desejado, e a escrita vem no
+    /// `tick` do próximo ciclo (spec 006, 6.5).
+    pub fn set_value(&mut self, id: &str, k: u64) -> OpOutcome {
+        match self.def(id) {
+            Some(d) if d.value.is_some() && !matches!(d.rule, FieldRule::Add { .. }) => {}
+            Some(_) => return OpOutcome::Refused(format!("{id} não tem valor")),
+            None => return OpOutcome::Refused(format!("cheat desconhecido: {id}")),
+        }
+        if self.reflection.is_none() {
+            return OpOutcome::Refused(crate::model::CHECKING.to_string());
+        }
+        self.desire(id, k);
+        OpOutcome::Done(Duration::ZERO)
+    }
+
+    /// Executa a ação `id` (spec 006, 6.6, passos 1 a 5; a janela de 1 s e o registro são do
+    /// controlador).
+    pub fn action(&mut self, engine: Option<&mut Engine>, id: &str, k: u64) -> ActionOutcome {
+        let Some(engine) = engine else {
+            return ActionOutcome::Refused("sem motor".to_string());
+        };
+        if engine.is_stuck() {
+            return ActionOutcome::Refused(STUCK_REFUSAL.to_string());
+        }
+        let amount = match self.def(id) {
+            Some(d) if matches!(d.rule, FieldRule::Add { .. }) => {
+                match d.value.as_ref().map(|g| g.value(k)) {
+                    Some(v) if v.is_finite() && v >= 0.0 && v <= f64::from(i32::MAX) => v as i32,
+                    _ => return ActionOutcome::Refused("quantidade inválida".to_string()),
+                }
+            }
+            _ => return ActionOutcome::Refused(format!("{id} não é uma ação")),
+        };
+        let Ok(globals) = &self.globals else {
+            return ActionOutcome::Refused(crate::model::CHECKING.to_string());
+        };
+        let Some(r) = self.reflection.as_mut() else {
+            return ActionOutcome::Refused(crate::model::CHECKING.to_string());
+        };
+        if let Err(reason) = r.catalog.avail(id) {
+            return ActionOutcome::Refused(reason);
+        }
+        let objects = match ObjectArray::read(&self.reader, &globals.sigs.layout, globals.gobjects)
+        {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::debug!("tabela de objetos ilegível: {e}");
+                return ActionOutcome::Refused("estado do jogo ausente".to_string());
+            }
+        };
+        let out = r.runtime.run_action(
+            engine,
+            &self.reader,
+            &r.index,
+            &objects,
+            self.controller,
+            id,
+            amount,
+        );
+        if out == ActionOutcome::NeedsController {
+            self.controller = None;
+            self.action_search = true;
+        }
+        out
+    }
+
+    /// Uma ação pediu a procura do controller e ela ainda não terminou.
+    pub fn action_wants_controller(&self) -> bool {
+        self.action_search
+    }
+
+    /// Resultado da procura pedida pela ação, entregue uma vez.
+    pub fn take_controller_news(&mut self) -> Option<bool> {
+        self.controller_news.take()
     }
 
     /// Globais de uma nova busca. Com um índice bom, nada muda: um índice já bom não é trocado
@@ -273,6 +378,9 @@ impl ValueCheats {
                         PlayerState::Absent(Absent::Unreadable)
                     }
                 };
+                if std::mem::take(&mut self.action_search) {
+                    self.controller_news = Some(state == PlayerState::Found);
+                }
                 news.retry = state != PlayerState::Found;
                 news.player_changed = Some(state);
             }
@@ -308,17 +416,27 @@ impl ValueCheats {
                 || controller_needs_search(true, self.pawn_null_since, now))
     }
 
-    pub fn on(&mut self, engine: Option<&mut Engine>, id: &str) -> OpOutcome {
+    pub fn on(&mut self, engine: Option<&mut Engine>, id: &str, k: u64) -> OpOutcome {
         if engine.is_none() {
             return OpOutcome::Refused("sem motor".to_string());
         }
-        match &self.reflection {
-            None => OpOutcome::Refused(crate::model::CHECKING.to_string()),
-            Some(r) => match r.catalog.avail(id) {
-                // A escrita vem na manutenção do próximo ciclo (100 ms).
-                Ok(()) => OpOutcome::Done(Duration::ZERO),
-                Err(reason) => OpOutcome::Refused(reason),
-            },
+        if self
+            .def(id)
+            .is_some_and(|d| matches!(d.rule, FieldRule::Add { .. }))
+        {
+            return OpOutcome::Refused(format!("{id} é uma ação"));
+        }
+        let avail = match &self.reflection {
+            None => return OpOutcome::Refused(crate::model::CHECKING.to_string()),
+            Some(r) => r.catalog.avail(id),
+        };
+        match avail {
+            // A escrita vem na manutenção do próximo ciclo (100 ms).
+            Ok(()) => {
+                self.desire(id, k);
+                OpOutcome::Done(Duration::ZERO)
+            }
+            Err(reason) => OpOutcome::Refused(reason),
         }
     }
 
@@ -516,6 +634,16 @@ mod tests {
             avail[1].1,
             Avail::Unavailable("campo CurrentFoo não encontrado".to_string())
         );
+    }
+
+    #[test]
+    fn field_infos_carry_value_and_action() {
+        let (_, defs) = synth_signatures();
+        let infos = field_infos(&defs, &Avail::Checking);
+        let find = |id: &str| infos.iter().find(|i| i.id == id).unwrap();
+        assert!(find("somar-ciencia").action && find("somar-ciencia").value.is_some());
+        assert!(!find("carga").action && find("carga").value.is_some());
+        assert!(!find("vida-infinita").action && find("vida-infinita").value.is_none());
     }
 
     #[test]

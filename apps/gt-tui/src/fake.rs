@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use gt_core::procinfo::Identity;
-use gt_grounded2::fields::TickReport;
+use gt_grounded2::fields::{ActionOutcome, TickReport};
 use gt_grounded2::signatures::Category;
 
 use crate::backend::{
@@ -77,7 +77,12 @@ pub(crate) enum Call {
     },
     FieldOn {
         id: String,
+        k: u64,
         busy: Option<String>,
+    },
+    FieldAction {
+        id: String,
+        k: u64,
     },
     FieldOff {
         id: String,
@@ -186,6 +191,12 @@ pub(crate) struct FakeState {
     pub news: VecDeque<ReflectionNews>,
     pub field_avail: Vec<(String, Avail)>,
     pub needs_controller: bool,
+    /// Resultados programados das próximas ações (vazia: soma `k` a partir de zero).
+    pub action_outcomes: VecDeque<ActionOutcome>,
+    /// Uma ação pediu a procura do controller.
+    pub action_wants: bool,
+    /// Resultado da procura pedida pela ação, entregue uma vez.
+    pub controller_news: Option<bool>,
     /// Relatórios dos próximos ciclos (vazia: ciclo sem manutenção).
     pub tick_reports: VecDeque<TickReport>,
 }
@@ -389,6 +400,24 @@ impl FakeCtl {
         self.state().needs_controller = needs;
     }
 
+    /// Programa o resultado da próxima ação.
+    pub fn push_action(&self, outcome: ActionOutcome) {
+        self.state().action_outcomes.push_back(outcome);
+    }
+
+    /// Programa a notícia da procura pedida pela ação (`true` achou, `false` não achou).
+    pub fn set_controller_news(&self, news: Option<bool>) {
+        self.state().controller_news = news;
+    }
+
+    pub fn action_wants(&self) -> bool {
+        self.state().action_wants
+    }
+
+    pub fn actions(&self) -> usize {
+        self.count(|c| matches!(c, Call::FieldAction { .. }))
+    }
+
     /// Programa o relatório do próximo ciclo de manutenção.
     pub fn push_tick(&self, report: TickReport) {
         self.state().tick_reports.push_back(report);
@@ -441,6 +470,9 @@ impl FakeBackend {
             news: VecDeque::new(),
             field_avail: Vec::new(),
             needs_controller: false,
+            action_outcomes: VecDeque::new(),
+            action_wants: false,
+            controller_news: None,
             tick_reports: VecDeque::new(),
         };
         FakeBackend {
@@ -733,11 +765,44 @@ impl Session<()> for FakeSession {
         self.ctl.state().needs_controller
     }
 
-    fn field_on(&mut self, id: &str) -> OpOutcome {
+    fn field_on(&mut self, id: &str, k: u64) -> OpOutcome {
         self.op(|busy| Call::FieldOn {
             id: id.to_string(),
+            k,
             busy,
         })
+    }
+
+    fn field_action(&mut self, id: &str, k: u64) -> ActionOutcome {
+        let mut s = self.ctl.state();
+        s.calls.push(Call::FieldAction {
+            id: id.to_string(),
+            k,
+        });
+        let out = s
+            .action_outcomes
+            .pop_front()
+            .unwrap_or(ActionOutcome::Done {
+                before: 0,
+                after: i32::try_from(k).unwrap_or(i32::MAX),
+            });
+        if out == ActionOutcome::NeedsController {
+            s.action_wants = true;
+        }
+        out
+    }
+
+    fn action_wants_controller(&self) -> bool {
+        self.ctl.state().action_wants
+    }
+
+    fn take_controller_news(&mut self) -> Option<bool> {
+        let mut s = self.ctl.state();
+        let news = s.controller_news.take();
+        if news.is_some() {
+            s.action_wants = false;
+        }
+        news
     }
 
     fn field_off(&mut self, id: &str) -> OpOutcome {
@@ -751,5 +816,49 @@ impl Session<()> for FakeSession {
         let mut s = self.ctl.state();
         s.calls.push(Call::FieldTick { on: on.to_vec() });
         s.tick_reports.pop_front().unwrap_or_else(idle_tick)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session() -> (FakeCtl, FakeSession) {
+        let backend = FakeBackend::new();
+        let ctl = backend.ctl.clone();
+        let session = FakeSession {
+            ctl: ctl.clone(),
+            engine: true,
+            disk: Ok(()),
+            number: 1,
+        };
+        (ctl, session)
+    }
+
+    #[test]
+    fn action_needs_controller_marks_search() {
+        let (ctl, mut s) = session();
+        assert!(!s.action_wants_controller());
+        ctl.push_action(ActionOutcome::NeedsController);
+        assert_eq!(s.field_action("a", 3), ActionOutcome::NeedsController);
+        assert!(s.action_wants_controller());
+        // Sem notícia, o pedido segue em aberto.
+        assert_eq!(s.take_controller_news(), None);
+        assert!(s.action_wants_controller());
+        ctl.set_controller_news(Some(true));
+        assert_eq!(s.take_controller_news(), Some(true));
+        assert!(!s.action_wants_controller());
+        assert_eq!(s.take_controller_news(), None);
+        assert_eq!(ctl.actions(), 1);
+    }
+
+    #[test]
+    fn field_on_records_k() {
+        let (ctl, mut s) = session();
+        assert!(matches!(s.field_on("f", 7), OpOutcome::Done(_)));
+        assert!(ctl.calls().iter().any(|c| matches!(
+            c,
+            Call::FieldOn { id, k: 7, .. } if id == "f"
+        )));
     }
 }

@@ -338,6 +338,7 @@ fn cheat_line(
                         + "indisponível ()".chars().count()
                         + again.chars().count()
                         + 1
+                        + usize::from(row.action)
                         + value_text(value, row.k).chars().count();
                     truncate(reason, width.saturating_sub(fixed))
                 }
@@ -944,6 +945,30 @@ mod tests {
         assert!(line.contains("[ação]"), "{line}");
         assert!(line.contains("+1000"), "{line}");
         assert!(!line.contains("[ON ]") && !line.contains("[OFF]"), "{line}");
+    }
+
+    #[test]
+    fn unavailable_action_keeps_plus_inside_width() {
+        let mut m = Model::new(false);
+        m.conn = connected();
+        let mut r = row(
+            "Somar ciência",
+            Category::Progressao,
+            Avail::Unavailable("bytes diferentes do esperado no endereço".into()),
+        );
+        r.field = true;
+        r.action = true;
+        r.value = Some(science());
+        r.k = 9;
+        m.cheats = vec![r];
+        let lines = draw(&m, MIN_WIDTH, MIN_HEIGHT);
+        let line = line_with(&lines, "Somar ciência");
+        assert!(line.contains("+1000 ◀ ▶"), "{line}");
+        assert!(line.contains('…'), "{line}");
+        assert!(
+            line.trim_end().chars().count() <= MIN_WIDTH as usize,
+            "{line}"
+        );
     }
 
     #[test]

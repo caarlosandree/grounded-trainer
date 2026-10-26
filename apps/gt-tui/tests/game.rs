@@ -167,7 +167,7 @@ fn game_bits_round_trip() {
         b[0]
     };
     for id in ["sem-dano-queda", "nao-morrer"] {
-        let on = session.field_on(id);
+        let on = session.field_on(id, 0);
         assert!(matches!(on, OpOutcome::Done(_)), "{id}: {on:?}");
         let report = session.field_tick(&[id.to_string()], Instant::now());
         assert!(report.notes.is_empty(), "{id}: {:?}", report.notes);

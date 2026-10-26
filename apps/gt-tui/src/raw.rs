@@ -18,7 +18,7 @@ use gt_core::procinfo::{Identity, check_alive, identity, is_dead, read_stat};
 use gt_core::recovery::recover;
 use gt_core::suspend::{PauseConfig, open_checked};
 use gt_core::value::ValueSpec;
-use gt_grounded2::fields::TickReport;
+use gt_grounded2::fields::{ActionOutcome, TickReport};
 use gt_grounded2::policy::data_policy;
 use gt_grounded2::signatures::{Category, FieldDef, UeSigs};
 
@@ -465,6 +465,9 @@ impl Session<RawPayload> for RawSession {
     }
 
     fn set_value(&mut self, id: &str, k: u64) -> OpOutcome {
+        if self.values.is_field(id) {
+            return self.values.set_value(id, k);
+        }
         let bytes = match self.def(id) {
             Some(def) if def.value.is_some() => def.bytes_at(k),
             Some(_) => return OpOutcome::Refused(format!("{id} não tem valor")),
@@ -539,8 +542,20 @@ impl Session<RawPayload> for RawSession {
         self.values.needs_controller(now)
     }
 
-    fn field_on(&mut self, id: &str) -> OpOutcome {
-        self.values.on(self.engine.as_mut(), id)
+    fn field_on(&mut self, id: &str, k: u64) -> OpOutcome {
+        self.values.on(self.engine.as_mut(), id, k)
+    }
+
+    fn field_action(&mut self, id: &str, k: u64) -> ActionOutcome {
+        self.values.action(self.engine.as_mut(), id, k)
+    }
+
+    fn action_wants_controller(&self) -> bool {
+        self.values.action_wants_controller()
+    }
+
+    fn take_controller_news(&mut self) -> Option<bool> {
+        self.values.take_controller_news()
     }
 
     fn field_off(&mut self, id: &str) -> OpOutcome {

@@ -1326,7 +1326,7 @@ impl<B: Backend> Controller<B> {
         let field = row.field;
         let Some(outcome) = self.run_op(busy, draw, |s| {
             if field {
-                s.field_on(&id)
+                s.field_on(&id, k)
             } else {
                 s.apply(&[(id.clone(), k)])
             }
@@ -1644,7 +1644,7 @@ impl<B: Backend> Controller<B> {
             .cloned()
             .collect();
         let mut batch: Vec<(String, u64)> = Vec::new();
-        let mut fields: Vec<String> = Vec::new();
+        let mut fields: Vec<(String, u64)> = Vec::new();
         for row in rows {
             let Some(wanted) = self.desired.get(&row.id).cloned() else {
                 continue;
@@ -1671,21 +1671,22 @@ impl<B: Backend> Controller<B> {
                         Note::NotReapplied,
                         format!("{}: não foi religado ({why})", row.name),
                     ),
-                    None if row.field => fields.push(row.id.clone()),
+                    None if row.field => fields.push((row.id.clone(), Self::shown_k(&row))),
                     None => batch.push((row.id.clone(), Self::shown_k(&row))),
                 },
             }
         }
         // Os cheats de valor, um a um (não pausam o jogo).
         let mut called = false;
-        for id in fields {
+        for (id, k) in fields {
             self.note_op(&id);
-            let Some(outcome) = self.run_op("religando…".to_string(), draw, |s| s.field_on(&id))
+            let Some(outcome) =
+                self.run_op("religando…".to_string(), draw, |s| s.field_on(&id, k))
             else {
                 return called;
             };
             called = true;
-            if !self.finish_reapply_one(&id, 0, outcome, &version_key, now) {
+            if !self.finish_reapply_one(&id, k, outcome, &version_key, now) {
                 return true;
             }
         }
@@ -4286,6 +4287,7 @@ mod tests {
             ons[1],
             Call::FieldOn {
                 id: "f".to_string(),
+                k: 0,
                 busy: Some("religando…".to_string())
             }
         );

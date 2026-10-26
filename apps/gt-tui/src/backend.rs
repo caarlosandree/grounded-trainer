@@ -15,7 +15,7 @@ use gt_core::journal::DiscardReason;
 use gt_core::procinfo::Identity;
 use gt_core::recovery::RecoveryReport;
 use gt_core::value::ValueGrid;
-use gt_grounded2::fields::{PlayerState, TickReport};
+use gt_grounded2::fields::{ActionOutcome, PlayerState, TickReport};
 use gt_grounded2::player::Absent;
 use gt_grounded2::signatures::Category;
 
@@ -337,9 +337,28 @@ pub trait Session<P> {
     }
 
     /// Liga um cheat de valor: a trava é aceita sempre; os bits escrevem já se o personagem
-    /// estiver presente.
-    fn field_on(&mut self, id: &str) -> OpOutcome {
+    /// estiver presente. `k` é o ponto da grade do valor, que vira o desejado (ignorado sem
+    /// `[field.value]`).
+    fn field_on(&mut self, id: &str, _k: u64) -> OpOutcome {
         OpOutcome::Refused(format!("{id} não é um cheat de valor"))
+    }
+
+    /// Executa a ação de somar (spec 006, 6.6) com a quantidade do ponto `k` da grade. Sem motor
+    /// ou com o motor parado, recusa com a mesma mensagem do ligar; um controller ausente
+    /// (`NeedsController`) também marca o pedido de procura.
+    fn field_action(&mut self, id: &str, _k: u64) -> ActionOutcome {
+        ActionOutcome::Refused(format!("{id} não é uma ação"))
+    }
+
+    /// Uma ação pediu a procura do controller e ela ainda não terminou.
+    fn action_wants_controller(&self) -> bool {
+        false
+    }
+
+    /// Resultado de uma procura pedida pela ação, entregue uma vez: `Some(true)` achou o
+    /// personagem, `Some(false)` não achou.
+    fn take_controller_news(&mut self) -> Option<bool> {
+        None
     }
 
     /// Desliga um cheat de valor: a trava só para; os bits voltam ao original.
