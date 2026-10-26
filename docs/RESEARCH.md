@@ -402,9 +402,30 @@ execução** (`scratch/fling/tools/ue_props.py`), não de SDK gerado.
 | `aobitemcd` | `+5c3bbff` | `subss xmm0,xmm6; comiss xmm0,xmm1; movss [rbx+0xb90],xmm0; ja` | registrador `xmm8` → `xmm6` |
 | `aobresearchlevelup` | `+5970f18` | `cmp eax,[rbx+0x514]; jle` (laço com `add r14,0x30`) | registrador base `r14`/`rsi` → `rbx` |
 | `aobgravity` | `+57bcb2b` e `+57c0431` | `mulss xmm0,[rbx+0x1b8]` (`GravityScale`) | contexto mudou; 2 ocorrências |
+| `aobitemdurability` | `+5a4e777` (bloco desde `+5a4e76c`) | `movss xmm1,[rbx+0x298]; movaps xmm2,xmm1; subss xmm2,xmm8; minss xmm2,xmm0; maxss xmm2,xmm6; ucomiss; je; …; movss [rbx+0x298],xmm2` | `movaps` novo e destino `xmm1` → `xmm2` |
+| `aobitempower` | `+5a5744b` (bloco desde `+5a57440`) | `movss xmm0,[rcx+0x250]; movaps xmm1,xmm0; addss xmm1,xmm3; minss xmm1,xmm2; ucomiss; je; …; movss [rcx+0x250],xmm1` | `movaps` novo; o limite vem de `[dados+0x748]` |
 
-Não achados ainda: `aobitemdurability` (a única escrita em `+0x298` com `minss`/`maxss`, `+39073a0`, é de outra
-estrutura: grava `+0x298` e `+0x29c` juntos), `aobdmg`/`aobdmgmul`, `aobplayerstats` (desnecessário, ver abaixo).
+- Os dois últimos viram **patch simples** (Fase 4): anular o `subss` (5 bytes) ou o `addss` (4 bytes) mantém o
+  valor, e o `je` do próprio jogo pula a gravação. Efeito colateral provável: reparo não aumenta a durabilidade. O
+  `call +1fed760` com `r8d = 0x11`/`0x0e` logo após a gravação marca a propriedade para replicação (índice do campo).
+- A escrita em `+0x298` de `+39073a0` (com `minss`/`maxss`) é de outra estrutura: grava `+0x298` e `+0x29c` juntos.
+- `aobdmg`/`aobdmgmul` não foram procurados: o dano causado sai por valor (ver abaixo). `aobplayerstats` é
+  desnecessário.
+
+### Dano causado e "não morrer" (estático, a confirmar no jogo)
+
+- `+5943892`, na aplicação de dano do `HealthComponent` (mesma função do ponto de defesa `+5943ec8`):
+  `rbx` = personagem que **causou** o dano (`call +14f2520`, conferido contra a classe); `movss xmm0,[rbx+0x1330];
+  mulss xmm0,[r15]; movss [r15],xmm0`. **`CustomDamageMultiplier` do atacante multiplica o dano causado**; é o único
+  uso do campo no executável.
+- Logo depois: `test byte [rsi+0x11d], 2` com `rsi` = `HealthComponent` do alvo. Máscaras das `FBoolProperty`
+  (`+0x72 ByteMask`, `+0x73 FieldMask`): em `+0x11d`, `PlayDamagedParticlesOnDeath = 0x01`,
+  `bCanDieFromDamage = 0x02`, `bCanDieEver = 0x04`; no jogador vale `0x06`. Limpar esses bits é candidato a god mode
+  por valor ("não morre", talvez sem ignorar o golpe). Outra opção: `ImmunityFlags` (`+0x110`).
+- Leitura completa do personagem pelos offsets (dono no save, 2026-10-26): vida 100/100, stamina 120/100, comida
+  54,1, água 4,8, fôlego 100, carga 5, `CustomDamageMultiplier` 1,0, pulos 0/1, gravidade 1,0, `MaxWalkSpeed` 350,
+  posição em `double`. O `CachedPartyComponent` (`+0xfa8`) do controller estava **nulo**: a ciência precisa de outro
+  caminho até o `PartyComponent`.
 
 ### Partes nativas do trainer (REA/Ghidra)
 
@@ -425,19 +446,19 @@ Caminho proposto para o nosso trainer: **V** = escrita de valor no objeto (Fase 
 
 | Tecla | Opção | Como o FLiNG faz | Estado no build | Nosso caminho |
 |---|---|---|---|---|
-| Num 1 | God Mode | `+56fc11c`: golpe no jogador é tratado como alvo sem componente | ponto ok, falta `player` | C (com o pawn escrito na cave); testar antes V com `bCanDieEver` |
+| Num 1 | God Mode | `+56fc11c`: golpe no jogador é tratado como alvo sem componente | ponto ok, falta `player` | C (com o pawn escrito na cave); testar antes V com os bits `bCanDie…` (`+0x11d`) |
 | Num 2 | Vida infinita | `CurrentDamage = -9999` no hook `aobplayerstats` | padrão quebrado | V: `CurrentDamage = 0` |
 | Num 3 | Stamina infinita | `CurrentStamina = 999999` | quebrado | V |
 | Num 5/6/7 | Comida / água / oxigênio | `CurrentFood/Water/Breath = 999999` | quebrado | V; comida e água também por `bAllow…Decrease = 0` |
 | Num 8 | Temperatura estável | `CurrentBodyTemperature = 0` | quebrado | V |
 | Num 9 | Furtividade | `bCreaturesIgnorePlayers = 1` (hook `+593af1c`) | ok | V nas configurações de modo (risco de save) |
-| Num 0 | Dano máximo | multiplicador do dano em `xmm7` = 9999 | quebrado | V `CustomDamageMultiplier` (a confirmar) |
-| Num . | Multiplicador de dano | idem, × valor | quebrado | V (a confirmar) |
+| Num 0 | Dano máximo | multiplicador do dano em `xmm7` = 9999 | quebrado | V `CustomDamageMultiplier` (multiplica o dano causado, `+5943892`) |
+| Num . | Multiplicador de dano | idem, × valor | quebrado | V `CustomDamageMultiplier` |
 | Num + | Multiplicador de defesa | divide o dano recebido em `+5943ec8` | ponto ok, falta `player` | C |
-| Ctrl+Num 1 | Editar ciência | `ScienceFound` no hook `aobpartycomponent` | quebrado | V (`CachedPartyComponent` do controller) |
+| Ctrl+Num 1 | Editar ciência | `ScienceFound` no hook `aobpartycomponent` | quebrado | V (caminho até o `PartyComponent` a achar; `CachedPartyComponent` estava nulo) |
 | Ctrl+Num 4 | Quantidade ao arrastar | `Item.StackSize` no hook `+5bbfe8c` | ok | C, ou V se acharmos o item arrastado |
 | Ctrl+Num 6 | Recarga instantânea | zera a subtração em `aobitemcd` | ponto novo `+5c3bbff` | V `ItemUseCooldownRemaining = 0` ou P |
-| Ctrl+Num 7 | Durabilidade infinita | força o novo valor ao máximo | não achado | a investigar (`Item.DurabilityRemaining`) |
+| Ctrl+Num 7 | Durabilidade infinita | força o novo valor ao máximo | ponto novo `+5a4e777` | P (anular o `subss`) |
 | Ctrl+Num 0 | Sem requisitos de receita | `bRecipesRequireIngredients = 0` | ok | V (risco de save) |
 | Ctrl+Num . | Sem requisitos de construção | troca `UnderConstruction` por `Built` em `+57689db` | ok | C, ou V com `bAutoCompleteBuildings` |
 | Alt+Num 1 | Brain Power rápido | iguala `ResearchPoints` ao limite do nível | ponto novo `+5970f18` | C |
@@ -453,7 +474,7 @@ Caminho proposto para o nosso trainer: **V** = escrita de valor no objeto (Fase 
 | — | Capacidade de carga (`hauling_capacity`) | `HaulingComponent.Capacity` | quebrado | V |
 | — | Bloqueio perfeito, sem atordoamento | soma 10000 à janela; `CurrentStunValue = -9999` | quebrado | V |
 | — | Cargas infinitas do analisador | copia `MaxPowerCapacity` para as cargas em `+57bd6d0` | ok | C |
-| — | Tocha infinita | zera `Item.PowerUsed` (`aobitempower`) | não achado | V no item equipado ou P (8 escritas em `+0x250`) |
+| — | Tocha infinita | zera `Item.PowerUsed` (`aobitempower`) | ponto novo `+5a5744b` | P (anular o `addss`) |
 
 **Conclusão:** cerca de 20 das opções viram **escrita de valor** a partir do pawn do jogador, sem patch de código e
 sem depender de padrões que quebram a cada atualização. Os offsets vêm da reflexão, então sobrevivem a mudanças de
@@ -485,6 +506,22 @@ Binário `target/debug/gt-tui --diagnostico`; conferência por `gt diff` e `gt-p
   terminal fechado, girava a 99% de CPU com o pty apagado (laço de `EIO` do crossterm, que a thread `gt-keys` corrige).
   Sem diário nem motor; encerrado à mão.
 - **Opinião do dono sobre a TUI:** "achei bom".
+
+## Sessão de 2026-10-26 (Fase 4): os três patches simples no jogo
+
+Build `c935e799-0b27c000` (`Augusta-CL-3207493`). Save de teste, FLiNG fechado, backup do save feito pelo dono.
+
+- **Testes `#[ignore]` de `gt-patch` com o jogo aberto:** 3 passaram em 252 s, inclusive `phase4_cheats_round_trip`
+  (liga e desliga cada um dos três; `gt diff` limpo no fim). O jogo seguiu aberto.
+- **Durabilidade infinita (`+5a4e777`):** ligada, a durabilidade de ferramentas e armas não cai; desligada, volta a
+  cair. **Também vale para a armadura** (mesma rotina de desgaste). Reparo com o cheat ligado: não testado.
+- **Tocha infinita (`energia-infinita`, `+5a5744b`):** ligada, a energia da tocha para de cair; desligada, volta a cair.
+  Renomeada de "Energia infinita" para não confundir com a stamina do personagem (`StaminaComponent`, Fase 5).
+- **Recarga instantânea (`+5c3bbfc`):** testada com o curativo: dá para usar de novo sem esperar. Funcionou com os
+  outros dois ligados ao mesmo tempo.
+- **Reinício do jogo:** com os três ligados e a TUI aberta, o jogo fechado e reaberto; a TUI reconectou e os três
+  voltaram ligados e funcionando.
+- **Saída:** `q` na TUI; `gt diff` mostrou `nenhuma alteração`. Jogo estável o tempo todo (relato do dono).
 
 ## Hipóteses descartadas
 

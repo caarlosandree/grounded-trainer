@@ -7,3 +7,15 @@ product_version = "Augusta-CL-3207493"
 [[patch]]
 id = "teste-codificacao"
 rva = 0x112c468
+
+[[patch]]
+id = "durabilidade-infinita"
+rva = 0x5a4e777
+
+[[patch]]
+id = "energia-infinita"
+rva = 0x5a5744b
+
+[[patch]]
+id = "recarga-instantanea"
+rva = 0x5c3bbfc

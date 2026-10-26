@@ -1229,4 +1229,101 @@ offset = 3
             other => panic!("esperava Error::Signature, veio {other:?}"),
         }
     }
+
+    /// (id, name, rva, expected, replacement) dos cheats da Fase 4, na ordem do generic.toml (spec 004).
+    const PHASE4: [(&str, &str, u64, &str, &str); 3] = [
+        (
+            "durabilidade-infinita",
+            "Durabilidade infinita",
+            0x5a4e777,
+            "f3 41 0f 5c d0",
+            "0f 1f 44 00 00",
+        ),
+        (
+            "energia-infinita",
+            "Tocha infinita",
+            0x5a5744b,
+            "f3 0f 58 cb",
+            "0f 1f 40 00",
+        ),
+        (
+            "recarga-instantanea",
+            "Recarga instantânea",
+            0x5c3bbfc,
+            "0f 28 c7",
+            "0f 57 c0",
+        ),
+    ];
+
+    fn hex(text: &str) -> Vec<u8> {
+        parse_hex("teste", "teste", text).unwrap()
+    }
+
+    #[test]
+    fn phase4_cheats_load_verified() {
+        let defs = Signatures::embedded()
+            .unwrap()
+            .for_version("c935e799-0b27c000");
+        for (id, name, rva, expected, replacement) in PHASE4 {
+            let def = defs
+                .iter()
+                .find(|d| d.id == id)
+                .unwrap_or_else(|| panic!("{id} ausente"));
+            assert_eq!(def.name, name);
+            assert_eq!(def.category, Category::Itens);
+            assert_eq!(def.value, None);
+            assert_eq!(def.rva, Some(rva), "{id}");
+            assert_eq!(def.expected, hex(expected), "{id}");
+            assert_eq!(def.replacement, hex(replacement), "{id}");
+            assert!(!def.description.is_empty(), "{id}");
+        }
+        let itens: Vec<_> = defs
+            .iter()
+            .filter(|d| d.category == Category::Itens)
+            .map(|d| d.id.as_str())
+            .collect();
+        assert_eq!(
+            itens,
+            PHASE4.iter().map(|p| p.0).collect::<Vec<_>>(),
+            "ordem em Itens"
+        );
+    }
+
+    #[test]
+    fn phase4_cheats_generic_without_rva() {
+        let defs = Signatures::embedded().unwrap().for_version("cccc-dddd");
+        for (id, _, _, expected, replacement) in PHASE4 {
+            let def = defs
+                .iter()
+                .find(|d| d.id == id)
+                .unwrap_or_else(|| panic!("{id} ausente"));
+            assert_eq!(def.rva, None, "{id}");
+            assert_eq!(def.expected, hex(expected), "{id}");
+            assert_eq!(def.replacement, hex(replacement), "{id}");
+        }
+    }
+
+    #[test]
+    fn phase4_cheats_keep_instruction_boundaries() {
+        use gt_core::patch::{PatchSpec, overlaps, validate};
+        let mut ranges = Vec::new();
+        ranges.push(0x112c468..0x112c46b); // teste-codificacao
+        for (id, _, rva, expected, replacement) in PHASE4 {
+            let v = validate(PatchSpec {
+                id: id.into(),
+                addr: rva,
+                expected: hex(expected),
+                replacement: hex(replacement),
+            })
+            .unwrap_or_else(|e| panic!("{id}: {e}"));
+            assert!(v.lost_on_apply().is_empty(), "{id}");
+            assert!(v.lost_on_undo().is_empty(), "{id}");
+            ranges.push(v.spec.range());
+        }
+        for (i, a) in ranges.iter().enumerate() {
+            for b in &ranges[i + 1..] {
+                assert!(!overlaps(a, b), "{a:x?} e {b:x?} se sobrepõem");
+            }
+        }
+    }
 }

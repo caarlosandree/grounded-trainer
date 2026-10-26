@@ -20,3 +20,43 @@ pattern = "f3 90 0f 31 48 c1 e2 20 48 0b c2 48 2b c7 48 3b c3 72 ed"
 offset = 8
 expected = "48 0b c2"
 replacement = "48 09 d0"
+
+# Fase 4 (spec 004): patches simples de itens. Pontos achados por nós em 2026-10-26 (RESEARCH.md, catálogo do
+# FLiNG); as trocas são instruções neutras do mesmo tamanho, sem bytes de terceiros.
+
+# Desgaste de item: `movss xmm1,[rbx+0x298]` (Item.DurabilityRemaining), `subss xmm2,xmm8` tira o desgaste e o
+# resultado é limitado entre 0 e o máximo. Sem a subtração o valor não muda e o `je` do jogo pula a gravação.
+[[patch]]
+id = "durabilidade-infinita"
+name = "Durabilidade infinita"
+category = "itens"
+description = "Ferramentas, armas e armaduras não perdem durabilidade (o reparo pode não funcionar enquanto ligado)"
+pattern = "f3 0f 10 8b 98 02 00 00 0f 28 d1 f3 41 0f 5c d0 f3 0f 5d d0 f3 0f 5f d6 0f 2e d1 74"
+offset = 11
+expected = "f3 41 0f 5c d0"
+replacement = "0f 1f 44 00 00"
+
+# Consumo de energia: `movss xmm0,[rcx+0x250]` (Item.PowerUsed), `addss xmm1,xmm3` soma o gasto e o resultado é
+# limitado ao total do item. Sem a soma a energia gasta não aumenta e o `je` do jogo pula a gravação.
+[[patch]]
+id = "energia-infinita"
+name = "Tocha infinita"
+category = "itens"
+description = "A tocha e os outros itens com energia não gastam energia"
+pattern = "f3 0f 10 81 50 02 00 00 0f 28 c8 f3 0f 58 cb f3 0f 5d ca 0f 2e c8 74"
+offset = 11
+expected = "f3 0f 58 cb"
+replacement = "0f 1f 40 00"
+
+# Recarga de uso de item, no Tick do SurvivalPlayerController: `movaps xmm0,xmm7` copia a recarga restante
+# (ItemUseCooldownRemaining, +0xb90) antes de tirar o tempo do quadro. Com `xorps xmm0,xmm0` o valor gravado fica
+# negativo e o jogo encerra a recarga pelo próprio caminho. O curinga é o deslocamento do `jbe`.
+[[patch]]
+id = "recarga-instantanea"
+name = "Recarga instantânea"
+category = "itens"
+description = "Sem espera entre um uso de item e o próximo"
+pattern = "f3 0f 10 bb 90 0b 00 00 0f 57 c9 0f 2f f9 76 ?? 0f 28 c7 f3 0f 5c c6 0f 2f c1 f3 0f 11 83 90 0b 00 00"
+offset = 16
+expected = "0f 28 c7"
+replacement = "0f 57 c0"

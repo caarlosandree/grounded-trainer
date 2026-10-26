@@ -81,35 +81,44 @@ ainda não há cheat real com valor (Fase 4).
 
 ## Fase 4 — Primeiros cheats (patch de código simples)
 
-**Objetivo:** primeiras funcionalidades reais, usando os pontos já descobertos nos achados de engenharia reversa.
+**Status:** ✅ concluída em 2026-10-26 (spec e plano `004-cheats-patch-simples`). Os três cheats confirmados no jogo
+pelo dono pela TUI, inclusive depois de reiniciar o jogo.
 
-| Categoria | Cheat | Ponto de partida |
+**Objetivo:** primeiras funcionalidades reais, com troca de bytes do mesmo tamanho pelo motor da Fase 2, sem código
+novo de motor.
+
+Reorganizada em 2026-10-26 depois da análise do FLiNG (`RESEARCH.md`, catálogo): os cheats que estavam aqui
+precisam do pawn do jogador ou de código novo e foram para as Fases 5 e 6.
+
+| Categoria | Cheat | Ponto (build `c935e799`) |
 |---|---|---|
-| Itens | Usos/cargas infinitas | `aobcharges` (FLiNG, funciona na versão atual) |
-| Itens | Quantidade ao arrastar (duplicar) | `aobdragitemamount` (FLiNG, funciona) |
-| Movimento | Velocidade do jogador | `aobplayerspeed` |
-| Movimento | Pulo infinito | `aobinfinitejumps` |
-| Sobrevivência | God mode | `aobgodmode`; o da FLiNG não funciona, então precisa de investigação nova |
+| Itens | Durabilidade infinita | `+5a4e777`: anular a subtração do desgaste |
+| Itens | Tocha infinita (energia da tocha e de itens com energia) | `+5a5744b`: anular a soma da energia gasta |
+| Itens | Recarga instantânea de item | `+5c3bbfc`: a recarga restante termina no quadro seguinte |
 
-**Pronto quando:** cada cheat da tabela funciona no jogo e sobrevive a reiniciar o jogo.
+**Pronto quando:** cada cheat da tabela funciona no jogo, liga e desliga pela TUI e sobrevive a reiniciar o jogo.
 **Você faz:** testar cada cheat no jogo e dizer se funcionou.
 
 ---
 
 ## Fase 5 — Estruturas do Unreal Engine (valores)
 
-**Objetivo:** ler e escrever valores do jogo pelo *nome* da estrutura, não por endereço solto. É a base para os cheats mais robustos.
+**Objetivo:** ler e escrever valores do jogo pelo *nome* da estrutura, não por endereço solto. É a base para a
+maioria dos cheats.
 
-- Gerar o SDK do jogo com Dumper-7 (uma vez por atualização), para obter os offsets das classes.
-- Resolver `GNames`, `GObjects` e `GWorld` por assinatura.
-- Navegar: `GWorld → GameInstance → LocalPlayer → PlayerController → Pawn → componentes`.
-- Cheats:
-  - Sobrevivência: vida, fome, sede e stamina travadas no máximo.
-  - Movimento: voar (`MovementMode = Flying`), teleporte (salvar/carregar posição).
-  - Itens: editar quantidade de pilhas no inventário.
+- Offsets lidos da **reflexão do jogo em execução** (`GUObjectArray` + `FNamePool` + `FProperty`), sem gerar SDK
+  com o Dumper-7 (decisão de 2026-10-26; achados em `RESEARCH.md`).
+- Achar o controller do jogador e o pawn (`Controller.Pawn`), e dele os componentes.
+- Cheats (por escrita de valor, com laço de "congelar" quando preciso):
+  - Sobrevivência: vida, stamina, comida, água, oxigênio, temperatura estável, sem dano de queda; tentativa de god
+    mode pelos bits de morte do `HealthComponent`.
+  - Itens: capacidade de carga.
+  - Progressão: dano causado (`CustomDamageMultiplier`), ciência.
+  - Movimento: velocidade, pulos infinitos, gravidade, teleporte (salvar/carregar posição).
 
-**Pronto quando:** os cheats de sobrevivência funcionam e continuam funcionando após uma atualização do jogo, só regenerando os offsets.
-**Você faz:** rodar o Dumper-7 quando eu pedir (passo guiado).
+**Pronto quando:** os cheats de sobrevivência funcionam e continuam funcionando depois de uma atualização do jogo
+sem mudar nada no trainer (os offsets vêm do próprio jogo).
+**Você faz:** testar os cheats no jogo.
 
 ---
 
@@ -120,11 +129,12 @@ ainda não há cheat real com valor (Fase 4).
 - Encontrar espaço livre no executável para código novo.
 - Montar o código com `iced-x86` e desviar a execução para ele.
 - Cheats:
-  - Progressão: multiplicador de XP / Brain Power.
-  - Itens: multiplicador ao coletar, durabilidade infinita, construção grátis.
+  - Sobrevivência: god mode por desvio (se a versão por valor da Fase 5 não servir), multiplicador de defesa.
+  - Progressão: Brain Power rápido, congelar a hora do dia / velocidade do tempo.
+  - Itens: cargas infinitas do analisador, quantidade ao arrastar, construção sem requisitos.
 
-**Pronto quando:** o multiplicador de XP funciona com o valor ajustável pela TUI.
-**Você faz:** testar ganho de XP no jogo.
+**Pronto quando:** o Brain Power rápido funciona no jogo.
+**Você faz:** testar os cheats no jogo.
 
 ---
 
