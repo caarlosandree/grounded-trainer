@@ -1,8 +1,11 @@
 # Definições genéricas dos patches, válidas para qualquer versão do jogo (spec 002, 6.3).
 #
 # Cada patch é um bloco [[patch]] com:
-#   id, description (pt-BR), module (opcional; padrão: o exe do jogo),
+#   id, name (nome curto em pt-BR), category (sobrevivencia, itens, progressao, movimento ou
+#   diagnostico), description (pt-BR), module (opcional; padrão: o exe do jogo),
 #   pattern (AOB com os bytes ORIGINAIS), offset, expected e replacement (bytes em hex).
+# Opcional: bloco [patch.value] (type, slot, min, max, step, default, unit, decimals) que faz do
+# patch um cheat com valor ajustável (spec 003, 6.3).
 #
 
 # Patch de teste da Fase 2 (spec 002, 6.9): troca sem efeito na partida. `or rax, rdx` (48 0B C2) vira a
@@ -10,6 +13,8 @@
 # executam o tempo todo. Achado em 2026-10-25 (RESEARCH.md, sessão B).
 [[patch]]
 id = "teste-codificacao"
+name = "Patch de teste"
+category = "diagnostico"
 description = "Troca sem efeito (codificação equivalente de or rax, rdx), para testar o motor"
 pattern = "f3 90 0f 31 48 c1 e2 20 48 0b c2 48 2b c7 48 3b c3 72 ed"
 offset = 8

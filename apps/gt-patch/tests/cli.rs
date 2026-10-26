@@ -89,6 +89,7 @@ fn restore_discards_dead_process_journal() {
                 addr: 0x1_4000_1000,
                 original: vec![0x48, 0x8B, 0xF9],
                 replacement: vec![0x48, 0x89, 0xCF],
+                next: None,
             }],
         })
         .unwrap();
@@ -145,7 +146,7 @@ fn restore_refused_while_locked() {
     let out = gt_patch(state.path(), &["restore"]);
     assert!(!out.status.success());
     assert!(
-        stderr(&out).contains("outro gt-patch já está em execução"),
+        stderr(&out).contains("outro gt-patch ou gt-tui já está em execução"),
         "{}",
         stderr(&out)
     );

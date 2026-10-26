@@ -142,7 +142,7 @@ pub fn recover(
         .entries
         .iter()
         .cloned()
-        .partition(|e| e.original.len() <= MAX_PATCH_LEN && exec.allows(&entry_range(e)));
+        .partition(|e| e.original.len() <= MAX_PATCH_LEN && exec.allows(&e.range()));
     for e in outside {
         tracing::warn!(
             id = %e.id,
@@ -156,7 +156,7 @@ pub fn recover(
         return Ok(report);
     }
 
-    let ranges: Vec<Range<u64>> = eligible.iter().map(entry_range).collect();
+    let ranges: Vec<Range<u64>> = eligible.iter().map(JournalEntry::range).collect();
     let policy: PolicyFn = Box::new(move |maps: &[MapRegion]| {
         let exec = exec_policy(maps);
         WritePolicy::new(ranges.iter().filter(|r| exec.allows(r)).cloned().collect())
@@ -202,7 +202,7 @@ pub fn recover(
     if !report.kept.is_empty() {
         tracing::warn!(
             ids = ?report.kept,
-            "entradas não restauradas; a próxima execução do gt-patch vai tentar de novo"
+            "entradas não restauradas; a próxima execução do trainer vai tentar de novo"
         );
     }
     Ok(report)
@@ -238,11 +238,6 @@ fn exec_policy(maps: &[MapRegion]) -> WritePolicy {
             .map(|r| r.start..r.end)
             .collect(),
     )
-}
-
-fn entry_range(e: &JournalEntry) -> Range<u64> {
-    let len = u64::try_from(e.original.len()).unwrap_or(u64::MAX);
-    e.addr..e.addr.saturating_add(len)
 }
 
 #[cfg(test)]

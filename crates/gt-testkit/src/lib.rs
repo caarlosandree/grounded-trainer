@@ -35,6 +35,11 @@ pub struct TestTarget {
     pub spin_page: u64,
     /// Página de uma thread bloqueada num `read`; o `pc` parado é `syscall_page + 22`.
     pub syscall_page: u64,
+    /// Página com o laço de valor (`gt_core::mem::test_support::value_code`): `B8 11 11 11 11`
+    /// no início (imediato no deslocamento 1); só há thread nela com `spin_value`.
+    pub value_page: u64,
+    /// Palavra de 32 bits em página `rw` onde o laço de valor escreve o imediato.
+    pub value_word: u64,
     /// Início de 3 páginas; a do meio (`region_start + page`) é ilegível.
     pub region_start: u64,
     /// Início de uma região `rw` de `big_len` bytes (2 MiB + 1 página).
@@ -52,6 +57,8 @@ pub struct TestTarget {
 pub struct TargetOpts {
     /// Cria uma thread que gira em `spin_page` (consome uma CPU).
     pub spin: bool,
+    /// Cria uma thread no laço de valor em `value_page` (consome uma CPU).
+    pub spin_value: bool,
 }
 
 fn parse_hex(v: &serde_json::Value) -> u64 {
@@ -71,6 +78,9 @@ impl TestTarget {
         if opts.spin {
             cmd.arg("--spin");
         }
+        if opts.spin_value {
+            cmd.arg("--spin-value");
+        }
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -89,6 +99,8 @@ impl TestTarget {
             exec2: parse_hex(&v["exec2"]),
             spin_page: parse_hex(&v["spin_page"]),
             syscall_page: parse_hex(&v["syscall_page"]),
+            value_page: parse_hex(&v["value_page"]),
+            value_word: parse_hex(&v["value_word"]),
             region_start: parse_hex(&v["region_start"]),
             big_region: parse_hex(&v["big_region"]),
             big_len: v["big_len"].as_u64().unwrap() as usize,

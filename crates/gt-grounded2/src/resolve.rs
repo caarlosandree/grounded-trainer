@@ -148,6 +148,23 @@ impl Target {
     }
 }
 
+/// Acha o PID do jogo sem abrir o alvo (a casca pública da busca que o [`Target::open`] faz).
+///
+/// Sem `pid`, varre `/proc` com a mesma regra do [`Target::open`] e devolve também os processos
+/// descartados (os que citam o jogo mas não são ele); [`Error::GameNotFound`] e
+/// [`Error::ManyCandidates`] como lá. Com `Some(pid)`, só confere que o processo existe e está
+/// vivo ([`gt_core::Error::ProcessGone`], dentro de [`Error::Core`], se não) e devolve a lista
+/// de descartados vazia.
+pub fn find_pid(pid: Option<i32>) -> Result<(i32, Vec<(i32, String)>)> {
+    match pid {
+        Some(pid) => {
+            identity(pid)?;
+            Ok((pid, Vec::new()))
+        }
+        None => find_game(),
+    }
+}
+
 /// Procura o jogo em `/proc`. Erro se não houver nenhum candidato ou houver mais de um.
 fn find_game() -> Result<(i32, Vec<(i32, String)>)> {
     let own = i32::try_from(std::process::id()).ok();
@@ -177,25 +194,25 @@ fn game_exe_path(maps: &[MapRegion]) -> Option<&Path> {
 
 /// Texto de ajuda para o erro de permissão (spec 6.10). Não sugere `sudo` como primeira opção.
 ///
-/// Serve ao `gt` e ao `gt-patch`; `ptrace_scope` é o valor de `kernel.yama.ptrace_scope`, se
+/// `program` é o nome do programa que mostra a ajuda (`gt`, `gt-patch`, `gt-tui`) e entra nas
+/// frases no lugar de "o programa". `ptrace_scope` é o valor de `kernel.yama.ptrace_scope`, se
 /// conhecido.
-pub fn permission_hint(ptrace_scope: Option<u8>) -> String {
+pub fn permission_hint(program: &str, ptrace_scope: Option<u8>) -> String {
     match ptrace_scope {
         Some(0) => "kernel.yama.ptrace_scope está em 0, que já permite a leitura; confira se o \
                     processo é de outro usuário ou se o SELinux/um container bloqueia o acesso."
             .to_string(),
-        Some(3) => {
+        Some(3) => format!(
             "kernel.yama.ptrace_scope está em 3, que bloqueia qualquer leitura da memória de \
-                    outro processo e só pode ser baixado reiniciando o sistema (o programa não \
-                    altera nada)."
-                .to_string()
-        }
+             outro processo e só pode ser baixado reiniciando o sistema (o {program} não altera \
+             nada)."
+        ),
         Some(value) => format!(
             "kernel.yama.ptrace_scope está em {value}, o que restringe a leitura da memória de \
-             outro processo (com 1, só descendentes do processo que lê). Confira se o programa e o \
-             jogo são do mesmo usuário; se aceitar mudar a política, baixe o valor com `sudo sysctl \
-             kernel.yama.ptrace_scope=0` (afeta o sistema todo; o programa nunca altera isso \
-             sozinho)."
+             outro processo (com 1, só descendentes do processo que lê). Confira se o {program} e \
+             o jogo são do mesmo usuário; se aceitar mudar a política, baixe o valor com `sudo \
+             sysctl kernel.yama.ptrace_scope=0` (afeta o sistema todo; o {program} nunca altera \
+             isso sozinho)."
         ),
         None => "o arquivo kernel.yama.ptrace_scope não existe (Yama ausente); a recusa vem de \
                  outra política, como SELinux, um container ou um processo de outro usuário."
@@ -205,12 +222,24 @@ pub fn permission_hint(ptrace_scope: Option<u8>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::permission_hint;
+    use super::{find_pid, permission_hint};
     use crate::Error;
 
     #[test]
+    fn find_pid_with_pid_only_checks_existence() {
+        let own = i32::try_from(std::process::id()).unwrap();
+        let (pid, discarded) = find_pid(Some(own)).unwrap();
+        assert_eq!(pid, own);
+        assert!(discarded.is_empty());
+        assert!(matches!(
+            find_pid(Some(i32::MAX)),
+            Err(Error::Core(gt_core::Error::ProcessGone { .. }))
+        ));
+    }
+
+    #[test]
     fn permission_hint_mentions_scope_and_value_without_sudo_first() {
-        let hint = permission_hint(Some(1));
+        let hint = permission_hint("gt", Some(1));
         assert!(hint.contains("ptrace_scope"));
         assert!(hint.contains('1'));
         assert!(!hint.trim_start().starts_with("sudo"));
@@ -221,14 +250,23 @@ mod tests {
 
     #[test]
     fn permission_hint_for_scope_3_says_only_a_reboot_lowers_it() {
-        let hint = permission_hint(Some(3));
+        let hint = permission_hint("gt", Some(3));
         assert!(hint.contains("reiniciando"), "{hint}");
         assert!(!hint.contains("sysctl"), "{hint}");
     }
 
     #[test]
+    fn permission_hint_names_program() {
+        let hint = permission_hint("gt-tui", Some(3));
+        assert!(hint.contains("o gt-tui não altera nada"), "{hint}");
+        let hint = permission_hint("gt-tui", Some(1));
+        assert!(hint.contains("o gt-tui e o jogo"), "{hint}");
+        assert!(!hint.contains("o programa"), "{hint}");
+    }
+
+    #[test]
     fn permission_hint_without_yama_says_so() {
-        assert!(permission_hint(None).contains("Yama ausente"));
+        assert!(permission_hint("gt", None).contains("Yama ausente"));
     }
 
     #[test]

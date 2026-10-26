@@ -20,7 +20,7 @@ use crate::state::{PatchState, StateInputs, compute_state};
 use crate::{Error, GAME_EXE, Result};
 
 /// Uma definição e o estado dela no processo.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
     pub def: PatchDef,
     pub state: PatchState,
@@ -49,7 +49,7 @@ pub struct CatalogScan {
 /// definição, na mesma ordem de `defs`. `disk` é `Err(causa)` quando o disco não pôde ser lido
 /// e `Ok(None)` quando nenhuma definição precisava da busca em disco. `current(addr, len)` lê
 /// os bytes da memória do alvo. O diário só vale se a identidade bate com `journal.1` e os
-/// bytes no endereço registrado são os novos; `locked` diz se outro `gt-patch` segura a trava.
+/// bytes no endereço registrado são os novos (ou, numa troca de valor em curso, os de `next`); `locked` diz se outro `gt-patch` segura a trava.
 pub fn resolve(
     defs: &[PatchDef],
     module_base: u64,
@@ -71,7 +71,9 @@ pub fn resolve(
             let journal_hit = journal.and_then(|(j, _)| {
                 let entry = j.entries.iter().find(|e| e.id == def.id)?;
                 let now = current(entry.addr, entry.replacement.len())?;
-                (now == entry.replacement).then_some((entry.addr, locked))
+                // Numa troca de valor em curso, os bytes atuais podem ser os de `next`.
+                (now == entry.replacement || entry.next.as_deref() == Some(now.as_slice()))
+                    .then_some((entry.addr, locked))
             });
             let memory = &mem[i];
             let current_bytes = match (memory.verdict, memory.hits.first()) {
@@ -111,10 +113,39 @@ pub fn scan(
     journal: Option<&Journal>,
     locked: bool,
 ) -> Result<CatalogScan> {
+    scan_defs(target, sigs, journal, locked, None)
+}
+
+/// Como [`scan`], só com as definições cujo `id` está em `ids`, e sem diário (nova busca de
+/// padrões que não depende do estado dos patches ativos, spec 003 6.2). `id` desconhecido é
+/// ignorado.
+pub fn scan_subset(target: &Target, sigs: &Signatures, ids: &[String]) -> Result<CatalogScan> {
+    scan_defs(target, sigs, None, false, Some(ids))
+}
+
+/// Mantém as definições cujo `id` está em `ids`, na ordem do arquivo (a ordem de `ids` não conta;
+/// `id` desconhecido é ignorado). Com `None`, devolve todas.
+pub fn select_defs(defs: Vec<PatchDef>, ids: Option<&[String]>) -> Vec<PatchDef> {
+    match ids {
+        None => defs,
+        Some(ids) => defs
+            .into_iter()
+            .filter(|def| ids.contains(&def.id))
+            .collect(),
+    }
+}
+
+fn scan_defs(
+    target: &Target,
+    sigs: &Signatures,
+    journal: Option<&Journal>,
+    locked: bool,
+    ids: Option<&[String]>,
+) -> Result<CatalogScan> {
     let (module, mem_headers) = target.module(GAME_EXE)?;
     let version_key = mem_headers.version_key();
     let has_version_file = sigs.has_version(&version_key);
-    let defs = sigs.for_version(&version_key);
+    let defs = select_defs(sigs.for_version(&version_key), ids);
 
     let identity = match journal {
         Some(_) => Some(identity(target.pid)?),
@@ -285,6 +316,8 @@ mod tests {
     const GENERIC: &str = r#"
 [[patch]]
 id = "teste-codificacao"
+name = "Patch de teste"
+category = "diagnostico"
 description = "Troca sem efeito"
 pattern = "48 8B F9 ?? 90"
 offset = 0
@@ -293,6 +326,8 @@ replacement = "48 89 CF"
 
 [[patch]]
 id = "outro"
+name = "Outro"
+category = "itens"
 description = "Outro patch"
 pattern = "90 90 ?? C3"
 offset = 2
@@ -353,6 +388,7 @@ rva = 0x1000
                 addr: HIT + 0x100,
                 original: ORIGINAL.to_vec(),
                 replacement: NEW.to_vec(),
+                next: None,
             }],
         }
     }
@@ -470,6 +506,56 @@ rva = 0x1000
             false,
         );
         assert_eq!(entries[0].state, PatchState::Verified { addr: HIT });
+    }
+
+    #[test]
+    fn journal_hit_accepts_next() {
+        let defs = Signatures::parse(&[("generic.toml", GENERIC)])
+            .unwrap()
+            .for_version("x");
+        let mem = [unique(HIT), none()];
+        let id = identity(5);
+        // Troca de valor interrompida: o diário guarda o valor antigo em `replacement`
+        // (o que não está no jogo agora) e os bytes atuais são os de `next`.
+        let mut j = journal();
+        j.entries[0].replacement = vec![0x48, 0x90, 0x90];
+        j.entries[0].next = Some(NEW.to_vec());
+        let state = |j: &Journal, locked| {
+            resolve(&defs, BASE, &mem, Ok(None), memory, Some((j, &id)), locked)[0]
+                .state
+                .clone()
+        };
+        assert_eq!(state(&j, false), PatchState::Pending { addr: HIT + 0x100 });
+        assert_eq!(state(&j, true), PatchState::Active { addr: HIT + 0x100 });
+        // Bytes que não são nem os de `replacement` nem os de `next`: o diário não vale.
+        j.entries[0].next = Some(vec![0x48, 0x89, 0xCE]);
+        assert!(!matches!(
+            state(&j, true),
+            PatchState::Active { .. } | PatchState::Pending { .. }
+        ));
+    }
+
+    #[test]
+    fn select_defs_keeps_listed_in_order() {
+        let defs = Signatures::parse(&[("generic.toml", GENERIC)])
+            .unwrap()
+            .for_version("x");
+        let names = |ids: Option<&[String]>| -> Vec<String> {
+            select_defs(defs.clone(), ids)
+                .into_iter()
+                .map(|d| d.id)
+                .collect()
+        };
+        assert_eq!(names(None), vec!["teste-codificacao", "outro"]);
+        // A ordem pedida não conta: vale a do arquivo.
+        assert_eq!(
+            names(Some(&ids(&["outro", "teste-codificacao"]))),
+            vec!["teste-codificacao", "outro"]
+        );
+        assert_eq!(names(Some(&ids(&["outro"]))), vec!["outro"]);
+        // `id` desconhecido é ignorado; lista vazia não escolhe nada.
+        assert_eq!(names(Some(&ids(&["fantasma", "outro"]))), vec!["outro"]);
+        assert!(names(Some(&[])).is_empty());
     }
 
     fn catalog(states: Vec<(&str, PatchState)>) -> CatalogScan {

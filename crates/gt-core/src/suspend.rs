@@ -6,6 +6,8 @@
 //! (`pause`, `PauseGuard`, `sample_pcs`, `is_stopped_now`, `open_checked`) exige a
 //! feature `write`.
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::time::{Duration, Instant};
 
 use crate::Result;
@@ -20,6 +22,18 @@ pub enum HookPoint {
     AfterApply,
 }
 
+/// Falhas injetadas pelos testes do motor (só para testes).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fault {
+    /// O primeiro `SIGCONT` do motor falha (uma vez por motor); os seguintes funcionam.
+    ContFailsOnce,
+    /// Todo `SIGCONT` do motor falha.
+    ContFailsAlways,
+    /// A escrita do lote falha e o desfazer também (restos no jogo).
+    WriteAndRollbackFail,
+}
+
 /// Parâmetros da pausa.
 #[derive(Debug, Clone)]
 pub struct PauseConfig {
@@ -32,6 +46,17 @@ pub struct PauseConfig {
     /// Gancho de teste, chamado em pontos fixos da pausa.
     #[doc(hidden)]
     pub hook: Option<fn(HookPoint)>,
+    /// Falha injetada (só para testes do motor).
+    #[doc(hidden)]
+    pub fault: Option<Fault>,
+    /// Conta cada tentativa de `SIGCONT` de `Engine::retry_resume`, inclusive as que
+    /// falham pela injeção (só para testes do motor).
+    #[doc(hidden)]
+    pub resume_counter: Option<Arc<AtomicU32>>,
+    /// O gancho `InPause` e a falha `WriteAndRollbackFail` valem na N-ésima pausa
+    /// bem-sucedida do motor (padrão 1: a primeira). Só para testes do motor.
+    #[doc(hidden)]
+    pub hook_on_pause: u32,
 }
 
 impl Default for PauseConfig {
@@ -41,6 +66,9 @@ impl Default for PauseConfig {
             max_attempts: 10,
             retry_wait: Duration::from_millis(20),
             hook: None,
+            fault: None,
+            resume_counter: None,
+            hook_on_pause: 1,
         }
     }
 }
@@ -225,6 +253,13 @@ mod live {
         /// Retoma o alvo (`SIGCONT`), se foi pausado por nós.
         pub fn resume(mut self) -> Result<()> {
             self.send_cont()
+        }
+
+        /// Marca o alvo como já retomado, sem enviar sinal (injeção de falha de SIGCONT
+        /// nos testes do motor).
+        #[doc(hidden)]
+        pub fn forget_resume(mut self) {
+            self.resumed = true;
         }
 
         fn send_cont(&mut self) -> Result<()> {
@@ -669,5 +704,6 @@ mod tests {
         assert_eq!(c.max_attempts, 10);
         assert_eq!(c.retry_wait, Duration::from_millis(20));
         assert!(c.hook.is_none());
+        assert_eq!(c.hook_on_pause, 1);
     }
 }

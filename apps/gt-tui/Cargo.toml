@@ -6,7 +6,37 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[lib]
+name = "gt_tui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gt-tui"
+path = "src/main.rs"
+
 [dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+gt-core = { workspace = true, features = ["write"] }
+gt-grounded2 = { workspace = true, features = ["write"] }
+nix.workspace = true
+ratatui.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[features]
+# Ganchos para os testes de integração (renderização em backend de teste); sem efeito em produção.
+test-backend = []
+
+[dev-dependencies]
+gt-testkit.workspace = true
+gt-tui = { path = ".", features = ["test-backend"] }
+nix = { workspace = true, features = ["term"] }
+serde_json.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

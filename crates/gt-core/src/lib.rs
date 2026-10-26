@@ -22,5 +22,6 @@ pub mod scan;
 #[cfg(feature = "write")]
 pub mod session;
 pub mod suspend;
+pub mod value;
 
 pub use error::{Error, Result};

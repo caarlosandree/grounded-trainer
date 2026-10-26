@@ -119,6 +119,25 @@ pub fn exec_code(code: &[u8], pages: usize) -> Result<u64> {
     Ok(p as u64)
 }
 
+/// Imediato inicial do laço de valor ([`value_code`]).
+pub const VALUE_INITIAL: u32 = 0x1111_1111;
+
+/// Laço que escreve um valor numa palavra: `mov eax, imm32` (`B8 xx xx xx xx`, imediato
+/// no deslocamento 1), `mov [abs], eax` (`A3` + endereço de 64 bits de `word`) e
+/// `jmp` para o início. O imediato inicial é [`VALUE_INITIAL`].
+///
+/// O trecho de 5 bytes `B8 imm32` é uma instrução inteira: trocar o imediato não muda as
+/// fronteiras de instrução, como numa troca de valor de um cheat.
+pub fn value_code(word: u64) -> Vec<u8> {
+    let mut code = vec![0xB8];
+    code.extend_from_slice(&VALUE_INITIAL.to_le_bytes());
+    code.push(0xA3);
+    code.extend_from_slice(&word.to_le_bytes());
+    // 5 + 9 + 2 = 16 bytes; o salto curto volta 16 bytes (do fim do `jmp` ao início).
+    code.extend_from_slice(&[0xEB, 0xF0]);
+    code
+}
+
 /// Cria uma thread que salta para `addr` e nunca volta.
 ///
 /// Só para testes: `addr` deve ser código do próprio teste (ex. de [`exec_code`]) que

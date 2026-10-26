@@ -7,12 +7,38 @@
 //! tentativas pela regra de perigo → identidade → releitura sob pausa → conferência de
 //! que tudo continua parado → escrita e releitura → SIGCONT → diário final.
 //!
+//! A troca de valor de um patch ativo ([`Engine::set_replacement`]) usa a mesma pausa
+//! conferida, sem ponto perigoso (os dois valores têm as mesmas fronteiras de instrução).
+//! Durante a troca o ativo fica fora de `active` e a entrada `{ original, replacement:
+//! antigo, next: Some(novo) }` fica em `pending`, para o diário nunca perder o `next`.
+//!
 //! O diário em disco espelha o que o motor guarda em memória: os patches ativos e as
 //! entradas ainda não resolvidas (intenções de um lote em curso, entradas vindas da
 //! recuperação, restos de uma falha). O `Drop` desfaz os ativos e tenta resolver o resto.
+//!
+//! # Desfechos de uma operação
+//!
+//! Não há enum de desfecho: quem chama classifica pelo resultado e pelo estado do motor.
+//!
+//! - **Sucesso**: `Ok(report)` com o `id` em `report.restored`.
+//! - **Bytes de outro**: `Ok(report)` com o `id` em `report.foreign`; o patch sai do
+//!   registro e nada é escrito.
+//! - **Recusa limpa**: qualquer outro `Err` com o `id` **fora** de [`Engine::pending_ids`]
+//!   (`ThreadsInPatch`, `PauseTimeout`, `BytesMismatch`, `Journal`, `Io`, `WriteRefused`,
+//!   `OutsidePolicy`, `Overlap`, `BadPatch` e, na troca de valor, `NotActive` e
+//!   `BoundariesChanged`). Nada ficou escrito pela operação.
+//! - **SIGCONT que falhou**: depois de **qualquer** operação, [`Engine::is_stuck`] diz se
+//!   o jogo pode ter ficado parado por nós; isso pode acontecer sem restos.
+//! - **Restos**: `Err(_)` com o `id` em [`Engine::pending_ids`]; a entrada fica no diário
+//!   e bloqueia o trecho até [`Engine::restore_pending`] (ou o `Drop`, ou a próxima
+//!   execução) resolvê-la.
+//! - **Jogo fechou**: `Err(ProcessGone)`; o motor já descartou ativos, pendentes e o
+//!   diário sem escrever. Sem rodar operação, [`Engine::discard_gone`] faz o mesmo.
 
-use std::ops::Range;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+
+use nix::sys::signal::Signal;
 
 use crate::journal::{EntryAction, Journal, JournalEntry, JournalLock, JournalStore, decide_entry};
 use crate::maps::{MapRegion, read_maps};
@@ -22,7 +48,7 @@ use crate::patch::{
 };
 use crate::procinfo::{Identity, ThreadPos, check_alive, identity};
 use crate::suspend::{
-    HookPoint, PauseConfig, PauseGuard, Thread, is_stopped_now, pause, resume_points,
+    Fault, HookPoint, PauseConfig, PauseGuard, Thread, is_stopped_now, pause, resume_points,
 };
 use crate::{Error, Result};
 
@@ -72,6 +98,9 @@ enum Danger {
     One(Direction),
     /// Restauração com bytes possivelmente misturados: união dos dois sentidos.
     Both,
+    /// Troca de valor: os dois lados têm as mesmas fronteiras (conferido antes), então
+    /// nenhum ponto de retomada é perigoso.
+    None,
 }
 
 /// O que uma escrita do lote faz.
@@ -83,6 +112,9 @@ enum Kind {
     Undo,
     /// Entrada do diário: decisão por byte (`decide_entry`).
     Restore(JournalEntry),
+    /// Troca de valor de um patch ativo: `from` → novos (`spec.replacement`); bytes
+    /// diferentes de `from` são de outro.
+    Swap { from: Vec<u8> },
 }
 
 /// Uma escrita do lote.
@@ -192,6 +224,36 @@ fn settle_resume(
     })
 }
 
+/// Erro do SIGCONT simulado pela injeção de falha dos testes.
+fn simulated_cont_error() -> Error {
+    Error::Io(std::io::Error::other("falha de SIGCONT simulada"))
+}
+
+/// A injeção de falha deve trocar este SIGCONT por um erro? `ContFailsOnce` dispara uma
+/// vez por motor (`fired`); só vale quando fomos nós que enviamos o `SIGSTOP`.
+fn inject_cont_fault(fault: Option<Fault>, fired: &mut bool, sent_stop: bool) -> bool {
+    if !sent_stop {
+        return false;
+    }
+    match fault {
+        Some(Fault::ContFailsAlways) => true,
+        Some(Fault::ContFailsOnce) if !*fired => {
+            *fired = true;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Retoma o alvo ao fim de uma tentativa pausada, com a falha de SIGCONT dos testes.
+fn resume_guard(guard: PauseGuard<'_>, fault: Option<Fault>, fired: &mut bool) -> Result<()> {
+    if inject_cont_fault(fault, fired, guard.sent_stop()) {
+        guard.forget_resume();
+        return Err(simulated_cont_error());
+    }
+    guard.resume()
+}
+
 /// Motor de patches de um processo.
 ///
 /// Quem cria o motor segura a [`JournalLock`] enquanto ele existir.
@@ -208,9 +270,16 @@ pub struct Engine {
     active: Vec<Validated>,
     /// Entradas do diário que não são patches ativos.
     pending: Vec<JournalEntry>,
-    in_pause_fired: bool,
+    /// Pausas bem-sucedidas deste motor (o gancho e a falha de escrita injetados valem na
+    /// `hook_on_pause`-ésima).
+    pauses_ok: u32,
     after_apply_fired: bool,
     in_drop: bool,
+    /// O SIGCONT falhou e o alvo pode ter ficado parado por nós: vale até um SIGCONT
+    /// bem-sucedido (ou o jogo fechar). Enquanto valer, todo diário grava o marcador.
+    stuck: bool,
+    /// A falha injetada `ContFailsOnce` já disparou neste motor.
+    cont_fault_fired: bool,
 }
 
 impl Engine {
@@ -251,37 +320,81 @@ impl Engine {
             pause_cfg: opts.pause,
             active: Vec::new(),
             pending: Vec::new(),
-            in_pause_fired: false,
+            pauses_ok: 0,
             after_apply_fired: false,
             in_drop: false,
+            stuck: false,
+            cont_fault_fired: false,
         })
     }
 
     /// Aplica um lote de patches (spec 6.2, passos 1–8). Tudo ou nada.
     pub fn apply(&mut self, batch: Vec<Validated>) -> Result<BatchReport> {
+        self.retry_resume()?;
         let result = self.apply_inner(batch);
         self.finish(result)
     }
 
     /// Desfaz os patches ativos com estes `id` (os outros `id` são ignorados).
     pub fn undo(&mut self, ids: &[&str]) -> Result<BatchReport> {
+        self.retry_resume()?;
         let result = self.undo_inner(|v| ids.contains(&v.spec.id.as_str()));
         self.finish(result)
     }
 
     /// Desfaz todos os patches ativos.
     pub fn undo_all(&mut self) -> Result<BatchReport> {
+        self.retry_resume()?;
         let result = self.undo_inner(|_| true);
+        self.finish(result)
+    }
+
+    /// Troca os bytes do patch ativo `id` por `new` numa pausa (spec 003 6.7).
+    ///
+    /// Os bytes originais continuam sendo os de antes do patch; `new` precisa ter o mesmo
+    /// tamanho e as mesmas fronteiras de instrução dos bytes atuais do patch
+    /// ([`Error::BoundariesChanged`] senão), então não há ponto perigoso. Durante a troca o
+    /// diário guarda `{ original, replacement: antigo, next: novo }`. Desfechos: veja o
+    /// topo do módulo (sucesso, bytes de outro em `foreign`, recusa limpa, restos, SIGCONT
+    /// que falhou e jogo fechou). `id` sem patch ativo: [`Error::NotActive`].
+    pub fn set_replacement(&mut self, id: &str, new: Vec<u8>) -> Result<BatchReport> {
+        self.retry_resume()?;
+        let result = self.swap_inner(id, new);
         self.finish(result)
     }
 
     /// Resolve entradas do diário: reescreve os originais onde cada byte é o original ou
     /// o nosso, esquece as que já estão originais e não toca nas de outro.
     ///
-    /// Falha por perigo ou prazo mantém as entradas no diário.
+    /// Falha por perigo ou prazo mantém as entradas no diário. Entradas fora da política de
+    /// escrita vão para `outside_policy`: não são tocadas e continuam no diário, porque os bytes
+    /// podem ser nossos e a próxima execução precisa vê-las.
     pub fn restore_entries(&mut self, entries: Vec<JournalEntry>) -> Result<RestoreReport> {
+        self.retry_resume()?;
         let result = self.restore_inner(entries);
         self.finish(result)
+    }
+
+    /// Restaura as entradas pendentes (restos de uma falha e intenções não resolvidas),
+    /// como na recuperação: é [`Engine::restore_entries`] com todas elas. Sem pendentes,
+    /// não escreve nada (o SIGCONT que falhou ainda é tentado antes).
+    pub fn restore_pending(&mut self) -> Result<RestoreReport> {
+        let entries = self.pending.clone();
+        self.restore_entries(entries)
+    }
+
+    /// `id` das entradas pendentes: restos de uma falha e intenções não resolvidas.
+    pub fn pending_ids(&self) -> Vec<String> {
+        self.pending.iter().map(|e| e.id.clone()).collect()
+    }
+
+    /// Se o jogo já terminou, descarta o registro sem escrever (zera ativos, pendentes e
+    /// `stuck`, limpa o diário), como o fim de uma operação com [`Error::ProcessGone`].
+    /// Com o jogo vivo, ou se não deu para saber, não faz nada.
+    pub fn discard_gone(&mut self) {
+        if let Err(e @ Error::ProcessGone { .. }) = check_alive(&self.identity) {
+            let _ = self.finish::<()>(Err(e));
+        }
     }
 
     /// Patches ativos.
@@ -301,12 +414,63 @@ impl Engine {
         &self.store
     }
 
+    /// O último SIGCONT falhou e o alvo pode ter ficado parado por nós. Enquanto isso
+    /// valer, o diário mantém o marcador "pausado por nós".
+    pub fn is_stuck(&self) -> bool {
+        self.stuck
+    }
+
+    /// Tenta de novo o SIGCONT que falhou. Sem `stuck`, não faz nada e não envia sinal.
+    ///
+    /// Com `stuck`, envia SIGCONT pelo `pidfd`: sucesso limpa o estado e regrava o diário
+    /// sem o marcador (apagando o arquivo se não houver entradas); [`Error::ProcessGone`]
+    /// descarta o registro e o diário; qualquer outra falha mantém o estado e o devolve.
+    ///
+    /// Toda operação do motor (e o `Drop`) chama isto antes de qualquer outra coisa,
+    /// inclusive antes da conferência "o alvo já está parado?": um alvo que nós deixamos
+    /// parado pareceria parado por outro.
+    pub fn retry_resume(&mut self) -> Result<()> {
+        if !self.stuck {
+            return Ok(());
+        }
+        if let Some(counter) = &self.pause_cfg.resume_counter {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+        let sent = if self.pause_cfg.fault == Some(Fault::ContFailsAlways) {
+            Err(simulated_cont_error())
+        } else {
+            self.pidfd.send(Signal::SIGCONT)
+        };
+        match sent {
+            Ok(()) => {
+                tracing::warn!(pid = self.pid, "SIGCONT enviado de novo; jogo retomado");
+                self.stuck = false;
+                self.save_final();
+                Ok(())
+            }
+            Err(e) => {
+                if !matches!(e, Error::ProcessGone { .. }) {
+                    tracing::error!(erro = %e, "nova tentativa de SIGCONT falhou; o diário mantém o marcador");
+                }
+                self.finish(Err(e))
+            }
+        }
+    }
+
+    /// Marca o motor como `stuck` e grava o diário com o marcador (só para testes).
+    #[doc(hidden)]
+    pub fn force_stuck_for_test(&mut self) {
+        self.stuck = true;
+        self.save_logged(true);
+    }
+
     /// `ProcessGone` descarta o registro e limpa o diário (sem escrever nada).
     fn finish<T>(&mut self, result: Result<T>) -> Result<T> {
         if let Err(Error::ProcessGone { pid }) = &result {
             tracing::warn!(pid, "o jogo fechou; patches descartados sem escrever");
             self.active.clear();
             self.pending.clear();
+            self.stuck = false;
             if let Err(e) = self.store.clear() {
                 tracing::error!(erro = %e, "falha ao limpar o diário");
             }
@@ -332,7 +496,7 @@ impl Engine {
                 .active
                 .iter()
                 .map(|a| a.spec.range())
-                .chain(self.pending.iter().map(entry_range))
+                .chain(self.pending.iter().map(JournalEntry::range))
                 .chain(batch[..i].iter().map(|b| b.spec.range()))
                 .any(|r| overlaps(&r, &range));
             if busy {
@@ -387,6 +551,102 @@ impl Engine {
                 if !f.dirty {
                     self.forget_pending(&entries);
                 }
+                self.stuck |= f.stuck;
+                self.save_logged(f.stuck);
+                Err(f.error)
+            }
+        }
+    }
+
+    fn swap_inner(&mut self, id: &str, new: Vec<u8>) -> Result<BatchReport> {
+        let index = self
+            .active
+            .iter()
+            .position(|v| v.spec.id == id)
+            .ok_or_else(|| Error::NotActive { id: id.to_owned() })?;
+        let old = self.active[index].clone();
+        check_alive(&self.identity)?;
+        let policy = self.current_policy()?;
+        if !policy.allows(&old.spec.range()) {
+            return Err(Error::OutsidePolicy {
+                id: id.to_owned(),
+                addr: old.spec.addr,
+            });
+        }
+        let fresh = validate(PatchSpec {
+            id: id.to_owned(),
+            addr: old.spec.addr,
+            expected: old.spec.expected.clone(),
+            replacement: new.clone(),
+        })?;
+        if fresh.replacement_starts != old.replacement_starts {
+            return Err(Error::BoundariesChanged { id: id.to_owned() });
+        }
+        let op = Op {
+            v: fresh,
+            danger: Danger::None,
+            kind: Kind::Swap {
+                from: old.spec.replacement.clone(),
+            },
+        };
+        // Leitura prévia, sem pausa: bytes que não são os do valor atual são de outro.
+        if let Decision::Skip(_) = self.decide_now(&op)?.0 {
+            tracing::warn!(id = %id, "bytes do patch alterados por outro; tirado do registro sem escrever");
+            self.active.remove(index);
+            self.save_final();
+            return Ok(BatchReport {
+                foreign: vec![id.to_owned()],
+                ..BatchReport::default()
+            });
+        }
+
+        // Intenção antes da pausa (com o marcador, se vamos pausar). Em memória, o ativo
+        // sai de `active` e a entrada com `next` entra em `pending`: qualquer regravação do
+        // diário no meio da troca mantém o `next`.
+        let entry = JournalEntry {
+            next: Some(new),
+            ..entry_of(&old)
+        };
+        let will_stop = !is_stopped_now(self.pid)?;
+        self.active.remove(index);
+        self.pending.push(entry.clone());
+        if let Err(e) = self.save_journal(will_stop) {
+            self.forget_pending(std::slice::from_ref(&entry));
+            self.active.insert(index.min(self.active.len()), old);
+            return Err(e);
+        }
+
+        match self.locked_write(std::slice::from_ref(&op), will_stop) {
+            Ok(pass) => {
+                self.forget_pending(std::slice::from_ref(&entry));
+                let mut report = BatchReport {
+                    pause: pass.pause,
+                    danger_retries: pass.danger_retries,
+                    timeout_retries: pass.timeout_retries,
+                    ..BatchReport::default()
+                };
+                if pass.outcomes.first().is_some_and(Option::is_none) {
+                    self.active.insert(index.min(self.active.len()), op.v);
+                    report.restored.push(id.to_owned());
+                } else {
+                    // Os bytes mudaram na pausa: o patch deixou de ser nosso.
+                    tracing::warn!(id = %id, "bytes do patch alterados por outro; tirado do registro sem escrever");
+                    report.foreign.push(id.to_owned());
+                }
+                self.save_final();
+                Ok(report)
+            }
+            Err(f) => {
+                if matches!(f.error, Error::ProcessGone { .. }) {
+                    return Err(f.error);
+                }
+                // Sem sobra escrita o ativo antigo volta; com sobra, a entrada com `next`
+                // fica pendente para a restauração.
+                if !f.dirty {
+                    self.forget_pending(std::slice::from_ref(&entry));
+                    self.active.insert(index.min(self.active.len()), old);
+                }
+                self.stuck |= f.stuck;
                 self.save_logged(f.stuck);
                 Err(f.error)
             }
@@ -461,7 +721,7 @@ impl Engine {
         let mut resolved: Vec<JournalEntry> = Vec::new();
         let mut ops = Vec::new();
         for e in entries {
-            if !policy.allows(&entry_range(&e)) {
+            if !policy.allows(&e.range()) {
                 // Não conta como resolvida: os bytes podem ser nossos, então a entrada
                 // fica no diário para a próxima execução (spec 6.7).
                 tracing::warn!(
@@ -537,6 +797,7 @@ impl Engine {
                         }
                     }
                 }
+                self.stuck |= f.stuck;
                 self.save_logged(f.stuck);
                 Err(f.error)
             }
@@ -586,6 +847,13 @@ impl Engine {
                     Decision::Skip(Skip::Foreign)
                 }
             }
+            Kind::Swap { from } => {
+                if current == *from {
+                    Decision::Write(spec.replacement.clone())
+                } else {
+                    Decision::Skip(Skip::Foreign)
+                }
+            }
             Kind::Restore(e) => match decide_entry(e, &current) {
                 EntryAction::Restore => Decision::Write(e.original.clone()),
                 EntryAction::Drop => Decision::Skip(Skip::Dropped),
@@ -610,15 +878,12 @@ impl Engine {
                 std::thread::sleep(self.pause_cfg.retry_wait);
             }
             check_alive(&self.identity).map_err(Failure::clean)?;
-            let (cfg, armed) = self.next_pause_config();
+            let cfg = self.next_pause_config();
             let started = Instant::now();
             let guard = match pause(&self.pidfd, self.pid, &cfg, need_positions) {
                 Ok(guard) => guard,
                 Err(e) => {
-                    // O gancho só dispara numa pausa que deu certo.
-                    if armed {
-                        self.in_pause_fired = false;
-                    }
+                    // O gancho só dispara numa pausa que deu certo, e só ela conta.
                     match e {
                         Error::PauseTimeout { .. } => {
                             timeout_retries += 1;
@@ -629,12 +894,16 @@ impl Engine {
                     }
                 }
             };
+            self.pauses_ok += 1;
             if needs_marker(guard.sent_stop(), marked) {
                 tracing::debug!(
                     attempt,
                     "alvo retomado antes da pausa e diário sem marcador; nova tentativa"
                 );
-                settle_resume(Ok(Step::Resumed), guard.resume())?;
+                settle_resume(
+                    Ok(Step::Resumed),
+                    resume_guard(guard, self.pause_cfg.fault, &mut self.cont_fault_fired),
+                )?;
                 self.save_journal(true).map_err(Failure::clean)?;
                 marked = true;
                 timeout_retries += 1;
@@ -645,7 +914,8 @@ impl Engine {
             let pause_len = started.elapsed();
             // O SIGCONT sai sempre por aqui (nunca pelo `Drop` do guarda), para que a falha
             // dele chegue a quem grava o diário.
-            match settle_resume(step, guard.resume())? {
+            let cont = resume_guard(guard, self.pause_cfg.fault, &mut self.cont_fault_fired);
+            match settle_resume(step, cont)? {
                 Step::Danger(id) => {
                     danger_retries += 1;
                     last_danger = Some(id);
@@ -727,6 +997,22 @@ impl Engine {
                 Decision::Write(bytes) => bytes,
             };
             let addr = op.v.spec.addr;
+            if self.pause_cfg.fault == Some(Fault::WriteAndRollbackFail)
+                && self.pauses_ok == self.pause_cfg.hook_on_pause
+            {
+                // Falha injetada (testes): os bytes novos ficam no jogo e o desfazer
+                // "também falha", deixando restos.
+                if let Err(error @ Error::ProcessGone { .. }) =
+                    self.write_verified(&op.v.spec.id, addr, &bytes)
+                {
+                    return Err(Failure::clean(error));
+                }
+                return Err(Failure {
+                    error: Error::Io(std::io::Error::other("falha de escrita simulada")),
+                    dirty: true,
+                    stuck: false,
+                });
+            }
             if let Err(error) = self.write_verified(&op.v.spec.id, addr, &bytes) {
                 if matches!(error, Error::ProcessGone { .. }) {
                     return Err(Failure::clean(error));
@@ -789,16 +1075,15 @@ impl Engine {
         clean
     }
 
-    /// Cópia da configuração da pausa: o gancho só vai na primeira pausa (nunca no `Drop`).
-    fn next_pause_config(&mut self) -> (PauseConfig, bool) {
+    /// Cópia da configuração da pausa: o gancho só vai na `hook_on_pause`-ésima pausa
+    /// bem-sucedida (nunca no `Drop`); a pausa que falha antes do gancho não conta.
+    fn next_pause_config(&self) -> PauseConfig {
         let mut cfg = self.pause_cfg.clone();
-        let armed = cfg.hook.is_some() && !self.in_pause_fired && !self.in_drop;
-        if armed {
-            self.in_pause_fired = true;
-        } else {
+        let armed = !self.in_drop && self.pauses_ok.saturating_add(1) == cfg.hook_on_pause;
+        if !armed {
             cfg.hook = None;
         }
-        (cfg, armed)
+        cfg
     }
 
     fn fire_after_apply(&mut self) {
@@ -828,6 +1113,8 @@ impl Engine {
 
     /// Grava o diário com o estado em memória; sem entradas nem marcador, apaga.
     fn save_journal(&self, paused_by_us: bool) -> Result<()> {
+        // `stuck` mantém o marcador em toda gravação, até um SIGCONT bem-sucedido.
+        let paused_by_us = paused_by_us || self.stuck;
         let entries = self.journal_entries();
         if entries.is_empty() && !paused_by_us {
             return self.store.clear();
@@ -870,6 +1157,12 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         self.in_drop = true;
+        // Primeiro o SIGCONT que falhou, mesmo sem nenhum patch ativo.
+        match self.retry_resume() {
+            Ok(()) => {}
+            Err(Error::ProcessGone { .. }) => return,
+            Err(e) => tracing::error!(erro = %e, "falha ao retomar o jogo na saída"),
+        }
         if !self.active.is_empty() {
             match self.undo_all() {
                 Ok(_) => {}
@@ -888,7 +1181,7 @@ impl Drop for Engine {
         }
         if !self.journal_entries().is_empty() {
             tracing::error!(
-                "alguns patches não puderam ser restaurados; a próxima execução do gt-patch vai restaurar"
+                "alguns patches não puderam ser restaurados; a próxima execução do trainer vai restaurar"
             );
         }
     }
@@ -900,12 +1193,8 @@ fn entry_of(v: &Validated) -> JournalEntry {
         addr: v.spec.addr,
         original: v.spec.expected.clone(),
         replacement: v.spec.replacement.clone(),
+        next: None,
     }
-}
-
-fn entry_range(e: &JournalEntry) -> Range<u64> {
-    let len = u64::try_from(e.original.len()).unwrap_or(u64::MAX);
-    e.addr..e.addr.saturating_add(len)
 }
 
 fn has_lost(v: &Validated, danger: Danger) -> bool {
@@ -913,6 +1202,7 @@ fn has_lost(v: &Validated, danger: Danger) -> bool {
         Danger::One(Direction::Apply) => !v.lost_on_apply().is_empty(),
         Danger::One(Direction::Undo) => !v.lost_on_undo().is_empty(),
         Danger::Both => !v.lost_on_apply().is_empty() || !v.lost_on_undo().is_empty(),
+        Danger::None => false,
     }
 }
 
@@ -922,6 +1212,7 @@ fn point_dangerous(v: &Validated, danger: Danger, point: Option<u64>) -> bool {
         Danger::Both => {
             is_dangerous(v, Direction::Apply, point) || is_dangerous(v, Direction::Undo, point)
         }
+        Danger::None => false,
     }
 }
 
@@ -973,6 +1264,48 @@ mod tests {
         assert!(!needs_marker(true, true));
         assert!(!needs_marker(false, false));
         assert!(!needs_marker(false, true));
+    }
+
+    #[test]
+    fn cont_fault_injection_rules() {
+        let mut fired = false;
+        // Sem falha configurada, ou sem SIGSTOP nosso, nunca injeta.
+        assert!(!inject_cont_fault(None, &mut fired, true));
+        assert!(!inject_cont_fault(
+            Some(Fault::ContFailsAlways),
+            &mut fired,
+            false
+        ));
+        assert!(!inject_cont_fault(
+            Some(Fault::WriteAndRollbackFail),
+            &mut fired,
+            true
+        ));
+        // `ContFailsOnce` dispara uma vez só (e só conta quando de fato disparou).
+        assert!(!inject_cont_fault(
+            Some(Fault::ContFailsOnce),
+            &mut fired,
+            false
+        ));
+        assert!(!fired);
+        assert!(inject_cont_fault(
+            Some(Fault::ContFailsOnce),
+            &mut fired,
+            true
+        ));
+        assert!(!inject_cont_fault(
+            Some(Fault::ContFailsOnce),
+            &mut fired,
+            true
+        ));
+        // `ContFailsAlways` sempre injeta.
+        for _ in 0..3 {
+            assert!(inject_cont_fault(
+                Some(Fault::ContFailsAlways),
+                &mut fired,
+                true
+            ));
+        }
     }
 
     #[test]

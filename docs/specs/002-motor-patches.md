@@ -309,6 +309,11 @@ Decisão do dono: cobrir SIGKILL, travamento e queda de energia com um diário.
     e avisa. `restore` com o jogo fechado não é erro: descarta e sai com 0;
   - diário ilegível ou corrompido: não escreve nada no jogo, renomeia o arquivo para `journal.json.bad` e avisa.
 - A decisão de recuperação (o que fazer com cada entrada) é uma função pura, testada sem processo.
+- **Nota (Fase 3, troca de valor):** uma troca de valor interrompida deixa no diário três conjuntos de bytes
+  por patch: os originais, os do valor antigo (`replacement`) e os do valor novo (campo opcional `next`). Na
+  recuperação, "o original ou o novo daquela posição" passa a valer também para o valor novo: cada byte igual ao
+  original, ao do valor antigo ou ao do valor novo restaura os originais; qualquer outro byte segue a regra de
+  "bytes de outro". Diários da Fase 2 (sem `next`) continuam legíveis. Ver spec 003, 6.7.
 
 ### 6.9 Patch de teste
 
@@ -372,6 +377,9 @@ Mensagens claras para: jogo não encontrado (mesma regra do `gt`), sem permissã
 patch desconhecido, patch indisponível (com o estado), bytes diferentes do esperado (mostrando os encontrados),
 threads que não saem do trecho, jogo que não pausa no prazo, outro `gt-patch` em execução, jogo fechou durante a
 operação.
+
+**Nota (Fase 3):** a mensagem da trava ocupada cita os dois programas que a pegam: "outro gt-patch ou gt-tui já
+está em execução", com a dica "feche o outro programa antes". Vale para o `gt-patch` e para o `gt-tui`.
 
 ### 6.12 Extensão dos módulos confiáveis (pendência da Fase 1)
 
