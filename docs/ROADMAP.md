@@ -81,6 +81,9 @@ ainda não há cheat real com valor (Fase 4).
 
 ## Fase 4 — Primeiros cheats (patch de código simples)
 
+**Status:** ✅ concluída em 2026-10-26 (spec e plano `004-cheats-patch-simples`). Os três cheats confirmados no jogo
+pelo dono pela TUI, inclusive depois de reiniciar o jogo.
+
 **Objetivo:** primeiras funcionalidades reais, com troca de bytes do mesmo tamanho pelo motor da Fase 2, sem código
 novo de motor.
 
@@ -90,7 +93,7 @@ precisam do pawn do jogador ou de código novo e foram para as Fases 5 e 6.
 | Categoria | Cheat | Ponto (build `c935e799`) |
 |---|---|---|
 | Itens | Durabilidade infinita | `+5a4e777`: anular a subtração do desgaste |
-| Itens | Energia infinita (tocha e itens com energia) | `+5a5744b`: anular a soma da energia gasta |
+| Itens | Tocha infinita (energia da tocha e de itens com energia) | `+5a5744b`: anular a soma da energia gasta |
 | Itens | Recarga instantânea de item | `+5c3bbfc`: a recarga restante termina no quadro seguinte |
 
 **Pronto quando:** cada cheat da tabela funciona no jogo, liga e desliga pela TUI e sobrevive a reiniciar o jogo.

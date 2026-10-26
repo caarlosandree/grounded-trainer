@@ -507,6 +507,22 @@ Binário `target/debug/gt-tui --diagnostico`; conferência por `gt diff` e `gt-p
   Sem diário nem motor; encerrado à mão.
 - **Opinião do dono sobre a TUI:** "achei bom".
 
+## Sessão de 2026-10-26 (Fase 4): os três patches simples no jogo
+
+Build `c935e799-0b27c000` (`Augusta-CL-3207493`). Save de teste, FLiNG fechado, backup do save feito pelo dono.
+
+- **Testes `#[ignore]` de `gt-patch` com o jogo aberto:** 3 passaram em 252 s, inclusive `phase4_cheats_round_trip`
+  (liga e desliga cada um dos três; `gt diff` limpo no fim). O jogo seguiu aberto.
+- **Durabilidade infinita (`+5a4e777`):** ligada, a durabilidade de ferramentas e armas não cai; desligada, volta a
+  cair. **Também vale para a armadura** (mesma rotina de desgaste). Reparo com o cheat ligado: não testado.
+- **Tocha infinita (`energia-infinita`, `+5a5744b`):** ligada, a energia da tocha para de cair; desligada, volta a cair.
+  Renomeada de "Energia infinita" para não confundir com a stamina do personagem (`StaminaComponent`, Fase 5).
+- **Recarga instantânea (`+5c3bbfc`):** testada com o curativo: dá para usar de novo sem esperar. Funcionou com os
+  outros dois ligados ao mesmo tempo.
+- **Reinício do jogo:** com os três ligados e a TUI aberta, o jogo fechado e reaberto; a TUI reconectou e os três
+  voltaram ligados e funcionando.
+- **Saída:** `q` na TUI; `gt diff` mostrou `nenhuma alteração`. Jogo estável o tempo todo (relato do dono).
+
 ## Hipóteses descartadas
 
 - (2026-10-25) "Os patches em `+57BD6D0`/`+5BBFE8C` indicam que as opções de cargas e arrastar item estavam

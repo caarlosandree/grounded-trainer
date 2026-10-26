@@ -3,7 +3,7 @@
 | Campo | Valor |
 |---|---|
 | Fase | 4 (ver `docs/ROADMAP.md`, reorganizada em 2026-10-26) |
-| Estado | Escrita sob delegação do dono ("o que for melhor"), revisada por subagente; aprovação final com o teste no jogo |
+| Estado | Aprovada; critério de pronto confirmado no jogo pelo dono em 2026-10-26 |
 | Data | 2026-10-26 |
 
 ## 1. Intenção
@@ -20,7 +20,8 @@ as trocas são nossas: instruções neutras escolhidas por nós, sem copiar byte
 
 1. Três cheats na categoria **Itens** da TUI, ligando e desligando pelo motor existente:
    - **Durabilidade infinita** (`durabilidade-infinita`);
-   - **Energia infinita** (`energia-infinita`): tocha e outros itens que gastam energia;
+   - **Tocha infinita** (`energia-infinita`): tocha e outros itens que gastam energia (renomeado de "Energia
+     infinita" no fechamento, para não confundir com a stamina do personagem);
    - **Recarga instantânea** (`recarga-instantanea`): a espera para usar item de novo acaba no primeiro quadro em
      que o jogo a confere.
 2. Definições em `generic.toml` (valem para qualquer versão, com conferência de padrão único) e entrada verificada
@@ -101,7 +102,7 @@ ferramentas, armas e armaduras para de cair.
 - Vale para todos os itens que passam por este ponto, não só os do jogador. Num jogo solo, os itens são os do
   jogador.
 
-### 6.2 Energia infinita
+### 6.2 Tocha infinita (id `energia-infinita`)
 
 Código do jogo (`Item.PowerUsed` = `+0x250`):
 
@@ -117,7 +118,7 @@ Código do jogo (`Item.PowerUsed` = `+0x250`):
 
 | Campo | Valor |
 |---|---|
-| `id` / `name` | `energia-infinita` / `Energia infinita` |
+| `id` / `name` | `energia-infinita` / `Tocha infinita` |
 | `category` | `itens` |
 | `pattern` | `f3 0f 10 81 50 02 00 00 0f 28 c8 f3 0f 58 cb f3 0f 5d ca 0f 2e c8 74` |
 | `offset` | `11` |
