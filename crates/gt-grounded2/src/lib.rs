@@ -12,6 +12,7 @@ pub mod signatures;
 pub mod state;
 pub mod target;
 pub mod trust;
+pub mod ue;
 
 pub use error::{Error, Result};
 
