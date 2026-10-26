@@ -46,6 +46,32 @@ pub fn write_policy(module: &Module, disk: &PeHeaders, maps: &[MapRegion]) -> Wr
     WritePolicy::new(allowed)
 }
 
+/// Onde o motor pode escrever em dados (spec 005, 6.4): regiões `rw-` do `maps` (sem execução),
+/// menos as imagens de módulo (`images`, de `base` a `end` de cada módulo). Os objetos do jogo
+/// moram no heap; a `.data` dos módulos nunca é escrita por um cheat de valor.
+pub fn data_policy(images: &[Range<u64>], maps: &[MapRegion]) -> WritePolicy {
+    let mut allowed: Vec<Range<u64>> = Vec::new();
+    for region in maps
+        .iter()
+        .filter(|r| r.perms.read && r.perms.write && !r.perms.exec)
+    {
+        // A região menos cada imagem que a corta.
+        let mut pieces: Vec<Range<u64>> = std::iter::once(region.start..region.end).collect();
+        for image in images {
+            pieces = pieces
+                .into_iter()
+                .flat_map(|p| {
+                    let left = p.start..p.end.min(image.start);
+                    let right = p.start.max(image.end)..p.end;
+                    [left, right].into_iter().filter(|r| r.start < r.end)
+                })
+                .collect();
+        }
+        allowed.extend(pieces);
+    }
+    WritePolicy::new(allowed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +196,30 @@ mod tests {
         ];
         let policy = write_policy(&module(true, 0x5000), &disk(), &split);
         assert!(policy.allows(&(BASE + 0x1ffe..BASE + 0x2002)));
+    }
+
+    #[test]
+    fn data_policy_is_rw_heap_outside_images() {
+        let maps = vec![
+            region(0x1000, 0x2000, "rw-p"),
+            region(0x2000, 0x3000, "r-xp"),
+            region(0x3000, 0x6000, "rw-p"),
+            region(0x6000, 0x7000, "r--p"),
+            region(0x7000, 0x8000, "rwxp"),
+        ];
+        // Uma imagem de módulo no meio da segunda região rw.
+        let image: Vec<Range<u64>> = std::iter::once(0x4000..0x5000).collect();
+        let p = data_policy(&image, &maps);
+        assert!(p.allows(&(0x1000..0x1004)));
+        assert!(p.allows(&(0x3ffc..0x4000)));
+        assert!(!p.allows(&(0x3ffe..0x4002)));
+        assert!(!p.allows(&(0x4000..0x4001)));
+        assert!(p.allows(&(0x5000..0x5001)));
+        // Executável, só leitura e rwx ficam de fora.
+        assert!(!p.allows(&(0x2000..0x2001)));
+        assert!(!p.allows(&(0x6000..0x6001)));
+        assert!(!p.allows(&(0x7000..0x7001)));
+        // Sem imagens, a região inteira vale.
+        assert!(data_policy(&[], &maps).allows(&(0x3000..0x6000)));
     }
 }

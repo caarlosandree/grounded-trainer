@@ -12,7 +12,7 @@ anyhow.workspace = true
 # `test-support` ficam nas dependências normais.
 gt-core = { workspace = true, features = ["write", "test-support"] }
 # Cena de reflexão sintética do `gt-testtarget --ue` e as definições que casam com ela.
-gt-grounded2.workspace = true
+gt-grounded2 = { workspace = true, features = ["write"] }
 gt-ue = { workspace = true, features = ["synth"] }
 nix = { workspace = true, features = ["signal"] }
 serde_json.workspace = true

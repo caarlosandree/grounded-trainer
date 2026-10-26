@@ -69,6 +69,8 @@ struct PlayerPath {
 #[derive(Debug, Clone)]
 struct CatalogEntry {
     id: String,
+    /// Nome curto do cheat (para os eventos).
+    name: String,
     resolved: Result<ResolvedField, String>,
 }
 
@@ -103,6 +105,7 @@ impl FieldCatalog {
                 }
                 CatalogEntry {
                     id: def.id.clone(),
+                    name: def.name.clone(),
                     resolved,
                 }
             })
@@ -121,6 +124,19 @@ impl FieldCatalog {
             Some(r) => r.as_ref().map(|_| ()).map_err(Clone::clone),
             None => Err(format!("{id} desconhecido")),
         }
+    }
+
+    /// Nome curto do cheat `id`.
+    pub fn name(&self, id: &str) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.name.as_str())
+    }
+
+    /// `id` dos cheats, na ordem das definições.
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|e| e.id.as_str())
     }
 
     /// Resultado da resolução do cheat `id`.

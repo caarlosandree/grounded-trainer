@@ -2,6 +2,8 @@
 
 pub mod catalog;
 pub mod error;
+#[cfg(feature = "write")]
+pub mod fields;
 pub mod fling;
 #[cfg(feature = "write")]
 pub mod patching;
