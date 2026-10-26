@@ -275,8 +275,17 @@ fn resume_guard(guard: PauseGuard<'_>, fault: Option<Fault>, fired: &mut bool) -
     guard.resume()
 }
 
-/// Motor de patches de um processo.
-///
+/// Falhas injetadas nas escritas em dados (só para testes).
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DataFault {
+    /// Toda escrita de restauração de dados falha (`WriteRefused`) sem tocar no jogo.
+    RestoreFails,
+    /// A próxima escrita de `set_word` grava estes bytes (o jogo mexeu no campo) e a releitura
+    /// diverge do pedido: `BytesMismatch` com um terceiro valor. Dispara uma vez.
+    ThirdValue(Vec<u8>),
+}
+
 /// Resultado de [`Engine::set_word`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SetOutcome {
@@ -292,6 +301,8 @@ pub enum SetOutcome {
     Rejected(Vec<u8>),
 }
 
+/// Motor de patches de um processo.
+///
 /// Quem cria o motor segura a [`JournalLock`] enquanto ele existir.
 pub struct Engine {
     pid: i32,
@@ -324,6 +335,8 @@ pub struct Engine {
     data: Vec<DataEntry>,
     /// Entradas de dados não resolvidas: restos de uma falha e as vindas da recuperação.
     data_pending: Vec<DataEntry>,
+    /// Falha injetada nas escritas em dados (só para testes).
+    data_fault: Option<DataFault>,
 }
 
 impl Engine {
@@ -373,6 +386,7 @@ impl Engine {
             data_maps: None,
             data: Vec::new(),
             data_pending: Vec::new(),
+            data_fault: None,
         })
     }
 
@@ -512,7 +526,7 @@ impl Engine {
         self.finish(result)
     }
 
-    /// Entradas de dados vivas (bits limpos e confirmados).
+    /// Entradas de dados vivas (bits limpos ou valor inteiro escrito, uma por par `id` e endereço).
     pub fn data_entries(&self) -> &[DataEntry] {
         &self.data
     }
@@ -643,6 +657,12 @@ impl Engine {
     pub fn force_stuck_for_test(&mut self) {
         self.stuck = true;
         self.save_logged(true);
+    }
+
+    /// Liga (ou desliga, com `None`) a falha injetada nas escritas em dados (só para testes).
+    #[doc(hidden)]
+    pub fn inject_data_fault_for_test(&mut self, fault: Option<DataFault>) {
+        self.data_fault = fault;
     }
 
     /// Põe uma entrada de dados como viva e grava o diário (só para testes).
@@ -902,15 +922,31 @@ impl Engine {
         if swapping {
             self.fire_hook(HookPoint::AfterNext);
         }
-        if let Err(e) = self.write_data_verified(&entry.id, entry.addr, &value) {
+        let written = if let Some(DataFault::ThirdValue(third)) = self.data_fault.clone() {
+            self.data_fault = None;
+            self.writer.write(entry.addr, &third).and_then(|()| {
+                Err(Error::BytesMismatch {
+                    id: entry.id.clone(),
+                    expected: hex(&value),
+                    found: hex(&third),
+                })
+            })
+        } else {
+            self.write_data_verified(&entry.id, entry.addr, &value)
+        };
+        if let Err(e) = written {
             if matches!(e, Error::ProcessGone { .. }) {
                 return Err(e);
             }
             match self.read_bytes(entry.addr, before.len()) {
                 // Nada foi escrito: volta a entrada de antes (ou nenhuma).
                 Ok(Some(now)) if now == before => self.revert_entry(&entry, previous),
-                // Sobrou escrita (ou não dá para saber): pendente até a recuperação, que
-                // decide pelo `written`/`next` da entrada.
+                // O jogo mexeu no campo depois da nossa escrita (releitura com um terceiro
+                // valor): vale a regra do "jogo mudou o campo"; a entrada (com o `next`, se
+                // houver) segue viva e o próximo `set_word` a resolve.
+                Ok(Some(now)) if now != value => {}
+                // O campo ficou com o nosso valor sem confirmação, ou não dá para saber:
+                // pendente até a recuperação, que decide pelo `written`/`next` da entrada.
                 _ => {
                     self.remove_data(&entry);
                     self.upsert_pending(entry);
@@ -1036,7 +1072,12 @@ impl Engine {
                     report.foreign.push(e.id.clone());
                 }
                 DataAction::Restore(bytes) => {
-                    if let Err(err) = self.write_verified(&e.id, e.addr, &bytes) {
+                    let written = if self.data_fault == Some(DataFault::RestoreFails) {
+                        Err(Error::WriteRefused { addr: e.addr })
+                    } else {
+                        self.write_verified(&e.id, e.addr, &bytes)
+                    };
+                    if let Err(err) = written {
                         if matches!(err, Error::ProcessGone { .. }) {
                             return Err(err);
                         }

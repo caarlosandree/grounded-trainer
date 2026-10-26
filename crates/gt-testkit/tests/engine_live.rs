@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gt_core::Error;
-use gt_core::engine::{Engine, EngineOptions, PolicyFn, SetOutcome};
+use gt_core::engine::{DataFault, Engine, EngineOptions, PolicyFn, SetOutcome};
 use gt_core::journal::{JournalEntry, JournalLock, JournalStore, Loaded};
 use gt_core::mem::{MemReader, MemWriter};
 use gt_core::patch::{PatchSpec, Validated, WritePolicy, validate};
@@ -2097,21 +2097,53 @@ fn entry_update_then_failed_restore_no_stale_copy() {
     let mut engine = data_engine(&t, &env, &obj);
     poke(&t, obj.word, &OLD);
     set(&mut engine, &obj, &OURS).unwrap();
-    let stale = engine.data_entries()[0].clone();
     // O jogo muda o campo: o original é atualizado (mesmo par, outra entrada).
     poke(&t, obj.word, &OTHER);
     assert_eq!(
         set(&mut engine, &obj, &OURS).unwrap(),
         SetOutcome::NewOriginal(OTHER.to_vec())
     );
-    // Uma cópia velha (com o original antigo) vinda de fora não vira segunda entrada do par.
-    let report = engine.restore_data(vec![stale]).unwrap();
-    assert_eq!(report.restored, vec!["carga"]);
-    assert!(engine.pending_ids().is_empty());
+    // A restauração falha: sobra uma entrada só por par, com o original atualizado.
+    engine.inject_data_fault_for_test(Some(DataFault::RestoreFails));
+    assert!(engine.restore_field("carga").is_err());
+    assert_eq!(engine.pending_ids(), vec!["carga"]);
     assert!(engine.data_entries().is_empty());
-    // Vale o original atualizado, não o velho.
+    let j = journal_now(&env);
+    assert_eq!(j.data.len(), 1);
+    assert_eq!(j.data[0].original, OTHER.to_vec());
+    assert_eq!(word_bytes(&t, obj.word), OURS);
+    // Sem a falha, a recuperação devolve o original novo, não o velho.
+    engine.inject_data_fault_for_test(None);
+    let report = engine.restore_pending().unwrap();
+    assert_eq!(report.restored, vec!["carga"]);
     assert_eq!(word_bytes(&t, obj.word), OTHER);
+    assert!(engine.pending_ids().is_empty());
     assert_eq!(env.store.peek().unwrap(), Loaded::Missing);
+}
+
+#[test]
+fn set_word_reread_third_value_keeps_entry_alive() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    poke(&t, obj.word, &OLD);
+    // O jogo escreve entre a nossa escrita e a releitura: terceiro valor.
+    engine.inject_data_fault_for_test(Some(DataFault::ThirdValue(OTHER.to_vec())));
+    let err = set(&mut engine, &obj, &OURS).unwrap_err();
+    assert!(matches!(err, Error::BytesMismatch { .. }), "{err:?}");
+    assert!(engine.pending_ids().is_empty());
+    assert_eq!(engine.data_entries().len(), 1);
+    assert_eq!(word_bytes(&t, obj.word), OTHER);
+    // O próximo `set_word` cai em "o jogo mudou o campo", sem `DataPending`.
+    assert_eq!(
+        set(&mut engine, &obj, &OURS).unwrap(),
+        SetOutcome::NewOriginal(OTHER.to_vec())
+    );
+    assert_eq!(word_bytes(&t, obj.word), OURS);
+    let j = journal_now(&env);
+    assert_eq!(j.data.len(), 1);
+    assert_eq!(j.data[0].original, OTHER.to_vec());
 }
 
 #[test]
