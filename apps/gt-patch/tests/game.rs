@@ -53,6 +53,22 @@ fn parse_hex(text: &str) -> u64 {
     u64::from_str_radix(text.trim_start_matches("0x"), 16).unwrap()
 }
 
+/// `true` se o trecho do `gt diff` em `[start, start + len)` encosta no patch em
+/// `[addr, addr + patch_len)`.
+fn touches_patch(start: u64, len: u64, addr: u64, patch_len: u64) -> bool {
+    start < addr + patch_len && addr < start + len
+}
+
+#[test]
+fn touches_patch_sees_difference_after_first_byte() {
+    // `recarga-instantanea` troca `0f 28 c7` por `0f 57 c0`: o primeiro byte não muda, então uma
+    // sobra do patch aparece no diff a partir do segundo byte.
+    assert!(touches_patch(0x1001, 2, 0x1000, 3));
+    assert!(touches_patch(0x0ff0, 0x20, 0x1000, 3));
+    assert!(!touches_patch(0x1003, 4, 0x1000, 3));
+    assert!(!touches_patch(0x0ff0, 0x10, 0x1000, 3));
+}
+
 #[test]
 #[ignore = "exige o jogo aberto"]
 fn list_shows_test_patch_verified() {
@@ -71,8 +87,9 @@ fn list_shows_test_patch_verified() {
     assert!(text.contains("disponível (verificado)"), "{text}");
 }
 
-/// Liga e desliga `id` uma vez e confere que a memória volta ao disco no endereço do patch.
-fn round_trip(id: &str) {
+/// Liga e desliga `id` (que troca `patch_len` bytes) uma vez e confere que a memória volta ao disco
+/// em todos os bytes do patch.
+fn round_trip(id: &str, patch_len: u64) {
     let state = tempfile::tempdir().unwrap();
     let list = gt_patch(state.path(), &["list"]);
     let text = String::from_utf8_lossy(&list.stdout).into_owned();
@@ -93,13 +110,13 @@ fn round_trip(id: &str) {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Depois do ciclo, a memória volta ao disco: nenhuma diferença cobre o endereço do patch.
+    // Depois do ciclo, a memória volta ao disco: nenhuma diferença encosta nos bytes do patch.
     let diff = gt_json(&["diff"]);
     for chunk in diff["chunks"].as_array().unwrap() {
         let start = parse_hex(chunk["address"].as_str().unwrap());
         let len = chunk["len"].as_u64().unwrap();
         assert!(
-            !(start..start + len).contains(&patch_addr),
+            !touches_patch(start, len, patch_addr, patch_len),
             "{id} deixou diferença em {patch_addr:#x}: {chunk}"
         );
     }
@@ -111,7 +128,7 @@ fn single_toggle_round_trip() {
     if !known_build() {
         return;
     }
-    round_trip("teste-codificacao");
+    round_trip("teste-codificacao", 3);
 }
 
 /// Cheats da Fase 4 (spec 004): cada um liga e desliga uma vez no endereço verificado.
@@ -121,11 +138,11 @@ fn phase4_cheats_round_trip() {
     if !known_build() {
         return;
     }
-    for id in [
-        "durabilidade-infinita",
-        "energia-infinita",
-        "recarga-instantanea",
+    for (id, patch_len) in [
+        ("durabilidade-infinita", 5),
+        ("energia-infinita", 4),
+        ("recarga-instantanea", 3),
     ] {
-        round_trip(id);
+        round_trip(id, patch_len);
     }
 }
