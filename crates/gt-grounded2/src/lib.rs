@@ -2,9 +2,12 @@
 
 pub mod catalog;
 pub mod error;
+#[cfg(feature = "write")]
+pub mod fields;
 pub mod fling;
 #[cfg(feature = "write")]
 pub mod patching;
+pub mod player;
 pub mod policy;
 pub mod profile;
 pub mod resolve;
@@ -12,6 +15,7 @@ pub mod signatures;
 pub mod state;
 pub mod target;
 pub mod trust;
+pub mod ue;
 
 pub use error::{Error, Result};
 

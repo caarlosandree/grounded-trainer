@@ -1,6 +1,7 @@
 //! Testes de API viva do `gt-core` contra o processo-alvo de teste (nunca contra o jogo).
 
-use gt_core::mem::{MemReader, MemWriter};
+use gt_core::Error;
+use gt_core::mem::{MemReader, MemWriter, ReadMem};
 use gt_testkit::{TestTarget, hex_with_spaces, marker_bytes};
 
 #[test]
@@ -250,4 +251,62 @@ fn ignore_job_control_sets_sig_ign() {
     for sig in [20u32, 21, 22] {
         assert!(mask & (1 << (sig - 1)) != 0, "sinal {sig} não ignorado");
     }
+}
+
+#[test]
+fn read_many_more_than_iov_max() {
+    let t = TestTarget::spawn();
+    // A região nasce zerada: grava um padrão distinto para a comparação ter sentido.
+    let pattern: Vec<u8> = (0..3000 * 8).map(|i| (i * 7 + 3) as u8).collect();
+    MemWriter::open(t.pid)
+        .unwrap()
+        .write(t.big_region, &pattern)
+        .unwrap();
+    let reader = MemReader::new(t.pid);
+    let reqs: Vec<(u64, usize)> = (0..3000u64).map(|i| (t.big_region + i * 8, 8)).collect();
+    let got = reader.read_many(&reqs).unwrap();
+    assert_eq!(got.len(), 3000);
+    for (i, item) in got.iter().enumerate() {
+        let mut expected = [0u8; 8];
+        reader.read_exact(reqs[i].0, &mut expected).unwrap();
+        assert_eq!(item.as_deref(), Some(&expected[..]), "pedido {i}");
+        assert_eq!(&expected[..], &pattern[i * 8..i * 8 + 8], "pedido {i}");
+    }
+}
+
+#[test]
+fn read_many_hole_in_the_middle() {
+    let t = TestTarget::spawn();
+    let page = t.page;
+    let writer = MemWriter::open(t.pid).unwrap();
+    writer.write(t.region_start, &[0xAA; 8]).unwrap();
+    writer.write(t.region_start + 2 * page, &[0xBB; 8]).unwrap();
+    let reqs = [
+        (t.region_start, 8),
+        (t.region_start + page, 8),
+        (t.region_start + 2 * page, 8),
+        (t.marker, 32),
+    ];
+    let got = MemReader::new(t.pid).read_many(&reqs).unwrap();
+    assert_eq!(
+        got,
+        vec![
+            Some(vec![0xAA; 8]),
+            None,
+            Some(vec![0xBB; 8]),
+            Some(marker_bytes().to_vec()),
+        ]
+    );
+}
+
+#[test]
+fn read_many_gone_process_is_error() {
+    let mut t = TestTarget::spawn();
+    let pid = t.pid;
+    t.child.kill().unwrap();
+    t.child.wait().unwrap();
+    assert!(matches!(
+        MemReader::new(pid).read_many(&[(t.marker, 32)]),
+        Err(Error::ProcessGone { .. })
+    ));
 }

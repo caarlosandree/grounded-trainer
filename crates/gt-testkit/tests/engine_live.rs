@@ -1563,3 +1563,256 @@ fn set_replacement_rewrite_keeps_next() {
     assert_eq!(j.entries[0].replacement, VALUE_33);
     assert_eq!(j.entries[0].next, None);
 }
+
+// ---------------------------------------------------------------------------
+// Escrita em dados (plano 005, tarefa 12)
+// ---------------------------------------------------------------------------
+
+/// "Objeto" em `big_region`: 16 bytes de guarda no início e o byte dos bits em `+0x100`.
+struct DataObj {
+    guard: Vec<gt_core::journal::GuardBytes>,
+    byte: u64,
+    word: u64,
+    region: Range<u64>,
+}
+
+fn data_obj(t: &TestTarget) -> DataObj {
+    let w = MemWriter::open(t.pid).unwrap();
+    let marker: Vec<u8> = (0..16u8).map(|i| 0xC0 | i).collect();
+    w.write(t.big_region, &marker).unwrap();
+    w.write(t.big_region + 0x100, &[0x07]).unwrap();
+    DataObj {
+        guard: vec![gt_core::journal::GuardBytes {
+            addr: t.big_region,
+            bytes: marker,
+        }],
+        byte: t.big_region + 0x100,
+        word: t.big_region + 0x200,
+        region: t.big_region..t.big_region + t.big_len as u64,
+    }
+}
+
+/// Motor sem política de patches e com a política de dados = a região do objeto.
+fn data_engine(t: &TestTarget, env: &Env, obj: &DataObj) -> Engine {
+    let mut engine = open_engine(t.pid, env, Vec::new(), None);
+    let region = obj.region.clone();
+    engine.set_data_policy(Box::new(move |_maps| {
+        WritePolicy::new(vec![region.clone()])
+    }));
+    engine
+}
+
+fn byte_at(t: &TestTarget, addr: u64) -> u8 {
+    let mut b = [0u8; 1];
+    MemReader::new(t.pid).read_exact(addr, &mut b).unwrap();
+    b[0]
+}
+
+fn poke(t: &TestTarget, addr: u64, bytes: &[u8]) {
+    MemWriter::open(t.pid).unwrap().write(addr, bytes).unwrap();
+}
+
+#[test]
+fn write_data_writes_and_rereads() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    engine
+        .write_data(obj.word, &1.5f32.to_le_bytes(), &obj.guard)
+        .unwrap();
+    let mut back = [0u8; 4];
+    MemReader::new(t.pid)
+        .read_exact(obj.word, &mut back)
+        .unwrap();
+    assert_eq!(f32::from_le_bytes(back), 1.5);
+    // Barras não vão ao diário.
+    assert_eq!(env.store.peek().unwrap(), Loaded::Missing);
+    // Sem política de dados, nenhuma escrita.
+    let mut bare = open_engine(t.pid, &env, Vec::new(), None);
+    assert!(matches!(
+        bare.write_data(obj.word, &[0], &obj.guard),
+        Err(Error::NoDataPolicy)
+    ));
+}
+
+#[test]
+fn write_data_outside_policy_refused() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    let err = engine.write_data(t.exec_page, &[0x90], &[]).unwrap_err();
+    assert!(
+        matches!(err, Error::DataOutsidePolicy { addr } if addr == t.exec_page),
+        "{err:?}"
+    );
+    // A escrita que cruza o fim da região também é recusada.
+    let edge = obj.region.end - 2;
+    assert!(matches!(
+        engine.write_data(edge, &[0; 4], &[]),
+        Err(Error::DataOutsidePolicy { .. })
+    ));
+}
+
+#[test]
+fn write_data_guard_mismatch_skips() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    poke(&t, obj.word, &7f32.to_le_bytes());
+    // O objeto muda entre a leitura e a escrita (outro pawn no mesmo endereço).
+    poke(&t, t.big_region + 3, &[0x00]);
+    let err = engine
+        .write_data(obj.word, &1f32.to_le_bytes(), &obj.guard)
+        .unwrap_err();
+    assert!(matches!(err, Error::GuardMismatch { .. }), "{err:?}");
+    let mut back = [0u8; 4];
+    MemReader::new(t.pid)
+        .read_exact(obj.word, &mut back)
+        .unwrap();
+    assert_eq!(f32::from_le_bytes(back), 7.0);
+}
+
+#[test]
+fn set_bits_journals_before_write() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    engine
+        .set_bits("nao-morrer", obj.byte, 0x06, &obj.guard)
+        .unwrap();
+    assert_eq!(byte_at(&t, obj.byte), 0x01);
+    let j = journal_now(&env);
+    assert!(j.entries.is_empty());
+    let [e] = j.data.as_slice() else {
+        panic!("esperada uma entrada de dados: {:?}", j.data);
+    };
+    assert_eq!(
+        (e.id.as_str(), e.addr, e.original, e.written, e.mask),
+        ("nao-morrer", obj.byte, 0x07, 0x01, 0x06)
+    );
+    assert_eq!(e.guard, obj.guard);
+    assert_eq!(engine.data_entries().len(), 1);
+}
+
+#[test]
+fn set_bits_maintenance_reclears() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    engine
+        .set_bits("queda", obj.byte, 0x06, &obj.guard)
+        .unwrap();
+    // O jogo religa um dos bits: a manutenção limpa de novo e o original não muda.
+    poke(&t, obj.byte, &[0x05]);
+    engine
+        .set_bits("queda", obj.byte, 0x06, &obj.guard)
+        .unwrap();
+    assert_eq!(byte_at(&t, obj.byte), 0x01);
+    let j = journal_now(&env);
+    assert_eq!(j.data.len(), 1);
+    assert_eq!(j.data[0].original, 0x07);
+    // Bits já limpos: nada muda.
+    engine
+        .set_bits("queda", obj.byte, 0x06, &obj.guard)
+        .unwrap();
+    assert_eq!(byte_at(&t, obj.byte), 0x01);
+}
+
+#[test]
+fn restore_keeps_foreign_bits() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    engine
+        .set_bits("nao-morrer", obj.byte, 0x06, &obj.guard)
+        .unwrap();
+    // O jogo liga outro bit do mesmo byte enquanto os nossos estão limpos.
+    poke(&t, obj.byte, &[0x81]);
+    let report = engine.restore_bits("nao-morrer").unwrap();
+    assert_eq!(report.restored, vec!["nao-morrer"]);
+    assert_eq!(byte_at(&t, obj.byte), 0x87);
+    assert_eq!(env.store.peek().unwrap(), Loaded::Missing);
+    assert!(engine.data_entries().is_empty());
+}
+
+#[test]
+fn restore_guard_mismatch_discards() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    engine
+        .set_bits("nao-morrer", obj.byte, 0x06, &obj.guard)
+        .unwrap();
+    // O objeto não é mais o mesmo: a entrada sai sem escrever nada.
+    poke(&t, t.big_region, &[0x00]);
+    let report = engine.restore_bits("nao-morrer").unwrap();
+    assert_eq!(report.foreign, vec!["nao-morrer"]);
+    assert!(report.restored.is_empty());
+    assert_eq!(byte_at(&t, obj.byte), 0x01);
+    assert_eq!(env.store.peek().unwrap(), Loaded::Missing);
+}
+
+#[test]
+fn undo_all_restores_bits() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    {
+        let mut engine = data_engine(&t, &env, &obj);
+        engine.set_bits("a", obj.byte, 0x02, &obj.guard).unwrap();
+        engine.set_bits("b", obj.byte, 0x04, &obj.guard).unwrap();
+        assert_eq!(byte_at(&t, obj.byte), 0x01);
+        let report = engine.undo_all().unwrap();
+        let mut restored = report.restored.clone();
+        restored.sort();
+        assert_eq!(restored, vec!["a", "b"]);
+        assert_eq!(byte_at(&t, obj.byte), 0x07);
+        assert_eq!(env.store.peek().unwrap(), Loaded::Missing);
+        // O `Drop` também restaura.
+        engine.set_bits("a", obj.byte, 0x02, &obj.guard).unwrap();
+        assert_eq!(byte_at(&t, obj.byte), 0x05);
+    }
+    assert_eq!(byte_at(&t, obj.byte), 0x07);
+    assert_eq!(env.store.peek().unwrap(), Loaded::Missing);
+}
+
+#[test]
+fn set_bits_refused_with_pending() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    engine.force_data_pending_for_test(gt_core::journal::DataEntry {
+        id: "nao-morrer".into(),
+        addr: obj.byte,
+        original: 0x07,
+        written: 0x01,
+        mask: 0x06,
+        guard: obj.guard.clone(),
+    });
+    assert_eq!(engine.pending_ids(), vec!["nao-morrer"]);
+    let err = engine
+        .set_bits("nao-morrer", obj.byte, 0x06, &obj.guard)
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::DataPending { id } if id == "nao-morrer"),
+        "{err:?}"
+    );
+    assert_eq!(byte_at(&t, obj.byte), 0x07);
+    // Outro `id` (em outro byte) segue livre, e a recuperação (`r`) resolve o resto.
+    poke(&t, obj.byte + 1, &[0x10]);
+    engine
+        .set_bits("outro", obj.byte + 1, 0x10, &obj.guard)
+        .unwrap();
+    assert_eq!(byte_at(&t, obj.byte + 1), 0x00);
+    let report = engine.restore_pending().unwrap();
+    assert_eq!(report.dropped, vec!["nao-morrer"]);
+    assert!(engine.pending_ids().is_empty());
+}

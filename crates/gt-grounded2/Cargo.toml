@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 gt-core.workspace = true
+gt-ue.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true
@@ -18,6 +19,8 @@ tracing.workspace = true
 write = ["gt-core/write"]
 
 [dev-dependencies]
+# Os testes de assinaturas comparam o `[ue.layout]` com `UeLayout::observed()`.
+gt-ue = { workspace = true, features = ["synth"] }
 # O portão da pausa (testes ignorados) precisa de `pause`; fica só nos testes para o `gt-cli` não ganhar `write`.
 gt-core = { workspace = true, features = ["write"] }
 tempfile.workspace = true

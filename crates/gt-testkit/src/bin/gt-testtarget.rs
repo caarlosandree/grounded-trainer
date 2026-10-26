@@ -5,13 +5,15 @@
 //! Argumento opcional `--spin`: cria uma thread que gira para sempre em `spin_page`.
 //! Argumento opcional `--spin-value`: cria uma thread no laço de valor em `value_page`,
 //! que escreve o imediato do `mov eax, imm32` em `value_word`.
+//! Argumento opcional `--ue`: monta a reflexão sintética (`gt_testkit::ue`) numa arena `rw` e
+//! informa os endereços na chave `ue`.
 
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
 use gt_core::mem::test_support::{
     allow_any_tracer, anon_rw, exec_code, exec_page, guarded_pages, page_size, pipe_never_written,
-    readonly_shared_page, spawn_thread_at, value_code,
+    readonly_shared_page, spawn_thread_at, value_code, write_local,
 };
 use gt_core::procinfo::{ThreadPos, list_tids, read_task_stat, read_thread_pos};
 
@@ -58,6 +60,7 @@ fn spawn_and_wait(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let spin = std::env::args().skip(1).any(|a| a == "--spin");
     let spin_value = std::env::args().skip(1).any(|a| a == "--spin-value");
+    let with_ue = std::env::args().skip(1).any(|a| a == "--ue");
     allow_any_tracer()?;
 
     // Montado em tempo de execução para o literal não existir em `.rodata`.
@@ -99,10 +102,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
     }
 
+    // Reflexão sintética: as escritas da imagem aplicadas na arena, em ordem.
+    let ue = if with_ue {
+        let arena = anon_rw(gt_testkit::ue::ARENA_LEN)?;
+        let (image, a) = gt_testkit::ue::build(arena, gt_testkit::ue::ARENA_LEN);
+        for (addr, bytes) in &image.writes {
+            write_local(*addr, bytes)?;
+        }
+        format!(
+            ",\"ue\":{{\"gobjects\":\"{:#x}\",\"names\":\"{:#x}\",\"controller\":\"{:#x}\",\"pawn\":\"{:#x}\",\"creature\":\"{:#x}\",\"pawn_field_addr\":\"{:#x}\",\"health\":\"{:#x}\",\"alt_pawn\":\"{:#x}\"}}",
+            a.gobjects,
+            a.names,
+            a.controller,
+            a.pawn,
+            a.creature,
+            a.pawn_field_addr,
+            a.health,
+            a.alt_pawn
+        )
+    } else {
+        String::new()
+    };
+
     let mut out = std::io::stdout().lock();
     writeln!(
         out,
-        "{{\"pid\":{},\"marker\":\"{:#x}\",\"marker_len\":{},\"exec_page\":\"{:#x}\",\"exec2\":\"{:#x}\",\"spin_page\":\"{:#x}\",\"syscall_page\":\"{:#x}\",\"value_page\":\"{:#x}\",\"value_word\":\"{:#x}\",\"region_start\":\"{:#x}\",\"big_region\":\"{:#x}\",\"big_len\":{},\"ro_shared\":\"{:#x}\",\"page\":{}}}",
+        "{{\"pid\":{},\"marker\":\"{:#x}\",\"marker_len\":{},\"exec_page\":\"{:#x}\",\"exec2\":\"{:#x}\",\"spin_page\":\"{:#x}\",\"syscall_page\":\"{:#x}\",\"value_page\":\"{:#x}\",\"value_word\":\"{:#x}\",\"region_start\":\"{:#x}\",\"big_region\":\"{:#x}\",\"big_len\":{},\"ro_shared\":\"{:#x}\",\"page\":{}{}}}",
         std::process::id(),
         marker.as_ptr() as u64,
         marker.len(),
@@ -117,6 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         big_len,
         ro_shared,
         page,
+        ue,
     )?;
     out.flush()?;
     drop(out);

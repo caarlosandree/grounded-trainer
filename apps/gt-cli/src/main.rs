@@ -1,4 +1,4 @@
-//! Ferramentas de pesquisa: inspect, read, scan, disasm, diff, dump, fling.
+//! Ferramentas de pesquisa: inspect, read, scan, disasm, diff, dump, fling, ue.
 //!
 //! O `gt` só lê a memória do processo: nunca escreve (spec 6.11).
 
@@ -97,6 +97,11 @@ enum Command {
         /// Sobrescreve arquivos que já existem.
         #[arg(long)]
         force: bool,
+    },
+    /// Lê a reflexão do Unreal: campos de uma classe e o personagem do jogador.
+    Ue {
+        #[command(subcommand)]
+        command: cmd::ue::UeCommand,
     },
 }
 
@@ -201,6 +206,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 force,
             },
         ),
+        Command::Ue { command } => cmd::ue::run(&global, &command),
     }
 }
 

@@ -1,8 +1,10 @@
 //! Implementação crua da interface de alvo, só para testes (spec 003, 5): patches crus
 //! contra um processo qualquer (o `gt-testtarget`), sem o jogo e sem assinaturas.
 //!
-//! Depende só do `gt-core`. Os testes de integração trazem o processo-alvo e controlam esta
-//! implementação por um [`RawControl`] compartilhado (qual PID existe, quais definições valem).
+//! Os testes de integração trazem o processo-alvo e controlam esta implementação por um
+//! [`RawControl`] compartilhado (qual PID existe, quais definições valem). Com
+//! [`RawControl::ue`], os cheats de valor (spec 005) entram também, com as globais entregues
+//! direto (sem busca de padrões) e a mesma lógica do jogo ([`ValueCheats`]).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -16,13 +18,51 @@ use gt_core::procinfo::{Identity, check_alive, identity, is_dead, read_stat};
 use gt_core::recovery::recover;
 use gt_core::suspend::{PauseConfig, open_checked};
 use gt_core::value::ValueSpec;
-use gt_grounded2::signatures::Category;
+use gt_grounded2::fields::TickReport;
+use gt_grounded2::policy::data_policy;
+use gt_grounded2::signatures::{Category, FieldDef, UeSigs};
 
 use crate::backend::{
-    Backend, CheatInfo, Find, OpOutcome, Recovered, Search, SearchError, SearchFn, Session,
-    TuiError, outcome_of, recovery_outcome, restore_outcome,
+    Backend, CheatInfo, Find, JobKind, OpOutcome, Recovered, ReflectionJob, ReflectionNews,
+    ReflectionOutcome, Search, SearchError, SearchFn, Session, TuiError, outcome_of,
+    recovery_outcome, restore_outcome,
 };
 use crate::model::Avail;
+use crate::values::{Globals, REFLECTION_UNRECOGNIZED, ValueCheats, field_infos, search_avail};
+
+/// Reflexão do alvo de teste: as globais (endereços absolutos), o `[ue]` e os `[[field]]`.
+#[derive(Debug, Clone)]
+pub struct RawUe {
+    pub gobjects: u64,
+    pub names: u64,
+    pub sigs: UeSigs,
+    pub fields: Vec<FieldDef>,
+}
+
+impl RawUe {
+    fn globals(&self) -> Globals {
+        Globals {
+            sigs: self.sigs.clone(),
+            gobjects: self.gobjects,
+            names: self.names,
+            verified: true,
+        }
+    }
+}
+
+/// O que a busca crua leva para a sessão.
+#[derive(Debug, Clone)]
+pub struct RawPayload {
+    defs: Vec<RawDef>,
+    ue: Option<RawUe>,
+}
+
+impl RawPayload {
+    /// As definições cruas que a busca viu.
+    pub fn defs(&self) -> &[RawDef] {
+        &self.defs
+    }
+}
 
 /// Um cheat cru: onde está, que bytes espera e que bytes escreve.
 #[derive(Debug, Clone, PartialEq)]
@@ -69,6 +109,8 @@ pub struct RawControl {
     pub search_delay: Duration,
     /// A busca entra em pânico (testa o desfazer da saída por pânico na thread de busca).
     pub search_panics: bool,
+    /// Cheats de valor do alvo (`gt-testtarget --ue`).
+    pub ue: Option<RawUe>,
 }
 
 fn lock_control(control: &Mutex<RawControl>) -> MutexGuard<'_, RawControl> {
@@ -113,15 +155,16 @@ fn raw_search(
     pid: i32,
     ids: Option<Vec<String>>,
     expected: Option<Identity>,
-) -> Result<Search<Vec<RawDef>>, SearchError> {
+) -> Result<Search<RawPayload>, SearchError> {
     let started = Instant::now();
-    let (defs, version_key, delay, panics) = {
+    let (defs, version_key, delay, panics, ue) = {
         let c = lock_control(control);
         (
             c.defs.clone(),
             c.version_key.clone(),
             c.search_delay,
             c.search_panics,
+            c.ue.clone(),
         )
     };
     if !delay.is_zero() {
@@ -146,7 +189,11 @@ fn raw_search(
             category: def.category,
             value: def.value.clone(),
             avail: avail_of(def, pid)?,
+            field: false,
         });
+    }
+    if let Some(ue) = &ue {
+        cheats.extend(field_infos(&ue.fields, &search_avail(&Ok(ue.globals()))));
     }
     Ok(Search {
         pid,
@@ -157,7 +204,7 @@ fn raw_search(
         cheats,
         ids,
         took: started.elapsed(),
-        payload: defs,
+        payload: RawPayload { defs, ue },
     })
 }
 
@@ -184,7 +231,7 @@ fn start_engine(
         version_key: version_key.to_string(),
         pause: PauseConfig::default(),
     };
-    Engine::open(
+    let mut engine = Engine::open(
         pid,
         Some(identity),
         store.clone(),
@@ -192,7 +239,10 @@ fn start_engine(
         exec_policy(),
         opts,
     )
-    .map_err(|e| TuiError::Other(e.to_string()))
+    .map_err(|e| TuiError::Other(e.to_string()))?;
+    // Escritas em dados: qualquer região `rw-` (o alvo não tem imagens de módulo PE).
+    engine.set_data_policy(Box::new(|maps| data_policy(&[], maps)));
+    Ok(engine)
 }
 
 /// Implementação crua da interface de alvo.
@@ -220,7 +270,7 @@ impl RawBackend {
 }
 
 impl Backend for RawBackend {
-    type Payload = Vec<RawDef>;
+    type Payload = RawPayload;
     type Session = RawSession;
 
     fn find(&mut self) -> Find {
@@ -233,7 +283,7 @@ impl Backend for RawBackend {
         }
     }
 
-    fn search_fn(&self) -> SearchFn<Vec<RawDef>> {
+    fn search_fn(&self) -> SearchFn<RawPayload> {
         let control = self.control.clone();
         Arc::new(move |pid, ids, expected| raw_search(&control, pid, ids, expected))
     }
@@ -242,11 +292,24 @@ impl Backend for RawBackend {
         recovery_outcome(recover(&self.store, &self.lock, &PauseConfig::default()))
     }
 
-    fn open(&mut self, search: Search<Vec<RawDef>>, engine: bool) -> Result<RawSession, TuiError> {
+    fn open(&mut self, search: Search<RawPayload>, engine: bool) -> Result<RawSession, TuiError> {
         let (pidfd, id) = open_checked(search.pid).map_err(|e| TuiError::Other(e.to_string()))?;
         if id != search.identity {
             return Err(TuiError::Other("o processo terminou".to_string()));
         }
+        let RawPayload { defs, ue } = search.payload;
+        let values = match ue {
+            Some(ue) => ValueCheats::new(
+                MemReader::new(search.pid),
+                ue.fields.clone(),
+                Ok(ue.globals()),
+            ),
+            None => ValueCheats::new(
+                MemReader::new(search.pid),
+                Vec::new(),
+                Err(REFLECTION_UNRECOGNIZED.to_string()),
+            ),
+        };
         let mut session = RawSession {
             engine: None,
             pidfd,
@@ -254,7 +317,8 @@ impl Backend for RawBackend {
             store: self.store.clone(),
             version_key: search.version_key,
             disk: search.disk,
-            defs: search.payload,
+            defs,
+            values,
             lock: self.lock.clone(),
         };
         if engine && session.disk.is_ok() {
@@ -276,6 +340,7 @@ pub struct RawSession {
     version_key: String,
     disk: Result<(), String>,
     defs: Vec<RawDef>,
+    values: ValueCheats,
     lock: Arc<JournalLock>,
 }
 
@@ -299,7 +364,7 @@ impl RawSession {
     }
 }
 
-impl Session<Vec<RawDef>> for RawSession {
+impl Session<RawPayload> for RawSession {
     fn has_engine(&self) -> bool {
         self.engine.is_some()
     }
@@ -322,7 +387,7 @@ impl Session<Vec<RawDef>> for RawSession {
         Ok(())
     }
 
-    fn merge_search(&mut self, s: Search<Vec<RawDef>>) -> bool {
+    fn merge_search(&mut self, s: Search<RawPayload>) -> bool {
         if s.identity != self.identity {
             return false;
         }
@@ -333,7 +398,10 @@ impl Session<Vec<RawDef>> for RawSession {
             .as_ref()
             .map(|e| e.active().iter().map(|p| p.id.clone()).collect())
             .unwrap_or_default();
-        for def in s.payload {
+        if let Some(ue) = &s.payload.ue {
+            self.values.update_globals(Ok(ue.globals()));
+        }
+        for def in s.payload.defs {
             let listed = s.ids.as_ref().is_none_or(|ids| ids.contains(&def.id));
             if !listed || active.contains(&def.id) {
                 continue;
@@ -452,5 +520,33 @@ impl Session<Vec<RawDef>> for RawSession {
                 (Vec::new(), Vec::new())
             }
         }
+    }
+
+    fn reflection_job(&self, kind: JobKind) -> Option<ReflectionJob> {
+        self.values.job(kind)
+    }
+
+    fn merge_reflection(&mut self, out: ReflectionOutcome) -> ReflectionNews {
+        self.values.merge(out)
+    }
+
+    fn field_avail(&self) -> Vec<(String, Avail)> {
+        self.values.avail()
+    }
+
+    fn needs_controller(&self, now: Instant) -> bool {
+        self.values.needs_controller(now)
+    }
+
+    fn field_on(&mut self, id: &str) -> OpOutcome {
+        self.values.on(self.engine.as_mut(), id)
+    }
+
+    fn field_off(&mut self, id: &str) -> OpOutcome {
+        self.values.off(self.engine.as_mut(), id)
+    }
+
+    fn field_tick(&mut self, on: &[String], now: Instant) -> TickReport {
+        self.values.tick(self.engine.as_mut(), on, now)
     }
 }

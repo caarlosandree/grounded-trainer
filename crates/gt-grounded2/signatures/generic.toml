@@ -7,6 +7,10 @@
 # Opcional: bloco [patch.value] (type, slot, min, max, step, default, unit, decimals) que faz do
 # patch um cheat com valor ajustável (spec 003, 6.3).
 #
+# Fase 5 (spec 005): o bloco [ue] traz o layout das estruturas de reflexão do motor, os padrões das duas
+# globais e o caminho até o personagem. Os cheats de valor ficam em blocos [[field]] (6.5), com os campos
+# citados por NOME da reflexão; nenhum offset de campo do jogo mora aqui.
+#
 
 # Patch de teste da Fase 2 (spec 002, 6.9): troca sem efeito na partida. `or rax, rdx` (48 0B C2) vira a
 # outra codificação da mesma instrução (48 09 D0), dentro de uma espera ativa que as threads do jogo
@@ -60,3 +64,236 @@ pattern = "f3 0f 10 bb 90 0b 00 00 0f 57 c9 0f 2f f9 76 ?? 0f 28 c7 f3 0f 5c c6 
 offset = 16
 expected = "0f 28 c7"
 replacement = "0f 57 c0"
+
+# Fase 5 (spec 005, 6.2): reflexão do motor. Nenhum valor é assumido no código; tudo vem daqui, e o
+# <chave>.toml de uma build pode trocar o [ue.layout] inteiro.
+#
+# Globais por padrão com disp32 RIP-relativo (endereço = fim da instrução + disp32 + adjust). Padrões e
+# conferência das ocorrências em docs/RESEARCH.md, sessão "Fase 5: globais do Unreal por padrão".
+# - gobjects: `mov rax,[rip+X]; mov rcx,[rax+rcx*8]; lea rax,[rcx+rdx*8]`; 281 ocorrências, todas para a
+#   mesma global. O disp32 fica em +3 e a instrução termina em +7.
+# - names: inicialização preguiçosa do FNamePool (`je +9; lea reg,[pool]; jmp; lea rcx,[pool]; call`); 19
+#   ocorrências, todas para o início da estrutura. Os blocos ficam em +0x10 dela, daí o `adjust` de 0x10.
+[ue]
+gobjects = { pattern = "48 8b 05 ?? ?? ?? ?? 48 8b 0c c8 48 8d 04 d1", disp_offset = 3, insn_end = 7, adjust = 0 }
+names = { pattern = "74 09 ?? 8d ?? ?? ?? ?? ?? eb ?? 48 8d 0d ?? ?? ?? ?? e8", disp_offset = 14, insn_end = 18, adjust = 0x10 }
+
+# GUObjectArray e a tabela de itens.
+[ue.layout.objects]
+chunks = 0x0
+max_elements = 0x10
+num_elements = 0x14
+max_chunks = 0x18
+num_chunks = 0x1c
+items_per_chunk = 65536
+item_size = 24
+item_object = 0x8
+
+# Cabeçalho de UObject (cdo_flag: bit de ObjectFlags que marca o CDO).
+[ue.layout.uobject]
+flags = 0x8
+index = 0xc
+class = 0x10
+name = 0x18
+outer = 0x20
+cdo_flag = 0x10
+
+[ue.layout.ustruct]
+super_struct = 0x40
+child_properties = 0x50
+properties_size = 0x58
+
+# class_name é o offset do nome do tipo dentro da FFieldClass.
+[ue.layout.ffield]
+class_private = 0x8
+class_name = 0x0
+next = 0x18
+name = 0x20
+
+[ue.layout.fprop]
+element_size = 0x34
+offset = 0x44
+
+[ue.layout.fbool]
+field_size = 0x70
+byte_offset = 0x71
+byte_mask = 0x72
+field_mask = 0x73
+
+# Ponteiro da UScriptStruct numa FStructProperty: os alvos `Struct.Campo` (ex.: HungerSettings.MaxValue).
+[ue.layout.fstruct]
+struct_ptr = 0x70
+
+# Caminho até o personagem (spec 005, 6.3): o controller aponta para o pawn por um campo da reflexão.
+[ue.player]
+controller_class = "/Script/Maine.SurvivalPlayerController"
+pawn_field = "Pawn"
+pawn_class = "/Script/Maine.SurvivalPlayerCharacter"
+# Montado, Pawn/Character/AcknowledgedPawn apontam para a montaria; este campo continua no personagem (P7,
+# RESEARCH.md 2026-10-26, Fase 5).
+alt_pawn_fields = ["CachedSurvivalPlayerCharacter"]
+
+# Fase 5 (spec 005, 6.5): cheats de valor, na ordem da spec. Campos e alvos por NOME da reflexão (P2–P8 em
+# RESEARCH.md, 2026-10-26). As faixas sãs têm folga para upgrades; alvo fora delas não é escrito.
+
+# Vida = MaxHealth − CurrentDamage: zera o dano acumulado.
+[[field]]
+id = "vida-infinita"
+name = "Vida infinita"
+category = "sobrevivencia"
+description = "Zera o dano recebido a cada instante (um golpe maior que a vida inteira ainda mata)"
+object = "HealthComponent"
+object_class = "/Script/Maine.HealthComponent"
+rule = "lock"
+field = "CurrentDamage"
+kind = "float"
+mode = "lower"
+target = 0
+min = 0
+max = 100000
+
+# O jogo deixa a stamina passar de MaxStamina (vimos 120 com MaxStamina 100, P3); a trava nunca baixa o excedente.
+[[field]]
+id = "stamina-infinita"
+name = "Stamina infinita"
+category = "sobrevivencia"
+description = "A stamina não fica abaixo do máximo"
+object = "StaminaComponent"
+object_class = "/Script/Maine.StaminaComponent"
+rule = "lock"
+field = "CurrentStamina"
+kind = "float"
+mode = "raise"
+target_field = "MaxStamina"
+min = 1
+max = 100000
+
+# O máximo é o MaxValue da struct de configuração (100 no save da pesquisa, P2).
+[[field]]
+id = "comida-infinita"
+name = "Comida infinita"
+category = "sobrevivencia"
+description = "A fome fica sempre cheia"
+object = "SurvivalComponent"
+object_class = "/Script/Maine.SurvivalComponent"
+rule = "lock"
+field = "CurrentFood"
+kind = "float"
+mode = "raise"
+target_field = "HungerSettings.MaxValue"
+min = 1
+max = 100000
+
+[[field]]
+id = "agua-infinita"
+name = "Água infinita"
+category = "sobrevivencia"
+description = "A sede fica sempre cheia"
+object = "SurvivalComponent"
+object_class = "/Script/Maine.SurvivalComponent"
+rule = "lock"
+field = "CurrentWater"
+kind = "float"
+mode = "raise"
+target_field = "ThirstSettings.MaxValue"
+min = 1
+max = 100000
+
+[[field]]
+id = "oxigenio-infinito"
+name = "Oxigênio infinito"
+category = "sobrevivencia"
+description = "O fôlego embaixo d'água não acaba"
+object = "SurvivalComponent"
+object_class = "/Script/Maine.SurvivalComponent"
+rule = "lock"
+field = "CurrentBreath"
+kind = "float"
+mode = "raise"
+target_field = "BreathSettings.MaxValue"
+min = 1
+max = 100000
+
+# Neutro = 0; o frio vai a −100 (MaxChill) e o calor a +100 (MaxSizzle) (P4). Sem campo de neutro: constante.
+[[field]]
+id = "temperatura-estavel"
+name = "Temperatura estável"
+category = "sobrevivencia"
+description = "Sem frio nem calor: a temperatura do corpo fica no neutro"
+object = "BodyTemperatureComponent"
+object_class = "/Script/Maine.BodyTemperatureComponent"
+rule = "lock"
+field = "CurrentBodyTemperature"
+kind = "float"
+mode = "exact"
+target = 0
+min = -1
+max = 1
+
+# bool nativo no SurvivalCharacter (P5); o jogo consulta o campo (P9) e tem um setter que o religa (P6).
+[[field]]
+id = "sem-dano-queda"
+name = "Sem dano de queda"
+category = "sobrevivencia"
+description = "Quedas não tiram vida"
+object = "pawn"
+object_class = "/Script/Maine.SurvivalCharacter"
+rule = "clear_bits"
+fields = ["bTakeFallDamage"]
+kind = "bool"
+
+# Os dois bits ficam no mesmo byte do HealthComponent (P5). Tentativa: ver spec 6.5.2.
+[[field]]
+id = "nao-morrer"
+name = "Não morrer"
+category = "sobrevivencia"
+description = "A vida cai, mas o personagem não morre (experimental)"
+object = "HealthComponent"
+object_class = "/Script/Maine.HealthComponent"
+rule = "clear_bits"
+fields = ["bCanDieFromDamage", "bCanDieEver"]
+kind = "bool"
+
+# Pet (pedido do dono em 2026-10-26, RESEARCH.md): o pet chamado vem do PetMasterComponent do personagem
+# (CurrentPetFull, um SurvivalCreature com os mesmos componentes). Sem pet no mundo, só estes esperam.
+[[field]]
+id = "pet-vida-infinita"
+name = "Vida infinita do pet"
+category = "pet"
+description = "Zera o dano recebido pelo pet a cada instante"
+object = "PetMasterComponent.CurrentPetFull.HealthComponent"
+object_class = "/Script/Maine.HealthComponent"
+rule = "lock"
+field = "CurrentDamage"
+kind = "float"
+mode = "lower"
+target = 0
+min = 0
+max = 100000
+
+[[field]]
+id = "pet-nao-morre"
+name = "Pet não morre"
+category = "pet"
+description = "A vida do pet cai, mas ele não morre"
+object = "PetMasterComponent.CurrentPetFull.HealthComponent"
+object_class = "/Script/Maine.HealthComponent"
+rule = "clear_bits"
+fields = ["bCanDieFromDamage", "bCanDieEver"]
+kind = "bool"
+
+# Montado, é a stamina do pet que gasta (vimos 70 com MaxStamina 60: a trava aprende o máximo efetivo).
+[[field]]
+id = "pet-stamina-infinita"
+name = "Stamina infinita do pet"
+category = "pet"
+description = "A stamina do pet (montaria) não fica abaixo do máximo"
+object = "PetMasterComponent.CurrentPetFull.StaminaComponent"
+object_class = "/Script/Maine.StaminaComponent"
+rule = "lock"
+field = "CurrentStamina"
+kind = "float"
+mode = "raise"
+target_field = "MaxStamina"
+min = 1
+max = 100000

@@ -523,6 +523,82 @@ Build `c935e799-0b27c000` (`Augusta-CL-3207493`). Save de teste, FLiNG fechado, 
   voltaram ligados e funcionando.
 - **Saída:** `q` na TUI; `gt diff` mostrou `nenhuma alteração`. Jogo estável o tempo todo (relato do dono).
 
+## Sessão de 2026-10-26 (Fase 5): globais do Unreal por padrão
+
+Build `c935e799-0b27c000` (`Augusta-CL-3207493`), jogo aberto no menu, FLiNG fechado. **Só leitura.** Os padrões
+foram contados no executável em disco (`scratch/fling/tools/globals.py`, que lê só o arquivo) e conferidos na memória
+com `gt scan` (mesmas contagens). Plano 005, Tarefa 1; regra de aceitação da spec 005 6.2 (uma ocorrência, ou várias
+que resolvem todas para o mesmo endereço).
+
+| Global | Padrão | `disp_offset` | `insn_end` | `adjust` | Ocorrências | Alvo resolvido | Endereço usado |
+|---|---|---|---|---|---|---|---|
+| `GUObjectArray` | `48 8b 05 ?? ?? ?? ?? 48 8b 0c c8 48 8d 04 d1` (`mov rax,[rip+X]; mov rcx,[rax+rcx*8]; lea rax,[rcx+rdx*8]`) | 3 | 7 | 0 | 281 (disco e memória) | `+a53bc30` em todas | `+a53bc30` |
+| `FNamePool` | `74 09 ?? 8d ?? ?? ?? ?? ?? eb ?? 48 8d 0d ?? ?? ?? ?? e8` (inicialização preguiçosa: `je +9; lea reg,[pool]; jmp; lea rcx,[pool]; call construtor`) | 14 | 18 | `0x10` | 19 (disco e memória) | `+a499e40` em todas | `+a499e50` (blocos) |
+
+- O `FNamePool` começa em `+a499e40`: o código referencia `+a499e40` (a estrutura, 43 vezes), `+a499e48` (1 vez) e
+  `+a499e50` (os blocos, 3 vezes, ex.: `+12ed080` `lea rax,[+a499e50]; ret`). Os blocos ficam em `+0x10` da
+  estrutura, daí o `adjust = 0x10`.
+- **Descartados:** `4c 8d 3d ?? ?? ?? ?? eb ?? 48 8d 0d ?? ?? ?? ?? e8` (1 ocorrência, mas preso ao registrador
+  `r15`, frágil); o mesmo sem o `74 09` inicial (28 ocorrências com 8 alvos diferentes: ambíguo, pega outras
+  inicializações preguiçosas); o getter `48 8d 05 ?? ?? ?? ?? c3` (comum a muitas globais).
+
+## Sessão de 2026-10-26 (Fase 5): reflexão do personagem (P2–P9)
+
+Build `c935e799-0b27c000`, partida carregada, FLiNG fechado. **Só leitura.** Plano 005, Tarefa 10. Classes e campos
+com `gt ue class`; valores ao vivo com `scratch/p10/watch.py` (refaz o caminho controller → pawn → componentes a cada
+0,5 s, `nice 19`), com o dono correndo, apanhando, caindo, passando frio e calor e montando. Os offsets abaixo são deste
+build e só servem para conferir os testes no jogo: o trainer acha tudo pela reflexão, por nome.
+
+**Custo (spec 6.1).** `gt ue player` sem endereços: globais em 0,45 s (com `rva`, só memória), índice em 1,0 s (9090
+classes), procura do controller em 1,0 s (477128 itens na tabela, 470 mil objetos). Bem abaixo do teto de 60 s.
+
+**Caminho (P8).** `SurvivalPlayerController` (`/Script/Maine`, filha de `PlayerController`) único, achado na primeira
+varredura. `Controller.Pawn` `+0x318`, `Controller.Character` `+0x328`, `PlayerController.AcknowledgedPawn` `+0x380`.
+Componentes em `SurvivalCharacter`: `HealthComponent` `+0x13b8`, `StaminaComponent` `+0x13d0`,
+`BodyTemperatureComponent` `+0x1420`, `SurvivalComponent` `+0x14e0` (todos `ObjectProperty`, classes de mesmo nome
+em `/Script/Maine`).
+
+| Pergunta | Resposta |
+|---|---|
+| P2 (máximos de comida, água e oxigênio) | Não há campo solto. O máximo é `MaxValue` (`+0x0`) das structs `HungerSettings` (`+0x150`, `SurvivalTraitSettings`), `ThirstSettings` (`+0x198`, `SurvivalTraitSettings`) e `BreathSettings` (`+0x1e0`, `BreathSettings`) do `SurvivalComponent`; 100 nas três. Atuais: `CurrentFood` `+0x290`, `CurrentWater` `+0x298`, `CurrentBreath` `+0x2a0`. O ponteiro da `UScriptStruct` fica em `+0x70` da `FStructProperty` (`scratch/p10/struct_fields.py`). |
+| P3 (stamina) | `CurrentStamina` `+0x100`, `MaxStamina` `+0x104` = 100. A stamina regenera até **120** (mais que `MaxStamina`) e nenhum campo do componente guarda esse 120: vem de efeitos fora dele. Alvo da trava: `MaxStamina`, que nunca baixa o excedente (regra de "só sobe"). |
+| P4 (temperatura) | `CurrentBodyTemperature` `+0x134`, neutro **0**; frio vai a −100 (`MaxChill`), calor a +100 (`MaxSizzle`). Observado: −83,3 no frio e +39,6 no calor (inseto ácido). `CurrentBodyTemperaturePerSecond` `+0x130` mostra a taxa (±5, ±10, +30/s). Volta a 0 sozinha fora do perigo. |
+| P5 (bits) | `HealthComponent`: `bCanDieFromDamage` e `bCanDieEver` no mesmo byte `+0x11d`, máscaras `0x02` e `0x04` (o `0x01` é `PlayDamagedParticlesOnDeath`); confere com o `+0x11d` da Fase 3. `SurvivalCharacter.bTakeFallDamage` `+0x1619`, `bool` nativo (máscara `0xff`). `MaxHealth` `+0x330`, `CurrentDamage` `+0x334`. |
+| P6 (bits voltam sozinhos) | Na sessão, os bits nunca foram limpos, então não deu para ver o jogo religá-los. Há um setter que grava 1 em `bTakeFallDamage` (`+563ea60`, `mov byte [rcx+0x1619],1; ret`): a manutenção a ~10 Hz continua necessária. |
+| P7 (morte, menu, montaria) | **Montado, `Pawn`, `Character` e `AcknowledgedPawn` apontam para a montaria** (vida 320, stamina 60, sem `SurvivalComponent`). `SurvivalPlayerController.CachedSurvivalPlayerCharacter` (`+0xfb8`, `ObjectProperty`) continua no personagem: vai para `alt_pawn_fields`. O pawn nunca ficou nulo nem mudou de endereço na sessão (morte e recarga não foram vistas no registro); a revalidação de 6.3 cobre esses casos. |
+| P9 (o jogo consulta `bTakeFallDamage`) | Sim. A consulta em `+5818260` devolve `false` se o personagem está numa lista de exceções; senão, se o byte `+0x161b` está ligado, devolve o byte `+0x161a` (substituição fora da reflexão); senão, devolve `bTakeFallDamage`. Únicos acessos ao `+0x1619`: essa leitura e dois `mov byte [...],1` (`+563ea60` e `+580f95b`). Com a substituição ligada, o cheat não teria efeito (não visto). |
+
+- **Alternativa anotada para o dono:** o `SurvivalComponent` tem `bAllowCurrentFoodDecrease` (`+0x294`) e
+  `bAllowCurrentWaterDecrease` (`+0x29c`), `bool` nativos. Limpá-los faria a comida e a água não caírem sem reescrever
+  o valor. Não usado: mudaria como os cheats funcionam (spec 6.5.1).
+
+## Sessão de 2026-10-26 (Fase 5): critério de pronto da spec 005 no jogo
+
+Build `c935e799-0b27c000`, backup do save feito pelo dono, FLiNG fechado. Plano 005, Tarefa 19.
+
+- Testes `#[ignore]` em `apps/gt-tui/tests/game.rs`: `game_globals_layout_and_fields_available` (busca de patches e
+  globais 1,5 s, índice 1,05 s, controller 0,97 s; os oito disponíveis e verificados) e `game_bits_round_trip`
+  (`sem-dano-queda`: byte `+0x1619` do pawn, original `0x01`, máscara `0xff`; `nao-morrer`: byte `+0x11d` do
+  `HealthComponent`, original `0x06`, máscara `0x06`; os dois voltaram ao original e o diário ficou vazio).
+- Critério 1–11 pela TUI com o dono: **tudo funcionou**, inclusive "Não morrer" e "Sem dano de queda", menos a
+  stamina na primeira rodada. A trava segurava `CurrentStamina` em 100, mas o jogo considera cheia em 120 (bônus sobre
+  `MaxStamina`), então a barra parecia não encher. Correção: as travas de subir miram o maior valor já visto naquele
+  objeto com o cheat ligado (nunca menos que o campo de alvo); na segunda rodada, a stamina ficou cheia. O dono lembra
+  que vida e stamina crescem com a progressão: a vida segue `MaxHealth − CurrentDamage` e a stamina, o `MaxStamina`
+  relido a cada ciclo mais o máximo aprendido.
+- Montado, os cheats seguem no personagem (`CachedSurvivalPlayerCharacter`); o `Pawn` alterna entre o personagem e a
+  montaria durante o jogo, sem efeito nos cheats.
+- **Pet** (pedido do dono, sem spec por decisão dele): o `PetMasterComponent` do personagem (`+0x14b0`) tem
+  `CurrentPetFull` (`+0x170`), `bBuggyGodModeActive` (`+0x180`, `bool` nativo, `0x00`, não usado),
+  `CurrentPetMaxHealth` (`+0x1c4`, 220) e `CurrentPetDamage` (`+0x1c8`, 13,4), que não batem com a vida real do pet
+  (320) e não são usados. O `+0x70` de um `ObjectProperty` é a classe apontada (`PropertyClass`, no mesmo lugar do
+  ponteiro da struct de uma `StructProperty`): `PetMasterComponent` → `PetMasterComponent`, `CurrentPetFull` →
+  `SurvivalCreature`, `HealthComponent` → `HealthComponent`. O pet é a montaria (vida 320, stamina 70 com
+  `MaxStamina` 60) e tem os mesmos componentes do personagem. `CurrentPetFull` fica nulo até o pet aparecer no mundo
+  e, depois, vale montado e desmontado (`scratch/p10/petwatch.py`: nulo às 12:07:20, o pet desde 12:08:05, com o
+  `Pawn` alternando entre o personagem e o pet ao montar). Os três cheats do pet (vida, não morre, stamina)
+  funcionaram no jogo; ficam na categoria `PET`.
+
 ## Hipóteses descartadas
 
 - (2026-10-25) "Os patches em `+57BD6D0`/`+5BBFE8C` indicam que as opções de cargas e arrastar item estavam

@@ -377,6 +377,7 @@ fn restore_discards_dead_process_journal() {
                 replacement: NOP2_NOP.to_vec(),
                 next: None,
             }],
+            data: Vec::new(),
         })
         .unwrap();
     let out = restore(dir.path());
@@ -417,6 +418,7 @@ fn restore_skips_entry_outside_exec_region() {
                 replacement: NOP2_NOP.to_vec(),
                 next: None,
             }],
+            data: Vec::new(),
         })
         .unwrap();
     let out = restore(dir.path());
@@ -535,5 +537,123 @@ fn cont_always_then_restore_resumes() {
     );
     assert!(wait_stopped(t.pid, false));
     assert_eq!(bytes_at(t.pid, t.exec2, 3), NOP3);
+    assert_eq!(journal(dir.path()), Loaded::Missing);
+}
+
+// ---------------------------------------------------------------------------
+// Bits em dados (plano 005, tarefa 12)
+// ---------------------------------------------------------------------------
+
+/// Guarda de 8 bytes no início do `big_region` e o byte `0x07` em `+0x100`.
+fn bits_object(t: &TestTarget) -> (u64, String) {
+    let w = gt_core::mem::MemWriter::open(t.pid).unwrap();
+    w.write(
+        t.big_region,
+        &[0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8],
+    )
+    .unwrap();
+    w.write(t.big_region + 0x100, &[0x07]).unwrap();
+    (
+        t.big_region + 0x100,
+        format!("{:#x}:c1c2c3c4c5c6c7c8", t.big_region),
+    )
+}
+
+/// `set-bits` do `id` `nao-morrer`, máscara `0x06`, com opções globais quaisquer.
+fn bits_cmd(t: &TestTarget, dir: &Path, globals: &[&str]) -> Command {
+    let (byte, guard) = bits_object(t);
+    let mut cmd = harness(dir);
+    cmd.args(["--pid".to_string(), t.pid.to_string()]);
+    cmd.args(globals);
+    cmd.args([
+        "set-bits".to_string(),
+        "--id".to_string(),
+        "nao-morrer".to_string(),
+        "--addr".to_string(),
+        format!("{byte:#x}"),
+        "--mask".to_string(),
+        "0x06".to_string(),
+        "--guard".to_string(),
+        guard,
+    ]);
+    cmd
+}
+
+#[test]
+fn set_bits_sigkill_then_recover() {
+    let t = TestTarget::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = spawn(bits_cmd(&t, dir.path(), &[]));
+    let _reader = wait_line(&mut child, "ativo");
+    let byte = t.big_region + 0x100;
+    assert_eq!(bytes_at(t.pid, byte, 1), [0x01]);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    match journal(dir.path()) {
+        Loaded::Ok(j) => {
+            assert!(j.entries.is_empty());
+            assert_eq!(j.data.len(), 1);
+            assert_eq!((j.data[0].original, j.data[0].mask), (0x07, 0x06));
+        }
+        other => panic!("diário inesperado: {other:?}"),
+    }
+    let out = restore(dir.path());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("restaurado: nao-morrer"), "{stdout}");
+    assert_eq!(bytes_at(t.pid, byte, 1), [0x07]);
+    assert_eq!(journal(dir.path()), Loaded::Missing);
+}
+
+#[test]
+fn set_bits_sigkill_object_gone_discards() {
+    let t = TestTarget::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = spawn(bits_cmd(&t, dir.path(), &[]));
+    let _reader = wait_line(&mut child, "ativo");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    // Outro objeto no mesmo endereço: a guarda não bate mais.
+    gt_core::mem::MemWriter::open(t.pid)
+        .unwrap()
+        .write(t.big_region, &[0x00])
+        .unwrap();
+    let out = restore(dir.path());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("bytes de outro, não tocado: nao-morrer"),
+        "{stdout}"
+    );
+    assert_eq!(bytes_at(t.pid, t.big_region + 0x100, 1), [0x01]);
+    assert_eq!(journal(dir.path()), Loaded::Missing);
+}
+
+#[test]
+fn set_bits_sigterm_restores() {
+    let t = TestTarget::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = spawn(bits_cmd(&t, dir.path(), &[]));
+    let reader = wait_line(&mut child, "ativo");
+    kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM).unwrap();
+    let status = wait_exit(&mut child);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+    assert!(rest(reader).contains("restaurado"));
+    assert_eq!(bytes_at(t.pid, t.big_region + 0x100, 1), [0x07]);
+    assert_eq!(journal(dir.path()), Loaded::Missing);
+}
+
+#[test]
+fn set_bits_panic_restores() {
+    let t = TestTarget::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let out = bits_cmd(&t, dir.path(), &["--hook", "panic-after-bits"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("pânico de teste"),
+        "{out:?}"
+    );
+    // O `Drop` do motor restaurou os bits.
+    assert_eq!(bytes_at(t.pid, t.big_region + 0x100, 1), [0x07]);
     assert_eq!(journal(dir.path()), Loaded::Missing);
 }

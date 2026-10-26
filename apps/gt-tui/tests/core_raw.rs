@@ -83,6 +83,7 @@ fn env() -> Env {
         version_key: "raw-1".into(),
         search_delay: Duration::ZERO,
         search_panics: false,
+        ue: None,
     }));
     let dir = tempfile::tempdir().unwrap();
     let backend = RawBackend::new(control.clone(), dir.path().to_path_buf()).unwrap();
@@ -223,7 +224,7 @@ fn raw_merge_search_updates_only_listed() {
     // O `merge_search` precisa respeitar `ids` por conta própria: este resultado leva as duas
     // definições novas no `payload`, mas lista só o `toggle` em `ids`.
     let mut again = (e.backend.search_fn())(t.pid, None, Some(identity)).unwrap();
-    assert_eq!(again.payload.len(), 2);
+    assert_eq!(again.payload.defs().len(), 2);
     again.ids = listed.ids;
     assert!(s.merge_search(again));
 
@@ -722,4 +723,213 @@ fn raw_search_panic_restores() {
         Loaded::Ok(j) => assert!(j.entries.is_empty(), "restou: {:?}", j.entries),
         other => panic!("diário inesperado: {other:?}"),
     }
+}
+
+// ---- cheats de valor (spec 005, plano 005 tarefa 17) ----
+
+use gt_testkit::ue::{DAMAGE_OFF, DIE_BYTE};
+use gt_testkit::{UeAddrs, synth_signatures};
+use gt_tui::model::PlayerLine;
+use gt_tui::raw::RawUe;
+
+/// Alvo com a reflexão sintética e o controlador ligado a ele.
+struct UeEnv {
+    target: TestTarget,
+    ue: UeAddrs,
+    c: Controller<RawBackend>,
+    _dir: tempfile::TempDir,
+    _guard: MutexGuard<'static, ()>,
+}
+
+fn ue_env() -> UeEnv {
+    let guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let target = TestTarget::spawn_with(TargetOpts {
+        ue: true,
+        ..Default::default()
+    });
+    let ue = target.ue.unwrap();
+    let (sigs, fields) = synth_signatures();
+    let control = Arc::new(Mutex::new(RawControl {
+        pid: Some(target.pid),
+        defs: defs_of(&target),
+        version_key: "raw-1".into(),
+        search_delay: Duration::ZERO,
+        search_panics: false,
+        ue: Some(RawUe {
+            gobjects: ue.gobjects,
+            names: ue.names,
+            sigs,
+            fields,
+        }),
+    }));
+    let dir = tempfile::tempdir().unwrap();
+    let backend = RawBackend::new(control, dir.path().to_path_buf()).unwrap();
+    let c = Controller::new(backend, Box::new(|| "00:00".to_string()), false, false);
+    UeEnv {
+        target,
+        ue,
+        c,
+        _dir: dir,
+        _guard: guard,
+    }
+}
+
+impl UeEnv {
+    /// Uma volta do laço em `now`, esperando o trabalho da tarefa de reflexão que ela iniciar.
+    fn step(&mut self, now: Instant) {
+        let mut draw = |_: &Model| {};
+        self.c.tick(now, &mut draw);
+        self.c.wait_job(now, Duration::from_secs(10));
+        self.c.tick(now, &mut draw);
+    }
+
+    fn connect(&mut self, now: Instant) {
+        let mut draw = |_: &Model| {};
+        self.c.start(&mut draw);
+        self.c.tick(now, &mut draw);
+        assert!(self.c.wait_search(now, Duration::from_secs(10)));
+        assert!(matches!(
+            self.c.model.conn,
+            Conn::Connected { engine: true, .. }
+        ));
+    }
+
+    fn row(&self, id: &str) -> &gt_tui::model::CheatRow {
+        self.c.model.cheats.iter().find(|r| r.id == id).unwrap()
+    }
+
+    fn toggle(&mut self, id: &str, now: Instant) {
+        let index = self
+            .c
+            .model
+            .visible()
+            .iter()
+            .position(|r| r.id == id)
+            .unwrap();
+        self.c.model.selected = index;
+        let mut draw = |_: &Model| {};
+        assert!(self.c.handle(Action::Toggle, now, &mut draw));
+    }
+
+    fn health(&self) -> u64 {
+        let raw = read(
+            self.target.pid,
+            self.ue.pawn + u64::from(gt_testkit::ue::HEALTH_OFF),
+            8,
+        );
+        u64::from_le_bytes(raw.try_into().unwrap())
+    }
+
+    fn damage(&self) -> f32 {
+        let raw = read(self.target.pid, self.health() + u64::from(DAMAGE_OFF), 4);
+        f32::from_le_bytes(raw.try_into().unwrap())
+    }
+
+    fn poke(&self, addr: u64, bytes: &[u8]) {
+        MemWriter::open(self.target.pid)
+            .unwrap()
+            .write(addr, bytes)
+            .unwrap();
+    }
+}
+
+#[test]
+fn raw_fields_checking_then_available() {
+    let mut e = ue_env();
+    let t0 = Instant::now();
+    e.connect(t0);
+    assert!(e.row("vida-infinita").field);
+    assert_eq!(e.row("vida-infinita").avail, Avail::Checking);
+    // O patch não espera a reflexão.
+    assert_eq!(e.row(TOGGLE).avail, Avail::Available { verified: true });
+    e.step(t0);
+    for id in ["vida-infinita", "nao-morrer", "comida-infinita"] {
+        assert_eq!(e.row(id).avail, Avail::Available { verified: true }, "{id}");
+    }
+}
+
+#[test]
+fn raw_lock_holds_value() {
+    let mut e = ue_env();
+    let t0 = Instant::now();
+    e.connect(t0);
+    e.step(t0);
+    let damage = e.health() + u64::from(DAMAGE_OFF);
+    e.poke(damage, &30f32.to_le_bytes());
+    e.toggle("vida-infinita", t0);
+    assert!(e.row("vida-infinita").on);
+    // A procura do controller e, no ciclo seguinte, a trava.
+    for i in 1..=3 {
+        e.step(t0 + Duration::from_millis(100 * i));
+    }
+    assert_eq!(e.damage(), 0.0);
+    assert_eq!(e.c.model.player, PlayerLine::Found);
+    // O jogo volta a ferir: a trava zera de novo.
+    e.poke(damage, &12f32.to_le_bytes());
+    e.step(t0 + Duration::from_millis(500));
+    assert_eq!(e.damage(), 0.0);
+}
+
+#[test]
+fn raw_bits_restored_on_shutdown() {
+    let mut e = ue_env();
+    let t0 = Instant::now();
+    e.connect(t0);
+    e.step(t0);
+    let die = e.health() + u64::from(DIE_BYTE);
+    assert_eq!(read(e.target.pid, die, 1), [0x03]);
+    e.toggle("nao-morrer", t0);
+    for i in 1..=3 {
+        e.step(t0 + Duration::from_millis(100 * i));
+    }
+    assert_eq!(read(e.target.pid, die, 1), [0x00]);
+    let (restored, foreign) = e.c.shutdown(&mut |_: &Model| {});
+    assert!(restored.contains(&"nao-morrer".to_string()), "{restored:?}");
+    assert!(foreign.is_empty());
+    assert_eq!(read(e.target.pid, die, 1), [0x03]);
+}
+
+#[test]
+fn raw_absent_then_found_resumes() {
+    let mut e = ue_env();
+    let t0 = Instant::now();
+    e.connect(t0);
+    e.step(t0);
+    e.toggle("vida-infinita", t0);
+    for i in 1..=3 {
+        e.step(t0 + Duration::from_millis(100 * i));
+    }
+    assert_eq!(e.c.model.player, PlayerLine::Found);
+    let damage = e.health() + u64::from(DAMAGE_OFF);
+    // Menu ou carregamento: `Pawn` nulo.
+    e.poke(e.ue.pawn_field_addr, &0u64.to_le_bytes());
+    e.poke(damage, &40f32.to_le_bytes());
+    e.step(t0 + Duration::from_millis(400));
+    assert_eq!(e.c.model.player, PlayerLine::NotFound);
+    assert_eq!(
+        e.row("vida-infinita").note,
+        Some(gt_grounded2::fields::Note::Waiting)
+    );
+    assert_eq!(e.damage(), 40.0);
+    // O personagem volta: retoma sozinho.
+    e.poke(e.ue.pawn_field_addr, &e.ue.pawn.to_le_bytes());
+    e.step(t0 + Duration::from_millis(500));
+    assert_eq!(e.c.model.player, PlayerLine::Found);
+    assert_eq!(e.row("vida-infinita").note, None);
+    assert_eq!(e.damage(), 0.0);
+    let events: Vec<&str> = e.c.model.events.iter().map(String::as_str).collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|l| l.ends_with("personagem perdido"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|l| l.ends_with("personagem encontrado"))
+            .count(),
+        2
+    );
 }

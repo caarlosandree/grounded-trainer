@@ -21,6 +21,7 @@ clap.workspace = true
 crossterm.workspace = true
 gt-core = { workspace = true, features = ["write"] }
 gt-grounded2 = { workspace = true, features = ["write"] }
+gt-ue.workspace = true
 nix.workspace = true
 ratatui.workspace = true
 thiserror.workspace = true
@@ -33,6 +34,8 @@ test-backend = []
 
 [dev-dependencies]
 gt-testkit.workspace = true
+# Reflexão sintética nos testes do `values.rs`.
+gt-ue = { workspace = true, features = ["synth"] }
 gt-tui = { path = ".", features = ["test-backend"] }
 nix = { workspace = true, features = ["term"] }
 serde_json.workspace = true

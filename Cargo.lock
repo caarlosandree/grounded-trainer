@@ -597,6 +597,7 @@ dependencies = [
  "gt-core",
  "gt-grounded2",
  "gt-testkit",
+ "gt-ue",
  "nix 0.31.3",
  "serde",
  "serde_json",
@@ -626,6 +627,7 @@ name = "gt-grounded2"
 version = "0.1.0"
 dependencies = [
  "gt-core",
+ "gt-ue",
  "serde",
  "tempfile",
  "thiserror 2.0.21",
@@ -654,6 +656,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "gt-core",
+ "gt-grounded2",
+ "gt-ue",
  "nix 0.31.3",
  "serde_json",
  "tempfile",
@@ -671,6 +675,7 @@ dependencies = [
  "gt-grounded2",
  "gt-testkit",
  "gt-tui",
+ "gt-ue",
  "nix 0.31.3",
  "ratatui",
  "serde_json",
@@ -683,6 +688,12 @@ dependencies = [
 [[package]]
 name = "gt-ue"
 version = "0.1.0"
+dependencies = [
+ "gt-core",
+ "gt-ue",
+ "thiserror 2.0.21",
+ "tracing",
+]
 
 [[package]]
 name = "hashbrown"

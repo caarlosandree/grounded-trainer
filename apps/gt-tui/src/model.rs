@@ -3,10 +3,15 @@
 use std::collections::VecDeque;
 
 use gt_core::value::ValueSpec;
+use gt_grounded2::fields::Note;
 use gt_grounded2::signatures::Category;
 
 /// Quantas linhas do registro de eventos o modelo guarda.
 const MAX_EVENTS: usize = 200;
+
+/// Estado de um cheat de valor enquanto a reflexão do jogo ainda não foi conferida (spec 005,
+/// 6.7). A tela mostra só este texto, sem `indisponível (…)`.
+pub const CHECKING: &str = "verificando…";
 
 /// Estado de conexão com o jogo (spec 6.2), mostrado no topo.
 #[derive(Debug, Clone, PartialEq)]
@@ -60,6 +65,8 @@ pub enum Avail {
     Available { verified: bool },
     /// Não pode ser ligado (motivo curto).
     Unavailable(String),
+    /// Cheat de valor esperando a tarefa de reflexão (`verificando…`).
+    Checking,
 }
 
 /// Estado mostrado na linha de um cheat.
@@ -98,6 +105,10 @@ pub struct CheatRow {
     pub residue: bool,
     /// Espelho para a tela do mapa de desejados do controlador (que é a fonte da verdade).
     pub desired: bool,
+    /// Cheat de valor (`[[field]]`), não patch.
+    pub field: bool,
+    /// Com o cheat ligado, por que ele não escreveu neste ciclo.
+    pub note: Option<Note>,
 }
 
 impl CheatRow {
@@ -115,6 +126,27 @@ impl CheatRow {
         match &self.avail {
             Avail::Available { .. } => CheatStatus::Off,
             Avail::Unavailable(reason) => CheatStatus::Unavailable(reason.clone()),
+            Avail::Checking => CheatStatus::Unavailable(CHECKING.to_string()),
+        }
+    }
+}
+
+/// Linha `personagem:` do topo (spec 005, 6.7).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PlayerLine {
+    /// Nenhum cheat de valor ligado ou desejado: ninguém procura.
+    #[default]
+    Idle,
+    Found,
+    NotFound,
+}
+
+impl PlayerLine {
+    pub fn label(self) -> &'static str {
+        match self {
+            PlayerLine::Idle => "personagem: —",
+            PlayerLine::Found => "personagem: encontrado",
+            PlayerLine::NotFound => "personagem: não encontrado",
         }
     }
 }
@@ -161,6 +193,8 @@ pub struct Model {
     pub diagnostic: bool,
     /// O terminal está menor que o mínimo.
     pub too_small: bool,
+    /// Linha `personagem:` (só aparece com cheats de valor na lista).
+    pub player: PlayerLine,
     /// `id` do cheat da última linha e o valor de antes da primeira troca da sequência, se ela
     /// veio de [`Model::merge_value_event`].
     last_value_event: Option<(String, String)>,
@@ -178,6 +212,7 @@ impl Model {
             events: VecDeque::new(),
             diagnostic,
             too_small: false,
+            player: PlayerLine::Idle,
             last_value_event: None,
         }
     }
@@ -274,6 +309,8 @@ mod tests {
             on: false,
             residue: false,
             desired: false,
+            field: false,
+            note: None,
         }
     }
 
@@ -441,5 +478,26 @@ mod tests {
             m.merge_value_event("00:00", &format!("id{i}"), "n", "a", &format!("v{i}"));
         }
         assert_eq!(m.events.len(), 200);
+    }
+
+    #[test]
+    fn checking_shows_verificando() {
+        let r = row("f", Category::Sobrevivencia, Avail::Checking);
+        assert_eq!(
+            r.status(&connected()),
+            CheatStatus::Unavailable(CHECKING.to_string())
+        );
+        // Não conta como disponível.
+        let mut m = Model::new(false);
+        m.cheats = vec![r];
+        assert_eq!(m.counts(), (0, 1));
+    }
+
+    #[test]
+    fn player_line_labels() {
+        assert_eq!(PlayerLine::Idle.label(), "personagem: —");
+        assert_eq!(PlayerLine::Found.label(), "personagem: encontrado");
+        assert_eq!(PlayerLine::NotFound.label(), "personagem: não encontrado");
+        assert_eq!(Model::new(false).player, PlayerLine::Idle);
     }
 }

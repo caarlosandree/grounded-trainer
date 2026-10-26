@@ -7,15 +7,16 @@ use gt_core::pe::PeHeaders;
 use gt_core::suspend::PauseConfig;
 
 use crate::Result;
-use crate::policy::write_policy;
+use crate::policy::{data_policy, write_policy};
 use crate::resolve::Target;
 
 /// Abre o motor de patches no processo `target`.
 ///
 /// A política de escrita é recalculada a cada lote com o `maps` novo ([`write_policy`]), a
-/// partir do `module` e do cabeçalho do disco `disk` (calculados uma vez, spec 6.6). O motor só
-/// abre se o processo ainda tiver a identidade lida no [`Target::open`]. Quem chama guarda o
-/// `lock` do diário até depois do `drop` do [`Engine`].
+/// partir do `module` e do cabeçalho do disco `disk` (calculados uma vez, spec 6.6). A das
+/// escritas em dados ([`data_policy`], spec 005 6.4) exclui as imagens de todos os módulos do
+/// alvo. O motor só abre se o processo ainda tiver a identidade lida no [`Target::open`]. Quem
+/// chama guarda o `lock` do diário até depois do `drop` do [`Engine`].
 pub fn open_engine(
     target: &Target,
     store: JournalStore,
@@ -30,12 +31,15 @@ pub fn open_engine(
         version_key,
         pause: PauseConfig::default(),
     };
-    Ok(Engine::open(
+    let mut engine = Engine::open(
         target.pid,
         Some(&target.identity),
         store,
         lock,
         policy,
         options,
-    )?)
+    )?;
+    let images: Vec<_> = target.modules.iter().map(|m| m.base..m.end()).collect();
+    engine.set_data_policy(Box::new(move |maps| data_policy(&images, maps)));
+    Ok(engine)
 }

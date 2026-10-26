@@ -247,6 +247,10 @@ leitura, ficam fora. As seções são calculadas assim:
 
 Um patch que cruza o fim de uma seção é recusado. Nos testes, o alvo de teste passa a página executável dele.
 
+> **Nota (spec 005, 6.6):** a escrita em dados da Fase 5 e as entradas de dados do diário (bits) **não** seguem esta
+> política de memória executável: têm uma política própria (regiões `rw-` fora das imagens de módulo) e, na
+> recuperação, a regra de `decide_data` (guarda do objeto relida, byte em região `rw`, só os bits da máscara).
+
 ### 6.7 Registro e identidade do processo
 
 - **Abertura, nesta ordem:** ler o horário de início, abrir o `pidfd`, abrir o `/proc/<pid>/mem` para escrita e

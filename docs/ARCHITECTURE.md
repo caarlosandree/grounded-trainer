@@ -50,27 +50,42 @@ grounded-trainer/
 │   │       ├── journal.rs        # diário em disco, trava OFD e decisão de recuperação (pura)
 │   │       ├── suspend.rs        # pausar/retomar o processo com conferência das threads
 │   │       ├── value.rs          # ValueSpec (i32/u32/f32), grade por k e bytes de um valor
-│   │       ├── engine.rs         # motor: aplica/desfaz lotes e troca valor, com diário e pausa (feature write)
+│   │       ├── global.rs         # globais por padrão AOB: alvo RIP-relativo e decisão de unicidade
+│   │       ├── engine.rs         # motor: patches com diário e pausa; escrita em dados e bits, sem pausa (feature write)
 │   │       ├── recovery.rs       # recuperação do diário no início de cada comando (feature write)
 │   │       └── session.rs        # sinais de encerramento, laço do run e toggle (feature write)
-│   ├── gt-ue/                    # estruturas do Unreal Engine 5 (Fase 5)
-│   │   └── src/                  # FName/GNames, GObjects, GWorld, leitura de UObjects
+│   ├── gt-ue/                    # leitor genérico da reflexão do Unreal Engine 5 (Fase 5), só leitura
+│   │   └── src/
+│   │       ├── layout.rs         # UeLayout (offsets das estruturas de reflexão, vindos do [ue] das assinaturas)
+│   │       ├── names.rs          # FNamePool: nomes por índice, com cache
+│   │       ├── objects.rs        # GUObjectArray: cabeçalho, consulta por índice e varredura em lotes com pausa
+│   │       ├── check.rs          # conferência barata do layout (nome 0, contagens, amostra de itens)
+│   │       ├── index.rs          # ReflectionIndex: classes por (pacote, nome), campos (com caminho Struct.Campo), is_a
+│   │       ├── dump.rs           # describe_class (gt ue class)
+│   │       └── synth.rs          # reflexão sintética e memória esparsa para testes (feature synth)
 │   ├── gt-grounded2/             # conhecimento específico do jogo
-│   │   ├── src/cheats/           # 1 módulo por cheat (sobrevivência, itens, progressão, movimento)
+│   │   ├── src/catalog.rs        # busca dos padrões dos patches e das globais numa passada
+│   │   ├── src/ue.rs             # estado das globais do Unreal e conferência barata (UeScan)
+│   │   ├── src/player.rs         # caminho até o personagem, catálogo dos cheats de valor e plano das escritas
+│   │   ├── src/fields.rs         # execução dos cheats de valor no motor (feature write)
 │   │   └── signatures/           # *.toml por build do jogo
 │   └── gt-testkit/               # apoio a testes (publish = false): TestTarget, bin_path e binários de apoio
 │       ├── src/bin/gt-testtarget.rs      # processo-alvo de teste (não é o gt)
 │       ├── src/bin/gt-patch-harness.rs   # mesma biblioteca do gt-patch com patch cru (testes)
+│       ├── src/ue.rs             # cena de reflexão sintética do gt-testtarget --ue e as definições dela
 │       ├── tests/core_live.rs    # testes de API viva do gt-core contra o alvo
-│       ├── tests/engine_live.rs  # testes do motor, da pausa e do toggle contra o alvo
-│       └── tests/harness.rs      # sinais, pânico, SIGKILL e recuperação pelo harness
+│       ├── tests/engine_live.rs  # testes do motor (patches, pausa, toggle, escrita em dados e bits) contra o alvo
+│       ├── tests/ue_live.rs      # leitor de reflexão e caminho até o personagem contra o alvo
+│       ├── tests/fields_live.rs  # execução dos cheats de valor contra o alvo
+│       └── tests/harness.rs      # sinais, pânico, SIGKILL e recuperação pelo harness (patches e bits)
 ├── apps/
-│   ├── gt-cli/                   # ferramentas de pesquisa: inspect, read, scan, disasm, diff, dump, fling
+│   ├── gt-cli/                   # ferramentas de pesquisa: inspect, read, scan, disasm, diff, dump, fling, ue (class, player)
 │   ├── gt-patch/                 # aplica/desfaz patches (list, run, toggle, restore, profile); com `write`
 │   └── gt-tui/                   # interface do jogador: biblioteca + binário; com `write`
 │       ├── src/model.rs, keys.rs, controller.rs   # núcleo da TUI: estado, teclas, conexão, desejados, fila de trocas de valor
 │       ├── src/backend.rs        # interface de alvo (Backend)
 │       ├── src/game.rs           # implementação do jogo (gt-grounded2)
+│       ├── src/values.rs         # cheats de valor da sessão: tarefa de reflexão, disponibilidade e manutenção
 │       ├── src/raw.rs            # implementação crua contra o gt-testtarget (feature test-backend)
 │       ├── src/fake.rs           # implementação falsa do alvo para os testes unitários (#[cfg(test)])
 │       ├── src/term.rs, ui.rs, app.rs, exit.rs, logfile.rs   # terminal (crossterm/ratatui), laço, saída, log
@@ -118,11 +133,13 @@ As versões são fixadas no `Cargo.toml` na Fase 0, usando a estável mais recen
 ### 5.3 Versão do jogo e assinaturas
 - Chave de versão: campo `TimeDateStamp` do PE (hash de build reprodutível, ex. `c935e799`) + `SizeOfImage`.
 - Assinaturas em `crates/gt-grounded2/signatures/*.toml`, embutidas no binário (`include_str!`); atualizar exige recompilar. Detalhes do comportamento na spec `002-motor-patches.md` (6.3 e 6.4).
-  - `generic.toml` (obrigatório): um bloco `[[patch]]` por patch, válido para qualquer versão: `id`, `name` (nome curto em pt-BR para a lista da TUI, obrigatório), `category` (`sobrevivencia`, `itens`, `progressao`, `movimento` ou `diagnostico`; obrigatória; a TUI mostra as categorias nessa ordem e os cheats na ordem do arquivo), `value` (opcional, faz do patch um cheat com valor: `type` `i32`/`u32`/`f32`, `slot`, `min`, `max`, `step`, `default`, `unit`, `decimals`; o `slot` fica inteiro dentro do imediato de uma instrução de `replacement` e tem exatamente o tamanho dele (imediato de tamanho diferente do tipo é recusado, e o deslocamento relativo de um desvio não conta como imediato); `u32` num imediato de 32 bits estendido com sinal só vai até `i32::MAX`; no `<chave>.toml` o bloco é sobrescrito inteiro), `description` (pt-BR), `module` (opcional; só o exe do jogo nesta fase), `pattern` (AOB com os bytes originais, mesma sintaxe do `gt scan`), `offset` (do início da ocorrência ao início do patch), `expected` e `replacement` (bytes em hex separados por espaço, mesmo tamanho).
+  - `generic.toml` (obrigatório): um bloco `[[patch]]` por patch, válido para qualquer versão: `id`, `name` (nome curto em pt-BR para a lista da TUI, obrigatório), `category` (`sobrevivencia`, `pet`, `itens`, `progressao`, `movimento` ou `diagnostico`; obrigatória; a TUI mostra as categorias nessa ordem e os cheats na ordem do arquivo), `value` (opcional, faz do patch um cheat com valor: `type` `i32`/`u32`/`f32`, `slot`, `min`, `max`, `step`, `default`, `unit`, `decimals`; o `slot` fica inteiro dentro do imediato de uma instrução de `replacement` e tem exatamente o tamanho dele (imediato de tamanho diferente do tipo é recusado, e o deslocamento relativo de um desvio não conta como imediato); `u32` num imediato de 32 bits estendido com sinal só vai até `i32::MAX`; no `<chave>.toml` o bloco é sobrescrito inteiro), `description` (pt-BR), `module` (opcional; só o exe do jogo nesta fase), `pattern` (AOB com os bytes originais, mesma sintaxe do `gt scan`), `offset` (do início da ocorrência ao início do patch), `expected` e `replacement` (bytes em hex separados por espaço, mesmo tamanho).
   - `<chave>.toml` (ex.: `c935e799-0b27c000.toml`): `version` (igual ao nome do arquivo), `product_version` (opcional, informativo) e, por patch verificado naquela build, `[[patch]]` com `id` (já definido no genérico) e `rva` (início do patch relativo à base do módulo, aceita hexadecimal `0x...`); opcionalmente sobrescreve `pattern`, `offset`, `expected` e `replacement` quando a build mudou o código.
   - Regra de carga (erro claro com arquivo e campo, também depois das sobrescritas): `id` único; `module` igual ao exe do jogo; hex válido; `expected` e `replacement` do mesmo tamanho; o trecho `[offset, offset + tamanho)` cabe no `pattern`; cada byte fixo do `pattern` nesse trecho é igual ao de `expected` (curingas no trecho são permitidos).
 - Versão com arquivo e `rva` conferido: patch "disponível (verificado)". Versão sem arquivo (ou sem entrada para o `id`) usa a definição genérica e, se o padrão for único na memória e no disco no mesmo lugar, fica "disponível (não verificado)".
 - Cada patch informa o próprio estado (tabela da spec 002, 6.4): disponível (verificado ou não verificado), ativo, pendente, bytes diferentes, fora do lugar, não encontrado, ambíguo, inconclusivo ou disco ilegível.
+- **Fase 5 (spec 005, 6.2 e 6.5):** o `generic.toml` também traz o bloco `[ue]`: os padrões das duas globais do Unreal (`gobjects` e `names`, com `disp_offset`, `insn_end` e `adjust` da resolução RIP-relativa), o `[ue.layout]` (offsets das estruturas de reflexão: `objects`, `uobject`, `ustruct`, `ffield`, `fprop`, `fbool`, `fstruct`) e o `[ue.player]` (classe do controller, campo do pawn, classe do pawn e campos alternativos, por nome). O `<chave>.toml` registra no `[ue]` o `rva` de cada global **resolvida** e pode sobrescrever o layout inteiro. Os cheats de valor são blocos `[[field]]`, separados dos `[[patch]]` (com `id` único entre os dois): objeto (campo do pawn ou `pawn`) e classe dele, regra `lock` (campo `float`, `mode` `raise`/`lower`/`exact`, alvo `target_field` (aceita `Struct.Campo`) ou `target` constante, faixa sã `min`/`max`) ou `clear_bits` (campos `bool`). Nenhum offset de campo do jogo vai às assinaturas: campos vêm da reflexão, por nome.
+- **Unicidade das globais:** um padrão de global é aceito com uma ocorrência ou com várias que resolvem todas para o mesmo endereço (só para **leitura** de globais; patches continuam exigindo ocorrência única). Com `rva`, o endereço resolvido tem de ser `base + rva` (senão `fora do lugar`); sem `rva`, fica não verificado.
 
 ### 5.4 Escrita segura de patches
 Detalhes na spec `docs/specs/002-motor-patches.md` (6.2 a 6.8).
@@ -134,6 +151,7 @@ Detalhes na spec `docs/specs/002-motor-patches.md` (6.2 a 6.8).
 6. **Troca de valor** (patch ativo com `value`): o diário guarda, antes da pausa, os bytes originais, os do valor atual (`replacement`, canônico) e os do valor novo (campo opcional `next`, só durante a troca). Com o jogo pausado, relê os bytes (precisam ser os do valor atual; senão recusa sem escrever e o patch sai do registro), escreve os do valor novo, relê, retoma e grava o diário só com o valor novo. Como o `slot` fica num imediato, as fronteiras de instrução são as mesmas nos dois lados. A recuperação aceita, por byte, o original, o do valor antigo ou o do valor novo. Diários da Fase 2 (sem `next`) continuam legíveis.
 7. **`stuck` persistente:** se o `SIGCONT` falha, o marcador "pausado por nós" fica no diário e o estado `stuck` é mantido até um `SIGCONT` bem-sucedido; toda operação seguinte (inclusive o desfazer da saída e o `Drop`) tenta de novo antes de qualquer outra coisa. A TUI mostra `kill -CONT <pid>` e o `r` tenta de novo.
 8. **Recuperação** (SIGKILL, travamento, queda de energia): no início de cada comando, o diário é conferido contra o `/proc` (`boot_id`, PID, horário de início). Outro boot ou processo: descarta. Mesmo processo: `SIGCONT` se estava pausado por nós e, para cada entrada em memória executável, reescreve os originais onde cada byte é o original ou o nosso; byte de outro → não escreve. O diário só é limpo quando tudo foi resolvido.
+9. **Escrita em dados** (Fase 5, spec 005 6.6): um segundo tipo de escrita, **sem pausa**, em campos de dados (1 a 8 bytes), numa política própria (regiões `rw-` do `maps` fora das imagens de módulo, em cache e relida quando o objeto muda ou uma escrita falha). Toda escrita relê imediatamente antes uma guarda do objeto (vtable, `InternalIndex`, `ClassPrivate`) e recusa se ela mudou. Travas de barra não vão ao diário (não há original a restaurar). Bits limpos vão: uma entrada `DataEntry` por cheat e byte (byte original, escrito, máscara e guarda), gravada **antes** da escrita. Restaurar (desligar, `undo_all`, `Drop`, recuperação) só devolve os bits da máscara ao original, preservando os outros; objeto trocado, byte ilegível ou fora de região `rw` descartam a entrada sem escrever. A recuperação trata as entradas de dados por essa regra, e não pela política de memória executável. Diários antigos (sem `data`) continuam legíveis.
 
 ### 5.5 Code caves (Fase 6)
 Sem `VirtualAllocEx` de fora do processo, existem duas estratégias:
@@ -143,11 +161,18 @@ Sem `VirtualAllocEx` de fora do processo, existem duas estratégias:
 As instruções originais copiadas para a cave passam por relocação (endereços relativos ao RIP são recalculados com `iced-x86`).
 
 ### 5.6 Valores via Unreal Engine (Fase 5)
-- Offsets das classes vêm da **reflexão do jogo em execução**: `GUObjectArray` e `FNamePool` resolvidos por assinatura
-  AOB, classes achadas pelo nome e propriedades lidas da lista `FProperty` (nome, tipo, `Offset_Internal`). Não há
-  SDK gerado nem arquivo de offsets por versão. Layout observado no build atual em `RESEARCH.md`; detalhes na spec
-  da Fase 5.
-- "Congelar" valores = um laço de ~10 Hz que reescreve o campo. Ele roda numa thread do trainer, nunca dentro do jogo.
+- Offsets dos campos vêm da **reflexão do jogo em execução**: `GUObjectArray` e `FNamePool` resolvidos por assinatura
+  AOB (na mesma passada da busca dos patches), classes achadas por pacote e nome e campos lidos da lista `FField`
+  (nome, tipo, `Offset_Internal`, máscara dos `bool`; alvos dentro de structs por `Struct.Campo`). Não há SDK gerado
+  nem arquivo de offsets de campo por versão; só os offsets das estruturas de reflexão ficam no `[ue.layout]`.
+  Detalhes na spec `005-sobrevivencia-por-reflexao.md`; layout e campos observados em `RESEARCH.md`.
+- A busca de padrões só resolve as globais e faz a conferência barata. A varredura da tabela de objetos (índice das
+  classes, uma vez por conexão, e procura do controller, só com cheat de valor ligado ou desejado) roda numa **tarefa
+  de fundo** da TUI, um trabalho de cada vez, em blocos de 1 MiB e lotes com pausa, com teto de 60 s; resultado de
+  outra conexão é descartado.
+- "Congelar" valores = a manutenção de ~10 Hz no **ciclo do laço principal** da TUI (onde moram o motor e o diário),
+  nunca dentro do jogo nem numa thread própria. Ela revalida o caminho controller → pawn → componente a cada ciclo e
+  não conta como operação.
 
 ### 5.7 Interface
 - `gt-tui`: ratatui num terminal ao lado do jogo. Comandos por teclado **no terminal** (sem hotkeys globais, por causa do Wayland). Detalhes na spec `docs/specs/003-interface-tui.md`.
@@ -198,6 +223,15 @@ As instruções originais copiadas para a cave passam por relocação (endereço
 | 2026-10-25 | Troca de valor vai para o jogo a cada tecla, com intervalo mínimo de ~150 ms entre o início de duas trocas, terminando no último valor mostrado | Cada troca pausa o jogo ~15 ms (spec 003, dono) |
 | 2026-10-25 | Valor só em imediato de uma instrução (tamanho exato, fora de desvios relativos), tipos `i32`/`u32`/`f32`; `ValueSpec` e a montagem dos bytes num módulo genérico do `gt-core` | Nenhum valor muda a fronteira de instrução, então a pausa não tem ponto perigoso novo (spec 003, 6.3) |
 | 2026-10-25 | Troca de valor numa pausa só, com três conjuntos de bytes no diário (`replacement` canônico e `next` opcional) e na recuperação; no máximo uma troca em andamento e um alvo pendente | Recuperar uma troca interrompida sem apagar o que é de outro (spec 003, 6.7) |
+| 2026-10-26 | Cheats de sobrevivência por escrita de valor, com campos achados pela reflexão do jogo por nome; layout de reflexão e padrões das globais no `[ue]`, sobrescritível por versão | Os offsets vêm do próprio jogo e sobrevivem a atualizações (spec 005) |
+| 2026-10-26 | Padrão de global aceito com várias ocorrências que resolvem para o mesmo endereço (só leitura de globais) | Dono, spec 005 6.2 |
+| 2026-10-26 | Barras travadas no máximo, sem valor ajustável; ao desligar ficam onde estão; nunca baixar uma barra acima do alvo; alvo relido do personagem a cada ciclo | Dono e IA, spec 005 6.5.1 |
+| 2026-10-26 | Vida infinita por `CurrentDamage = 0`; "Não morrer" separado, pelos bits do `HealthComponent`; sem dano de queda por `bTakeFallDamage` do personagem | Dono e IA, spec 005 6.5 |
+| 2026-10-26 | Escrita em dados sem pausa; bits no diário com guarda do objeto por bytes (vtable, `InternalIndex`, `ClassPrivate`); uma entrada por cheat e byte, a antiga resolvida antes de criar a nova | Spec 005 6.6 |
+| 2026-10-26 | Índice da reflexão e procura do controller numa tarefa de fundo, com os cheats de valor em `verificando…` até o índice; manutenção de ~10 Hz no laço principal | A conexão e os cheats de patch não ficam mais lentos; o motor mora no laço principal (spec 005 6.3) |
+| 2026-10-26 | Pawn escrito só se `is_a(SurvivalPlayerCharacter)`; montado, o personagem vem do `CachedSurvivalPlayerCharacter` do controller | Uma montaria no `Pawn` nunca é escrita (spec 005 6.3, P7) |
+| 2026-10-26 | Comandos `gt ue class` e `gt ue player` (com `--controller` e `--watch`), só leitura | Pesquisa e conferência depois de atualizações (spec 005 6.8) |
+| 2026-10-26 | Cheats do pet (vida, não morre, stamina) na categoria `PET`, pelo caminho `PetMasterComponent.CurrentPetFull.<componente>` com a classe de cada salto conferida (`PropertyClass`); sem o pet no mundo, só eles esperam (`aguardando o pet`) | Pedido do dono, sem spec por decisão dele; a regra "nunca escrever em criaturas" da spec 005 passa a ter a exceção do pet apontado pelo próprio personagem |
 | 2026-10-25 | `name` e `category` obrigatórios nas assinaturas; bloco `value` sobrescrito inteiro por versão | Lista agrupada e sem campos pela metade (spec 003, 6.3) |
 | 2026-10-25 | Núcleo da TUI testável por uma interface de alvo (jogo, crua e falsa) e por uma interface de terminal com versão falsa | Testar conexão, reconexão, sinais e restauração sem o jogo |
 | 2026-10-25 | `stuck` mantido até um `SIGCONT` bem-sucedido, com nova tentativa antes de cada operação; restos de falha viram `erro` e só a recuperação (`r`) resolve | Nunca deixar o jogo parado sem aviso (spec 003, 6.8) |

@@ -173,16 +173,28 @@ fn no_game_running_message() {
         eprintln!("aviso: o jogo está aberto; teste ignorado");
         return;
     }
+    for args in [&["read", "0x1000"][..], &["ue", "class", "Actor"]] {
+        let out = Command::new(env!("CARGO_BIN_EXE_gt"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(
+            stderr(&out).contains("abra o Grounded 2"),
+            "{args:?}: {}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
+fn ue_globals_must_come_together() {
     let out = Command::new(env!("CARGO_BIN_EXE_gt"))
-        .args(["read", "0x1000"])
+        .args(["ue", "player", "--gobjects", "0x1000"])
         .output()
         .unwrap();
     assert!(!out.status.success());
-    assert!(
-        stderr(&out).contains("abra o Grounded 2"),
-        "{}",
-        stderr(&out)
-    );
+    assert!(stderr(&out).contains("--names"), "{}", stderr(&out));
 }
 
 #[test]

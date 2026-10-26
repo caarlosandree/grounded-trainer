@@ -8,6 +8,7 @@ pub mod fling;
 pub mod inspect;
 pub mod read;
 pub mod scan;
+pub mod ue;
 
 /// Opções globais (`--pid`, `--module`, `--json`).
 #[derive(Debug, Clone)]

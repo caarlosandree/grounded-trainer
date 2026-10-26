@@ -464,6 +464,7 @@ mod tests {
                     replacement: vec![2],
                     next: None,
                 }],
+                data: Vec::new(),
             })
             .unwrap();
         let end = RunEnd {

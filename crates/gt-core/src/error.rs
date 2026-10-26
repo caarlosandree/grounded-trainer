@@ -105,6 +105,22 @@ pub enum Error {
     #[error("os bytes novos do patch {id} mudam as fronteiras de instrução")]
     BoundariesChanged { id: String },
 
+    /// Escrita em dados fora da política de dados (região `rw` fora dos módulos).
+    #[error("escrita em dados fora da área permitida ({addr:#x})")]
+    DataOutsidePolicy { addr: u64 },
+
+    /// A conferência de identidade do objeto falhou imediatamente antes da escrita.
+    #[error("o objeto em {addr:#x} mudou; nada foi escrito")]
+    GuardMismatch { addr: u64 },
+
+    /// Escrita em dados com um motor sem política de dados.
+    #[error("o motor não tem política de escrita em dados")]
+    NoDataPolicy,
+
+    /// O cheat tem entrada de dados pendente (restos de uma falha) até a recuperação.
+    #[error("o cheat {id} tem restos pendentes no jogo; use a recuperação (r)")]
+    DataPending { id: String },
+
     /// Outro `gt-patch` já segura a trava do diário.
     #[error("outro gt-patch ou gt-tui já está em execução")]
     AlreadyRunning,

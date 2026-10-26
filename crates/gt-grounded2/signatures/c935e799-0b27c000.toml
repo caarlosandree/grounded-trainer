@@ -4,6 +4,13 @@
 version = "c935e799-0b27c000"
 product_version = "Augusta-CL-3207493"
 
+# Fase 5: `rva` das globais do Unreal já resolvidas, comparado DEPOIS do `adjust` do padrão do
+# generic.toml (ou seja, o endereço que o leitor usa). Opcionalmente, [ue.layout] substitui o bloco
+# inteiro do generic.toml.
+[ue]
+gobjects_rva = 0xa53bc30
+names_rva = 0xa499e50
+
 [[patch]]
 id = "teste-codificacao"
 rva = 0x112c468

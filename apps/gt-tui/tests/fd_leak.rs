@@ -38,6 +38,7 @@ fn raw_50_reconnects_no_fd_leak() {
         version_key: "raw-1".into(),
         search_delay: Duration::ZERO,
         search_panics: false,
+        ue: None,
     }));
     let dir = tempfile::tempdir().unwrap();
     let backend = RawBackend::new(control.clone(), dir.path().to_path_buf()).unwrap();

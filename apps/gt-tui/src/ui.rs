@@ -10,7 +10,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 
-use crate::model::{Avail, CheatRow, CheatStatus, Conn, Model};
+use crate::model::{Avail, CHECKING, CheatRow, CheatStatus, Conn, Model};
+use gt_grounded2::fields::Note;
 
 /// Largura mínima do terminal.
 pub const MIN_WIDTH: u16 = 60;
@@ -186,9 +187,14 @@ fn status_lines(model: &Model, width: usize) -> Vec<Line<'static>> {
                 Ok(()) => "sem assinaturas",
             };
             let (ok, total) = model.counts();
-            return vec![Line::from(format!(
+            let mut lines = vec![Line::from(format!(
                 "versão {version_key} ({signatures})  {ok}/{total}"
             ))];
+            // Com cheats de valor na lista, a linha do personagem (spec 005, 6.7).
+            if model.cheats.iter().any(|r| r.field) {
+                lines.push(Line::from(model.player.label()));
+            }
+            return lines;
         }
         Conn::Waiting => wrap("procurando o processo do jogo…", width),
         Conn::NoAccess(reason) => wrap(reason, width),
@@ -289,12 +295,24 @@ fn cheat_line(
     let unverified_mark = if unverified { " ?" } else { "  " };
     let again_mark = if again { " ↻" } else { "  " };
 
+    let note = match row.note {
+        Some(Note::Waiting) => " aguardando o personagem",
+        Some(Note::WaitingPet) => " aguardando o pet",
+        Some(Note::InvalidTarget) => " alvo inválido",
+        None => "",
+    };
     let (state, style, has_value) = match &status {
+        CheatStatus::On if !note.is_empty() => {
+            (format!("[ON ]{note}"), Style::new().fg(Color::Yellow), true)
+        }
         CheatStatus::On => (
             format!("[ON ]{unverified_mark}{again_mark}"),
             Style::new().fg(Color::Green),
             true,
         ),
+        CheatStatus::Unavailable(reason) if reason == CHECKING => {
+            (CHECKING.to_string(), Style::new().fg(Color::DarkGray), true)
+        }
         CheatStatus::Off => (
             format!("[OFF]{unverified_mark}{again_mark}"),
             Style::new(),
@@ -438,6 +456,8 @@ mod tests {
             on: false,
             residue: false,
             desired: false,
+            field: false,
+            note: None,
         }
     }
 
@@ -826,5 +846,61 @@ mod tests {
         // Sem necessidade, não rola.
         assert_eq!(scroll_offset(&is_header, 3, height), 0);
         assert_eq!(scroll_offset(&is_header, 3, 0), 0);
+    }
+
+    #[test]
+    fn on_with_waiting_note() {
+        let mut m = Model::new(false);
+        m.conn = connected();
+        let mut r = row("Vida infinita", Category::Sobrevivencia, ok());
+        r.field = true;
+        r.on = true;
+        r.note = Some(Note::Waiting);
+        m.cheats = vec![r];
+        let lines = screen(&m);
+        assert!(line_with(&lines, "Vida infinita").contains("[ON ] aguardando o personagem"));
+    }
+
+    #[test]
+    fn on_with_invalid_target_note() {
+        let mut m = Model::new(false);
+        m.conn = connected();
+        let mut r = row("Stamina infinita", Category::Sobrevivencia, ok());
+        r.field = true;
+        r.on = true;
+        r.note = Some(Note::InvalidTarget);
+        m.cheats = vec![r];
+        let lines = screen(&m);
+        assert!(line_with(&lines, "Stamina infinita").contains("[ON ] alvo inválido"));
+    }
+
+    #[test]
+    fn checking_row_shows_only_verificando() {
+        let mut m = Model::new(false);
+        m.conn = connected();
+        let mut r = row("Comida infinita", Category::Sobrevivencia, Avail::Checking);
+        r.field = true;
+        m.cheats = vec![r];
+        let lines = screen(&m);
+        let line = line_with(&lines, "Comida infinita");
+        assert!(line.contains("verificando…"), "{line}");
+        assert!(!line.contains("indisponível"), "{line}");
+    }
+
+    #[test]
+    fn render_includes_player_line() {
+        let mut m = Model::new(false);
+        m.conn = connected();
+        m.cheats = vec![row("Patch", Category::Itens, ok())];
+        // Sem cheats de valor, sem a linha.
+        assert!(!flat(&screen(&m)).contains("personagem:"));
+        let mut f = row("Vida infinita", Category::Sobrevivencia, ok());
+        f.field = true;
+        m.cheats.push(f);
+        assert!(flat(&screen(&m)).contains("personagem: —"));
+        m.player = crate::model::PlayerLine::Found;
+        assert!(flat(&screen(&m)).contains("personagem: encontrado"));
+        m.player = crate::model::PlayerLine::NotFound;
+        assert!(flat(&screen(&m)).contains("personagem: não encontrado"));
     }
 }

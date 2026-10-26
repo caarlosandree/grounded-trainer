@@ -10,13 +10,17 @@ use gt_core::journal::Journal;
 use gt_core::memscan::{MemScan, Verdict, scan_bytes, scan_memory};
 use gt_core::modules::{Module, open_in_root};
 use gt_core::pe::{PeHeaders, check_same_version};
-use gt_core::procinfo::{Identity, identity};
+use gt_core::procinfo::{Identity, check_alive, identity};
 use gt_core::scan::Pattern;
 
 use crate::policy::exec_ranges;
 use crate::resolve::Target;
-use crate::signatures::{PatchDef, Signatures};
+use crate::signatures::{GlobalDef, PatchDef, Signatures, UeSigs};
 use crate::state::{PatchState, StateInputs, compute_state};
+use crate::ue::{
+    DISK_UNREADABLE, GlobalSearch, GlobalState, Occurrence, UE_ID, UeScan, build_scan, data_ranges,
+    disp_at, occurrences, resolve_global,
+};
 use crate::{Error, GAME_EXE, Result};
 
 /// Uma definição e o estado dela no processo.
@@ -41,6 +45,9 @@ pub struct CatalogScan {
     /// Cabeçalho do arquivo em disco, já conferido com a memória. `None` se não pôde ser lido
     /// ou se a versão difere (sem ele não se escreve, spec 6.6).
     pub disk: Option<PeHeaders>,
+    /// Globais do Unreal e conferência barata da reflexão. `None` se o `generic.toml` não tem
+    /// `[ue]` ou se a busca não pediu as globais (`scan_subset` sem [`UE_ID`]).
+    pub ue: Option<UeScan>,
 }
 
 /// Calcula o estado de cada definição a partir de leituras já feitas.
@@ -118,7 +125,8 @@ pub fn scan(
 
 /// Como [`scan`], só com as definições cujo `id` está em `ids`, e sem diário (nova busca de
 /// padrões que não depende do estado dos patches ativos, spec 003 6.2). `id` desconhecido é
-/// ignorado.
+/// ignorado. O id especial [`UE_ID`] (`"@ue"`) pede também as globais do Unreal e a conferência
+/// barata da reflexão; sem ele, o resultado vem sem `ue`.
 pub fn scan_subset(target: &Target, sigs: &Signatures, ids: &[String]) -> Result<CatalogScan> {
     scan_defs(target, sigs, None, false, Some(ids))
 }
@@ -135,6 +143,16 @@ pub fn select_defs(defs: Vec<PatchDef>, ids: Option<&[String]>) -> Vec<PatchDef>
     }
 }
 
+/// A busca pede as globais do Unreal: sem filtro de `ids`, ou com [`UE_ID`] entre eles.
+pub fn wants_ue(ids: Option<&[String]>) -> bool {
+    ids.is_none_or(|ids| ids.iter().any(|id| id == UE_ID))
+}
+
+/// A busca em disco é necessária: algum patch ou alguma global pedida não tem `rva`.
+fn needs_disk(defs: &[PatchDef], globals: &[&GlobalDef]) -> bool {
+    defs.iter().any(|d| d.rva.is_none()) || globals.iter().any(|g| g.rva.is_none())
+}
+
 fn scan_defs(
     target: &Target,
     sigs: &Signatures,
@@ -146,6 +164,11 @@ fn scan_defs(
     let version_key = mem_headers.version_key();
     let has_version_file = sigs.has_version(&version_key);
     let defs = select_defs(sigs.for_version(&version_key), ids);
+    let ue_sigs = if wants_ue(ids) {
+        sigs.ue_for_version(&version_key)
+    } else {
+        None
+    };
 
     let identity = match journal {
         Some(_) => Some(identity(target.pid)?),
@@ -176,7 +199,7 @@ fn scan_defs(
                 .map_err(|_| "versão do disco difere da memória".to_string())
         });
 
-    let (entries, disk) = match disk_headers {
+    let (entries, disk, ue) = match disk_headers {
         Err(cause) => {
             let empty: Vec<MemScan> = defs
                 .iter()
@@ -195,7 +218,8 @@ fn scan_defs(
                 journal_arg,
                 locked,
             );
-            (entries, None)
+            let ue = ue_sigs.map(unreadable_ue);
+            (entries, None, ue)
         }
         Ok(headers) => {
             let ranges = exec_ranges(module, &headers);
@@ -208,27 +232,50 @@ fn scan_defs(
                     range.end - range.start,
                 )?;
             }
-            let patterns: Vec<Pattern> = defs.iter().map(|d| d.pattern.clone()).collect();
-            let mem = if patterns.is_empty() {
+            let globals: Vec<&GlobalDef> = ue_sigs
+                .as_ref()
+                .map(|ue| vec![&ue.gobjects, &ue.names])
+                .unwrap_or_default();
+            // Os padrões das globais vão depois dos dos patches, na mesma passada.
+            let patterns: Vec<Pattern> = defs
+                .iter()
+                .map(|d| d.pattern.clone())
+                .chain(globals.iter().map(|g| g.pattern.pattern.clone()))
+                .collect();
+            let mut mem = if patterns.is_empty() {
                 Vec::new()
             } else {
                 scan_memory(&target.reader, &ranges, &patterns)?
             };
-            let disk_hits = if defs.iter().any(|d| d.rva.is_none()) {
-                disk_hits(target, module, &mem_headers, &defs, &ranges).map(Some)
+            let global_mem = mem.split_off(defs.len());
+            // O disco só é lido se algum patch ou global não tem `rva`; senão a memória vale sozinha.
+            let disk_scan = if needs_disk(&defs, &globals) {
+                disk_hits(target, module, &mem_headers, &defs, &globals, &ranges).map(Some)
             } else {
                 Ok(None)
+            };
+            let ue = match (ue_sigs, &disk_scan) {
+                (None, _) => None,
+                (Some(sigs), Err(_)) => Some(unreadable_ue(sigs)),
+                (Some(sigs), Ok(disk)) => Some(resolve_ue(
+                    target,
+                    sigs,
+                    module,
+                    &data_ranges(module, &mem_headers),
+                    &global_mem,
+                    disk.as_ref().map(|d| d.globals.as_slice()),
+                )?),
             };
             let entries = resolve(
                 &defs,
                 module.base,
                 &mem,
-                disk_hits,
+                disk_scan.map(|d| d.map(|d| d.patches)),
                 current,
                 journal_arg,
                 locked,
             );
-            (entries, Some(headers))
+            (entries, Some(headers), ue)
         }
     };
     Ok(CatalogScan {
@@ -238,18 +285,28 @@ fn scan_defs(
         entries,
         module: module.clone(),
         disk,
+        ue,
     })
 }
 
-/// Ocorrências em disco dos padrões dos patches sem `rva`, nas mesmas seções da busca em
-/// memória e em endereços da base atual. Os patches com `rva` ficam com lista vazia.
+/// Ocorrências em disco, em endereços da base atual.
+struct DiskScan {
+    /// Uma lista por patch; os patches com `rva` ficam com lista vazia.
+    patches: Vec<Vec<u64>>,
+    /// Uma lista por global (`GUObjectArray`, `FNamePool`), com o `disp32` lido do disco.
+    globals: Vec<Vec<Occurrence>>,
+}
+
+/// Ocorrências em disco dos padrões dos patches sem `rva` e de todas as globais, nas mesmas
+/// seções da busca em memória.
 fn disk_hits(
     target: &Target,
     module: &Module,
     mem_headers: &PeHeaders,
     defs: &[PatchDef],
+    globals: &[&GlobalDef],
     ranges: &[std::ops::Range<u64>],
-) -> std::result::Result<Vec<Vec<u64>>, String> {
+) -> std::result::Result<DiskScan, String> {
     let image = target
         .open_disk(module, mem_headers)
         .map_err(|err| err.to_string())?;
@@ -265,13 +322,82 @@ fn disk_hits(
         regions.push((range.start, bytes));
     }
     let wanted: Vec<usize> = (0..defs.len()).filter(|&i| defs[i].rva.is_none()).collect();
-    let patterns: Vec<Pattern> = wanted.iter().map(|&i| defs[i].pattern.clone()).collect();
-    let found = scan_bytes(&regions, &patterns);
-    let mut out = vec![Vec::new(); defs.len()];
+    let patterns: Vec<Pattern> = wanted
+        .iter()
+        .map(|&i| defs[i].pattern.clone())
+        .chain(globals.iter().map(|g| g.pattern.pattern.clone()))
+        .collect();
+    let mut found = scan_bytes(&regions, &patterns);
+    let global_hits = found.split_off(wanted.len());
+    let mut patches = vec![Vec::new(); defs.len()];
     for (i, hits) in wanted.into_iter().zip(found) {
-        out[i] = hits;
+        patches[i] = hits;
     }
-    Ok(out)
+    let globals = globals
+        .iter()
+        .zip(global_hits)
+        .map(|(global, hits)| {
+            occurrences(&hits, global.pattern.disp_offset, |addr| {
+                let (start, bytes) = regions
+                    .iter()
+                    .find(|(start, bytes)| addr >= *start && addr - start < bytes.len() as u64)?;
+                let at = usize::try_from(addr - start).ok()?;
+                disp_at(bytes, at).map(i32::to_le_bytes)
+            })
+        })
+        .collect();
+    Ok(DiskScan { patches, globals })
+}
+
+/// Globais e conferência barata quando o disco não pôde ser lido: nada a afirmar.
+fn unreadable_ue(sigs: UeSigs) -> UeScan {
+    UeScan {
+        sigs,
+        gobjects: GlobalState::Unavailable(DISK_UNREADABLE),
+        names: GlobalState::Unavailable(DISK_UNREADABLE),
+        cheap: Err("globais indisponíveis".to_string()),
+    }
+}
+
+/// Resolve as duas globais com as ocorrências da memória (`global_mem`, na ordem `GUObjectArray`,
+/// `FNamePool`) e do disco (se lido) e roda a conferência barata. Um `Err` da conferência só vale
+/// se o processo ainda é o mesmo; se não, sobe o erro de processo.
+fn resolve_ue(
+    target: &Target,
+    sigs: UeSigs,
+    module: &Module,
+    data: &[std::ops::Range<u64>],
+    global_mem: &[MemScan],
+    disk: Option<&[Vec<Occurrence>]>,
+) -> Result<UeScan> {
+    let state = |i: usize, def: &GlobalDef| {
+        let mem = occurrences(&global_mem[i].hits, def.pattern.disp_offset, |addr| {
+            let mut raw = [0u8; 4];
+            target.reader.read_exact(addr, &mut raw).ok()?;
+            Some(raw)
+        });
+        resolve_global(
+            def,
+            module.base,
+            data,
+            &GlobalSearch {
+                mem_verdict: global_mem[i].verdict,
+                mem: &mem,
+                disk: disk.map(|lists| lists[i].as_slice()),
+            },
+        )
+    };
+    let gobjects = state(0, &sigs.gobjects);
+    let names = state(1, &sigs.names);
+    let layout = sigs.layout;
+    build_scan(sigs, gobjects, names, |gobjects_addr, names_addr| {
+        let cheap = gt_ue::cheap_check(&target.reader, &layout, gobjects_addr, names_addr);
+        if cheap.is_err() {
+            // Um erro transitório (processo morto ou trocado) não pode virar `reflexão não reconhecida`.
+            check_alive(&target.identity)?;
+        }
+        Ok(cheap)
+    })
 }
 
 /// Escolhe os patches de `ids` para aplicar: definição, endereço e se é "não verificado".
@@ -390,6 +516,7 @@ rva = 0x1000
                 replacement: NEW.to_vec(),
                 next: None,
             }],
+            data: Vec::new(),
         }
     }
 
@@ -536,6 +663,47 @@ rva = 0x1000
     }
 
     #[test]
+    fn wants_ue_only_without_filter_or_with_special_id() {
+        assert!(wants_ue(None));
+        assert!(wants_ue(Some(&ids(&["@ue"]))));
+        assert!(wants_ue(Some(&ids(&["outro", "@ue"]))));
+        assert!(!wants_ue(Some(&ids(&["outro"]))));
+        assert!(!wants_ue(Some(&[])));
+        // O id especial não é um patch: `select_defs` o ignora.
+        let defs = Signatures::parse(&[("generic.toml", GENERIC)])
+            .unwrap()
+            .for_version("x");
+        assert!(select_defs(defs, Some(&ids(&["@ue"]))).is_empty());
+    }
+
+    #[test]
+    fn disk_is_read_when_a_patch_or_a_global_lacks_rva() {
+        let global = |rva| GlobalDef {
+            pattern: gt_core::global::GlobalPattern {
+                pattern: Pattern::parse("48 8b 05 ?? ?? ?? ??").unwrap(),
+                disp_offset: 3,
+                insn_end: 7,
+                adjust: 0,
+            },
+            rva,
+        };
+        // Uma global sem `rva`: o disco é lido, mesmo sem patches na seleção.
+        assert!(needs_disk(&[], &[&global(None), &global(Some(0x20))]));
+        // Tudo com `rva`: a memória vale sozinha.
+        let (gobjects, names) = (global(Some(0x10)), global(Some(0x20)));
+        assert!(!needs_disk(&[], &[&gobjects, &names]));
+        // Um patch sem `rva` basta, com ou sem globais.
+        let sigs =
+            Signatures::parse(&[("generic.toml", GENERIC), ("aaaa-bbbb.toml", VERSION)]).unwrap();
+        let defs = sigs.for_version("aaaa-bbbb");
+        assert!(defs.iter().any(|d| d.rva.is_none()));
+        assert!(needs_disk(&defs, &[&gobjects, &names]));
+        assert!(needs_disk(&defs, &[]));
+        // Sem nada pedido, nada a ler.
+        assert!(!needs_disk(&[], &[]));
+    }
+
+    #[test]
     fn select_defs_keeps_listed_in_order() {
         let defs = Signatures::parse(&[("generic.toml", GENERIC)])
             .unwrap()
@@ -575,6 +743,7 @@ rva = 0x1000
             entries,
             module: Module::default(),
             disk: None,
+            ue: None,
         }
     }
 

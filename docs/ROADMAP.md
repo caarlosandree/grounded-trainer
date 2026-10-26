@@ -120,6 +120,14 @@ maioria dos cheats.
 sem mudar nada no trainer (os offsets vêm do próprio jogo).
 **Você faz:** testar os cheats no jogo.
 
+A fase foi dividida em duas specs:
+- **Spec 005 — Sobrevivência por reflexão** (`docs/specs/005-sobrevivencia-por-reflexao.md`): leitor de reflexão
+  (`gt-ue`), comandos `gt ue`, escrita em dados no motor e os oito cheats de sobrevivência (vida, stamina, comida,
+  água, oxigênio, temperatura, sem dano de queda, não morrer). **Fechada em 2026-10-26**: os oito funcionaram no
+  jogo com o dono (branch `fase-5-sobrevivencia`). Pendência: confirmar na próxima atualização do jogo que tudo
+  continua funcionando sem mudar o trainer.
+- **Spec 006 — o resto da Fase 5:** carga, dano causado, ciência e movimento.
+
 ---
 
 ## Fase 6 — Code caves (lógica nova)

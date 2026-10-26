@@ -6,7 +6,18 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+# Reflexão sintética (`SynthUe`, `SparseMem`) para testes de quem consome o `gt-ue`.
+synth = []
+
 [dependencies]
+gt-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# O próprio crate com `synth`, para os testes unitários usarem a reflexão sintética.
+gt-ue = { workspace = true, features = ["synth"] }
 
 [lints]
 workspace = true

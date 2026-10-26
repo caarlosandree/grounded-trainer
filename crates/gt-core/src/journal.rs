@@ -115,6 +115,33 @@ impl JournalEntry {
     }
 }
 
+/// Trecho de um objeto do jogo conferido imediatamente antes de uma escrita em dados (vtable,
+/// `InternalIndex`, `ClassPrivate`): se os bytes mudaram, o objeto não é mais o mesmo.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct GuardBytes {
+    #[serde(with = "hex_addr")]
+    pub addr: u64,
+    #[serde(with = "hex_bytes")]
+    pub bytes: Vec<u8>,
+}
+
+/// Bits limpos em dados do jogo (spec 005, 6.5.2 e 6.6): uma entrada por cheat e byte.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct DataEntry {
+    pub id: String,
+    /// Endereço do byte.
+    #[serde(with = "hex_addr")]
+    pub addr: u64,
+    /// Byte antes da primeira escrita neste objeto.
+    pub original: u8,
+    /// Byte escrito (o original com os bits da máscara limpos).
+    pub written: u8,
+    /// Bits nossos.
+    pub mask: u8,
+    /// Conferência de identidade do objeto dono do byte.
+    pub guard: Vec<GuardBytes>,
+}
+
 /// Conteúdo do diário: identidade do processo e os patches ativos.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Journal {
@@ -125,6 +152,9 @@ pub struct Journal {
     /// O `gt-patch` pausou o jogo e ainda não o retomou.
     pub paused_by_us: bool,
     pub entries: Vec<JournalEntry>,
+    /// Bits limpos em dados (Fase 5). Diários antigos não têm a chave.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data: Vec<DataEntry>,
 }
 
 /// Resultado da leitura do diário.
@@ -306,6 +336,46 @@ pub enum EntryAction {
     Foreign,
 }
 
+/// O que fazer com uma entrada de dados ao restaurar (desligar, sair ou recuperar).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataAction {
+    /// Os bits da máscara já são os originais: só esquecer a entrada.
+    Drop,
+    /// Escrever este byte: os bits da máscara voltam ao original, os outros ficam como estão.
+    Restore(u8),
+    /// O objeto não é mais o mesmo, o byte é ilegível ou não é gravável, ou algum bit da
+    /// máscara não é nem o nosso nem o original: esquecer sem escrever.
+    Discard,
+}
+
+/// Decide a restauração de uma entrada de dados (spec 005, 6.6). `current` é o byte lido agora
+/// (`None` se ilegível), `guard_ok` diz se a conferência de identidade bateu e `writable` se o
+/// byte está numa região `rw` do `maps` atual. Só os bits da máscara são considerados; um bit da
+/// máscara é "de outro" quando o original e o escrito eram iguais nele e o atual difere.
+pub fn decide_data(
+    e: &DataEntry,
+    current: Option<u8>,
+    guard_ok: bool,
+    writable: bool,
+) -> DataAction {
+    let Some(current) = current else {
+        return DataAction::Discard;
+    };
+    if !guard_ok || !writable {
+        return DataAction::Discard;
+    }
+    let mask = e.mask;
+    let same = !(e.original ^ e.written);
+    if mask & same & (current ^ e.original) != 0 {
+        return DataAction::Discard;
+    }
+    if current & mask == e.original & mask {
+        DataAction::Drop
+    } else {
+        DataAction::Restore((current & !mask) | (e.original & mask))
+    }
+}
+
 /// Por que o diário foi descartado sem escrever nada.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiscardReason {
@@ -409,7 +479,120 @@ mod tests {
             version_key: "c935e799-0a1b2c".into(),
             paused_by_us: false,
             entries,
+            data: Vec::new(),
         }
+    }
+
+    fn data_entry(original: u8, written: u8, mask: u8) -> DataEntry {
+        DataEntry {
+            id: "nao-morrer".into(),
+            addr: 0x7fff_0000_011d,
+            original,
+            written,
+            mask,
+            guard: vec![GuardBytes {
+                addr: 0x7fff_0000_0000,
+                bytes: vec![0xaa, 0xbb],
+            }],
+        }
+    }
+
+    #[test]
+    fn decide_data_cases() {
+        // Dois bits nossos (0x06) e um alheio (0x01) no mesmo byte.
+        let e = data_entry(0x07, 0x01, 0x06);
+        // Ainda como escrevemos: os bits voltam, o alheio fica.
+        assert_eq!(
+            decide_data(&e, Some(0x01), true, true),
+            DataAction::Restore(0x07)
+        );
+        // O jogo mexeu no bit alheio enquanto os nossos estavam limpos: ele é preservado.
+        assert_eq!(
+            decide_data(&e, Some(0x00), true, true),
+            DataAction::Restore(0x06)
+        );
+        // Um dos nossos já voltou sozinho: só o outro é restaurado.
+        assert_eq!(
+            decide_data(&e, Some(0x03), true, true),
+            DataAction::Restore(0x07)
+        );
+        // Os dois já originais: só esquecer.
+        assert_eq!(decide_data(&e, Some(0x06), true, true), DataAction::Drop);
+        assert_eq!(decide_data(&e, Some(0x07), true, true), DataAction::Drop);
+        // Objeto trocado, byte ilegível ou fora de região gravável: descartar sem escrever.
+        assert_eq!(
+            decide_data(&e, Some(0x01), false, true),
+            DataAction::Discard
+        );
+        assert_eq!(decide_data(&e, None, true, true), DataAction::Discard);
+        assert_eq!(
+            decide_data(&e, Some(0x01), true, false),
+            DataAction::Discard
+        );
+        // Bit da máscara que já era 0 no original e foi ligado por outro: não é nosso.
+        let partial = data_entry(0x04, 0x00, 0x06);
+        assert_eq!(
+            decide_data(&partial, Some(0x02), true, true),
+            DataAction::Discard
+        );
+        assert_eq!(
+            decide_data(&partial, Some(0x00), true, true),
+            DataAction::Restore(0x04)
+        );
+        // `bool` nativo: máscara inteira.
+        let native = data_entry(0x01, 0x00, 0xff);
+        assert_eq!(
+            decide_data(&native, Some(0x00), true, true),
+            DataAction::Restore(0x01)
+        );
+        assert_eq!(
+            decide_data(&native, Some(0x01), true, true),
+            DataAction::Drop
+        );
+        assert_eq!(
+            decide_data(&native, Some(0x02), true, true),
+            DataAction::Discard
+        );
+    }
+
+    #[test]
+    fn journal_without_data_still_loads() {
+        let j = journal(vec![entry(&[0x48], &[0x90])]);
+        let text = serde_json::to_string(&j).unwrap();
+        assert!(!text.contains("\"data\""), "{text}");
+        // Diário antigo (sem a chave) carrega com `data` vazio.
+        let back: Journal = serde_json::from_str(&text).unwrap();
+        assert!(back.data.is_empty());
+        // Com dados, a chave aparece e o endereço é hexadecimal.
+        let with = Journal {
+            data: vec![data_entry(0x07, 0x01, 0x06)],
+            ..j
+        };
+        let text = serde_json::to_string(&with).unwrap();
+        assert!(text.contains("\"data\""), "{text}");
+        assert!(text.contains("\"0x7fff0000011d\""), "{text}");
+        assert_eq!(serde_json::from_str::<Journal>(&text).unwrap(), with);
+    }
+
+    #[test]
+    fn data_entries_other_process_discarded() {
+        let j = Journal {
+            data: vec![data_entry(0x07, 0x01, 0x06)],
+            ..journal(Vec::new())
+        };
+        let never = |_: &JournalEntry| -> Option<Vec<u8>> { panic!("nada deve ser lido") };
+        assert_eq!(
+            decide(&j, "boot-a", stat('S', 999), never),
+            Recovery::Discard(DiscardReason::OtherProcess)
+        );
+        assert_eq!(
+            decide(&j, "boot-b", stat('S', 1000), never),
+            Recovery::Discard(DiscardReason::OtherBoot)
+        );
+        assert_eq!(
+            decide(&j, "boot-a", None, never),
+            Recovery::Discard(DiscardReason::ProcessGone)
+        );
     }
 
     fn stat(state: char, start_time: u64) -> Option<ProcStat> {
