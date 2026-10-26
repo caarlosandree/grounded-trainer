@@ -190,6 +190,7 @@ fn raw_search(
             value: def.value.as_ref().map(|v| v.grid.clone()),
             avail: avail_of(def, pid)?,
             field: false,
+            action: false,
         });
     }
     if let Some(ue) = &ue {

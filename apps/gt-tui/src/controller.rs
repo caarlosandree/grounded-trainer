@@ -137,6 +137,7 @@ fn row_of(c: CheatInfo) -> CheatRow {
         residue: false,
         desired: false,
         field: c.field,
+        action: c.action,
         note: None,
     }
 }

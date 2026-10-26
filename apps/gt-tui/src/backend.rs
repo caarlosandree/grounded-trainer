@@ -73,6 +73,8 @@ pub struct CheatInfo {
     pub avail: Avail,
     /// Cheat de valor (`[[field]]`, spec 005), não patch.
     pub field: bool,
+    /// Ação de uma execução (`rule = "add"`, spec 006 6.6), não um cheat que liga e desliga.
+    pub action: bool,
 }
 
 /// Resultado de abrir o alvo e buscar o catálogo; `P` é o que cada implementação leva

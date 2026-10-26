@@ -119,6 +119,7 @@ pub(crate) fn field(id: &str, avail: Avail) -> CheatInfo {
         value: None,
         avail,
         field: true,
+        action: false,
     }
 }
 
@@ -131,6 +132,7 @@ pub(crate) fn cheat(id: &str, avail: Avail) -> CheatInfo {
         value: None,
         avail,
         field: false,
+        action: false,
     }
 }
 

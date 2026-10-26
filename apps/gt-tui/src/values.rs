@@ -88,6 +88,7 @@ pub fn field_infos(defs: &[FieldDef], avail: &Avail) -> Vec<CheatInfo> {
             value: None,
             avail: avail.clone(),
             field: true,
+            action: false,
         })
         .collect()
 }

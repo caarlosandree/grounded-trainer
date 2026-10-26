@@ -315,6 +315,12 @@ fn cheat_line(
         CheatStatus::Unavailable(reason) if reason == CHECKING => {
             (CHECKING.to_string(), Style::new().fg(Color::DarkGray), true)
         }
+        // Uma ação não liga nem desliga: pede uma execução (spec 006, 6.6).
+        CheatStatus::Off if row.action => (
+            format!("[ação]{unverified_mark}"),
+            Style::new().fg(Color::Cyan),
+            true,
+        ),
         CheatStatus::Off => (
             format!("[OFF]{unverified_mark}{again_mark}"),
             Style::new(),
@@ -361,7 +367,12 @@ fn cheat_line(
         Span::styled(state, style),
     ];
     if has_value && let Some(value) = &row.value {
-        spans.push(Span::raw(format!(" {}", value_text(value, row.k))));
+        let text = if row.action {
+            format!(" +{}", value_text(value, row.k))
+        } else {
+            format!(" {}", value_text(value, row.k))
+        };
+        spans.push(Span::raw(text));
     }
     Line::from(spans)
 }
@@ -459,6 +470,7 @@ mod tests {
             residue: false,
             desired: false,
             field: false,
+            action: false,
             note: None,
         }
     }
@@ -903,5 +915,84 @@ mod tests {
         assert!(flat(&screen(&m)).contains("personagem: encontrado"));
         m.player = crate::model::PlayerLine::NotFound;
         assert!(flat(&screen(&m)).contains("personagem: não encontrado"));
+    }
+
+    fn science() -> ValueGrid {
+        ValueGrid {
+            ty: ValueType::I32,
+            min: 100.0,
+            max: 5000.0,
+            step: 100.0,
+            default_k: 9,
+            unit: None,
+            decimals: 0,
+        }
+    }
+
+    #[test]
+    fn action_row_shows_acao_and_amount() {
+        let mut m = Model::new(false);
+        m.conn = connected();
+        let mut r = row("Somar ciência", Category::Progressao, ok());
+        r.field = true;
+        r.action = true;
+        r.value = Some(science());
+        r.k = 9;
+        m.cheats = vec![r];
+        let lines = screen(&m);
+        let line = line_with(&lines, "Somar ciência");
+        assert!(line.contains("[ação]"), "{line}");
+        assert!(line.contains("+1000"), "{line}");
+        assert!(!line.contains("[ON ]") && !line.contains("[OFF]"), "{line}");
+    }
+
+    #[test]
+    fn notes_new_texts() {
+        let mut m = Model::new(false);
+        m.conn = connected();
+        let mut a = row("Velocidade", Category::Movimento, ok());
+        a.field = true;
+        a.on = true;
+        a.note = Some(Note::InvalidGameValue);
+        let mut b = row("Pulos", Category::Movimento, ok());
+        b.field = true;
+        b.on = true;
+        b.note = Some(Note::GameRefuses);
+        m.cheats = vec![a, b];
+        let lines = screen(&m);
+        assert!(line_with(&lines, "Velocidade").contains("[ON ] valor do jogo inválido"));
+        assert!(line_with(&lines, "Pulos").contains("[ON ] o jogo não deixa"));
+    }
+
+    #[test]
+    fn field_row_with_value_shows_value() {
+        let mut m = Model::new(false);
+        m.conn = connected();
+        let mut r = row("Velocidade", Category::Movimento, ok());
+        r.field = true;
+        r.on = true;
+        r.value = Some(ValueGrid {
+            decimals: 2,
+            ..speed()
+        });
+        r.k = 3;
+        m.cheats = vec![r];
+        let lines = screen(&m);
+        let line = line_with(&lines, "Velocidade");
+        assert!(line.contains("[ON ]") && line.contains("2.00x"), "{line}");
+    }
+
+    #[test]
+    fn pulos_row_without_value() {
+        let mut m = Model::new(false);
+        m.conn = connected();
+        let mut r = row("Pulos infinitos", Category::Movimento, ok());
+        r.field = true;
+        r.on = true;
+        m.cheats = vec![r];
+        let lines = screen(&m);
+        let line = line_with(&lines, "Pulos infinitos");
+        assert!(line.contains("[ON ]"), "{line}");
+        assert!(!line.contains('◀') && !line.contains('x'), "{line}");
     }
 }

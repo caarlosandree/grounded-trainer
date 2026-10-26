@@ -114,6 +114,7 @@ fn cheats_of(
             value: e.def.value.as_ref().map(|v| v.grid.clone()),
             avail: avail_of(&e.state),
             field: false,
+            action: false,
         })
         .collect();
     if ue.is_some() {
