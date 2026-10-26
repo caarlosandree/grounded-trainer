@@ -214,6 +214,96 @@ Observação: um `gt-patch list` rodado no instante em que o `run` aplicava most
 Os testes `#[ignore]` de `apps/gt-patch/tests/game.rs` não foram rodados nesta sessão (o jogo foi fechado no
 item 5); os passos manuais acima cobrem o mesmo comportamento.
 
+## Sessão de 2026-10-25 (Fase 3): análise estática do trainer FLiNG
+
+Mesmo build do jogo (`c935e799-0b27c000`). Alvo: `Grounded 2 Early Access Plus 38 Trainer Updated 2026.08.17.exe`
+(PE32+ x86-64, 1.823.232 bytes, SHA-256 `33104962d39aa0ee74a8cea857bfb8a01f775b435af8b3be6c3584ea6353bc16`).
+Sem jogo aberto. Nada do código do FLiNG foi copiado para o projeto (`AGENTS.md` 3); a extração e as ferramentas
+ficam em `scratch/fling/` (ignorado pelo git).
+
+**Como foi feito:** entropia das seções (nada empacotado: `.text` 6,4; só a `.rsrc` alta, 7,6), `strings` ASCII e
+UTF-16, e o REA 6.7.0 (`rea analyze/search/xrefs/decompile --provider ghidra`, Ghidra 12.1.4) para o código nativo.
+
+### Arquitetura do trainer
+
+- **Os cheats são scripts no formato do auto-assembler do Cheat Engine**, guardados em texto puro na `.rdata`
+  (`[ENABLE]`/`[DISABLE]`, `aobscanmodule`, `alloc`, `label`, `registersymbol`, `db`). O trainer traz o próprio
+  interpretador desses scripts, montado sobre o **AsmJit** (mensagens de erro do AsmJit nas strings).
+- Sintaxe própria nos padrões: `s1.N` é um curinga de N bytes cujo valor é **capturado** em `s1` (o offset do
+  campo); `s1.2.*.0x800.0xF00` limita o valor capturado a uma faixa. O `[DISABLE]` restaura `db … s1 …` com o
+  valor capturado, ou seja, o original é reconstruído, não guardado.
+- Cada script tem um alvo `aobscanmodule(...)` + uma cave alocada perto do alvo (`alloc(newmem,$1000,alvo)`), com
+  variáveis de controle no fim da cave (`newmem+200`, `+400`). Ligar uma opção no menu **só escreve 1 numa
+  variável da cave**; o desvio é instalado ao conectar. Isso explica a observação de 2026-10-25 (desvios com
+  todas as opções desligadas).
+- Há uma lista de nomes de executável (`Grounded2Steam-Win64`, `Grounded2-WinGRTS`, `-WinGDK`, `-Win64`) e o
+  módulo do script é trocado por ela: scripts marcados `WinGRTS` também valem na versão Steam.
+- Existe um modo por linha de comando (`--godmode`, `--speed_f` etc.) e as teclas `Num`/`Ctrl+Num`/`Alt+Num`.
+- A velocidade do jogo (`Set Game Speed`) usa a DLL embutida `TrSpeedHack_x64.dll`, não um script.
+
+### Leitor de reflexão do Unreal embutido
+
+- O trainer lê a **reflexão do Unreal em tempo real**: acha `GUObjectArray` e o `FNamePool` por padrões AOB
+  genéricos de UE4/UE5, percorre classes e propriedades (`IntProperty`, `FloatProperty`, `StructProperty`, …) e
+  preenche uma tabela `Classe_Campo = offset` antes de instalar os scripts. Strings de progresso: "All unreal
+  engine structures and enums processed!".
+- Tabela usada (`//Maine.<Classe>=<Apelido>` + `Apelido_Campo:`), em `FUN_14007f070` (`UE_OFFSETS_CHECKED_`):
+  `SurvivalCharacter` → `HealthComponent`, `BlockComponent`, `ReactionComponent`, `StaminaComponent`,
+  `BodyTemperatureComponent`, `HaulingComponent`, `SurvivalComponent`; `HealthComponent.MaxHealth`/`CurrentDamage`;
+  `StaminaComponent.CurrentStamina`/`MaxStamina`; `BlockComponent.PerfectBlockWindow(Mounted)`;
+  `ReactionComponent.CurrentStunValue`; `BodyTemperatureComponent.CurrentBodyTemperature`;
+  `HaulingComponent.Capacity`; `SurvivalComponent.CurrentFood`/`CurrentWater`/`CurrentBreath`; `Item.StackSize`;
+  `PartyComponent.ScienceFound`/`PartyUpgradePoints`/`PersonalUpgradePoints`;
+  `SurvivalGameModeSettings.bAutoCompleteBuildings`/`bRecipesRequireIngredients`/`bCreaturesIgnorePlayers`/
+  `FallDamageMultiplier`; `ResourceAnalyzerBuilding.MaxPowerCapacity`; enum `EBuildingState` (`Built`,
+  `UnderConstruction`). O módulo do jogo no Unreal se chama **`Maine`**.
+- Os scripts que usam essa tabela só agem quando `UE_OFFSETS_CHECKED = 1`.
+- `GetPlayerDamageMultiplier` é resolvido por um padrão que acha uma referência à função (`FUN_140089080`).
+- Consequência para a Fase 5: os offsets podem vir da reflexão do jogo em execução, sem gerar SDK com o
+  Dumper-7 a cada atualização. **Proposta**, não decisão; ver `ARCHITECTURE.md` quando a Fase 5 começar.
+
+### Os padrões contra o executável atual
+
+`scratch/fling/scan_fling.py` converte os padrões do FLiNG e busca na `.text` do exe em disco. Resultado: os
+mesmos **11** endereços do `symbols.ini`, o que confirma a leitura dos scripts. Ausentes (0 ocorrências):
+`aobplayerpawn` (as duas variantes), `aobplayerstats`, `aobdmg`, `aobdmgmul`, `aobpartycomponent`, `aobitemcd`,
+`aobitemdurability`, `aobitempower`, `aobresearchlevelup`, `aobgravity`, `aoboffsetcheck`.
+
+### Por que o God Mode não funciona (causa provável)
+
+- O script `aobplayerpawn` é um *hook* que grava o ponteiro do pawn do jogador numa variável `player`. **Ele não
+  acha o padrão na versão atual**, então `player` nunca existe.
+- Dependem de `player`: god mode, estatísticas (vida, stamina, comida, água, oxigênio, temperatura), multiplicador
+  de defesa, velocidade de movimento, velocidade do jogador/IA, pulo infinito, gravidade e localização.
+- Com o FLiNG conectado, os 6 encontrados que dependem de `player` (`godmode`, `defmultiplier`, `speed`,
+  `playerspeed`, `infinitejumps`, `location`) **não** tinham desvio; os 5 com desvio são exatamente os que não usam
+  `player` (`buildingreg`, `charges`, `daytime`, `gamemodesettings`, `dragitemamount`). Hipótese forte: o script
+  falha ao montar por causa do símbolo `player` não registrado. Mesmo que montasse, compararia com zero.
+- **Mecanismo do god mode** em `+56FC11C`: depois do `call`, o jogo faz `cmp qword [rsi+0xb0], 0` / `je`. O FLiNG
+  troca o `cmp` por uma comparação do retorno do `call` (`rax`) com o pawn do jogador; se for o jogador, `ZF = 1`
+  e o `je` seguinte é tomado, como se o componente fosse nulo: o golpe é ignorado ("God Mode/Ignore Hits").
+- Para o nosso god mode basta saber qual é o pawn do jogador: pela cadeia `GWorld → … → Pawn` (Fase 5) ou por um
+  novo ponto de captura do pawn no build atual.
+
+### O que cada ponto encontrado faz (lido dos scripts)
+
+| Ponto | O que o FLiNG faz |
+|---|---|
+| `+57BD6D0` cargas | Antes de ler `[rcx+s1]` (cargas atuais, float), copia `ResourceAnalyzerBuilding.MaxPowerCapacity` (int → float) para ele |
+| `+5BBFE8C` arrastar item | Ao arrastar, escreve o valor escolhido em `Item.StackSize` do item em `rcx` e zera o pedido (uso único) |
+| `+593AF1C` modo de jogo | Lê `SurvivalGameModeSettings` em `[rax+s1]` e força `bRecipesRequireIngredients`, `FallDamageMultiplier` e `bCreaturesIgnorePlayers` |
+| `+57689DB` construção | Ao gravar o estado da construção (`mov [rdi+s1], bl`), troca `UnderConstruction` por `Built` |
+| `+58C8A2A` hora do dia | No `addsd xmm0, [rbx+s1]` multiplica o incremento de tempo (ou zera, para congelar) |
+| `+56FC11C` god mode | Ver acima (depende de `player`) |
+| `+5943EC8` defesa | Divide o dano em `[r15]` pelo multiplicador quando `[rsi+0x20]` é o jogador |
+| `+37EEE9B` velocidade | Depois de um `call [rax+s1]` virtual, multiplica o retorno (`xmm0`) se `[rbx+0x20]` é o jogador |
+| `+3785DF2` velocidade do ator | Escreve um float em `[rcx+0x68]` do ator (jogador ou IA); provável `CustomTimeDilation` |
+| `+378553E` pulo infinito | Para o jogador, zera o contador de pulos `[rbx+s1]` e garante máximo ≥ 2 em `[rbx+s1-4]` |
+| `+35FB632` localização | Guarda o endereço da posição (`[rax+s1]`, 3 floats) quando `[rax+0x20]` é o jogador; usado pelo teleporte |
+
+Os offsets "`[x+0x20]` é o jogador" sugerem que esses objetos são componentes cujo dono (`Outer`/`Owner`) fica em
+`+0x20`. Não verificado.
+
 ## Hipóteses descartadas
 
 - (2026-10-25) "Os patches em `+57BD6D0`/`+5BBFE8C` indicam que as opções de cargas e arrastar item estavam
