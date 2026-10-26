@@ -35,7 +35,7 @@ Nenhum código de funcionalidade sem spec aprovada. Exceções: correções triv
 - **Nunca altere arquivos do jogo em disco** (`steamapps/common/Grounded2`). Só memória do processo em execução.
 - **Saves:** nenhuma funcionalidade mexe em arquivos de save. Antes de testes arriscados, peça ao dono para fazer backup do save.
 - **Somente solo/offline**: nada de rede, multiplayer, servidores ou contorno de anti-cheat.
-- **Código de terceiros**: nunca copiar, decompilar para reaproveitar ou redistribuir código do FLiNG, WeMod/Wand ou outros. Observar o *comportamento* (ex.: quais bytes do jogo eles alteram) é permitido e deve ser registrado em `RESEARCH.md`.
+- **Código de terceiros (FLiNG, WeMod/Wand e outros):** é permitido desmontar e decompilar o código que eles injetam no jogo para entender o que fazem, registrando o achado em `RESEARCH.md` (o quê, onde, como foi descoberto). É proibido copiar código ou bytes deles para o trainer, ou redistribuí-los: a implementação é sempre nossa, escrita a partir do entendimento.
 - Nunca use `sudo`, nem altere `kernel.yama.ptrace_scope` ou outra configuração do sistema, sem pedir.
 
 ## 4. Engenharia reversa

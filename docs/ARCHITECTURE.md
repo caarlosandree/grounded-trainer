@@ -170,3 +170,4 @@ As instruções originais copiadas para a cave passam por relocação (endereço
 | 2026-10-25 | Identidade do processo por PID + horário de início + `boot_id`; sinais por `pidfd`; escrita pelo descritor do `mem` | Nunca escrever nem sinalizar um PID reaproveitado |
 | 2026-10-25 | Escrita só nas seções executáveis (do disco) do módulo declarado pelo patch | Escrever é mais rígido que ler; o cabeçalho em memória poderia ser alterado |
 | 2026-10-25 | `gt-patch` e `gt-tui` com a feature `write`; o `gt` continua só leitura | Spec 003: a TUI aplica patches pelo mesmo motor do `gt-patch`; a escrita segue isolada atrás da feature (decisão do dono) |
+| 2026-10-25 | Código de terceiros pode ser desmontado e decompilado para entender o que faz; copiar ou redistribuir continua proibido | Entender as caves do FLiNG acelera a pesquisa; a implementação segue nossa, sem código deles (decisão do dono, `AGENTS.md` 3) |
