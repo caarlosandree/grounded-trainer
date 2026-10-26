@@ -473,7 +473,7 @@ mod tests {
         let mut v = cheats();
         let (_, defs) = synth_signatures();
         v.merge(outcome(index_data(&defs)));
-        assert_eq!(available_count(&v), 8);
+        assert_eq!(available_count(&v), defs.len());
         // Um índice pior (um campo que falta) e uma falha não trocam o bom.
         let mut worse = defs.clone();
         if let FieldRule::Lock { field, .. } = &mut worse[0].rule {
@@ -481,10 +481,10 @@ mod tests {
         }
         let news = v.merge(outcome(index_data(&worse)));
         assert!(news.index_ok);
-        assert_eq!(available_count(&v), 8);
+        assert_eq!(available_count(&v), defs.len());
         let news = v.merge(outcome(Err(REFLECTION_INCOHERENT.to_string())));
         assert!(news.index_ok && !news.retry);
-        assert_eq!(available_count(&v), 8);
+        assert_eq!(available_count(&v), defs.len());
     }
 
     #[test]

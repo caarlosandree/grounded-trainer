@@ -1,14 +1,18 @@
-//! Cena de reflexão sintética do `gt-testtarget --ue` (spec 005, 8): um controller com o pawn
-//! `SurvivalPlayerCharacter` e os quatro componentes, uma criatura `SurvivalCharacter` com
-//! componentes próprios e um segundo personagem não referenciado, para simular a troca de pawn.
+//! Cena de reflexão sintética do `gt-testtarget --ue` (spec 005, 8, e spec 006, 8): um controller
+//! com o pawn `SurvivalPlayerCharacter` e os quatro componentes, a carga, o movimento, os pulos e
+//! o multiplicador de dano, o caminho `Outer` → `Level` → `World` → `GameState` →
+//! `PartyComponent`, uma criatura `SurvivalCharacter` com componentes próprios (inclusive carga e
+//! movimento) e um segundo personagem não referenciado, para simular a troca de pawn.
 //!
 //! Os nomes de classes e campos são os do jogo; os offsets são outros, de propósito: o caminho
 //! tem de vir da reflexão, por nome. O layout das estruturas é o [`UeLayout::observed`].
 
 use gt_core::global::GlobalPattern;
 use gt_core::scan::Pattern;
+use gt_core::value::{ValueGrid, ValueType};
 use gt_grounded2::signatures::{
-    Category, FieldDef, FieldRoot, FieldRule, GlobalDef, LockMode, LockTarget, PlayerCfg, UeSigs,
+    Category, FieldDef, FieldKind, FieldRoot, FieldRule, GameStateCfg, GlobalDef, LockMode,
+    LockTarget, PlayerCfg, UeSigs,
 };
 use gt_ue::UeLayout;
 use gt_ue::synth::{SynthField, SynthImage, SynthUe};
@@ -43,6 +47,33 @@ const SETTINGS_OFF: [u32; 3] = [0x50, 0x60, 0x70];
 pub const CACHED_OFF: u32 = 0x78;
 const CUR_TEMP: u32 = 0x30;
 
+/// `SurvivalCharacter.HaulingComponent` e `.CustomDamageMultiplier`.
+pub const HAULING_OFF: u32 = 0x80;
+pub const DAMAGE_MULT_OFF: u32 = 0x88;
+/// `Character.CharacterMovement` e `.JumpMaxCount` (a classe `Character` é a do motor).
+pub const MOVEMENT_OFF: u32 = 0x70;
+pub const JUMP_OFF: u32 = 0x78;
+/// `HaulingComponent.Capacity`.
+pub const CAPACITY_OFF: u32 = 0x34;
+/// `MaineCharMovementComponent`: os dois multiplicadores de velocidade e a gravidade.
+pub const GROUND_MULT_OFF: u32 = 0x30;
+pub const SWIM_MULT_OFF: u32 = 0x34;
+pub const GRAVITY_OFF: u32 = 0x3c;
+/// `Level.OwningWorld`, `World.GameState`, `InGameGameState.PartyComponent` e
+/// `PartyComponent.ScienceFound`.
+pub const WORLD_OFF: u32 = 0x40;
+pub const GAME_STATE_OFF: u32 = 0x48;
+pub const PARTY_OFF: u32 = 0x38;
+pub const SCIENCE_OFF: u32 = 0x30;
+
+/// Valores iniciais dos campos novos (o personagem sem nenhum cheat).
+pub const CAPACITY_START: i32 = 10;
+pub const SCIENCE_START: i32 = 500;
+pub const JUMP_START: i32 = 1;
+pub const DAMAGE_MULT_START: f32 = 1.0;
+pub const SPEED_START: f32 = 1.0;
+pub const GRAVITY_START: f32 = 1.0;
+
 /// Endereços da cena, como o alvo os informa.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UeAddrs {
@@ -58,6 +89,19 @@ pub struct UeAddrs {
     pub health: u64,
     /// Outro `SurvivalPlayerCharacter`, com componentes próprios e fora do caminho.
     pub alt_pawn: u64,
+    /// `HaulingComponent` do pawn.
+    pub hauling: u64,
+    /// Componente de movimento do pawn (`Character.CharacterMovement`).
+    pub movement: u64,
+    /// `HaulingComponent` e componente de movimento da criatura (montaria): próprios, fora do
+    /// caminho do personagem.
+    pub creature_hauling: u64,
+    pub creature_movement: u64,
+    /// `Outer` do controller e do pawn.
+    pub level: u64,
+    pub world: u64,
+    pub game_state: u64,
+    pub party: u64,
 }
 
 fn field(name: &'static str, kind: &'static str, offset: u32, size: u32) -> SynthField {
@@ -72,6 +116,10 @@ fn field(name: &'static str, kind: &'static str, offset: u32, size: u32) -> Synt
 
 fn float(name: &'static str, offset: u32) -> SynthField {
     field(name, "FloatProperty", offset, 4)
+}
+
+fn int(name: &'static str, offset: u32) -> SynthField {
+    field(name, "IntProperty", offset, 4)
 }
 
 fn object(name: &'static str, offset: u32) -> SynthField {
@@ -114,12 +162,25 @@ pub fn build(arena: u64, len: usize) -> (SynthImage, UeAddrs) {
         0x80,
         &[object("CachedSurvivalPlayerCharacter", CACHED_OFF)],
     );
+    // `Character` do motor: o movimento e os pulos moram nele, como no jogo.
+    let engine_character_c = s.add_class(
+        engine,
+        "Character",
+        Some(actor),
+        0x80,
+        &[
+            object("CharacterMovement", MOVEMENT_OFF),
+            int("JumpMaxCount", JUMP_OFF),
+        ],
+    );
     let character_c = s.add_class(
         maine,
         "SurvivalCharacter",
-        Some(actor),
-        0x70,
+        Some(engine_character_c),
+        0xa0,
         &[
+            object("HaulingComponent", HAULING_OFF),
+            float("CustomDamageMultiplier", DAMAGE_MULT_OFF),
             object("HealthComponent", HEALTH_OFF),
             object("StaminaComponent", STAMINA_OFF),
             object("SurvivalComponent", SURVIVAL_OFF),
@@ -131,7 +192,7 @@ pub fn build(arena: u64, len: usize) -> (SynthImage, UeAddrs) {
         maine,
         "SurvivalPlayerCharacter",
         Some(character_c),
-        0x80,
+        0xa0,
         &[],
     );
     let health_c = s.add_class(
@@ -188,13 +249,68 @@ pub fn build(arena: u64, len: usize) -> (SynthImage, UeAddrs) {
         0x38,
         &[float("CurrentBodyTemperature", CUR_TEMP)],
     );
+    let hauling_c = s.add_class(
+        maine,
+        "HaulingComponent",
+        Some(object_c),
+        0x40,
+        &[int("Capacity", CAPACITY_OFF)],
+    );
+    let movement_c = s.add_class(
+        maine,
+        "MaineCharMovementComponent",
+        Some(object_c),
+        0x50,
+        &[
+            float("CustomGroundSpeedMultiplier", GROUND_MULT_OFF),
+            float("CustomSwimSpeedMultiplier", SWIM_MULT_OFF),
+            float("GravityScale", GRAVITY_OFF),
+        ],
+    );
+    let level_c = s.add_class(
+        engine,
+        "Level",
+        Some(object_c),
+        0x60,
+        &[object("OwningWorld", WORLD_OFF)],
+    );
+    let world_c = s.add_class(
+        engine,
+        "World",
+        Some(object_c),
+        0x70,
+        &[object("GameState", GAME_STATE_OFF)],
+    );
+    let game_state_c = s.add_class(
+        maine,
+        "InGameGameState",
+        Some(actor),
+        0x60,
+        &[object("PartyComponent", PARTY_OFF)],
+    );
+    let party_c = s.add_class(
+        maine,
+        "PartyComponent",
+        Some(object_c),
+        0x40,
+        &[int("ScienceFound", SCIENCE_OFF)],
+    );
 
-    let controller = s.add_object(survival_controller_c, "Controller_0", maine);
-    let pawn = s.add_object(player_character_c, "Player_0", maine);
+    // O controller e o pawn compartilham o `Outer` (o nível persistente), como no jogo.
+    let level = s.add_object(level_c, "PersistentLevel", maine);
+    let world = s.add_object(world_c, "World_0", maine);
+    let game_state = s.add_object(game_state_c, "GameState_0", level);
+    let party = s.add_object(party_c, "Party", game_state);
+    s.set(level, WORLD_OFF, &world.to_le_bytes());
+    s.set(world, GAME_STATE_OFF, &game_state.to_le_bytes());
+    s.set(game_state, PARTY_OFF, &party.to_le_bytes());
+    s.set(party, SCIENCE_OFF, &SCIENCE_START.to_le_bytes());
+    let controller = s.add_object(survival_controller_c, "Controller_0", level);
+    let pawn = s.add_object(player_character_c, "Player_0", level);
     let creature = s.add_object(character_c, "Creature_0", maine);
     let alt_pawn = s.add_object(player_character_c, "Player_1", maine);
     // Componentes de um personagem, com os valores de um personagem saudável e os bits ligados
-    // como no jogo. Devolve o `HealthComponent`.
+    // como no jogo. Devolve o `HealthComponent`, a carga e o movimento.
     let mut components = |owner: u64| {
         let health = s.add_object(health_c, "Health", owner);
         let stamina = s.add_object(stamina_c, "Stamina", owner);
@@ -216,10 +332,21 @@ pub fn build(arena: u64, len: usize) -> (SynthImage, UeAddrs) {
             s.set(survival, off, &100f32.to_le_bytes());
         }
         s.set(temperature, CUR_TEMP, &NEUTRAL_TEMP.to_le_bytes());
-        health
+        let hauling = s.add_object(hauling_c, "Hauling", owner);
+        let movement = s.add_object(movement_c, "Movement", owner);
+        s.set(owner, HAULING_OFF, &hauling.to_le_bytes());
+        s.set(owner, MOVEMENT_OFF, &movement.to_le_bytes());
+        s.set(hauling, CAPACITY_OFF, &CAPACITY_START.to_le_bytes());
+        for off in [GROUND_MULT_OFF, SWIM_MULT_OFF] {
+            s.set(movement, off, &SPEED_START.to_le_bytes());
+        }
+        s.set(movement, GRAVITY_OFF, &GRAVITY_START.to_le_bytes());
+        s.set(owner, JUMP_OFF, &JUMP_START.to_le_bytes());
+        s.set(owner, DAMAGE_MULT_OFF, &DAMAGE_MULT_START.to_le_bytes());
+        (health, hauling, movement)
     };
-    let health = components(pawn);
-    components(creature);
+    let (health, hauling, movement) = components(pawn);
+    let (_, creature_hauling, creature_movement) = components(creature);
     components(alt_pawn);
     s.set(controller, PAWN_OFF, &pawn.to_le_bytes());
     s.set(controller, CACHED_OFF, &pawn.to_le_bytes());
@@ -234,6 +361,14 @@ pub fn build(arena: u64, len: usize) -> (SynthImage, UeAddrs) {
         pawn_field_addr: controller + u64::from(PAWN_OFF),
         health,
         alt_pawn,
+        hauling,
+        movement,
+        creature_hauling,
+        creature_movement,
+        level,
+        world,
+        game_state,
+        party,
     };
     (image, addrs)
 }
@@ -281,8 +416,130 @@ fn clear_bits(id: &str, object: &str, class: &str, fields: &[&str]) -> FieldDef 
     }
 }
 
-/// `[ue]` e `[[field]]` da cena: o `[ue.player]` e os oito cheats da spec 6.5, com os nomes do
-/// jogo, e o layout observado. As globais não têm `rva` (a cena entrega os endereços direto).
+/// Cheat `set` ou `add` da spec 006 com a grade do `generic.toml`.
+fn progression(
+    id: &str,
+    category: Category,
+    (object, class, root): (&str, &str, FieldRoot),
+    rule: FieldRule,
+    value: Option<ValueGrid>,
+) -> FieldDef {
+    FieldDef {
+        id: id.into(),
+        name: id.into(),
+        category,
+        description: String::new(),
+        object: object.into(),
+        object_class: class.into(),
+        root,
+        value,
+        rule,
+    }
+}
+
+fn grid(
+    ty: ValueType,
+    (min, max, step): (f64, f64, f64),
+    default: f64,
+    unit: Option<&str>,
+) -> ValueGrid {
+    ValueGrid {
+        ty,
+        min,
+        max,
+        step,
+        default_k: ((default - min) / step).round() as u64,
+        unit: unit.map(str::to_string),
+        decimals: match ty {
+            ValueType::F32 => 2,
+            _ => 0,
+        },
+    }
+}
+
+fn set_rule(fields: &[&str], kind: FieldKind, target: Option<f64>) -> FieldRule {
+    FieldRule::Set {
+        fields: fields.iter().map(|f| f.to_string()).collect(),
+        kind,
+        target,
+    }
+}
+
+/// Os seis cheats da spec 006, 6.7, com os nomes do jogo e as grades do `generic.toml`.
+fn progression_defs() -> Vec<FieldDef> {
+    let maine = |class: &str| format!("{MAINE}.{class}");
+    let movement = || ("CharacterMovement", maine("MaineCharMovementComponent"));
+    let (mv_obj, mv_class) = movement();
+    let carga = progression(
+        "carga",
+        Category::Itens,
+        (
+            "HaulingComponent",
+            &maine("HaulingComponent"),
+            FieldRoot::Pawn,
+        ),
+        set_rule(&["Capacity"], FieldKind::Int, None),
+        Some(grid(ValueType::I32, (1.0, 100.0, 1.0), 20.0, None)),
+    );
+    vec![
+        carga,
+        progression(
+            "dano",
+            Category::Progressao,
+            ("pawn", &maine("SurvivalCharacter"), FieldRoot::Pawn),
+            set_rule(&["CustomDamageMultiplier"], FieldKind::Float, None),
+            Some(ValueGrid {
+                decimals: 0,
+                ..grid(ValueType::F32, (1.0, 100.0, 1.0), 10.0, Some("x"))
+            }),
+        ),
+        progression(
+            "somar-ciencia",
+            Category::Progressao,
+            (
+                "PartyComponent",
+                &maine("PartyComponent"),
+                FieldRoot::GameState,
+            ),
+            FieldRule::Add {
+                field: "ScienceFound".into(),
+                result_max: 100_000,
+            },
+            Some(grid(ValueType::I32, (100.0, 10_000.0, 100.0), 1000.0, None)),
+        ),
+        progression(
+            "velocidade",
+            Category::Movimento,
+            (mv_obj, &mv_class, FieldRoot::Pawn),
+            set_rule(
+                &["CustomGroundSpeedMultiplier", "CustomSwimSpeedMultiplier"],
+                FieldKind::Float,
+                None,
+            ),
+            Some(grid(ValueType::F32, (0.5, 4.0, 0.25), 2.0, Some("x"))),
+        ),
+        progression(
+            "pulos-infinitos",
+            Category::Movimento,
+            ("pawn", "/Script/Engine.Character", FieldRoot::Pawn),
+            set_rule(&["JumpMaxCount"], FieldKind::Int, Some(1000.0)),
+            None,
+        ),
+        progression(
+            "gravidade",
+            Category::Movimento,
+            (mv_obj, &mv_class, FieldRoot::Pawn),
+            set_rule(&["GravityScale"], FieldKind::Float, None),
+            Some(ValueGrid {
+                decimals: 1,
+                ..grid(ValueType::F32, (0.1, 2.0, 0.1), 0.5, Some("x"))
+            }),
+        ),
+    ]
+}
+
+/// `[ue]` e `[[field]]` da cena: o `[ue.player]`, os oito cheats da spec 5 (6.5) e os seis da
+/// spec 6 (6.7), com os nomes do jogo, e o layout observado. As globais não têm `rva` (a cena entrega os endereços direto).
 pub fn synth_signatures() -> (UeSigs, Vec<FieldDef>) {
     let global = || GlobalDef {
         pattern: GlobalPattern {
@@ -302,12 +559,18 @@ pub fn synth_signatures() -> (UeSigs, Vec<FieldDef>) {
             pawn_field: "Pawn".into(),
             pawn_class: format!("{MAINE}.SurvivalPlayerCharacter"),
             alt_pawn_fields: vec!["CachedSurvivalPlayerCharacter".into()],
-            game_state: None,
+            game_state: Some(GameStateCfg {
+                level_class: "/Script/Engine.Level".into(),
+                world_field: "OwningWorld".into(),
+                world_class: "/Script/Engine.World".into(),
+                game_state_field: "GameState".into(),
+                game_state_class: format!("{MAINE}.InGameGameState"),
+            }),
         },
     };
     let bar = (0.0, 10_000.0);
     let max = |f: &str| LockTarget::Field(f.into());
-    let defs = vec![
+    let mut defs = vec![
         lock(
             "vida-infinita",
             "HealthComponent",
@@ -369,5 +632,6 @@ pub fn synth_signatures() -> (UeSigs, Vec<FieldDef>) {
             &["bCanDieFromDamage", "bCanDieEver"],
         ),
     ];
+    defs.extend(progression_defs());
     (sigs, defs)
 }
