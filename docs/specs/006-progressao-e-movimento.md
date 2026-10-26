@@ -3,7 +3,7 @@
 | Campo | Valor |
 |---|---|
 | Fase | 5, segunda e última parte (ver `docs/ROADMAP.md`) |
-| Estado | Aprovada pelo dono em 2026-10-26 (passagem para o plano 006) |
+| Estado | Implementada e confirmada no jogo pelo dono em 2026-10-26 (Fase 5 fechada) |
 | Data | 2026-10-26 |
 
 ## 1. Intenção
@@ -160,7 +160,8 @@ sobrevivência. Com esta spec:
 - No índice, a falta de uma classe ou campo do caminho do `game_state` (`Level`, `World`, `InGameGameState`,
   `OwningWorld`, `GameState`) deixa `indisponível (classe X não encontrada)` ou `(campo X não encontrado)` **só** a
   ação, e a falta de uma classe do caminho do pawn deixa indisponíveis só os cheats do pawn.
-- A linha `personagem:` do topo continua sendo só do pawn.
+- A linha `personagem:` do topo continua mostrando o personagem (pawn), e não o estado do jogo; depois de uma procura,
+  ela segue o controller guardado também sem cheat ligado (6.6).
 
 Combinações: nesta spec, `root = "game_state"` só é aceito com `rule = "add"`; com `lock`, `clear_bits` ou `set` é
 erro de carga, para não ter caminho sem uso e sem teste. `object = "pawn"` com `root = "game_state"` também é erro de

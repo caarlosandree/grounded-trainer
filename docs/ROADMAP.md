@@ -126,7 +126,7 @@ A fase foi dividida em duas specs:
   água, oxigênio, temperatura, sem dano de queda, não morrer). **Fechada em 2026-10-26**: os oito funcionaram no
   jogo com o dono (branch `fase-5-sobrevivencia`). Pendência: confirmar na próxima atualização do jogo que tudo
   continua funcionando sem mudar o trainer.
-- **Spec 006 — o resto da Fase 5:** carga, dano causado, ciência (como ação de somar) e movimento (velocidade, pulos infinitos, gravidade). **Em andamento**: spec aprovada e implementada (`docs/specs/006-progressao-e-movimento.md`); falta o teste no jogo com o dono para fechar a fase.
+- **Spec 006 — o resto da Fase 5:** carga, dano causado, ciência (como ação de somar) e movimento (velocidade, pulos infinitos, gravidade). **Fechada em 2026-10-26**: os seis cheats funcionaram no jogo com o dono (branch `fase-5-progressao`). Com isso a **Fase 5 está fechada**, com a pendência da spec 005: confirmar na próxima atualização do jogo que tudo continua funcionando sem mudar o trainer.
 
 ---
 

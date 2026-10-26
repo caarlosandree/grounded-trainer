@@ -632,6 +632,28 @@ abaixo só para conferir testes: o trainer acha tudo por nome.
 - **Montado:** o `RelativeLocation` da raiz do personagem fica `(0, 0, 0)` (preso à montaria) e a posição no mundo
   (`+0x210` da `SceneComponent`, fora da reflexão) continua certa. Teleporte saiu do escopo (decisão do dono).
 
+## Sessão de 2026-10-26 (Fase 5): critério de pronto da spec 006 no jogo
+
+Build `c935e799-0b27c000`, backup do save feito pelo dono, FLiNG fechado. Plano 006, Tarefa 14.
+
+- Testes `#[ignore]` em `apps/gt-tui/tests/game.rs` (188 s): `game_globals_layout_and_fields_available` (os 17
+  cheats de valor disponíveis e verificados; busca de patches e globais 59 s com o jogo recém-aberto, índice 1,5 s,
+  controller 1,4 s), `game_bits_round_trip` (bits da spec 005 inalterados) e `game_set_round_trip`. Neste, cada ajuste
+  foi escrito com o valor padrão, conferido pelo diário e devolvido ao original ao desligar:
+
+  | Cheat | Original | Escrito |
+  |---|---|---|
+  | `carga` (`Capacity`) | 5 | 20 |
+  | `dano` (`CustomDamageMultiplier`) | 1,0 | 10,0 |
+  | `velocidade` (`CustomGroundSpeedMultiplier`, `CustomSwimSpeedMultiplier`) | 1,0 e 1,0 | 2,0 e 2,0 |
+  | `pulos-infinitos` (`JumpMaxCount`) | 1 | 1000 |
+  | `gravidade` (`GravityScale`) | 1,0 | 0,5 |
+
+- Critério 2–13 da spec 006 (seção 9) pela TUI com o dono: **tudo funcionou como esperado** (relato do dono): carga,
+  dano, somar ciência (uma vez por segundo, gasto e persistência no save), velocidade, pulos no ar, gravidade, montado,
+  morte e menu, save com os ajustes ligados, reinício do jogo com a TUI aberta, saída e estabilidade do jogo e do save.
+- Nenhum cheat saiu da spec; a grade de velocidade (×0,5 a ×4) ficou como estava.
+
 ## Hipóteses descartadas
 
 - (2026-10-25) "Os patches em `+57BD6D0`/`+5BBFE8C` indicam que as opções de cargas e arrastar item estavam
