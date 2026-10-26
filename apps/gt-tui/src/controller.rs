@@ -12,7 +12,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
 use gt_core::procinfo::Identity;
-use gt_grounded2::fields::PlayerState;
+use gt_grounded2::fields::{Note as FieldNote, PlayerState};
 use gt_grounded2::ue::UE_ID;
 
 use crate::backend::{
@@ -1431,7 +1431,8 @@ impl<B: Backend> Controller<B> {
         if k == row.k {
             return false;
         }
-        let in_game = row.on && row.applied_k.is_some();
+        // Com `o jogo não deixa`, as setas só mudam o valor mostrado (spec 006, 6.4).
+        let in_game = row.on && row.applied_k.is_some() && row.note != Some(FieldNote::GameRefuses);
         self.set_shown_k(&id, k);
         in_game && self.swap_due(now) && self.do_swap(&id, now, draw)
     }
@@ -1452,7 +1453,10 @@ impl<B: Backend> Controller<B> {
             .model
             .cheats
             .iter()
-            .find(|r| r.on && r.applied_k.is_some_and(|a| a != r.k))
+            .find(|r| {
+                r.on && r.note != Some(FieldNote::GameRefuses)
+                    && r.applied_k.is_some_and(|a| a != r.k)
+            })
             .map(|r| r.id.clone());
         match pending {
             Some(id) => self.do_swap(&id, now, draw),
@@ -1493,6 +1497,14 @@ impl<B: Backend> Controller<B> {
                     &spec.format(before),
                     &spec.format(k),
                 );
+            }
+            // Cheat de valor antes do índice da reflexão (`verificando…`): o valor mostrado é
+            // guardado e vale ao ligar ou religar; sem linha no registro nem volta do valor
+            // (spec 006, 6.5). `applied_k` acompanha para a troca não se repetir a cada volta.
+            OpOutcome::Refused(reason) if row.field && reason == crate::model::CHECKING => {
+                if let Some(r) = self.model.cheats.iter_mut().find(|r| r.id == id) {
+                    r.applied_k = Some(k);
+                }
             }
             // Recusa limpa: o jogo continua com o valor de antes e a tela volta a mostrá-lo.
             OpOutcome::Refused(reason) => {
@@ -4332,5 +4344,231 @@ mod tests {
         // Nada ligado: a linha do personagem volta a `—`.
         h.tick(400);
         assert_eq!(h.c.model.player, PlayerLine::Idle);
+    }
+
+    // ---- Tarefa 10 do plano 006: valor ajustável nos cheats de valor ----
+
+    /// Cheat de valor com a grade `grid()` (`0..=10`, padrão 2).
+    fn vfield(id: &str) -> CheatInfo {
+        let mut c = field(id, Avail::Checking);
+        c.value = Some(grid());
+        c
+    }
+
+    /// Conectado em 0 com o cheat de valor `f` (grade `grid()`), disponível pela sessão.
+    fn with_value_field() -> H {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![vfield("f")]);
+        h.ctl.set_field_avail(&[("f", available())]);
+        h.connect(0);
+        h
+    }
+
+    fn field_ons(h: &H) -> Vec<Call> {
+        h.ctl
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, Call::FieldOn { .. }))
+            .collect()
+    }
+
+    fn field_on_call(k: u64, busy: &str) -> Call {
+        Call::FieldOn {
+            id: "f".to_string(),
+            k,
+            busy: Some(busy.to_string()),
+        }
+    }
+
+    #[test]
+    fn field_value_arrows_off_and_on() {
+        let mut h = with_value_field();
+        assert_eq!(h.row("f").k, 2);
+        // Desligado, as setas só mudam o valor mostrado.
+        assert!(!h.key(Action::Inc, 100));
+        assert_eq!(h.row("f").k, 3);
+        assert!(swaps(&h).is_empty());
+        // Ligar usa o valor mostrado.
+        assert!(h.toggle("f", 200));
+        assert_eq!(field_ons(&h), [field_on_call(3, "ligando f…")]);
+        assert_eq!(h.row("f").applied_k, Some(3));
+        assert_eq!(h.c.desired().get("f").map(|d| d.k), Some(3));
+
+        // Ligado: uma tecla isolada vai na hora.
+        assert!(h.key(Action::Inc, 2_000));
+        assert_eq!(swaps(&h), [set_call("f", 4)]);
+        // Dentro dos 150 ms só muda o mostrado; passado o intervalo, vai o último valor.
+        assert!(!h.key(Action::Inc, 2_025));
+        assert!(!h.key(Action::Inc, 2_050));
+        assert_eq!(h.row("f").k, 6);
+        assert!(!h.tick(2_149));
+        assert!(h.tick(2_150));
+        assert_eq!(swaps(&h), [set_call("f", 4), set_call("f", 6)]);
+        assert_eq!(h.row("f").applied_k, Some(6));
+        assert_eq!(h.c.desired().get("f").map(|d| d.k), Some(6));
+        assert!(!h.tick(2_400));
+        assert_eq!(swaps(&h).len(), 2);
+    }
+
+    #[test]
+    fn field_relink_uses_shown_value() {
+        let mut h = with_value_field();
+        assert!(h.toggle("f", 100));
+        assert!(h.key(Action::Inc, 2_000));
+        assert_eq!(h.row("f").k, 3);
+        // O jogo fecha; as setas seguem mudando o mostrado (e o desejado).
+        h.ctl.set_exited(true);
+        h.tick(2_100);
+        h.ctl.set_exited(false);
+        assert!(!h.key(Action::Inc, 2_200));
+        assert_eq!(h.row("f").k, 4);
+        h.connect(4_200);
+        h.tick(4_300);
+        let ons = field_ons(&h);
+        assert_eq!(ons.len(), 2);
+        assert_eq!(ons[1], field_on_call(4, "religando…"));
+        assert!(h.row("f").on);
+        assert_eq!(h.row("f").applied_k, Some(4));
+    }
+
+    #[test]
+    fn field_swap_during_checking_keeps_shown_value() {
+        let mut h = with_value_field();
+        assert!(h.toggle("f", 100));
+        let before = h.c.model.events.len();
+        // A sessão ainda não tem o índice: recusa a troca com `verificando…`.
+        h.ctl
+            .push_outcome(OpOutcome::Refused(crate::model::CHECKING.to_string()));
+        assert!(h.key(Action::Inc, 2_000));
+        // O valor mostrado e o desejado ficam; nada vai ao registro.
+        assert_eq!(h.row("f").k, 3);
+        assert_eq!(h.c.desired().get("f").map(|d| d.k), Some(3));
+        assert_eq!(h.c.model.events.len(), before);
+        assert!(!h.events().iter().any(|e| e.contains("verificando")));
+        // Sem repetir a troca a cada volta.
+        assert!(!h.tick(2_200));
+        assert!(!h.tick(2_400));
+        assert_eq!(swaps(&h).len(), 1);
+    }
+
+    #[test]
+    fn set_maintenance_with_new_original_keeps_keys() {
+        let mut h = with_value_field();
+        assert!(h.toggle("f", 100));
+        let ops = h.c.op_counts.clone();
+        let mut r = report(PlayerState::Found, &[]);
+        r.events = vec!["f: o jogo mudou o valor para 7; novo original".to_string()];
+        h.ctl.push_tick(r);
+        // Não é operação: o `tick` não chama o laço de teclas a descartar e as buscas valem.
+        assert!(!h.tick(200));
+        assert_eq!(h.c.op_counts, ops);
+        assert_eq!(
+            event_count(&h, "f: o jogo mudou o valor para 7; novo original"),
+            1
+        );
+        assert_eq!(
+            h.c.after_op_keys(vec![Action::Inc, Action::Dec, Action::Quit]),
+            [Action::Inc, Action::Dec, Action::Quit]
+        );
+        // Uma busca iniciada antes ainda vale para este cheat.
+        assert!(h.row("f").on);
+    }
+
+    #[test]
+    fn game_refuses_arrows_only_change_shown() {
+        let mut h = with_value_field();
+        assert!(h.toggle("f", 100));
+        h.ctl
+            .push_tick(report(PlayerState::Found, &[("f", FieldNote::GameRefuses)]));
+        h.tick(200);
+        assert_eq!(h.row("f").note, Some(FieldNote::GameRefuses));
+        // Com a marca, as setas só mudam o valor mostrado, sem trocar nada no jogo.
+        assert!(!h.key(Action::Inc, 5_000));
+        assert!(!h.key(Action::Inc, 5_300));
+        assert_eq!(h.row("f").k, 4);
+        assert_eq!(h.c.desired().get("f").map(|d| d.k), Some(4));
+        h.ctl
+            .push_tick(report(PlayerState::Found, &[("f", FieldNote::GameRefuses)]));
+        assert!(!h.tick(5_600));
+        assert!(swaps(&h).is_empty());
+        // A marca some: o valor mostrado vai ao jogo.
+        h.ctl.push_tick(report(PlayerState::Found, &[]));
+        assert!(!h.tick(5_700));
+        assert_eq!(h.row("f").note, None);
+        assert!(h.tick(5_800));
+        assert_eq!(swaps(&h), [set_call("f", 4)]);
+    }
+
+    #[test]
+    fn game_refuses_cleared_on_reconnect() {
+        let mut h = with_value_field();
+        assert!(h.toggle("f", 100));
+        h.ctl
+            .push_tick(report(PlayerState::Found, &[("f", FieldNote::GameRefuses)]));
+        h.tick(200);
+        assert_eq!(h.row("f").note, Some(FieldNote::GameRefuses));
+        h.reopen(300, 3_000);
+        assert_eq!(h.row("f").note, None);
+        h.tick(3_100);
+        assert!(h.row("f").on);
+        assert_eq!(h.row("f").note, None);
+        // De novo as setas trocam o valor no jogo.
+        assert!(h.key(Action::Inc, 4_000));
+        assert_eq!(swaps(&h), [set_call("f", 3)]);
+    }
+
+    #[test]
+    fn set_maintenance_suspended_stuck_or_pending() {
+        let mut h = with_value_field();
+        assert!(h.toggle("f", 100));
+        h.ctl.set_stuck(true);
+        h.tick(200);
+        assert_eq!(h.ctl.field_ticks(), 0);
+        h.ctl.set_stuck(false);
+        h.tick(300);
+        assert_eq!(h.ctl.field_ticks(), 1);
+
+        // Resto pendente do `f`: a linha vira erro, sai da manutenção e nada é criado para ele.
+        h.ctl.set_pending(&["f"]);
+        h.tick(400);
+        assert!(h.row("f").residue);
+        assert!(!h.row("f").on);
+        let ticks = h.ctl.field_ticks();
+        h.tick(500);
+        h.tick(600);
+        assert_eq!(h.ctl.field_ticks(), ticks);
+        assert!(h.ctl.calls().iter().all(|c| match c {
+            Call::FieldTick { on } => !on.is_empty(),
+            _ => true,
+        }));
+    }
+
+    #[test]
+    fn set_turn_off_failure_marks_error_blocks_id() {
+        let mut h = with_value_field();
+        assert!(h.toggle("f", 100));
+        h.ctl.push_residue("escrita recusada", &["f"]);
+        assert!(h.toggle("f", 200));
+        assert!(h.row("f").residue);
+        assert!(!h.row("f").on);
+        assert!(!h.c.desired().contains_key("f"));
+        assert!(h.c.model.banners.residue.is_some());
+        assert_eq!(
+            event_count(&h, "f: falhou deixando restos no jogo (escrita recusada)"),
+            1
+        );
+        // Com o resto pendente, nada novo é criado para o id: espaço restaura, não liga.
+        assert!(h.toggle("f", 300));
+        assert_eq!(field_ons(&h).len(), 1);
+        assert!(
+            h.ctl
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::RestorePending { .. }))
+        );
+        // A manutenção não roda sem cheat de valor ligado.
+        let ticks = h.ctl.field_ticks();
+        h.tick(400);
+        assert_eq!(h.ctl.field_ticks(), ticks);
     }
 }

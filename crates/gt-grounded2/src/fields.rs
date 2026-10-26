@@ -238,11 +238,6 @@ impl FieldRuntime {
         self.desired.insert(id.to_string(), value);
     }
 
-    /// Valor pedido por [`set_desired`](Self::set_desired) para o `id`, se houve algum.
-    pub fn requested(&self, id: &str) -> Option<f64> {
-        self.desired.get(id).copied()
-    }
-
     /// Valor desejado do `set` `id`: o `target` (cheat só liga/desliga, spec 6.4), senão o
     /// pedido, senão o padrão da grade.
     fn desired_value(&self, id: &str, target: Option<f64>) -> Option<f64> {
