@@ -281,7 +281,7 @@ fn resume_guard(guard: PauseGuard<'_>, fault: Option<Fault>, fired: &mut bool) -
 pub enum DataFault {
     /// Toda escrita de restauração de dados falha (`WriteRefused`) sem tocar no jogo.
     RestoreFails,
-    /// A próxima escrita de `set_word` grava estes bytes (o jogo mexeu no campo) e a releitura
+    /// A próxima escrita de `set_word` ou `write_data` grava estes bytes (o jogo mexeu no campo) e a releitura
     /// diverge do pedido: `BytesMismatch` com um terceiro valor. Dispara uma vez.
     ThirdValue(Vec<u8>),
 }
@@ -766,6 +766,17 @@ impl Engine {
             });
         }
         self.check_data_write(addr, bytes.len(), guard)?;
+        if let Some(DataFault::ThirdValue(third)) = self.data_fault.clone() {
+            // O jogo escreve entre a nossa escrita e a releitura (só para testes).
+            self.data_fault = None;
+            self.writer.write(addr, &third)?;
+            self.data_maps = None;
+            return Err(Error::BytesMismatch {
+                id: "dados".to_owned(),
+                expected: hex(bytes),
+                found: hex(&third),
+            });
+        }
         self.write_data_verified("dados", addr, bytes)
     }
 

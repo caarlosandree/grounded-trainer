@@ -488,10 +488,10 @@ fn set_value_change_goes_through_next() {
     }
     s.runtime.turn_off(&mut s.engine, "velocidade").unwrap();
     assert_eq!((s.f32_at(ground), s.f32_at(swim)), (1.0, 1.0));
-    // Com `target`, o valor do cheat é o `target`, até alguém pedir outro.
+    // Com `target`, o valor escrito é sempre o `target`: `set_desired` não o muda (spec 6.4).
     s.runtime.set_desired("pulos-infinitos", 7.0);
     s.tick(&["pulos-infinitos"]);
-    assert_eq!(s.i32_at(s.ue.pawn + u64::from(JUMP_OFF)), 7);
+    assert_eq!(s.i32_at(s.ue.pawn + u64::from(JUMP_OFF)), 1000);
 }
 
 #[test]
@@ -535,6 +535,12 @@ fn set_invalid_game_value_note_and_resume() {
     s.poke(gravity, &1.0f32.to_le_bytes());
     let third = s.tick(&["gravidade"]);
     assert!(third.notes.is_empty());
+    // A volta ao normal gera uma linha, uma vez só.
+    assert_eq!(
+        third.events,
+        vec!["gravidade: valor do jogo válido de novo".to_string()]
+    );
+    assert!(s.tick(&["gravidade"]).events.is_empty());
     assert_eq!(s.f32_at(gravity), 0.5);
     s.runtime.turn_off(&mut s.engine, "gravidade").unwrap();
     assert_eq!(s.f32_at(gravity), 1.0);
@@ -744,6 +750,19 @@ fn action_adds_and_rereads() {
             after: 100_000
         }
     );
+}
+
+#[test]
+fn action_raced_when_game_writes_during_the_write() {
+    let mut s = scene();
+    let c = Some(s.ue.controller);
+    s.engine
+        .inject_data_fault_for_test(Some(DataFault::ThirdValue(777i32.to_le_bytes().to_vec())));
+    assert_eq!(s.action(c, 1000), ActionOutcome::Raced { read: 777 });
+    // Não tenta de novo: o valor do jogo fica como está.
+    assert_eq!(s.i32_at(s.science()), 777);
+    assert!(s.engine.data_entries().is_empty());
+    assert_eq!(s.store.peek().unwrap(), Loaded::Missing);
 }
 
 #[test]
