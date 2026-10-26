@@ -146,6 +146,8 @@ mod tests {
     fn def(rva: Option<u64>) -> PatchDef {
         PatchDef {
             id: "p".into(),
+            name: "Patch".into(),
+            category: crate::signatures::Category::Itens,
             description: "d".into(),
             module: crate::GAME_EXE.into(),
             pattern: Pattern::parse("48 8B ?? 90").unwrap(),
@@ -153,6 +155,7 @@ mod tests {
             expected: vec![0x8B, 0xF9],
             replacement: vec![0x89, 0xCF],
             rva,
+            value: None,
         }
     }
 

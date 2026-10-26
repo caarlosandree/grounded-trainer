@@ -20,7 +20,7 @@ use crate::state::{PatchState, StateInputs, compute_state};
 use crate::{Error, GAME_EXE, Result};
 
 /// Uma definição e o estado dela no processo.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
     pub def: PatchDef,
     pub state: PatchState,
@@ -113,10 +113,39 @@ pub fn scan(
     journal: Option<&Journal>,
     locked: bool,
 ) -> Result<CatalogScan> {
+    scan_defs(target, sigs, journal, locked, None)
+}
+
+/// Como [`scan`], só com as definições cujo `id` está em `ids`, e sem diário (nova busca de
+/// padrões que não depende do estado dos patches ativos, spec 003 6.2). `id` desconhecido é
+/// ignorado.
+pub fn scan_subset(target: &Target, sigs: &Signatures, ids: &[String]) -> Result<CatalogScan> {
+    scan_defs(target, sigs, None, false, Some(ids))
+}
+
+/// Mantém as definições cujo `id` está em `ids`, na ordem do arquivo (a ordem de `ids` não conta;
+/// `id` desconhecido é ignorado). Com `None`, devolve todas.
+pub fn select_defs(defs: Vec<PatchDef>, ids: Option<&[String]>) -> Vec<PatchDef> {
+    match ids {
+        None => defs,
+        Some(ids) => defs
+            .into_iter()
+            .filter(|def| ids.contains(&def.id))
+            .collect(),
+    }
+}
+
+fn scan_defs(
+    target: &Target,
+    sigs: &Signatures,
+    journal: Option<&Journal>,
+    locked: bool,
+    ids: Option<&[String]>,
+) -> Result<CatalogScan> {
     let (module, mem_headers) = target.module(GAME_EXE)?;
     let version_key = mem_headers.version_key();
     let has_version_file = sigs.has_version(&version_key);
-    let defs = sigs.for_version(&version_key);
+    let defs = select_defs(sigs.for_version(&version_key), ids);
 
     let identity = match journal {
         Some(_) => Some(identity(target.pid)?),
@@ -287,6 +316,8 @@ mod tests {
     const GENERIC: &str = r#"
 [[patch]]
 id = "teste-codificacao"
+name = "Patch de teste"
+category = "diagnostico"
 description = "Troca sem efeito"
 pattern = "48 8B F9 ?? 90"
 offset = 0
@@ -295,6 +326,8 @@ replacement = "48 89 CF"
 
 [[patch]]
 id = "outro"
+name = "Outro"
+category = "itens"
 description = "Outro patch"
 pattern = "90 90 ?? C3"
 offset = 2
@@ -500,6 +533,29 @@ rva = 0x1000
             state(&j, true),
             PatchState::Active { .. } | PatchState::Pending { .. }
         ));
+    }
+
+    #[test]
+    fn select_defs_keeps_listed_in_order() {
+        let defs = Signatures::parse(&[("generic.toml", GENERIC)])
+            .unwrap()
+            .for_version("x");
+        let names = |ids: Option<&[String]>| -> Vec<String> {
+            select_defs(defs.clone(), ids)
+                .into_iter()
+                .map(|d| d.id)
+                .collect()
+        };
+        assert_eq!(names(None), vec!["teste-codificacao", "outro"]);
+        // A ordem pedida não conta: vale a do arquivo.
+        assert_eq!(
+            names(Some(&ids(&["outro", "teste-codificacao"]))),
+            vec!["teste-codificacao", "outro"]
+        );
+        assert_eq!(names(Some(&ids(&["outro"]))), vec!["outro"]);
+        // `id` desconhecido é ignorado; lista vazia não escolhe nada.
+        assert_eq!(names(Some(&ids(&["fantasma", "outro"]))), vec!["outro"]);
+        assert!(names(Some(&[])).is_empty());
     }
 
     fn catalog(states: Vec<(&str, PatchState)>) -> CatalogScan {
