@@ -3,13 +3,15 @@
 //! leitura, e espera o `stdin` fechar. Nunca é o jogo.
 //!
 //! Argumento opcional `--spin`: cria uma thread que gira para sempre em `spin_page`.
+//! Argumento opcional `--spin-value`: cria uma thread no laço de valor em `value_page`,
+//! que escreve o imediato do `mov eax, imm32` em `value_word`.
 
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
 use gt_core::mem::test_support::{
     allow_any_tracer, anon_rw, exec_code, exec_page, guarded_pages, page_size, pipe_never_written,
-    readonly_shared_page, spawn_thread_at,
+    readonly_shared_page, spawn_thread_at, value_code,
 };
 use gt_core::procinfo::{ThreadPos, list_tids, read_task_stat, read_thread_pos};
 
@@ -55,6 +57,7 @@ fn spawn_and_wait(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let spin = std::env::args().skip(1).any(|a| a == "--spin");
+    let spin_value = std::env::args().skip(1).any(|a| a == "--spin-value");
     allow_any_tracer()?;
 
     // Montado em tempo de execução para o literal não existir em `.rodata`.
@@ -86,10 +89,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
     }
 
+    // Laço de valor: a palavra fica numa página `rw` própria e a thread só existe com
+    // `--spin-value`, como a do `--spin`.
+    let value_word = anon_rw(page as usize)?;
+    let value_page = exec_code(&value_code(value_word), 1)?;
+    if spin_value {
+        spawn_and_wait(value_page, |tid| {
+            Ok(read_task_stat(pid, tid)?.is_some_and(|s| s.state == 'R'))
+        })?;
+    }
+
     let mut out = std::io::stdout().lock();
     writeln!(
         out,
-        "{{\"pid\":{},\"marker\":\"{:#x}\",\"marker_len\":{},\"exec_page\":\"{:#x}\",\"exec2\":\"{:#x}\",\"spin_page\":\"{:#x}\",\"syscall_page\":\"{:#x}\",\"region_start\":\"{:#x}\",\"big_region\":\"{:#x}\",\"big_len\":{},\"ro_shared\":\"{:#x}\",\"page\":{}}}",
+        "{{\"pid\":{},\"marker\":\"{:#x}\",\"marker_len\":{},\"exec_page\":\"{:#x}\",\"exec2\":\"{:#x}\",\"spin_page\":\"{:#x}\",\"syscall_page\":\"{:#x}\",\"value_page\":\"{:#x}\",\"value_word\":\"{:#x}\",\"region_start\":\"{:#x}\",\"big_region\":\"{:#x}\",\"big_len\":{},\"ro_shared\":\"{:#x}\",\"page\":{}}}",
         std::process::id(),
         marker.as_ptr() as u64,
         marker.len(),
@@ -97,6 +110,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         exec2,
         spin_page,
         syscall_page,
+        value_page,
+        value_word,
         region,
         big_region,
         big_len,

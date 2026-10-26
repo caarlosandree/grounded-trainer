@@ -7,6 +7,7 @@
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -34,16 +35,41 @@ mod hex_bytes {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
         let text = String::deserialize(d)?;
-        if !text.is_ascii() || text.len() % 2 != 0 {
-            return Err(D::Error::custom(format!("hex inválido: '{text}'")));
+        parse(&text).map_err(D::Error::custom)
+    }
+
+    /// Lê o texto hexadecimal; a mensagem do erro é a do diário.
+    pub fn parse(text: &str) -> Result<Vec<u8>, String> {
+        let bad = || format!("hex inválido: '{text}'");
+        if !text.is_ascii() || !text.len().is_multiple_of(2) {
+            return Err(bad());
         }
         (0..text.len())
             .step_by(2)
-            .map(|i| {
-                u8::from_str_radix(&text[i..i + 2], 16)
-                    .map_err(|_| D::Error::custom(format!("hex inválido: '{text}'")))
-            })
+            .map(|i| u8::from_str_radix(&text[i..i + 2], 16).map_err(|_| bad()))
             .collect()
+    }
+}
+
+/// Serialização de bytes opcionais como hexadecimal (`None` não é gravado: use junto de
+/// `skip_serializing_if = "Option::is_none"` e `default`).
+mod hex_opt {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub fn serialize<S: Serializer>(bytes: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        match bytes {
+            Some(bytes) => super::hex_bytes::serialize(bytes, s),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        match Option::<String>::deserialize(d)? {
+            Some(text) => super::hex_bytes::parse(&text)
+                .map(Some)
+                .map_err(D::Error::custom),
+            None => Ok(None),
+        }
     }
 }
 
@@ -72,9 +98,21 @@ pub struct JournalEntry {
     /// Bytes antes do patch.
     #[serde(with = "hex_bytes")]
     pub original: Vec<u8>,
-    /// Bytes escritos pelo patch.
+    /// Bytes que o patch tinha no jogo antes da troca em curso (fora de uma troca, os que
+    /// ele escreveu). É sempre o valor que estava no jogo antes de uma troca de valor.
     #[serde(with = "hex_bytes")]
     pub replacement: Vec<u8>,
+    /// Bytes novos, só durante uma troca de valor (spec 003 6.7); `None` fora dela.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "hex_opt")]
+    pub next: Option<Vec<u8>>,
+}
+
+impl JournalEntry {
+    /// Intervalo de endereços coberto pela entrada.
+    pub fn range(&self) -> Range<u64> {
+        let len = u64::try_from(self.original.len()).unwrap_or(u64::MAX);
+        self.addr..self.addr.saturating_add(len)
+    }
 }
 
 /// Conteúdo do diário: identidade do processo e os patches ativos.
@@ -290,17 +328,20 @@ pub enum Recovery {
     },
 }
 
-/// Classifica os bytes atuais de uma entrada.
+/// Classifica os bytes atuais de uma entrada: cada byte precisa ser o original, o de
+/// `replacement` ou, numa troca de valor em curso, o de `next` naquela posição.
 pub fn decide_entry(e: &JournalEntry, current: &[u8]) -> EntryAction {
     if current == e.original {
         return EntryAction::Drop;
     }
-    let comparable = current.len() == e.original.len() && current.len() == e.replacement.len();
+    let next = e.next.as_deref();
+    let comparable = current.len() == e.original.len()
+        && current.len() == e.replacement.len()
+        && next.is_none_or(|n| n.len() == current.len());
     if comparable
-        && current
-            .iter()
-            .zip(e.original.iter().zip(&e.replacement))
-            .all(|(c, (o, n))| c == o || c == n)
+        && current.iter().enumerate().all(|(i, c)| {
+            *c == e.original[i] || *c == e.replacement[i] || next.is_some_and(|n| *c == n[i])
+        })
     {
         EntryAction::Restore
     } else {
@@ -356,6 +397,7 @@ mod tests {
             addr: 0x1_4012_3456,
             original: original.to_vec(),
             replacement: replacement.to_vec(),
+            next: None,
         }
     }
 
@@ -404,6 +446,56 @@ mod tests {
         assert_eq!(decide_entry(&e, &[1, 2, 9, 4]), EntryAction::Restore);
         assert_eq!(decide_entry(&e, &[1, 2, 7, 4]), EntryAction::Foreign);
         assert_eq!(decide_entry(&e, &[1, 2, 3]), EntryAction::Foreign);
+    }
+
+    #[test]
+    fn decide_entry_with_next() {
+        let mut e = entry(&[1, 2], &[3, 4]);
+        e.next = Some(vec![5, 6]);
+        assert_eq!(decide_entry(&e, &[5, 6]), EntryAction::Restore);
+        assert_eq!(decide_entry(&e, &[3, 6]), EntryAction::Restore);
+        assert_eq!(decide_entry(&e, &[1, 6]), EntryAction::Restore);
+        assert_eq!(decide_entry(&e, &[7, 6]), EntryAction::Foreign);
+        assert_eq!(decide_entry(&e, &[1, 2]), EntryAction::Drop);
+        // Sem `next`, o byte do valor novo não vale.
+        e.next = None;
+        assert_eq!(decide_entry(&e, &[5, 6]), EntryAction::Foreign);
+    }
+
+    #[test]
+    fn phase2_journal_still_loads() {
+        // Formato gravado pela Fase 2: sem a chave `next`.
+        let text = r#"{
+  "boot_id": "boot-a",
+  "pid": 4242,
+  "start_time": 1000,
+  "version_key": "c935e799-0a1b2c",
+  "paused_by_us": false,
+  "entries": [
+    { "id": "god_mode", "addr": "0x140123456", "original": "488bf9", "replacement": "909090" }
+  ]
+}"#;
+        let j: Journal = serde_json::from_str(text).unwrap();
+        assert_eq!(j.entries[0].next, None);
+        assert_eq!(j.entries[0].replacement, vec![0x90; 3]);
+        // Sem `next`, salvar não escreve a chave.
+        let saved = serde_json::to_string(&j).unwrap();
+        assert!(!saved.contains("next"), "{saved}");
+        // Com `next`, vai em hexadecimal e volta igual.
+        let mut with_next = j.clone();
+        with_next.entries[0].next = Some(vec![0x66, 0x90, 0x90]);
+        let saved = serde_json::to_string(&with_next).unwrap();
+        assert!(saved.contains("\"next\":\"669090\""), "{saved}");
+        assert_eq!(serde_json::from_str::<Journal>(&saved).unwrap(), with_next);
+        // Hexadecimal inválido em `next` é recusado.
+        let bad = saved.replace("669090", "66909");
+        assert!(serde_json::from_str::<Journal>(&bad).is_err());
+    }
+
+    #[test]
+    fn entry_range_covers_original() {
+        let e = entry(&[1, 2, 3], &[4, 5, 6]);
+        assert_eq!(e.range(), 0x1_4012_3456..0x1_4012_3459);
     }
 
     #[test]

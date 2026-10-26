@@ -5,8 +5,8 @@ use std::cell::Cell;
 use std::ops::Range;
 use std::os::unix::fs::PermissionsExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gt_core::Error;
@@ -134,7 +134,10 @@ fn sample_pcs_stops_early() {
 
 #[test]
 fn sample_pcs_sees_spin_loop() {
-    let t = TestTarget::spawn_with(TargetOpts { spin: true });
+    let t = TestTarget::spawn_with(TargetOpts {
+        spin: true,
+        ..Default::default()
+    });
     let (pidfd, _id) = open_checked(t.pid).unwrap();
     let pcs = sample_pcs(
         &pidfd,
@@ -298,6 +301,7 @@ fn apply_and_undo_on_exec_page() {
                     addr: t.exec2,
                     original: NOP3.to_vec(),
                     replacement: NOP2_NOP.to_vec(),
+                    next: None,
                 }]
             );
         }
@@ -766,6 +770,7 @@ fn restore_entries_handles_mixed_bytes() {
         addr: t.exec2,
         original: vec![0x90; 4],
         replacement: new.to_vec(),
+        next: None,
     };
     let report = engine.restore_entries(vec![entry]).unwrap();
     assert_eq!(report.restored, vec!["meio".to_string()]);
@@ -776,7 +781,10 @@ fn restore_entries_handles_mixed_bytes() {
 
 #[test]
 fn stress_1000_toggles_on_spinning_loop() {
-    let t = TestTarget::spawn_with(TargetOpts { spin: true });
+    let t = TestTarget::spawn_with(TargetOpts {
+        spin: true,
+        ..Default::default()
+    });
     let env = env();
     let mut engine = open_engine(t.pid, &env, vec![page_range(&t, t.spin_page)], None);
     let p = patch(
@@ -1163,4 +1171,395 @@ fn discard_gone_clears_stuck_and_pending() {
     assert!(engine.pending_ids().is_empty());
     assert!(!engine.is_stuck());
     assert!(missing(&env));
+}
+
+// ---------------------------------------------------------------------------
+// Troca dos bytes de um patch ativo (plano 003, tarefa 3)
+// ---------------------------------------------------------------------------
+
+/// `mov eax, imm32` com o imediato do laço de valor do alvo.
+const VALUE_11: [u8; 5] = [0xB8, 0x11, 0x11, 0x11, 0x11];
+const VALUE_22: [u8; 5] = [0xB8, 0x22, 0x22, 0x22, 0x22];
+const VALUE_33: [u8; 5] = [0xB8, 0x33, 0x33, 0x33, 0x33];
+
+/// Os testes com a thread do laço de valor se serializam: a pausa tem prazo de 500 ms por
+/// tentativa e não pode disputar CPU com outros alvos girando.
+static SPIN_VALUE_LOCK: Mutex<()> = Mutex::new(());
+
+fn spin_value_lock() -> std::sync::MutexGuard<'static, ()> {
+    SPIN_VALUE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn spin_value_target() -> TestTarget {
+    TestTarget::spawn_with(TargetOpts {
+        spin_value: true,
+        ..Default::default()
+    })
+}
+
+/// Patch de valor: `B8 11 11 11 11` → `B8 22 22 22 22` em `value_page`.
+fn value_patch(t: &TestTarget) -> Validated {
+    patch("val", t.value_page, &VALUE_11, &VALUE_22)
+}
+
+fn value_engine(t: &TestTarget, env: &Env, cfg: PauseConfig) -> Engine {
+    open_engine_with(t.pid, env, vec![page_range(t, t.value_page)], cfg)
+}
+
+fn read_word(t: &TestTarget) -> u32 {
+    u32::from_le_bytes(bytes_at(t.pid, t.value_word, 4).try_into().unwrap())
+}
+
+/// Espera (até 2 s) a palavra do laço de valor chegar a `want`.
+fn wait_word(t: &TestTarget, want: u32) -> bool {
+    wait_until(
+        || Ok(read_word(t) == want),
+        Duration::from_secs(2),
+        Duration::from_millis(1),
+    )
+    .unwrap()
+}
+
+/// Diário num diretório de memória (`/dev/shm`, se existir): milhares de gravações com
+/// `fsync` ficam rápidas.
+fn env_fast() -> Env {
+    let dir = if std::path::Path::new("/dev/shm").is_dir() {
+        tempfile::tempdir_in("/dev/shm").unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    };
+    let store = JournalStore::new(dir.path().join("state"));
+    let lock = store.lock().unwrap();
+    Env { dir, store, lock }
+}
+
+#[test]
+fn set_replacement_changes_executed_value() {
+    let _serial = spin_value_lock();
+    let t = spin_value_target();
+    let env = env();
+    let mut engine = value_engine(&t, &env, PauseConfig::default());
+    // O laço escreve o imediato inicial até o patch entrar.
+    assert!(wait_word(&t, 0x1111_1111));
+    engine.apply(vec![value_patch(&t)]).unwrap();
+    assert!(wait_word(&t, 0x2222_2222), "{:#x}", read_word(&t));
+
+    let report = engine.set_replacement("val", VALUE_33.to_vec()).unwrap();
+    assert_eq!(report.restored, vec!["val".to_string()]);
+    assert!(report.foreign.is_empty());
+    assert_eq!(report.danger_retries, 0);
+    assert!(wait_word(&t, 0x3333_3333), "{:#x}", read_word(&t));
+    assert_eq!(bytes_at(t.pid, t.value_page, 5), VALUE_33);
+    assert_eq!(engine.active().len(), 1);
+    assert_eq!(engine.active()[0].replacement, VALUE_33);
+    assert!(engine.pending_ids().is_empty());
+
+    // Diário: uma única entrada, com o valor novo e sem `next`.
+    let j = journal_now(&env);
+    assert!(!j.paused_by_us);
+    assert_eq!(
+        j.entries,
+        vec![JournalEntry {
+            id: "val".into(),
+            addr: t.value_page,
+            original: VALUE_11.to_vec(),
+            replacement: VALUE_33.to_vec(),
+            next: None,
+        }]
+    );
+
+    // Desfazer devolve os originais e o laço volta ao valor inicial.
+    engine.undo_all().unwrap();
+    assert_eq!(bytes_at(t.pid, t.value_page, 5), VALUE_11);
+    assert!(wait_word(&t, 0x1111_1111), "{:#x}", read_word(&t));
+    assert!(missing(&env));
+    assert!(wait_all_running(t.pid), "{:?}", states(t.pid));
+}
+
+#[test]
+fn set_replacement_foreign_drops_patch() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let mut engine = value_engine(&t, &env, PauseConfig::default());
+    engine.apply(vec![value_patch(&t)]).unwrap();
+    // Alguém troca os bytes por fora.
+    let other = [0xB8, 0x44, 0x44, 0x44, 0x44];
+    MemWriter::open(t.pid)
+        .unwrap()
+        .write(t.value_page, &other)
+        .unwrap();
+
+    let report = engine.set_replacement("val", VALUE_33.to_vec()).unwrap();
+    assert_eq!(report.foreign, vec!["val".to_string()]);
+    assert!(report.restored.is_empty());
+    assert!(engine.active().is_empty());
+    assert!(engine.pending_ids().is_empty());
+    // Nada foi escrito: o alvo continua como o outro deixou.
+    assert_eq!(bytes_at(t.pid, t.value_page, 5), other);
+    assert!(missing(&env));
+    assert!(wait_all_running(t.pid), "{:?}", states(t.pid));
+}
+
+#[test]
+fn set_replacement_rejects_new_boundaries() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let mut engine = value_engine(&t, &env, PauseConfig::default());
+    engine.apply(vec![value_patch(&t)]).unwrap();
+    // Cinco `nop` decodificam em outras instruções que o `mov eax, imm32`.
+    let err = engine.set_replacement("val", vec![0x90; 5]).unwrap_err();
+    assert!(
+        matches!(&err, Error::BoundariesChanged { id } if id == "val"),
+        "{err:?}"
+    );
+    assert_eq!(bytes_at(t.pid, t.value_page, 5), VALUE_22);
+    assert_eq!(engine.active().len(), 1);
+    assert!(engine.pending_ids().is_empty());
+    let j = journal_now(&env);
+    assert_eq!(j.entries[0].replacement, VALUE_22);
+    assert_eq!(j.entries[0].next, None);
+}
+
+#[test]
+fn set_replacement_1000_times_under_load() {
+    let _serial = spin_value_lock();
+    let t = spin_value_target();
+    let env = env_fast();
+    let mut engine = value_engine(&t, &env, PauseConfig::default());
+    engine.apply(vec![value_patch(&t)]).unwrap();
+    let mut danger = 0;
+    let mut last = VALUE_22;
+    for i in 0..1000 {
+        last = if i % 2 == 0 { VALUE_33 } else { VALUE_22 };
+        let report = engine.set_replacement("val", last.to_vec()).unwrap();
+        assert_eq!(report.restored, vec!["val".to_string()]);
+        danger += report.danger_retries;
+    }
+    assert_eq!(danger, 0);
+    assert_ne!(read_stat(t.pid).unwrap().state, 'Z');
+    let want = u32::from_le_bytes([last[1], last[2], last[3], last[4]]);
+    assert!(wait_word(&t, want), "{:#x}", read_word(&t));
+    // O laço continua escrevendo: uma troca a mais ainda chega à palavra.
+    engine.set_replacement("val", VALUE_11.to_vec()).unwrap();
+    assert!(wait_word(&t, 0x1111_1111), "{:#x}", read_word(&t));
+    engine.undo_all().unwrap();
+    assert_eq!(bytes_at(t.pid, t.value_page, 5), VALUE_11);
+    assert!(missing(&env));
+}
+
+#[test]
+fn set_replacement_unknown_id() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let mut engine = value_engine(&t, &env, PauseConfig::default());
+    let err = engine
+        .set_replacement("nada", VALUE_33.to_vec())
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::NotActive { id } if id == "nada"),
+        "{err:?}"
+    );
+    assert!(missing(&env));
+    // Com outro patch ativo, o `id` errado continua sendo recusado sem tocar nele.
+    engine.apply(vec![value_patch(&t)]).unwrap();
+    let err = engine
+        .set_replacement("nada", VALUE_33.to_vec())
+        .unwrap_err();
+    assert!(matches!(err, Error::NotActive { .. }), "{err:?}");
+    assert_eq!(bytes_at(t.pid, t.value_page, 5), VALUE_22);
+    assert_eq!(engine.active().len(), 1);
+}
+
+#[test]
+fn set_replacement_retries_stuck_resume_first() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let counter = Arc::new(AtomicU32::new(0));
+    let mut engine = value_engine(
+        &t,
+        &env,
+        PauseConfig {
+            fault: Some(Fault::ContFailsAlways),
+            resume_counter: Some(counter.clone()),
+            ..PauseConfig::default()
+        },
+    );
+    engine.force_stuck_for_test();
+    // Mesmo com `id` desconhecido, o SIGCONT que falhou é tentado antes de tudo.
+    let err = engine
+        .set_replacement("nada", VALUE_33.to_vec())
+        .unwrap_err();
+    assert!(matches!(err, Error::Io(_)), "{err:?}");
+    assert_eq!(counter.load(Ordering::SeqCst), 1);
+    assert!(engine.is_stuck());
+}
+
+#[test]
+fn set_replacement_clean_refusal_restores_journal() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let dir = env.dir.path().join("state");
+    let mut engine = value_engine(&t, &env, PauseConfig::default());
+    engine.apply(vec![value_patch(&t)]).unwrap();
+
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let result = engine.set_replacement("val", VALUE_33.to_vec());
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let err = result.unwrap_err();
+    match &err {
+        Error::Journal(msg) => assert!(msg.contains("journal.json"), "{msg}"),
+        other => panic!("esperava Journal, veio {other:?}"),
+    }
+    // Falhou antes da pausa: o ativo e os bytes no alvo continuam os antigos.
+    assert!(!states(t.pid).contains(&'T'), "{:?}", states(t.pid));
+    assert_eq!(bytes_at(t.pid, t.value_page, 5), VALUE_22);
+    assert_eq!(engine.active().len(), 1);
+    assert_eq!(engine.active()[0].replacement, VALUE_22);
+    assert!(engine.pending_ids().is_empty());
+    let j = journal_now(&env);
+    assert_eq!(j.entries.len(), 1);
+    assert_eq!(j.entries[0].replacement, VALUE_22);
+    assert_eq!(j.entries[0].next, None);
+
+    // Com a permissão de volta, o motor segue normal e o `undo_all` restaura.
+    let report = engine.undo_all().unwrap();
+    assert_eq!(report.restored, vec!["val".to_string()]);
+    assert_eq!(bytes_at(t.pid, t.value_page, 5), VALUE_11);
+    assert!(missing(&env));
+}
+
+#[test]
+fn set_replacement_dirty_leaves_pending_with_next() {
+    let t = TestTarget::spawn();
+    let env = env();
+    // A falha de escrita vale só para a segunda pausa (a da troca).
+    let mut engine = value_engine(
+        &t,
+        &env,
+        PauseConfig {
+            fault: Some(Fault::WriteAndRollbackFail),
+            hook_on_pause: 2,
+            ..PauseConfig::default()
+        },
+    );
+    engine.apply(vec![value_patch(&t)]).unwrap();
+    assert_eq!(engine.active().len(), 1);
+
+    let err = engine
+        .set_replacement("val", VALUE_33.to_vec())
+        .unwrap_err();
+    assert!(matches!(err, Error::Io(_)), "{err:?}");
+    assert!(!engine.is_stuck());
+    assert!(engine.active().is_empty());
+    assert_eq!(engine.pending_ids(), vec!["val".to_string()]);
+    // Os bytes novos ficaram no jogo e o diário guarda os três conjuntos de bytes.
+    assert_eq!(bytes_at(t.pid, t.value_page, 5), VALUE_33);
+    let j = journal_now(&env);
+    assert!(!j.paused_by_us);
+    assert_eq!(
+        j.entries,
+        vec![JournalEntry {
+            id: "val".into(),
+            addr: t.value_page,
+            original: VALUE_11.to_vec(),
+            replacement: VALUE_22.to_vec(),
+            next: Some(VALUE_33.to_vec()),
+        }]
+    );
+
+    let report = engine.restore_pending().unwrap();
+    assert_eq!(report.restored, vec!["val".to_string()]);
+    assert_eq!(bytes_at(t.pid, t.value_page, 5), VALUE_11);
+    assert!(engine.pending_ids().is_empty());
+    assert!(missing(&env));
+}
+
+static KILL_PID_SWAP: AtomicI32 = AtomicI32::new(0);
+
+/// Mata o alvo dentro da pausa da troca e espera ele virar zumbi.
+fn kill_in_swap(point: HookPoint) {
+    if point != HookPoint::InPause {
+        return;
+    }
+    let pid = KILL_PID_SWAP.load(Ordering::SeqCst);
+    kill(Pid::from_raw(pid), Signal::SIGKILL).unwrap();
+    let dead = wait_until(
+        || Ok(read_stat(pid).map(|s| s.state == 'Z').unwrap_or(true)),
+        Duration::from_secs(2),
+        Duration::from_millis(1),
+    )
+    .unwrap();
+    assert!(dead);
+}
+
+#[test]
+fn set_replacement_target_exit_is_process_gone() {
+    let t = TestTarget::spawn();
+    let env = env();
+    KILL_PID_SWAP.store(t.pid, Ordering::SeqCst);
+    let mut engine = value_engine(
+        &t,
+        &env,
+        PauseConfig {
+            hook: Some(kill_in_swap),
+            hook_on_pause: 2,
+            ..PauseConfig::default()
+        },
+    );
+    engine.apply(vec![value_patch(&t)]).unwrap();
+    let err = engine
+        .set_replacement("val", VALUE_33.to_vec())
+        .unwrap_err();
+    assert!(matches!(err, Error::ProcessGone { .. }), "{err:?}");
+    assert!(engine.active().is_empty());
+    assert!(engine.pending_ids().is_empty());
+    assert!(!engine.is_stuck());
+    assert!(missing(&env));
+}
+
+/// Caminho do diário e o que o gancho viu dentro da pausa da troca.
+static JOURNAL_PATH_SWAP: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+static JOURNAL_SEEN_SWAP: Mutex<Option<gt_core::journal::Journal>> = Mutex::new(None);
+
+/// Lê o diário dentro da pausa e guarda o que viu.
+fn read_journal_in_swap(point: HookPoint) {
+    if point != HookPoint::InPause {
+        return;
+    }
+    let dir = JOURNAL_PATH_SWAP.lock().unwrap().clone().unwrap();
+    if let Loaded::Ok(j) = JournalStore::new(dir).peek().unwrap() {
+        *JOURNAL_SEEN_SWAP.lock().unwrap() = Some(j);
+    }
+}
+
+#[test]
+fn set_replacement_rewrite_keeps_next() {
+    let t = TestTarget::spawn();
+    let env = env();
+    *JOURNAL_PATH_SWAP.lock().unwrap() = Some(env.dir.path().join("state"));
+    *JOURNAL_SEEN_SWAP.lock().unwrap() = None;
+    let mut engine = value_engine(
+        &t,
+        &env,
+        PauseConfig {
+            hook: Some(read_journal_in_swap),
+            hook_on_pause: 2,
+            ..PauseConfig::default()
+        },
+    );
+    engine.apply(vec![value_patch(&t)]).unwrap();
+    // O gancho só dispara na segunda pausa: depois do `apply` ainda não viu nada.
+    assert!(JOURNAL_SEEN_SWAP.lock().unwrap().is_none());
+    engine.set_replacement("val", VALUE_33.to_vec()).unwrap();
+    let seen = JOURNAL_SEEN_SWAP.lock().unwrap().take().unwrap();
+    assert!(seen.paused_by_us);
+    assert_eq!(seen.entries.len(), 1);
+    assert_eq!(seen.entries[0].replacement, VALUE_22);
+    assert_eq!(seen.entries[0].next, Some(VALUE_33.to_vec()));
+    // Depois da troca, o diário final não tem `next`.
+    let j = journal_now(&env);
+    assert_eq!(j.entries[0].replacement, VALUE_33);
+    assert_eq!(j.entries[0].next, None);
 }

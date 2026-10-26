@@ -86,6 +86,14 @@ fn harness(dir: &Path) -> Command {
 
 /// `run` do patch `90 90 90` → `66 90 90` no início do `exec2`, com o gancho opcional.
 fn run_cmd(t: &TestTarget, dir: &Path, hook: Option<&str>) -> Command {
+    match hook {
+        Some(hook) => run_cmd_with(t, dir, &["--hook", hook]),
+        None => run_cmd_with(t, dir, &[]),
+    }
+}
+
+/// Como [`run_cmd`], com opções globais do harness quaisquer (`--hook`, `--fault`...).
+fn run_cmd_with(t: &TestTarget, dir: &Path, globals: &[&str]) -> Command {
     let mut cmd = harness(dir);
     cmd.args([
         "--pid".to_string(),
@@ -93,9 +101,7 @@ fn run_cmd(t: &TestTarget, dir: &Path, hook: Option<&str>) -> Command {
         "--allow".to_string(),
         format!("{:#x}:{}", t.exec2, 2 * t.page),
     ]);
-    if let Some(hook) = hook {
-        cmd.args(["--hook", hook]);
-    }
+    cmd.args(globals);
     cmd.args([
         "run".to_string(),
         "--addr".to_string(),
@@ -369,6 +375,7 @@ fn restore_discards_dead_process_journal() {
                 addr: 0x1000,
                 original: NOP3.to_vec(),
                 replacement: NOP2_NOP.to_vec(),
+                next: None,
             }],
         })
         .unwrap();
@@ -408,6 +415,7 @@ fn restore_skips_entry_outside_exec_region() {
                 addr: t.big_region,
                 original: NOP3.to_vec(),
                 replacement: NOP2_NOP.to_vec(),
+                next: None,
             }],
         })
         .unwrap();
@@ -417,5 +425,115 @@ fn restore_skips_entry_outside_exec_region() {
         "{out:?}"
     );
     assert_eq!(bytes_at(t.pid, t.big_region, 3), NOP2_NOP);
+    assert_eq!(journal(dir.path()), Loaded::Missing);
+}
+
+/// `run` do laço de valor (`B8 11 11 11 11` → `B8 22 22 22 22`) com troca para `set_value`.
+fn value_run_cmd(t: &TestTarget, dir: &Path, globals: &[&str], set_value: &str) -> Command {
+    let mut cmd = harness(dir);
+    cmd.args([
+        "--pid".to_string(),
+        t.pid.to_string(),
+        "--allow".to_string(),
+        format!("{:#x}:{}", t.value_page, t.page),
+    ]);
+    cmd.args(globals);
+    cmd.args([
+        "run".to_string(),
+        "--addr".to_string(),
+        format!("{:#x}", t.value_page),
+        "--expected".to_string(),
+        "b811111111".to_string(),
+        "--replacement".to_string(),
+        "b822222222".to_string(),
+        "--set-value".to_string(),
+        set_value.to_string(),
+    ]);
+    cmd
+}
+
+#[test]
+fn sigkill_during_value_swap_then_recover() {
+    let t = TestTarget::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    // O gancho mata o harness dentro da segunda pausa (a da troca de valor).
+    let out = value_run_cmd(
+        &t,
+        dir.path(),
+        &["--hook", "kill-in-pause", "--hook-pause", "2"],
+        "b833333333",
+    )
+    .output()
+    .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("ativo"), "{stdout}");
+    assert!(!stdout.contains("valor trocado"), "{stdout}");
+    assert!(stopped(t.pid), "o alvo deveria continuar parado");
+    // O diário guarda os três conjuntos de bytes da troca interrompida.
+    match journal(dir.path()) {
+        Loaded::Ok(j) => {
+            assert!(j.paused_by_us);
+            assert_eq!(j.entries.len(), 1);
+            assert_eq!(j.entries[0].original, [0xB8, 0x11, 0x11, 0x11, 0x11]);
+            assert_eq!(j.entries[0].replacement, [0xB8, 0x22, 0x22, 0x22, 0x22]);
+            assert_eq!(j.entries[0].next, Some(vec![0xB8, 0x33, 0x33, 0x33, 0x33]));
+        }
+        other => panic!("diário inesperado: {other:?}"),
+    }
+    let out = restore(dir.path());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("retomado"), "{stdout}");
+    assert!(stdout.contains("restaurado: harness"), "{stdout}");
+    assert!(wait_stopped(t.pid, false));
+    assert_eq!(
+        bytes_at(t.pid, t.value_page, 5),
+        [0xB8, 0x11, 0x11, 0x11, 0x11]
+    );
+    assert_eq!(journal(dir.path()), Loaded::Missing);
+}
+
+#[test]
+fn value_swap_runs_until_signal_and_restores() {
+    let t = TestTarget::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = spawn(value_run_cmd(&t, dir.path(), &[], "b833333333"));
+    let reader = wait_line(&mut child, "valor trocado");
+    assert_eq!(
+        bytes_at(t.pid, t.value_page, 5),
+        [0xB8, 0x33, 0x33, 0x33, 0x33]
+    );
+    kill(Pid::from_raw(child.id() as i32), Signal::SIGINT).unwrap();
+    assert_eq!(wait_exit(&mut child).code(), Some(0));
+    assert!(rest(reader).contains("restaurado"));
+    assert_eq!(
+        bytes_at(t.pid, t.value_page, 5),
+        [0xB8, 0x11, 0x11, 0x11, 0x11]
+    );
+    assert_eq!(journal(dir.path()), Loaded::Missing);
+}
+
+#[test]
+fn cont_always_then_restore_resumes() {
+    let t = TestTarget::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    // Todo SIGCONT do motor falha: o `run` sai com erro e o alvo fica parado por nós.
+    let out = run_cmd_with(&t, dir.path(), &["--fault", "cont-always"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    assert!(stopped(t.pid), "o alvo deveria continuar parado");
+    match journal(dir.path()) {
+        Loaded::Ok(j) => assert!(j.paused_by_us),
+        other => panic!("diário inesperado: {other:?}"),
+    }
+    // Sem `--fault`, o `restore` retoma o alvo e restaura os originais.
+    let out = restore(dir.path());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("retomado"),
+        "{out:?}"
+    );
+    assert!(wait_stopped(t.pid, false));
+    assert_eq!(bytes_at(t.pid, t.exec2, 3), NOP3);
     assert_eq!(journal(dir.path()), Loaded::Missing);
 }

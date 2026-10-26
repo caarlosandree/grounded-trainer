@@ -97,6 +97,14 @@ pub enum Error {
     #[error("o kernel recusou a escrita em {addr:#x}; confira proc_mem.force_override")]
     WriteRefused { addr: u64 },
 
+    /// Não há patch ativo com esse `id` (troca de valor de um patch que não está ligado).
+    #[error("o patch {id} não está ativo")]
+    NotActive { id: String },
+
+    /// Os bytes novos da troca de valor decodificam em outras fronteiras de instrução.
+    #[error("os bytes novos do patch {id} mudam as fronteiras de instrução")]
+    BoundariesChanged { id: String },
+
     /// Outro `gt-patch` já segura a trava do diário.
     #[error("outro gt-patch já está em execução")]
     AlreadyRunning,

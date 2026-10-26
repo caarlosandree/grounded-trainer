@@ -7,10 +7,15 @@
 //! ```text
 //! gt-patch-harness --journal-dir D [--pid P --allow START:LEN]
 //!     [--hook panic-in-pause|kill-in-pause|sigint-in-pause|panic-after-apply]
-//!     (run --addr A --expected HEX --replacement HEX | restore)
+//!     [--hook-pause N] [--fault cont-always|cont-once|write]
+//!     (run --addr A --expected HEX --replacement HEX [--set-value HEX] | restore)
 //! ```
 //!
-//! `run` imprime `ativo` depois de aplicar e `restaurado` (ou `o jogo fechou`) ao sair.
+//! `run` imprime `ativo` depois de aplicar, `valor trocado` depois de `--set-value` (que
+//! troca o `replacement` do patch ativo e segue no laço do `run`) e `restaurado` (ou
+//! `o jogo fechou`) ao sair. `--hook-pause N` faz o gancho (e a falha de `--fault write`)
+//! valer na N-ésima pausa do motor em vez da primeira; `--fault` injeta a falha de teste
+//! do motor (só no `run`).
 
 use std::io::Write;
 use std::ops::Range;
@@ -24,7 +29,7 @@ use gt_core::patch::{PatchSpec, WritePolicy, validate};
 use gt_core::procinfo::identity;
 use gt_core::recovery::{RecoveryReport, recover};
 use gt_core::session::{RunEnd, Shutdown, run_until_shutdown};
-use gt_core::suspend::{HookPoint, PauseConfig};
+use gt_core::suspend::{Fault, HookPoint, PauseConfig};
 use nix::sys::signal::{Signal, raise};
 
 /// Intervalo em que o laço do `run` acorda (spec 12).
@@ -38,6 +43,7 @@ enum Cmd {
         addr: u64,
         expected: Vec<u8>,
         replacement: Vec<u8>,
+        set_value: Option<Vec<u8>>,
     },
     Restore,
 }
@@ -47,6 +53,8 @@ struct Args {
     pid: Option<i32>,
     allow: Option<Range<u64>>,
     hook: Option<fn(HookPoint)>,
+    hook_pause: Option<u32>,
+    fault: Option<Fault>,
     cmd: Cmd,
 }
 
@@ -119,12 +127,22 @@ fn parse_hook(s: &str) -> Result<fn(HookPoint)> {
     })
 }
 
+fn parse_fault(s: &str) -> Result<Fault> {
+    Ok(match s {
+        "cont-always" => Fault::ContFailsAlways,
+        "cont-once" => Fault::ContFailsOnce,
+        "write" => Fault::WriteAndRollbackFail,
+        other => bail!("falha desconhecida: {other}"),
+    })
+}
+
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
     let mut it = args.into_iter();
     let value = |it: &mut dyn Iterator<Item = String>, flag: &str| {
         it.next().with_context(|| format!("{flag} sem valor"))
     };
     let (mut journal_dir, mut pid, mut allow, mut hook) = (None, None, None, None);
+    let (mut hook_pause, mut fault) = (None, None);
     let cmd = loop {
         let Some(arg) = it.next() else {
             bail!("falta o subcomando (run ou restore)");
@@ -137,15 +155,25 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
             }
             "--allow" => allow = Some(parse_allow(&value(&mut it, &arg)?)?),
             "--hook" => hook = Some(parse_hook(&value(&mut it, &arg)?)?),
+            "--hook-pause" => {
+                let v = value(&mut it, &arg)?;
+                hook_pause = Some(
+                    v.parse()
+                        .with_context(|| format!("--hook-pause inválido: {v}"))?,
+                );
+            }
+            "--fault" => fault = Some(parse_fault(&value(&mut it, &arg)?)?),
             "restore" => break Cmd::Restore,
             "run" => {
                 let (mut addr, mut expected, mut replacement) = (None, None, None);
+                let mut set_value = None;
                 while let Some(flag) = it.next() {
                     let v = value(&mut it, &flag)?;
                     match flag.as_str() {
                         "--addr" => addr = Some(parse_num(&v)?),
                         "--expected" => expected = Some(parse_hex(&v)?),
                         "--replacement" => replacement = Some(parse_hex(&v)?),
+                        "--set-value" => set_value = Some(parse_hex(&v)?),
                         other => bail!("opção desconhecida do run: {other}"),
                     }
                 }
@@ -153,6 +181,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
                     addr: addr.context("run sem --addr")?,
                     expected: expected.context("run sem --expected")?,
                     replacement: replacement.context("run sem --replacement")?,
+                    set_value,
                 };
             }
             other => bail!("argumento desconhecido: {other}"),
@@ -166,6 +195,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
         pid,
         allow,
         hook,
+        hook_pause,
+        fault,
         cmd,
     })
 }
@@ -228,6 +259,9 @@ fn restore(args: Args) -> Result<()> {
     if args.pid.is_some() || args.allow.is_some() {
         bail!("restore não aceita --pid nem --allow");
     }
+    if args.hook.is_some() || args.hook_pause.is_some() || args.fault.is_some() {
+        bail!("restore não aceita --hook, --hook-pause nem --fault");
+    }
     let store = JournalStore::new(args.journal_dir);
     let lock = store.lock()?;
     let report = recover(&store, &lock, &PauseConfig::default())?;
@@ -241,7 +275,13 @@ fn restore(args: Args) -> Result<()> {
     ensure_recovered(&report)
 }
 
-fn run(args: Args, addr: u64, expected: Vec<u8>, replacement: Vec<u8>) -> Result<()> {
+fn run(
+    args: Args,
+    addr: u64,
+    expected: Vec<u8>,
+    replacement: Vec<u8>,
+    set_value: Option<Vec<u8>>,
+) -> Result<()> {
     let pid = args.pid.context("run exige --pid")?;
     let allow = args.allow.context("run exige --allow")?;
     let shutdown = Shutdown::install()?;
@@ -267,6 +307,8 @@ fn run(args: Args, addr: u64, expected: Vec<u8>, replacement: Vec<u8>) -> Result
         version_key: "harness".into(),
         pause: PauseConfig {
             hook: args.hook,
+            fault: args.fault,
+            hook_on_pause: args.hook_pause.unwrap_or(1),
             ..PauseConfig::default()
         },
     };
@@ -275,6 +317,12 @@ fn run(args: Args, addr: u64, expected: Vec<u8>, replacement: Vec<u8>) -> Result
     {
         let mut out = std::io::stdout().lock();
         writeln!(out, "ativo")?;
+        out.flush()?;
+    }
+    if let Some(bytes) = set_value {
+        engine.set_replacement(PATCH_ID, bytes)?;
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "valor trocado")?;
         out.flush()?;
     }
     let end = run_until_shutdown(&mut engine, &shutdown, TICK)?;
@@ -302,7 +350,8 @@ fn main() -> Result<()> {
             addr,
             expected,
             replacement,
-        } => run(args, addr, expected, replacement),
+            set_value,
+        } => run(args, addr, expected, replacement, set_value),
     }
 }
 

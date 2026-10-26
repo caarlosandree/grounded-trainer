@@ -49,7 +49,7 @@ pub struct CatalogScan {
 /// definição, na mesma ordem de `defs`. `disk` é `Err(causa)` quando o disco não pôde ser lido
 /// e `Ok(None)` quando nenhuma definição precisava da busca em disco. `current(addr, len)` lê
 /// os bytes da memória do alvo. O diário só vale se a identidade bate com `journal.1` e os
-/// bytes no endereço registrado são os novos; `locked` diz se outro `gt-patch` segura a trava.
+/// bytes no endereço registrado são os novos (ou, numa troca de valor em curso, os de `next`); `locked` diz se outro `gt-patch` segura a trava.
 pub fn resolve(
     defs: &[PatchDef],
     module_base: u64,
@@ -71,7 +71,9 @@ pub fn resolve(
             let journal_hit = journal.and_then(|(j, _)| {
                 let entry = j.entries.iter().find(|e| e.id == def.id)?;
                 let now = current(entry.addr, entry.replacement.len())?;
-                (now == entry.replacement).then_some((entry.addr, locked))
+                // Numa troca de valor em curso, os bytes atuais podem ser os de `next`.
+                (now == entry.replacement || entry.next.as_deref() == Some(now.as_slice()))
+                    .then_some((entry.addr, locked))
             });
             let memory = &mem[i];
             let current_bytes = match (memory.verdict, memory.hits.first()) {
@@ -353,6 +355,7 @@ rva = 0x1000
                 addr: HIT + 0x100,
                 original: ORIGINAL.to_vec(),
                 replacement: NEW.to_vec(),
+                next: None,
             }],
         }
     }
@@ -470,6 +473,33 @@ rva = 0x1000
             false,
         );
         assert_eq!(entries[0].state, PatchState::Verified { addr: HIT });
+    }
+
+    #[test]
+    fn journal_hit_accepts_next() {
+        let defs = Signatures::parse(&[("generic.toml", GENERIC)])
+            .unwrap()
+            .for_version("x");
+        let mem = [unique(HIT), none()];
+        let id = identity(5);
+        // Troca de valor interrompida: o diário guarda o valor antigo em `replacement`
+        // (o que não está no jogo agora) e os bytes atuais são os de `next`.
+        let mut j = journal();
+        j.entries[0].replacement = vec![0x48, 0x90, 0x90];
+        j.entries[0].next = Some(NEW.to_vec());
+        let state = |j: &Journal, locked| {
+            resolve(&defs, BASE, &mem, Ok(None), memory, Some((j, &id)), locked)[0]
+                .state
+                .clone()
+        };
+        assert_eq!(state(&j, false), PatchState::Pending { addr: HIT + 0x100 });
+        assert_eq!(state(&j, true), PatchState::Active { addr: HIT + 0x100 });
+        // Bytes que não são nem os de `replacement` nem os de `next`: o diário não vale.
+        j.entries[0].next = Some(vec![0x48, 0x89, 0xCE]);
+        assert!(!matches!(
+            state(&j, true),
+            PatchState::Active { .. } | PatchState::Pending { .. }
+        ));
     }
 
     fn catalog(states: Vec<(&str, PatchState)>) -> CatalogScan {

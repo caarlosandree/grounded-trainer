@@ -53,6 +53,10 @@ pub struct PauseConfig {
     /// falham pela injeção (só para testes do motor).
     #[doc(hidden)]
     pub resume_counter: Option<Arc<AtomicU32>>,
+    /// O gancho `InPause` e a falha `WriteAndRollbackFail` valem na N-ésima pausa
+    /// bem-sucedida do motor (padrão 1: a primeira). Só para testes do motor.
+    #[doc(hidden)]
+    pub hook_on_pause: u32,
 }
 
 impl Default for PauseConfig {
@@ -64,6 +68,7 @@ impl Default for PauseConfig {
             hook: None,
             fault: None,
             resume_counter: None,
+            hook_on_pause: 1,
         }
     }
 }
@@ -699,5 +704,6 @@ mod tests {
         assert_eq!(c.max_attempts, 10);
         assert_eq!(c.retry_wait, Duration::from_millis(20));
         assert!(c.hook.is_none());
+        assert_eq!(c.hook_on_pause, 1);
     }
 }

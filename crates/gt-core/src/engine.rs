@@ -7,6 +7,11 @@
 //! tentativas pela regra de perigo → identidade → releitura sob pausa → conferência de
 //! que tudo continua parado → escrita e releitura → SIGCONT → diário final.
 //!
+//! A troca de valor de um patch ativo ([`Engine::set_replacement`]) usa a mesma pausa
+//! conferida, sem ponto perigoso (os dois valores têm as mesmas fronteiras de instrução).
+//! Durante a troca o ativo fica fora de `active` e a entrada `{ original, replacement:
+//! antigo, next: Some(novo) }` fica em `pending`, para o diário nunca perder o `next`.
+//!
 //! O diário em disco espelha o que o motor guarda em memória: os patches ativos e as
 //! entradas ainda não resolvidas (intenções de um lote em curso, entradas vindas da
 //! recuperação, restos de uma falha). O `Drop` desfaz os ativos e tenta resolver o resto.
@@ -20,7 +25,7 @@
 //!   registro e nada é escrito.
 //! - **Recusa limpa**: qualquer outro `Err` com o `id` **fora** de [`Engine::pending_ids`]
 //!   (`ThreadsInPatch`, `PauseTimeout`, `BytesMismatch`, `Journal`, `Io`, `WriteRefused`,
-//!   `OutsidePolicy`, `Overlap` e, a partir da troca de valor, `NotActive` e
+//!   `OutsidePolicy`, `Overlap`, `BadPatch` e, na troca de valor, `NotActive` e
 //!   `BoundariesChanged`). Nada ficou escrito pela operação.
 //! - **SIGCONT que falhou**: depois de **qualquer** operação, [`Engine::is_stuck`] diz se
 //!   o jogo pode ter ficado parado por nós; isso pode acontecer sem restos.
@@ -30,8 +35,6 @@
 //! - **Jogo fechou**: `Err(ProcessGone)`; o motor já descartou ativos, pendentes e o
 //!   diário sem escrever. Sem rodar operação, [`Engine::discard_gone`] faz o mesmo.
 
-use std::cell::Cell;
-use std::ops::Range;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -95,6 +98,9 @@ enum Danger {
     One(Direction),
     /// Restauração com bytes possivelmente misturados: união dos dois sentidos.
     Both,
+    /// Troca de valor: os dois lados têm as mesmas fronteiras (conferido antes), então
+    /// nenhum ponto de retomada é perigoso.
+    None,
 }
 
 /// O que uma escrita do lote faz.
@@ -106,6 +112,9 @@ enum Kind {
     Undo,
     /// Entrada do diário: decisão por byte (`decide_entry`).
     Restore(JournalEntry),
+    /// Troca de valor de um patch ativo: `from` → novos (`spec.replacement`); bytes
+    /// diferentes de `from` são de outro.
+    Swap { from: Vec<u8> },
 }
 
 /// Uma escrita do lote.
@@ -261,7 +270,9 @@ pub struct Engine {
     active: Vec<Validated>,
     /// Entradas do diário que não são patches ativos.
     pending: Vec<JournalEntry>,
-    in_pause_fired: bool,
+    /// Pausas bem-sucedidas deste motor (o gancho e a falha de escrita injetados valem na
+    /// `hook_on_pause`-ésima).
+    pauses_ok: u32,
     after_apply_fired: bool,
     in_drop: bool,
     /// O SIGCONT falhou e o alvo pode ter ficado parado por nós: vale até um SIGCONT
@@ -269,9 +280,6 @@ pub struct Engine {
     stuck: bool,
     /// A falha injetada `ContFailsOnce` já disparou neste motor.
     cont_fault_fired: bool,
-    /// A falha injetada `WriteAndRollbackFail` já disparou neste motor (`write_plan` é
-    /// `&self`, por isso `Cell`).
-    write_fault_fired: Cell<bool>,
 }
 
 impl Engine {
@@ -312,12 +320,11 @@ impl Engine {
             pause_cfg: opts.pause,
             active: Vec::new(),
             pending: Vec::new(),
-            in_pause_fired: false,
+            pauses_ok: 0,
             after_apply_fired: false,
             in_drop: false,
             stuck: false,
             cont_fault_fired: false,
-            write_fault_fired: Cell::new(false),
         })
     }
 
@@ -339,6 +346,20 @@ impl Engine {
     pub fn undo_all(&mut self) -> Result<BatchReport> {
         self.retry_resume()?;
         let result = self.undo_inner(|_| true);
+        self.finish(result)
+    }
+
+    /// Troca os bytes do patch ativo `id` por `new` numa pausa (spec 003 6.7).
+    ///
+    /// Os bytes originais continuam sendo os de antes do patch; `new` precisa ter o mesmo
+    /// tamanho e as mesmas fronteiras de instrução dos bytes atuais do patch
+    /// ([`Error::BoundariesChanged`] senão), então não há ponto perigoso. Durante a troca o
+    /// diário guarda `{ original, replacement: antigo, next: novo }`. Desfechos: veja o
+    /// topo do módulo (sucesso, bytes de outro em `foreign`, recusa limpa, restos, SIGCONT
+    /// que falhou e jogo fechou). `id` sem patch ativo: [`Error::NotActive`].
+    pub fn set_replacement(&mut self, id: &str, new: Vec<u8>) -> Result<BatchReport> {
+        self.retry_resume()?;
+        let result = self.swap_inner(id, new);
         self.finish(result)
     }
 
@@ -473,7 +494,7 @@ impl Engine {
                 .active
                 .iter()
                 .map(|a| a.spec.range())
-                .chain(self.pending.iter().map(entry_range))
+                .chain(self.pending.iter().map(JournalEntry::range))
                 .chain(batch[..i].iter().map(|b| b.spec.range()))
                 .any(|r| overlaps(&r, &range));
             if busy {
@@ -527,6 +548,101 @@ impl Engine {
                 // as entradas ficam como pendentes para o `Drop` ou a próxima execução.
                 if !f.dirty {
                     self.forget_pending(&entries);
+                }
+                self.stuck |= f.stuck;
+                self.save_logged(f.stuck);
+                Err(f.error)
+            }
+        }
+    }
+
+    fn swap_inner(&mut self, id: &str, new: Vec<u8>) -> Result<BatchReport> {
+        let index = self
+            .active
+            .iter()
+            .position(|v| v.spec.id == id)
+            .ok_or_else(|| Error::NotActive { id: id.to_owned() })?;
+        let old = self.active[index].clone();
+        check_alive(&self.identity)?;
+        let policy = self.current_policy()?;
+        if !policy.allows(&old.spec.range()) {
+            return Err(Error::OutsidePolicy {
+                id: id.to_owned(),
+                addr: old.spec.addr,
+            });
+        }
+        let fresh = validate(PatchSpec {
+            id: id.to_owned(),
+            addr: old.spec.addr,
+            expected: old.spec.expected.clone(),
+            replacement: new.clone(),
+        })?;
+        if fresh.replacement_starts != old.replacement_starts {
+            return Err(Error::BoundariesChanged { id: id.to_owned() });
+        }
+        let op = Op {
+            v: fresh,
+            danger: Danger::None,
+            kind: Kind::Swap {
+                from: old.spec.replacement.clone(),
+            },
+        };
+        // Leitura prévia, sem pausa: bytes que não são os do valor atual são de outro.
+        if let Decision::Skip(_) = self.decide_now(&op)?.0 {
+            tracing::warn!(id = %id, "bytes do patch alterados por outro; tirado do registro sem escrever");
+            self.active.remove(index);
+            self.save_final();
+            return Ok(BatchReport {
+                foreign: vec![id.to_owned()],
+                ..BatchReport::default()
+            });
+        }
+
+        // Intenção antes da pausa (com o marcador, se vamos pausar). Em memória, o ativo
+        // sai de `active` e a entrada com `next` entra em `pending`: qualquer regravação do
+        // diário no meio da troca mantém o `next`.
+        let entry = JournalEntry {
+            next: Some(new),
+            ..entry_of(&old)
+        };
+        let will_stop = !is_stopped_now(self.pid)?;
+        self.active.remove(index);
+        self.pending.push(entry.clone());
+        if let Err(e) = self.save_journal(will_stop) {
+            self.forget_pending(std::slice::from_ref(&entry));
+            self.active.insert(index.min(self.active.len()), old);
+            return Err(e);
+        }
+
+        match self.locked_write(std::slice::from_ref(&op), will_stop) {
+            Ok(pass) => {
+                self.forget_pending(std::slice::from_ref(&entry));
+                let mut report = BatchReport {
+                    pause: pass.pause,
+                    danger_retries: pass.danger_retries,
+                    timeout_retries: pass.timeout_retries,
+                    ..BatchReport::default()
+                };
+                if pass.outcomes.first().is_some_and(Option::is_none) {
+                    self.active.insert(index.min(self.active.len()), op.v);
+                    report.restored.push(id.to_owned());
+                } else {
+                    // Os bytes mudaram na pausa: o patch deixou de ser nosso.
+                    tracing::warn!(id = %id, "bytes do patch alterados por outro; tirado do registro sem escrever");
+                    report.foreign.push(id.to_owned());
+                }
+                self.save_final();
+                Ok(report)
+            }
+            Err(f) => {
+                if matches!(f.error, Error::ProcessGone { .. }) {
+                    return Err(f.error);
+                }
+                // Sem sobra escrita o ativo antigo volta; com sobra, a entrada com `next`
+                // fica pendente para a restauração.
+                if !f.dirty {
+                    self.forget_pending(std::slice::from_ref(&entry));
+                    self.active.insert(index.min(self.active.len()), old);
                 }
                 self.stuck |= f.stuck;
                 self.save_logged(f.stuck);
@@ -603,7 +719,7 @@ impl Engine {
         let mut resolved: Vec<JournalEntry> = Vec::new();
         let mut ops = Vec::new();
         for e in entries {
-            if !policy.allows(&entry_range(&e)) {
+            if !policy.allows(&e.range()) {
                 // Não conta como resolvida: os bytes podem ser nossos, então a entrada
                 // fica no diário para a próxima execução (spec 6.7).
                 tracing::warn!(
@@ -729,6 +845,13 @@ impl Engine {
                     Decision::Skip(Skip::Foreign)
                 }
             }
+            Kind::Swap { from } => {
+                if current == *from {
+                    Decision::Write(spec.replacement.clone())
+                } else {
+                    Decision::Skip(Skip::Foreign)
+                }
+            }
             Kind::Restore(e) => match decide_entry(e, &current) {
                 EntryAction::Restore => Decision::Write(e.original.clone()),
                 EntryAction::Drop => Decision::Skip(Skip::Dropped),
@@ -753,15 +876,12 @@ impl Engine {
                 std::thread::sleep(self.pause_cfg.retry_wait);
             }
             check_alive(&self.identity).map_err(Failure::clean)?;
-            let (cfg, armed) = self.next_pause_config();
+            let cfg = self.next_pause_config();
             let started = Instant::now();
             let guard = match pause(&self.pidfd, self.pid, &cfg, need_positions) {
                 Ok(guard) => guard,
                 Err(e) => {
-                    // O gancho só dispara numa pausa que deu certo.
-                    if armed {
-                        self.in_pause_fired = false;
-                    }
+                    // O gancho só dispara numa pausa que deu certo, e só ela conta.
                     match e {
                         Error::PauseTimeout { .. } => {
                             timeout_retries += 1;
@@ -772,6 +892,7 @@ impl Engine {
                     }
                 }
             };
+            self.pauses_ok += 1;
             if needs_marker(guard.sent_stop(), marked) {
                 tracing::debug!(
                     attempt,
@@ -875,7 +996,7 @@ impl Engine {
             };
             let addr = op.v.spec.addr;
             if self.pause_cfg.fault == Some(Fault::WriteAndRollbackFail)
-                && !self.write_fault_fired.replace(true)
+                && self.pauses_ok == self.pause_cfg.hook_on_pause
             {
                 // Falha injetada (testes): os bytes novos ficam no jogo e o desfazer
                 // "também falha", deixando restos.
@@ -952,16 +1073,15 @@ impl Engine {
         clean
     }
 
-    /// Cópia da configuração da pausa: o gancho só vai na primeira pausa (nunca no `Drop`).
-    fn next_pause_config(&mut self) -> (PauseConfig, bool) {
+    /// Cópia da configuração da pausa: o gancho só vai na `hook_on_pause`-ésima pausa
+    /// bem-sucedida (nunca no `Drop`); a pausa que falha antes do gancho não conta.
+    fn next_pause_config(&self) -> PauseConfig {
         let mut cfg = self.pause_cfg.clone();
-        let armed = cfg.hook.is_some() && !self.in_pause_fired && !self.in_drop;
-        if armed {
-            self.in_pause_fired = true;
-        } else {
+        let armed = !self.in_drop && self.pauses_ok.saturating_add(1) == cfg.hook_on_pause;
+        if !armed {
             cfg.hook = None;
         }
-        (cfg, armed)
+        cfg
     }
 
     fn fire_after_apply(&mut self) {
@@ -1071,12 +1191,8 @@ fn entry_of(v: &Validated) -> JournalEntry {
         addr: v.spec.addr,
         original: v.spec.expected.clone(),
         replacement: v.spec.replacement.clone(),
+        next: None,
     }
-}
-
-fn entry_range(e: &JournalEntry) -> Range<u64> {
-    let len = u64::try_from(e.original.len()).unwrap_or(u64::MAX);
-    e.addr..e.addr.saturating_add(len)
 }
 
 fn has_lost(v: &Validated, danger: Danger) -> bool {
@@ -1084,6 +1200,7 @@ fn has_lost(v: &Validated, danger: Danger) -> bool {
         Danger::One(Direction::Apply) => !v.lost_on_apply().is_empty(),
         Danger::One(Direction::Undo) => !v.lost_on_undo().is_empty(),
         Danger::Both => !v.lost_on_apply().is_empty() || !v.lost_on_undo().is_empty(),
+        Danger::None => false,
     }
 }
 
@@ -1093,6 +1210,7 @@ fn point_dangerous(v: &Validated, danger: Danger, point: Option<u64>) -> bool {
         Danger::Both => {
             is_dangerous(v, Direction::Apply, point) || is_dangerous(v, Direction::Undo, point)
         }
+        Danger::None => false,
     }
 }
 
