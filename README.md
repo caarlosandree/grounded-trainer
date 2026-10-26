@@ -27,6 +27,7 @@ que não deram certo.
 - [Metodologia de engenharia reversa](#metodologia-de-engenharia-reversa)
 - [Fluxo de desenvolvimento](#fluxo-de-desenvolvimento)
 - [Documentação](#documentação)
+- [Licença](#licença)
 
 ---
 
@@ -307,3 +308,9 @@ Grande parte do código é escrita com assistência de IA (Claude Code), guiada 
 | [`docs/specs/`](docs/specs) | especificações por funcionalidade |
 | [`docs/plans/`](docs/plans) | planos de implementação |
 | [`AGENTS.md`](AGENTS.md) | regras do projeto (segurança, código, git) |
+
+---
+
+## Licença
+
+Distribuído sob a licença MIT. Veja [`LICENSE`](LICENSE).
