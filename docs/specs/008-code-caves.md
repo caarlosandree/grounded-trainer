@@ -266,12 +266,27 @@ código. Desligar não muda a variável; sair a zera.
 #### 6.7.3 Cave de observação (ferramenta de pesquisa)
 
 O motor de desvios é usado primeiro para pesquisa: uma cave que só **conta** passagens e guarda, num anel de
-variáveis, o endereço de retorno (`[rsp]` no começo da função) e um registrador. Ela não muda nada no jogo e não
-desreferencia nada além do `[rsp]`; o trainer lê de fora o que precisar (por exemplo o `ClassPrivate` do registrador).
-É instalada por `gt-patch observe <padrão> <offset> <registrador>` (o registrador do anel é escolhido no comando; o
-ponto tem de ser o **começo de uma função**, conferido pela `.pdata`, senão o comando recusa, porque só ali `[rsp]` é
-o retorno). Para a coleta, observar duas vezes (`rcx` e `rdx`) ou um registrador por vez. (no `gt-patch`, que já escreve com diário e recuperação; o `gt`
-continua só leitura), que mostra os chamadores distintos e devolve tudo ao sair. Uma observação por vez. Serve para o arrastar (6.7.2) e para a coleta (6.7.4).
+variáveis, o endereço de retorno (`[rsp]` no ponto) e um registrador. Ela não muda nada no jogo e não desreferencia
+nada além do `[rsp]`; o trainer lê de fora o que precisar (por exemplo o `ClassPrivate` do registrador).
+É instalada por `gt-patch observe <padrão> <offset> <registrador>` (no `gt-patch`, que já escreve com diário e
+recuperação; o `gt` continua só leitura), que mostra os chamadores distintos e devolve tudo ao sair. O registrador do
+anel é escolhido no comando; para a coleta, observar duas vezes (`rcx` e `rdx`). Uma observação por vez. Serve para o
+arrastar (6.7.2), o analisador (6.7.1) e a coleta (6.7.4).
+
+**Ponto aceito** (só nele `[rsp]` é o endereço de retorno). O comando recusa qualquer outro, com o motivo:
+
+1. **Começo de função pela `.pdata`**: o ponto é o `start` de uma entrada da `.pdata` do disco.
+2. **Começo de função folha**: o ponto não fica dentro de nenhuma entrada da `.pdata` (funções folha, que não mexem na
+   pilha, não têm entrada) e o byte logo antes dele é `CC` (preenchimento) ou o fim de um `ret`. Exemplos: o getter do
+   analisador (`+57bd6d0`) e a entrada da interface do `AddItem` (`+5942240`).
+3. **Prefixo sem pilha**: o ponto fica dentro de uma entrada da `.pdata`, depois do `start`, e a desmontagem linear do
+   `start` até o ponto (no máximo 64 bytes) chega exatamente nele numa fronteira de instrução, sem nenhuma instrução
+   que mude o `rsp` (`push`, `pop`, `call`, `ret`, `enter`, `leave`, ou destino `rsp`/`esp`), e **nenhum desvio da
+   função inteira** (desmontada pela entrada da `.pdata`) tem destino entre `start + 1` e o ponto. Desvios condicionais
+   no prefixo são aceitos (eles saem; quem chega ao ponto veio direto do `start`). Exemplo: `+5941669` no `AddItem`
+   (`test rdx,rdx; je …; mov [rsp+0x18],r8b`).
+
+Funções com unwind encadeado (`UNW_FLAG_CHAININFO`) não contam como começo de função na regra 1.
 
 #### 6.7.4 `coleta-multiplicada` ("Coleta multiplicada") — tentativa
 

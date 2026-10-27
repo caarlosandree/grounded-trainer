@@ -330,15 +330,39 @@ variável) com as ferramentas da Tarefa 4.
 - [ ] **Step 2:** rodar → falha. **Step 3:** implementar. **Step 4:** `cargo test --workspace` → passa.
 - [ ] **Step 5:** commit `feat(cli): observe, gt caves e desvios no gt diff`.
 
+### Tarefa 9b: Ponto aceito pelo `observe` (função folha e prefixo sem pilha)
+
+**Spec:** 6.7.3 (as três regras do ponto aceito).
+
+**Files:** Modify `apps/gt-patch/src/cmd/observe.rs` (e, se a desmontagem ficar genérica, uma função pura em
+`crates/gt-core/src/cave.rs`); `crates/gt-testkit/src/module.rs` (funções sintéticas para os casos).
+
+**Interfaces — Produces:** `fn accept_point(functions: &[RuntimeFunction], text: &[u8], text_rva: u32, rva: u32)
+-> Result<PointKind, String>` (função pura), com `enum PointKind { PdataStart, LeafEntry, StackFreePrefix }`; ela
+substitui `check_function_start`. Motivos de recusa em pt-BR, um por regra que falhou.
+
+- [ ] **Step 1: testes** (puros, com `.text` sintética): `accepts_pdata_start`, `rejects_chained_unwind_start`,
+  `accepts_leaf_after_cc`, `accepts_leaf_after_ret`, `rejects_leaf_without_padding`,
+  `accepts_stack_free_prefix_with_jcc` (forma do `AddItem`: `test rdx,rdx; je far; mov [rsp+0x18],r8b`),
+  `rejects_prefix_with_push`, `rejects_prefix_not_on_boundary`, `rejects_prefix_over_64_bytes`,
+  `rejects_point_targeted_by_inner_branch` (um `jmp` mais adiante na função cai no ponto); e um de integração no
+  módulo sintético: `observe_counts_on_leaf_entry` (função folha nova no módulo, sem `.pdata`, seguida de `CC`).
+- [ ] **Step 2:** rodar → falha.
+- [ ] **Step 3:** implementar.
+- [ ] **Step 4:** `cargo build --workspace && cargo test --workspace` → passa.
+- [ ] **Step 5:** commit `feat(patch): observe aceita função folha e prefixo sem pilha`.
+
 ### Tarefa 10: Pesquisa no jogo (sessão principal, com o dono)
 
 **Spec:** 6.7.1, 6.7.2, 6.7.4; anti-objetivo da falha de página.
 
 Com backup do save e o FLiNG fechado, usando o `gt-patch observe`:
 
-- [ ] **Arrastar:** observar `+5bbfe70` com `rcx`. O dono arrasta um item, move entre slots, abre o baú. Anotar
+- [ ] **Arrastar:** `+5bbfe70` **não** roda no arraste (sessão de 2026-10-27, 0 passagens). Candidatos: os
+  nativos de `ServerSwapItemSlots`, `ServerSwapItemSlotsBetweenInventories`, `ServerTransferItemTo/From` e
+  `ServerMergeItemStacks` (thunks na reflexão, `Func` em `UFunction+0xd8`; seguir o thunk até o nativo). Observar cada um com `rcx`; o dono arrasta um item, move entre slots, abre o baú. Anotar
   chamadores e classes. Critério: `rcx` é sempre `Item` (ou subclasse) **e** o arrastado. Se não, procurar outro
-  ponto (instrução 5+ bytes, começo de função) e registrar; sem ponto, o cheat sai e volta ao dono.
+  ponto (instrução 5+ bytes, ponto aceito pela spec 6.7.3) e registrar; sem ponto, o cheat sai e volta ao dono.
 - [ ] **Analisador:** observar `+57bd6d0` com `rcx`: chamadores e classes; ler cargas e `MaxPowerCapacity` com um
   analisador cheio e um gasto. Registrar se cheio é `float(MaxPowerCapacity)`.
 - [ ] **Coleta:** observar `+5941660` com `rcx` e depois com `rdx`. O dono pega do chão, colhe, pega loot, cria na
