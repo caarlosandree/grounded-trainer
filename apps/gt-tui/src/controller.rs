@@ -1099,7 +1099,11 @@ impl<B: Backend> Controller<B> {
         let Some(report) = self.session_call(|s| s.field_tick(&on, now)) else {
             return;
         };
-        self.cycle_pawn = Some(report.pawn);
+        // Sem cheat de valor ligado o `tick` nem tentou ler (`pawn: None` é "não lido", não "sem
+        // personagem"): quem precisar do pawn o lê por conta própria.
+        if !on.is_empty() {
+            self.cycle_pawn = Some(report.pawn);
+        }
         for row in self.model.cheats.iter_mut().filter(|r| r.field) {
             row.note = if row.on {
                 report.notes.get(&row.id).copied()
@@ -5989,6 +5993,31 @@ mod tests {
         // Lido uma vez no ciclo: o dos cheats de valor vale e não há segunda leitura.
         assert!(h.ctl.calls().contains(&Call::HookTick { pawn: Some(0x20) }));
         assert_eq!(hook_calls(&h, |c| matches!(c, Call::ReadPawn)), 0);
+    }
+
+    #[test]
+    fn hook_reads_the_pawn_when_a_value_cheat_is_wanted_but_not_on() {
+        let mut h = H::new();
+        h.ctl
+            .set_catalog(vec![field("f", Avail::Checking), collect_info()]);
+        h.ctl.set_field_avail(&[("f", available())]);
+        h.ctl.set_hook_avail(&[(COLLECT, available())]);
+        h.connect(0);
+        assert!(h.toggle("f", 100));
+        // O jogo fecha e a religação do cheat de valor é recusada: desejado e não ligado.
+        h.reopen(1_000, 4_000);
+        h.ctl.push_outcome(OpOutcome::Refused("lote".to_string()));
+        h.tick(4_100);
+        assert!(h.row("f").desired && !h.row("f").on);
+        assert!(h.toggle(COLLECT, 4_200));
+        h.ctl.set_pawn(Some(0x10));
+        h.ctl.clear_calls();
+        h.tick(4_300);
+        // `tick` dos cheats de valor ocioso (nada ligado) devolve `pawn: None`, que não vale
+        // como leitura: a coleta lê o personagem sozinha.
+        assert!(h.ctl.field_ticks() > 0);
+        assert!(h.ctl.calls().contains(&Call::ReadPawn));
+        assert!(h.ctl.calls().contains(&Call::HookTick { pawn: Some(0x10) }));
     }
 
     #[test]

@@ -11,6 +11,7 @@ use gt_core::cave::CaveAllocator;
 use gt_core::engine::Engine;
 use gt_core::mem::{MemReader, MemWriter};
 use gt_core::patch::{CAVE_FILL, PatchKind};
+use gt_core::suspend::{Fault, PauseConfig};
 use gt_grounded2::catalog::HookHit;
 use gt_grounded2::caves::var;
 use gt_grounded2::hooks::{
@@ -143,6 +144,8 @@ struct Opts {
     var_len: Option<u64>,
     /// Sem sequência de `CC` livre.
     no_runs: bool,
+    /// Configuração de pausa do motor (falhas injetadas); `None`: a padrão.
+    pause: Option<PauseConfig>,
 }
 
 fn default_opts() -> Opts {
@@ -150,6 +153,7 @@ fn default_opts() -> Opts {
         refl: refl(RESEARCH_POINTS as u32, &[]),
         var_len: None,
         no_runs: false,
+        pause: None,
     }
 }
 
@@ -188,7 +192,10 @@ fn scene_with(opts: Opts) -> Scene {
     if opts.no_runs {
         env.allocator = CaveAllocator::new(Vec::new());
     }
-    let engine = rig.engine();
+    let engine = match opts.pause {
+        Some(pause) => rig.engine_with_pause(pause),
+        None => rig.engine(),
+    };
     let defs = Signatures::embedded().unwrap().hooks().to_vec();
     Scene {
         engine,
@@ -584,6 +591,66 @@ fn disable_keeps_cave() {
     // Sair: tudo devolvido.
     s.engine.undo_all().unwrap();
     assert_eq!(s.level_point_bytes(), original);
+}
+
+#[test]
+fn disable_failure_leaving_the_hook_pending_reinstalls_after_the_restore() {
+    // A 2ª pausa do motor (a do `disable`; a 1ª foi a do `enable`) escreve e não consegue
+    // desfazer: o desvio fica pendente.
+    let mut s = scene_with(Opts {
+        pause: Some(PauseConfig {
+            fault: Some(Fault::WriteAndRollbackFail),
+            hook_on_pause: 2,
+            ..PauseConfig::default()
+        }),
+        ..default_opts()
+    });
+    s.resolve();
+    let original = s.level_point_bytes();
+    s.rt.enable(&mut s.engine, BRAIN, None).unwrap();
+    let jumped = s.level_point_bytes();
+    assert_ne!(jumped, original);
+    assert!(s.rt.disable(&mut s.engine, BRAIN).is_err());
+    assert_eq!(s.engine.pending_ids(), ["brain-power-hook".to_string()]);
+    // O desvio saiu do motor: `hooked` bate com ele.
+    assert!(!s.rt.is_hooked(BRAIN));
+    s.engine.restore_pending().unwrap();
+    assert!(s.engine.pending_ids().is_empty());
+    assert_eq!(s.level_point_bytes(), original);
+    // Religar instala o `jmp` de novo e a cave multiplica.
+    s.rt.enable(&mut s.engine, BRAIN, Some(1)).unwrap();
+    assert!(s.rt.is_hooked(BRAIN));
+    assert_eq!(s.level_point_bytes(), jumped, "o jmp voltou ao ponto");
+    assert_eq!(
+        s.engine_ids(),
+        [
+            "brain-power-cave".to_string(),
+            "brain-power-hook".to_string()
+        ]
+    );
+    s.set_points(0);
+    s.gain(10);
+    assert_eq!(s.points(), 30);
+    s.engine.undo_all().unwrap();
+    assert_eq!(s.level_point_bytes(), original);
+}
+
+#[test]
+fn recognize_installed_drops_a_hooked_flag_the_engine_does_not_have() {
+    let mut s = scene();
+    s.resolve();
+    s.rt.enable(&mut s.engine, BRAIN, None).unwrap();
+    assert!(s.rt.is_hooked(BRAIN));
+    // O desvio sai do motor por fora do runtime (um desfazer que o deixou fora dos ativos).
+    s.engine.undo(&["brain-power-hook"]).unwrap();
+    let defs = s.defs.clone();
+    let found = s.rt.recognize_installed(&s.engine, &defs);
+    assert!(found.is_empty(), "{found:?}");
+    assert!(!s.rt.is_hooked(BRAIN));
+    // Religar escreve o desvio de novo.
+    s.rt.enable(&mut s.engine, BRAIN, None).unwrap();
+    assert!(s.rt.is_hooked(BRAIN));
+    assert!(s.engine_ids().contains(&"brain-power-hook".to_string()));
 }
 
 #[test]

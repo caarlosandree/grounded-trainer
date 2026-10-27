@@ -7,13 +7,15 @@ use std::ops::Range;
 use std::collections::HashMap;
 
 use gt_core::cave::{CaveAllocator, hook_bytes};
-use gt_core::engine::Engine;
+use gt_core::engine::{Engine, EngineOptions, PolicyFn};
 use gt_core::journal::{JournalLock, JournalStore};
 use gt_core::mem::MemReader;
 use gt_core::modules::Module;
 use gt_core::patch::{CAVE_FILL, PatchKind, PatchSpec, validate};
 use gt_core::pe::DiskImage;
+use gt_core::suspend::PauseConfig;
 use gt_grounded2::caves::{self, CaveCtx, Register};
+use gt_grounded2::policy::{data_policy, write_policy};
 use gt_grounded2::resolve::Target;
 use gt_ue::UeLayout;
 
@@ -73,6 +75,32 @@ impl SynthRig {
             self.disk.headers.clone(),
         )
         .unwrap()
+    }
+
+    /// Como [`SynthRig::engine`], mas com a configuração de pausa `pause` (para injetar falhas do
+    /// motor nos testes). As políticas são as de `gt_grounded2::patching::open_engine`.
+    pub fn engine_with_pause(&self, pause: PauseConfig) -> Engine {
+        let (module, headers) = (self.module.clone(), self.disk.headers.clone());
+        let version_key = headers.version_key();
+        let policy: PolicyFn = Box::new(move |maps| write_policy(&module, &headers, maps));
+        let options = EngineOptions { version_key, pause };
+        let mut engine = Engine::open(
+            self.t.pid,
+            Some(&self.target.identity),
+            self.store.clone(),
+            &self.lock,
+            policy,
+            options,
+        )
+        .unwrap();
+        let images: Vec<_> = self
+            .target
+            .modules
+            .iter()
+            .map(|m| m.base..m.end())
+            .collect();
+        engine.set_data_policy(Box::new(move |maps| data_policy(&images, maps)));
+        engine
     }
 
     /// Folga da `.data` para as variáveis (`gt_grounded2::policy::var_region`).

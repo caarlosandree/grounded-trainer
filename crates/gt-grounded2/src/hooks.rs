@@ -305,6 +305,15 @@ fn hook_id(id: &str) -> String {
     format!("{id}-hook")
 }
 
+/// O `Code` do desvio `id` está ativo no motor (o diário do mesmo processo)?
+fn engine_has_hook(engine: &Engine, id: &str) -> bool {
+    let hook = hook_id(id);
+    engine
+        .active()
+        .iter()
+        .any(|s| s.id == hook && s.kind == PatchKind::Code)
+}
+
 impl HookRuntime {
     /// Runtime sem nenhum desvio resolvido.
     pub fn new(env: HookEnv) -> Self {
@@ -430,8 +439,15 @@ impl HookRuntime {
         };
         let mut found = Vec::new();
         for def in defs {
-            if self.slots.get(&def.id).is_some_and(|s| s.hooked) {
-                continue;
+            if let Some(slot) = self.slots.get_mut(&def.id)
+                && slot.hooked
+            {
+                // `hooked` tem de bater com o motor: um desvio que não está ativo nele (saiu num
+                // desligar que falhou, por exemplo) não conta como instalado.
+                if find(&hook_id(&def.id), PatchKind::Code).is_some() {
+                    continue;
+                }
+                slot.hooked = false;
             }
             let Some(cave) = find(&cave_id(&def.id), PatchKind::Cave) else {
                 continue;
@@ -659,7 +675,16 @@ impl HookRuntime {
                 state: "sem plano".to_string(),
             });
         };
-        let (cave_written, hooked) = (slot.cave_written, slot.hooked);
+        let cave_written = slot.cave_written;
+        // `hooked` tem de bater com o motor: depois de um desligar que falhou e deixou o desvio
+        // pendente, o `restore_pending` o tira do jogo e só o motor sabe disso.
+        let hooked = slot.hooked && engine_has_hook(engine, id);
+        if slot.hooked
+            && !hooked
+            && let Some(slot) = self.slots.get_mut(id)
+        {
+            slot.hooked = false;
+        }
         let base = self.claim(engine)?;
         let value = Self::value_of(&def, value_k)?;
         if hooked {
@@ -746,11 +771,14 @@ impl HookRuntime {
         if slot.def.body == CaveBody::Drag && self.drag.is_some() {
             self.disarm(engine)?;
         }
-        engine.undo(&[&hook_id(id)]).map_err(core)?;
+        let undone = engine.undo(&[&hook_id(id)]).map_err(core);
+        // Só sai de `hooked` quando o desvio saiu do motor: um desfazer que falhou sem tirá-lo
+        // dos ativos o deixa instalado; um que o deixou pendente o tira dos ativos (o
+        // `restore_pending` resolve os bytes).
         if let Some(slot) = self.slots.get_mut(id) {
-            slot.hooked = false;
+            slot.hooked = engine_has_hook(engine, id);
         }
-        Ok(())
+        undone.map(|_| ())
     }
 
     /// Troca o valor de um desvio ligado (ou não): só uma escrita na variável, sem pausa (6.5).
