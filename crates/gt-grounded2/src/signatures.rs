@@ -132,6 +132,9 @@ pub struct PlayerCfg {
     /// Onde está `PartyComponent.ResearchPoints` (spec 008, 6.10); só existe se o `[ue.player]` traz
     /// os três campos e o caminho do `GameState`.
     pub research: Option<ResearchCfg>,
+    /// Campo do pawn que aponta para o `InventoryComponent` do jogador (spec 008, 6.7.4); sem ele
+    /// a coleta não acha o inventário.
+    pub inventory_field: Option<String>,
 }
 
 /// `PartyComponent.ResearchPoints`, a partir do `GameState` (spec 008, 6.10): só leitura, para o
@@ -317,6 +320,10 @@ pub struct HookDef {
     pub value: Option<ValueGrid>,
     /// Ação por tecla com desvio (hoje só o arrastar): não conta como ligada no topo.
     pub action: bool,
+    /// Classe do objeto que a cave confere (`Pacote.Nome`) e dona do campo que ela escreve: `Item`
+    /// no arrastar e na coleta, `ResourceAnalyzerBuilding` no analisador. O Brain Power não tem
+    /// (usa a `party_class` do `[ue.player]`).
+    pub object_class: Option<String>,
 }
 
 /// Conjunto das assinaturas carregadas: o genérico e uma lista de definições por versão.
@@ -405,6 +412,8 @@ struct PlayerBlock {
     party_field: Option<String>,
     party_class: Option<String>,
     research_points_field: Option<String>,
+    // Campo do pawn que aponta para o inventário do jogador (spec 008, 6.7.4); opcional.
+    inventory_field: Option<String>,
 }
 
 // Espelhos de `UeLayout` para o serde (o `gt-ue` não depende dele). Sem `Default`: todo campo é
@@ -527,6 +536,8 @@ struct GenericHook {
     body: Option<String>,
     action: Option<bool>,
     value: Option<ValueBlock>,
+    /// Classe dona do objeto que a cave confere (`Pacote.Nome`); obrigatória fora do `brain`.
+    object_class: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1054,6 +1065,20 @@ fn build_hook(file: &str, raw: GenericHook) -> Result<HookDef> {
         (None, _) => return Err(err("value", "campo obrigatório ausente")),
         (Some(block), _) => Some(build_points_grid(file, id, block)?),
     };
+    let object_class = match (raw.object_class, body) {
+        (Some(_), CaveBody::Brain) => {
+            return Err(err(
+                "object_class",
+                "o corpo brain usa a party_class do [ue.player]",
+            ));
+        }
+        (None, CaveBody::Brain) => None,
+        (None, _) => return Err(err("object_class", "campo obrigatório ausente")),
+        (Some(class), _) => {
+            check_class_path(file, "object_class", &class)?;
+            Some(class)
+        }
+    };
     Ok(HookDef {
         id: raw.id,
         name,
@@ -1065,6 +1090,7 @@ fn build_hook(file: &str, raw: GenericHook) -> Result<HookDef> {
         body,
         value,
         action,
+        object_class,
     })
 }
 
@@ -1351,6 +1377,9 @@ fn build_player(file: &str, block: PlayerBlock) -> Result<PlayerCfg> {
             ));
         }
     };
+    if let Some(field) = &block.inventory_field {
+        check_not_blank(file, "ue.player.inventory_field", field)?;
+    }
     Ok(PlayerCfg {
         controller_class: block.controller_class,
         pawn_field: block.pawn_field,
@@ -1358,6 +1387,7 @@ fn build_player(file: &str, block: PlayerBlock) -> Result<PlayerCfg> {
         alt_pawn_fields: block.alt_pawn_fields,
         game_state,
         research,
+        inventory_field: block.inventory_field,
     })
 }
 
@@ -3036,6 +3066,7 @@ alt_pawn_fields = []
                 alt_pawn_fields: vec![],
                 game_state: None,
                 research: None,
+                inventory_field: None,
             }
         );
 
@@ -4409,6 +4440,9 @@ bools = [false, true]
         )
     }
 
+    const ANALYZER_BODY: &str =
+        "body = \"analyzer\"\nobject_class = \"/Script/Maine.ResourceAnalyzerBuilding\"\n";
+    const DRAG_CLASS: &str = "object_class = \"/Script/Maine.Item\"\n";
     const POINTS: &str = "[hook.value]\ntype = \"i32\"\npoints = [2, 3, 5]\ndefault = 3\n";
 
     fn hook_err(extra: &str) -> String {
@@ -4490,14 +4524,16 @@ bools = [false, true]
     fn hook_action_only_drag() {
         let ok = parse(&[(
             "generic.toml",
-            &hook_toml(&format!("body = \"drag\"\naction = true\n{POINTS}")),
+            &hook_toml(&format!(
+                "body = \"drag\"\naction = true\n{DRAG_CLASS}{POINTS}"
+            )),
         )])
         .unwrap();
         assert!(ok.hooks()[0].action);
         // Sem `action`, o padrão é falso.
         let plain = parse(&[(
             "generic.toml",
-            &hook_toml(&format!("body = \"drag\"\n{POINTS}")),
+            &hook_toml(&format!("body = \"drag\"\n{DRAG_CLASS}{POINTS}")),
         )])
         .unwrap();
         assert!(!plain.hooks()[0].action);
@@ -4513,11 +4549,11 @@ bools = [false, true]
     fn hook_id_collides_with_patch() {
         let patch_id = "[[patch]]\nid = \"h\"\nname = \"P\"\ncategory = \"itens\"\ndescription = \"d\"\n\
                         pattern = \"48 8B F9\"\noffset = 0\nexpected = \"48 8B F9\"\nreplacement = \"48 89 CF\"\n\n";
-        let text = format!("{patch_id}{}", hook_toml("body = \"analyzer\"\n"));
+        let text = format!("{patch_id}{}", hook_toml(ANALYZER_BODY));
         let err = parse(&[("generic.toml", &text)]).unwrap_err().to_string();
         assert!(err.contains("`h` repetido"), "{err}");
         // Dois hooks com o mesmo id também.
-        let one = hook_toml("body = \"analyzer\"\n");
+        let one = hook_toml(ANALYZER_BODY);
         let err = parse(&[("generic.toml", &format!("{one}\n{one}"))])
             .unwrap_err()
             .to_string();
@@ -4527,7 +4563,7 @@ bools = [false, true]
     #[test]
     fn hook_load_rules() {
         // `offset` dentro do padrão.
-        let text = hook_toml("body = \"analyzer\"\n").replace("offset = 0", "offset = 8");
+        let text = hook_toml(ANALYZER_BODY).replace("offset = 0", "offset = 8");
         let err = parse(&[("generic.toml", &text)]).unwrap_err().to_string();
         assert!(
             err.contains("offset") && err.contains("fora do pattern"),
@@ -4542,6 +4578,82 @@ bools = [false, true]
         // `module` só o exe do jogo; campos desconhecidos recusados.
         assert!(hook_err("body = \"analyzer\"\nmodule = \"x.dll\"\n").contains("x.dll"));
         assert!(hook_err("body = \"analyzer\"\nexpected = \"48\"\n").contains("expected"));
+    }
+
+    #[test]
+    fn hook_object_class_rules() {
+        // O analisador, o arrastar e a coleta trazem a classe; ela fica em `HookDef`.
+        let ok = parse(&[("generic.toml", &hook_toml(ANALYZER_BODY))]).unwrap();
+        assert_eq!(
+            ok.hooks()[0].object_class.as_deref(),
+            Some("/Script/Maine.ResourceAnalyzerBuilding")
+        );
+        // Sem ela, o campo é obrigatório fora do Brain Power.
+        for body in ["analyzer", "drag", "collect"] {
+            let value = if body == "analyzer" { "" } else { POINTS };
+            let err = hook_err(&format!("body = \"{body}\"\n{value}"));
+            assert!(err.contains("object_class"), "{body}: {err}");
+        }
+        // Formato `Pacote.Nome`.
+        let err = hook_err("body = \"analyzer\"\nobject_class = \"Analisador\"\n");
+        assert!(err.contains("Pacote.Nome"), "{err}");
+        // O Brain Power usa a `party_class` do `[ue.player]`: a classe no `[[hook]]` é recusada.
+        let err = hook_err(&format!(
+            "body = \"brain\"\nobject_class = \"/Script/Maine.PartyComponent\"\n{POINTS}"
+        ));
+        assert!(err.contains("party_class"), "{err}");
+        // Os embutidos: arrastar e analisador com a classe, Brain Power sem.
+        let sigs = Signatures::embedded().unwrap();
+        let class = |id: &str| {
+            sigs.hooks()
+                .iter()
+                .find(|h| h.id == id)
+                .unwrap()
+                .object_class
+                .clone()
+        };
+        assert_eq!(
+            class("quantidade-arrastar").as_deref(),
+            Some("/Script/Maine.Item")
+        );
+        assert_eq!(
+            class("analisador-infinito").as_deref(),
+            Some("/Script/Maine.ResourceAnalyzerBuilding")
+        );
+        assert_eq!(class("brain-power"), None);
+    }
+
+    #[test]
+    fn inventory_field_is_optional_and_not_blank() {
+        let with = |extra: &str| {
+            let text = format!("{GENERIC}{UE_PATTERNS}{UE_LAYOUT}{UE_PLAYER}{extra}");
+            parse(&[("generic.toml", &text)])
+        };
+        let player = |extra: &str| {
+            with(extra)
+                .unwrap()
+                .ue_for_version("0000-0000")
+                .unwrap()
+                .player
+        };
+        assert_eq!(
+            player("inventory_field = \"InventoryComponent\"\n")
+                .inventory_field
+                .as_deref(),
+            Some("InventoryComponent")
+        );
+        assert_eq!(player("").inventory_field, None);
+        let err = with("inventory_field = \" \"\n").unwrap_err().to_string();
+        assert!(err.contains("inventory_field"), "{err}");
+        // Os embutidos trazem o campo do inventário.
+        let ue = Signatures::embedded()
+            .unwrap()
+            .ue_for_version("0000-0000")
+            .unwrap();
+        assert_eq!(
+            ue.player.inventory_field.as_deref(),
+            Some("InventoryComponent")
+        );
     }
 
     #[test]

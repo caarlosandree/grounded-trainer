@@ -40,7 +40,7 @@ use crate::caves::{
 };
 use crate::error::{Error, Result};
 use crate::policy::{cave_allocator, var_region};
-use crate::signatures::{CaveBody, HookDef, brain_captures_from_hit};
+use crate::signatures::{CaveBody, HookDef, PlayerCfg, brain_captures_from_hit};
 
 /// Quanto o trainer espera, depois de escrever 0 no arme do arrastar, antes de reler o contador
 /// de aplicadas (spec 6.7.2).
@@ -49,17 +49,6 @@ pub const DISARM_WAIT: Duration = Duration::from_millis(50);
 pub const DRAG_EXPIRY: Duration = Duration::from_secs(60);
 /// Tentativas de uma leitura estável do registro do Brain Power por ciclo.
 const LOG_TRIES: usize = 4;
-
-/// Pacote e nome da classe `PartyComponent` (dona de `ResearchPoints`).
-const PARTY_CLASS: &str = "/Script/Maine.PartyComponent";
-/// Classe `Item` (dona de `StackSize`; o arrastar e a coleta conferem o objeto por ela).
-const ITEM_CLASS: &str = "/Script/Maine.Item";
-/// Classe do analisador de recursos (dona de `MaxPowerCapacity`).
-const ANALYZER_CLASS: &str = "/Script/Maine.ResourceAnalyzerBuilding";
-/// Classe do personagem (dona de `InventoryComponent`).
-const CHARACTER_CLASS: &str = "/Script/Maine.SurvivalPlayerCharacter";
-/// Campo do personagem que aponta para o inventário dele (6.7.4).
-pub const FIELD_INVENTORY_COMPONENT: &str = "InventoryComponent";
 
 /// O que o trainer sabe, no início da conexão, para planejar os desvios.
 pub struct HookEnv {
@@ -73,6 +62,10 @@ pub struct HookEnv {
     pub var_region: Option<Range<u64>>,
     /// Alocador das sequências de `CC` da `.text` do disco.
     pub allocator: CaveAllocator,
+    /// O `[ue.player]` das assinaturas: o pawn, a `party_class` e o campo de `ResearchPoints` do
+    /// Brain Power, e o campo do inventário da coleta. As classes dos outros desvios vêm do
+    /// `object_class` de cada `[[hook]]`.
+    pub player: PlayerCfg,
 }
 
 impl HookEnv {
@@ -84,6 +77,7 @@ impl HookEnv {
         disk: Arc<DiskImage>,
         maps: &[MapRegion],
         layout: UeLayout,
+        player: PlayerCfg,
     ) -> HookEnv {
         let var_region = var_region(&module, &disk.headers, maps);
         let allocator =
@@ -94,6 +88,7 @@ impl HookEnv {
             disk,
             var_region,
             allocator,
+            player,
         }
     }
 }
@@ -176,6 +171,9 @@ struct Plan {
     cave: Vec<u8>,
     /// Ponteiros de classe para as variáveis: `(deslocamento, valor)`.
     class_vars: Vec<(u64, u64)>,
+    /// A cave já está escrita no jogo (uma cave nossa sem desvio, reconhecida pelo motor): só o
+    /// desvio entra ao ligar.
+    cave_present: bool,
 }
 
 /// Arrastar armado.
@@ -237,6 +235,9 @@ pub struct HookRuntime {
     /// Último contador de sequência do Brain Power visto (ou o da hora de ligar).
     brain_seq: Option<u32>,
     drag: Option<Armed>,
+    /// Caves nossas escritas e sem desvio ativo no motor, por `id`: `(lugar, bytes)`. O `resolve`
+    /// as reaproveita se a cave montada agora for igual.
+    orphan_caves: HashMap<String, (u64, Vec<u8>)>,
     /// Último valor escrito na variável do inventário (para escrever só na mudança).
     inventory_written: Option<u64>,
 }
@@ -314,6 +315,7 @@ impl HookRuntime {
             inventory_off: None,
             brain_seq: None,
             drag: None,
+            orphan_caves: HashMap::new(),
             inventory_written: None,
         }
     }
@@ -343,8 +345,9 @@ impl HookRuntime {
         mem: &M,
         refl: &ReflectionIndex,
     ) -> Vec<(String, HookAvail)> {
-        self.inventory_off = class_of(refl, CHARACTER_CLASS).ok().and_then(|c| {
-            let field = refl.find_field(mem, c, FIELD_INVENTORY_COMPONENT).ok()?;
+        self.inventory_off = self.env.player.inventory_field.as_deref().and_then(|name| {
+            let class = class_of(refl, &self.env.player.pawn_class).ok()?;
+            let field = refl.find_field(mem, class, name).ok()?;
             is_object_family(&field.kind).then_some(field.offset)
         });
         let mut out = Vec::new();
@@ -370,6 +373,11 @@ impl HookRuntime {
                 .slots
                 .get(&id)
                 .map_or((false, false), |s| (s.cave_written, s.hooked));
+            let reused = plan.as_ref().is_some_and(|p| p.cave_present);
+            if reused {
+                self.orphan_caves.remove(&id);
+            }
+            let cave_written = cave_written || reused;
             self.slots.insert(
                 id.clone(),
                 Slot {
@@ -398,11 +406,21 @@ impl HookRuntime {
         out
     }
 
-    /// Reconhece desvios nossos que já estão instalados no motor (o diário do mesmo processo): o
-    /// padrão deles sumiu da memória e a varredura diria `não encontrado`. Só vale com a cave e o
-    /// desvio ativos no motor; a instrução original e o lugar vêm das entradas dele. Devolve os
-    /// `id` reconhecidos.
+    /// Sincroniza com as caves que o motor já tem no jogo (o diário do mesmo processo): chame
+    /// antes do [`HookRuntime::resolve`] de um runtime novo sobre um motor que já escreveu.
+    ///
+    /// - os trechos de **todas** as caves do motor (ativas e pendentes) saem do alocador, para a
+    ///   cave de outro desvio não cair em cima delas;
+    /// - cave e desvio ativos: o desvio é reconhecido como ligado (o padrão dele sumiu da memória e
+    ///   a varredura diria `não encontrado`); a instrução original vem do `expected` do desvio;
+    /// - só a cave ativa (o desvio foi desligado): ela é lembrada e o `resolve` a reaproveita,
+    ///   se a cave de agora for igual, de modo que religar escreva só o desvio.
+    ///
+    /// Devolve os `id` reconhecidos como ligados.
     pub fn recognize_installed(&mut self, engine: &Engine, defs: &[HookDef]) -> Vec<String> {
+        for range in engine.cave_ranges() {
+            self.env.allocator.reserve(range);
+        }
         let active = engine.active();
         let find = |id: &str, kind: PatchKind| {
             active
@@ -415,12 +433,15 @@ impl HookRuntime {
             if self.slots.get(&def.id).is_some_and(|s| s.hooked) {
                 continue;
             }
-            let (Some(cave), Some(hook)) = (
-                find(&cave_id(&def.id), PatchKind::Cave),
-                find(&hook_id(&def.id), PatchKind::Code),
-            ) else {
+            let Some(cave) = find(&cave_id(&def.id), PatchKind::Cave) else {
                 continue;
             };
+            let Some(hook) = find(&hook_id(&def.id), PatchKind::Code) else {
+                self.orphan_caves
+                    .insert(def.id.clone(), (cave.addr, cave.replacement));
+                continue;
+            };
+            self.orphan_caves.remove(&def.id);
             self.slots.insert(
                 def.id.clone(),
                 Slot {
@@ -432,6 +453,7 @@ impl HookRuntime {
                         cave_at: cave.addr,
                         cave: cave.replacement,
                         class_vars: Vec::new(),
+                        cave_present: true,
                     }),
                     cave_written: true,
                     hooked: true,
@@ -439,12 +461,11 @@ impl HookRuntime {
             );
             found.push(def.id.clone());
         }
-        if !found.is_empty()
-            && self
-                .env
-                .var_region
-                .as_ref()
-                .is_some_and(|r| engine.vars().iter().any(|v| v.addr == r.start))
+        if self
+            .env
+            .var_region
+            .as_ref()
+            .is_some_and(|r| engine.vars().iter().any(|v| v.addr == r.start))
         {
             self.claimed = true;
         }
@@ -474,19 +495,31 @@ impl HookRuntime {
             return Err("sem espaço para variáveis".to_string());
         }
 
-        // Campos e classes da reflexão.
+        // Campos e classes da reflexão: o Brain Power usa a `party_class` e o campo do
+        // `[ue.player]`; os outros, o `object_class` do próprio `[[hook]]`.
         let mut fields: HashMap<&'static str, u32> = HashMap::new();
         let mut class_vars = Vec::new();
+        let owner = |def: &HookDef| {
+            def.object_class
+                .clone()
+                .ok_or_else(|| "classe do objeto não configurada".to_string())
+        };
         match def.body {
             CaveBody::Brain => {
-                let class = class_of(refl, PARTY_CLASS)?;
+                let research = self
+                    .env
+                    .player
+                    .research
+                    .as_ref()
+                    .ok_or(format!("campo {FIELD_RESEARCH_POINTS} não encontrado"))?;
+                let class = class_of(refl, &research.party_class)?;
                 fields.insert(
                     FIELD_RESEARCH_POINTS,
-                    field_off(refl, mem, class, FIELD_RESEARCH_POINTS)?,
+                    field_off(refl, mem, class, &research.points_field)?,
                 );
             }
             CaveBody::Analyzer => {
-                let class = class_of(refl, ANALYZER_CLASS)?;
+                let class = class_of(refl, &owner(def)?)?;
                 fields.insert(
                     FIELD_MAX_POWER_CAPACITY,
                     field_off(refl, mem, class, FIELD_MAX_POWER_CAPACITY)?,
@@ -494,14 +527,18 @@ impl HookRuntime {
                 class_vars.push((var::ANALYZER_CLASS, class));
             }
             CaveBody::Drag | CaveBody::Collect => {
-                let class = class_of(refl, ITEM_CLASS)?;
+                let class = class_of(refl, &owner(def)?)?;
                 fields.insert(
                     FIELD_STACK_SIZE,
                     field_off(refl, mem, class, FIELD_STACK_SIZE)?,
                 );
                 class_vars.push((var::ITEM_CLASS, class));
                 if def.body == CaveBody::Collect && self.inventory_off.is_none() {
-                    return Err(format!("campo {FIELD_INVENTORY_COMPONENT} não encontrado"));
+                    let name = self.env.player.inventory_field.as_deref();
+                    return Err(format!(
+                        "campo {} não encontrado",
+                        name.unwrap_or("do inventário")
+                    ));
                 }
             }
         }
@@ -528,14 +565,23 @@ impl HookRuntime {
             Error::CaveBuild { reason } => reason,
             other => other.to_string(),
         })?;
-        // Um slot ainda sem cave escrita pode ter reservado um lugar de igual tamanho: reaproveita.
+        // Uma cave nossa que já está no jogo (sem desvio) e é igual à de agora é reaproveitada.
+        let build_at = |at: u64| caves::build(def.body, &ctx(at)).map_err(|e| e.to_string());
+        let present = match self.orphan_caves.get(&def.id) {
+            Some((at, bytes)) if bytes.len() == probe.len() => {
+                (build_at(*at)? == *bytes).then_some(*at)
+            }
+            _ => None,
+        };
+        // Senão, um slot ainda sem cave escrita pode ter reservado um lugar de igual tamanho.
         let reuse = self
             .slots
             .get(&def.id)
             .and_then(|s| s.plan.as_ref())
             .filter(|p| p.cave.len() == probe.len())
             .map(|p| p.cave_at);
-        let cave_at = match reuse {
+        let cave_present = present.is_some();
+        let cave_at = match present.or(reuse) {
             Some(at) => at,
             None => self
                 .env
@@ -543,7 +589,7 @@ impl HookRuntime {
                 .alloc(probe.len())
                 .ok_or("sem espaço para a cave")?,
         };
-        let cave = caves::build(def.body, &ctx(cave_at)).map_err(|e| e.to_string())?;
+        let cave = build_at(cave_at)?;
         if cave.len() != probe.len() {
             return Err("cave de tamanho variável".to_string());
         }
@@ -553,6 +599,7 @@ impl HookRuntime {
             cave_at,
             cave,
             class_vars,
+            cave_present,
         })
     }
 

@@ -73,6 +73,29 @@ impl CaveAllocator {
         Self { slots }
     }
 
+    /// Tira `range` do que o alocador ainda oferece (caves que já estão escritas, de uma conexão
+    /// anterior ou deixadas no jogo): o trecho livre que ele corta se divide em dois, e o que
+    /// sobra antes e depois continua alocável. Reservar de novo o mesmo trecho não muda nada.
+    pub fn reserve(&mut self, range: Range<u64>) {
+        if range.start >= range.end {
+            return;
+        }
+        let mut out = Vec::with_capacity(self.slots.len() + 1);
+        for (next, end) in self.slots.drain(..) {
+            if range.end <= next || range.start >= end {
+                out.push((next, end));
+                continue;
+            }
+            if range.start > next {
+                out.push((next, range.start));
+            }
+            if range.end < end {
+                out.push((range.end, end));
+            }
+        }
+        self.slots = out;
+    }
+
     /// Reserva `len` bytes para uma cave e devolve o endereço dela.
     ///
     /// Usa a primeira sequência em que a cave cabe. `None` se `len` é 0 ou se nenhuma serve.
@@ -202,6 +225,26 @@ mod tests {
 
     fn decode_one(bytes: &[u8], ip: u64) -> iced_x86::Instruction {
         Decoder::with_ip(64, bytes, ip, DecoderOptions::NONE).decode()
+    }
+
+    #[test]
+    fn reserve_cuts_what_is_already_taken() {
+        let mut a = CaveAllocator::new(vec![0x1000..0x1200, 0x2000..0x2040]);
+        // Trecho no começo da sequência (depois da margem): a alocação segue dali.
+        a.reserve(0x1010..0x1050);
+        assert_eq!(a.alloc(0x10), Some(0x1050));
+        // Trecho no meio: o que sobra antes continua alocável, e o depois também.
+        a.reserve(0x1100..0x1180);
+        assert_eq!(a.alloc(0x80), Some(0x1060), "cabe entre 0x1060 e 0x1100");
+        assert_eq!(a.alloc(0x80), Some(0x1180));
+        // Reservar de novo (ou fora de qualquer sequência) não muda nada.
+        a.reserve(0x1100..0x1180);
+        a.reserve(0x9000..0x9100);
+        a.reserve(0x1180..0x1180);
+        // O que restou antes do trecho reservado ainda serve; depois, a segunda sequência.
+        assert_eq!(a.alloc(0x10), Some(0x10e0));
+        assert_eq!(a.alloc(0x20), Some(0x2010));
+        assert_eq!(a.alloc(0x20), None);
     }
 
     #[test]

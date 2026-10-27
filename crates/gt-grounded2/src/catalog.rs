@@ -930,6 +930,7 @@ pattern = "48 89 5c 24 08 90 ?? c3"
 offset = 0
 body = "drag"
 action = true
+object_class = "/Script/Maine.Item"
 [hook.value]
 type = "i32"
 points = [10, 50]
@@ -943,6 +944,7 @@ description = "Teste"
 pattern = "f3 0f 10 89 ?? ?? 00 00 c3"
 offset = 0
 body = "analyzer"
+object_class = "/Script/Maine.ResourceAnalyzerBuilding"
 "#;
 
     const OCCURRENCE: [u8; 8] = [0x48, 0x89, 0x5C, 0x24, 0x08, 0x90, 0x11, 0xC3];

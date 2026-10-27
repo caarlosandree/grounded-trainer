@@ -672,6 +672,7 @@ pub fn synth_signatures() -> (UeSigs, Vec<FieldDef>) {
                 game_state_class: format!("{MAINE}.InGameGameState"),
             }),
             research: None,
+            inventory_field: None,
         },
     };
     let bar = (0.0, 10_000.0);

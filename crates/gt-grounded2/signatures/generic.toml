@@ -144,6 +144,8 @@ game_state_class = "/Script/Maine.InGameGameState"
 party_field = "PartyComponent"
 party_class = "/Script/Maine.PartyComponent"
 research_points_field = "ResearchPoints"
+# Inventário do jogador (spec 008, 6.7.4): campo do pawn que aponta para o `InventoryComponent`; a coleta o mantém numa variável.
+inventory_field = "InventoryComponent"
 
 # Fase 5 (spec 005, 6.5): cheats de valor, na ordem da spec. Campos e alvos por NOME da reflexão (P2–P8 em
 # RESEARCH.md, 2026-10-26). As faixas sãs têm folga para upgrades; alvo fora delas não é escrito.
@@ -493,6 +495,7 @@ description = "O analisador de recursos não gasta cargas"
 pattern = "f3 0f 10 89 ?? ?? 00 00 f3 0f 58 ?? f3 0f 5c ?? ?? ?? ?? ?? f3 0f 2d ?? d1 f8 c3"
 offset = 0
 body = "analyzer"
+object_class = "/Script/Maine.ResourceAnalyzerBuilding"
 
 # Quantidade ao arrastar (spec 6.7.2): `mov [rsp+8],rbx`, primeira instrução da função. Ação por tecla com
 # desvio: arma a quantidade, o jogo a aplica uma vez no próximo item arrastado.
@@ -505,6 +508,7 @@ pattern = "48 89 5c 24 08 48 89 6c 24 10 48 89 74 24 18 57 48 83 ec 20 41 8b e9 
 offset = 0
 body = "drag"
 action = true
+object_class = "/Script/Maine.Item"
 
 [hook.value]
 type = "i32"

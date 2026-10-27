@@ -193,6 +193,7 @@ fn cfg() -> PlayerCfg {
         alt_pawn_fields: vec!["CachedSurvivalPlayerCharacter".into()],
         game_state: None,
         research: None,
+        inventory_field: None,
     }
 }
 

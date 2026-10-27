@@ -153,20 +153,31 @@ fn default_opts() -> Opts {
     }
 }
 
+/// O ambiente de um runtime novo sobre o módulo sintético, com o `[ue.player]` do genérico.
+fn make_env(rig: &SynthRig) -> HookEnv {
+    let (module, mem_headers) = rig.target.module(MODULE_NAME).unwrap();
+    let disk = rig.target.open_disk(module, &mem_headers).unwrap();
+    let player = Signatures::embedded()
+        .unwrap()
+        .ue_for_version("0000-0000")
+        .unwrap()
+        .player;
+    HookEnv::new(
+        module.clone(),
+        Arc::new(disk),
+        &rig.target.maps,
+        UeLayout::observed(),
+        player,
+    )
+}
+
 fn scene() -> Scene {
     scene_with(default_opts())
 }
 
 fn scene_with(opts: Opts) -> Scene {
     let rig = SynthRig::new();
-    let (module, mem_headers) = rig.target.module(MODULE_NAME).unwrap();
-    let disk = rig.target.open_disk(module, &mem_headers).unwrap();
-    let mut env = HookEnv::new(
-        module.clone(),
-        Arc::new(disk),
-        &rig.target.maps,
-        UeLayout::observed(),
-    );
+    let mut env = make_env(&rig);
     if let Some(len) = opts.var_len {
         env.var_region = env
             .var_region
@@ -365,6 +376,39 @@ fn unavailable_reasons() {
             "{id}"
         );
     }
+}
+
+/// As classes e campos vêm das assinaturas (`[ue.player]` e `object_class` do `[[hook]]`).
+#[test]
+fn classes_come_from_the_signatures() {
+    let mut s = scene();
+    // Sem o `ResearchPoints` no `[ue.player]` o Brain Power não tem de onde conferir o `disp`.
+    s.rt = HookRuntime::new({
+        let mut env = make_env(&s.rig);
+        env.player.research = None;
+        env
+    });
+    let got = s.resolve();
+    assert_eq!(
+        got[BRAIN],
+        HookAvail::Unavailable("campo ResearchPoints não encontrado".into())
+    );
+    // Outra classe no `object_class` do arrastar: a da reflexão não é a pedida.
+    let mut hit = s.hit(DRAG);
+    hit.def.object_class = Some("/Script/Maine.Outra".into());
+    let got = s.rt.resolve(&[hit], &s.refl.mem, &s.refl.index);
+    assert_eq!(
+        got[0].1,
+        HookAvail::Unavailable("classe Outra não encontrada".into())
+    );
+    // Sem o campo do inventário no `[ue.player]`, o inventário não é mantido.
+    s.rt = HookRuntime::new({
+        let mut env = make_env(&s.rig);
+        env.player.inventory_field = None;
+        env
+    });
+    s.resolve();
+    assert_eq!(s.rt.inventory_offset(), None);
 }
 
 #[test]
@@ -580,17 +624,7 @@ fn installed_hook_stays_available_without_the_pattern() {
     assert_eq!(got, vec![(BRAIN.to_string(), HookAvail::Available)]);
 
     // Um runtime novo sobre o mesmo motor reconhece o desvio pelo diário e segue controlando-o.
-    let env = {
-        let (module, mem_headers) = s.rig.target.module(MODULE_NAME).unwrap();
-        let disk = s.rig.target.open_disk(module, &mem_headers).unwrap();
-        HookEnv::new(
-            module.clone(),
-            Arc::new(disk),
-            &s.rig.target.maps,
-            UeLayout::observed(),
-        )
-    };
-    let mut fresh = HookRuntime::new(env);
+    let mut fresh = HookRuntime::new(make_env(&s.rig));
     assert_eq!(fresh.recognize_installed(&s.engine, &s.defs), [BRAIN]);
     assert!(fresh.is_hooked(BRAIN));
     fresh.set_value(&mut s.engine, BRAIN, 3).unwrap();
@@ -603,6 +637,79 @@ fn installed_hook_stays_available_without_the_pattern() {
     // E religa só com o desvio (a cave continua).
     fresh.enable(&mut s.engine, BRAIN, Some(0)).unwrap();
     assert_eq!(s.level_point_bytes()[0], 0xE9);
+    s.engine.undo_all().unwrap();
+}
+
+/// Os trechos das caves ativas do motor, ordenados.
+fn cave_spans(s: &Scene) -> Vec<(u64, u64)> {
+    let mut spans: Vec<(u64, u64)> = s
+        .engine
+        .active()
+        .iter()
+        .filter(|p| p.kind == PatchKind::Cave)
+        .map(|p| (p.addr, p.addr + p.replacement.len() as u64))
+        .collect();
+    spans.sort();
+    spans
+}
+
+#[test]
+fn recognized_caves_are_not_overlapped_by_a_new_runtime() {
+    let mut s = scene();
+    s.resolve();
+    s.rt.enable(&mut s.engine, BRAIN, None).unwrap();
+    let brain_cave = cave_spans(&s)[0];
+    // Runtime novo sobre o mesmo motor: o padrão do Brain Power sumiu (o nosso desvio o tirou),
+    // então só o analisador e o arrastar vêm como ocorrência.
+    s.rt = HookRuntime::new(make_env(&s.rig));
+    assert_eq!(s.rt.recognize_installed(&s.engine, &s.defs), [BRAIN]);
+    let hits = [s.hit(ANALYZER), s.hit(DRAG)];
+    let got = s.rt.resolve(&hits, &s.refl.mem, &s.refl.index);
+    assert_eq!(
+        got,
+        vec![
+            (ANALYZER.to_string(), HookAvail::Available),
+            (DRAG.to_string(), HookAvail::Available),
+            (BRAIN.to_string(), HookAvail::Available),
+        ]
+    );
+    s.rt.enable(&mut s.engine, ANALYZER, None).unwrap();
+    s.rt.enable(&mut s.engine, DRAG, None).unwrap();
+    let spans = cave_spans(&s);
+    assert_eq!(spans.len(), 3);
+    assert!(spans.contains(&brain_cave));
+    assert!(spans.windows(2).all(|w| w[0].1 <= w[1].0), "{spans:x?}");
+    // O Brain Power segue sob controle do runtime novo.
+    s.rt.set_value(&mut s.engine, BRAIN, 2).unwrap();
+    s.set_points(0);
+    s.gain(10);
+    assert_eq!(s.points(), 50);
+}
+
+#[test]
+fn a_cave_without_its_hook_is_recognized_and_reused() {
+    let mut s = scene();
+    s.resolve();
+    s.rt.enable(&mut s.engine, BRAIN, None).unwrap();
+    s.rt.disable(&mut s.engine, BRAIN).unwrap();
+    let brain_cave = cave_spans(&s)[0];
+    // Reconectou com o cheat desligado: a cave continua no jogo, sem desvio.
+    s.rt = HookRuntime::new(make_env(&s.rig));
+    assert!(s.rt.recognize_installed(&s.engine, &s.defs).is_empty());
+    let got = s.resolve();
+    assert!(got.values().all(|a| *a == HookAvail::Available), "{got:?}");
+    // Os outros desvios não caem em cima dela.
+    s.rt.enable(&mut s.engine, ANALYZER, None).unwrap();
+    s.rt.enable(&mut s.engine, DRAG, None).unwrap();
+    // Religar o Brain Power reaproveita a cave: entra só o desvio, no mesmo lugar.
+    s.rt.enable(&mut s.engine, BRAIN, Some(2)).unwrap();
+    let spans = cave_spans(&s);
+    assert_eq!(spans.len(), 3, "{spans:x?}");
+    assert!(spans.contains(&brain_cave));
+    assert!(spans.windows(2).all(|w| w[0].1 <= w[1].0), "{spans:x?}");
+    s.set_points(0);
+    s.gain(10);
+    assert_eq!(s.points(), 50);
     s.engine.undo_all().unwrap();
 }
 

@@ -798,6 +798,16 @@ impl Engine {
             .collect()
     }
 
+    /// Trechos das caves que o motor tem no jogo: as ativas e as pendentes (uma cave que ficou
+    /// com thread dentro). Quem aloca caves os tira do que oferece (`CaveAllocator::reserve`).
+    pub fn cave_ranges(&self) -> Vec<Range<u64>> {
+        self.journal_entries()
+            .iter()
+            .filter(|e| e.kind == PatchKind::Cave)
+            .map(JournalEntry::range)
+            .collect()
+    }
+
     /// Se o jogo já terminou, descarta o registro sem escrever (zera ativos, pendentes e
     /// `stuck`, limpa o diário), como o fim de uma operação com [`Error::ProcessGone`].
     /// Com o jogo vivo, ou se não deu para saber, não faz nada.
