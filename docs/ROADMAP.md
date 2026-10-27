@@ -127,6 +127,7 @@ A fase foi dividida em duas specs:
   jogo com o dono (branch `fase-5-sobrevivencia`). Pendência: confirmar na próxima atualização do jogo que tudo
   continua funcionando sem mudar o trainer.
 - **Spec 006 — o resto da Fase 5:** carga, dano causado, ciência (como ação de somar) e movimento (velocidade, pulos infinitos, gravidade). **Fechada em 2026-10-26**: os seis cheats funcionaram no jogo com o dono (branch `fase-5-progressao`). Com isso a **Fase 5 está fechada**, com a pendência da spec 005: confirmar na próxima atualização do jogo que tudo continua funcionando sem mudar o trainer.
+- **Spec 007 — construção e defesa** (`docs/specs/007-construcao-e-defesa.md`): construir sem ingredientes (sem materiais e construção pronta na hora) e dano recebido (`EnemyDamageMultiplier`), como cheats do mundo pelas configurações do modo de jogo. **Em andamento** (branch `spec-007-construcao`): o código está pronto; falta o teste no jogo com o dono (Tarefa 9). "Multiplicador de defesa" e "construção sem requisitos" seguem na lista da Fase 6 e só saem dela depois que esse teste confirmar que os dois funcionam.
 
 ---
 

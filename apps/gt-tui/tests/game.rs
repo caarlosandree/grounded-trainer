@@ -77,7 +77,7 @@ use std::time::{Duration, Instant};
 use gt_core::journal::Loaded;
 use gt_tui::backend::{JobKind, ReflectionJob};
 
-const FIELDS: [&str; 17] = [
+const FIELDS: [&str; 19] = [
     "vida-infinita",
     "stamina-infinita",
     "comida-infinita",
@@ -95,6 +95,8 @@ const FIELDS: [&str; 17] = [
     "velocidade",
     "pulos-infinitos",
     "gravidade",
+    "construir-sem-ingredientes",
+    "dano-recebido",
 ];
 
 /// Roda um trabalho da tarefa de reflexão nesta thread e junta o resultado na sessão.
@@ -259,6 +261,101 @@ fn game_set_round_trip() {
                 "{id}: {:#x} original {:02x?} escrito {:02x?}",
                 e.addr, e.original, e.written
             );
+            assert_eq!(
+                read(e.addr, e.written.len()),
+                e.written,
+                "{id}: valor no jogo"
+            );
+        }
+        let off = session.field_off(id);
+        assert!(matches!(off, OpOutcome::Done(_)), "{id}: {off:?}");
+        for e in &entries {
+            assert_eq!(
+                read(e.addr, e.original.len()),
+                e.original,
+                "{id}: original de volta"
+            );
+        }
+    }
+    assert!(session.pending_ids().is_empty());
+    assert_eq!(store.peek().unwrap(), Loaded::Missing);
+}
+
+/// Valores de campo em bytes, um por campo do cheat.
+type Bytes = Vec<Vec<u8>>;
+
+/// Cheats do mundo da spec 007 (`construir-sem-ingredientes` e `dano-recebido`): liga e desliga cada
+/// um com o jogo aberto, confere o valor escrito nas configurações do modo e, no fim, que os
+/// originais voltaram: `bRecipesRequireIngredients = true`, `bAutoCompleteBuildings = false` e
+/// `EnemyDamageMultiplier = 1.0` (spec 007, 9).
+#[test]
+#[ignore = "exige o jogo aberto e escreve nele (faça o backup do save antes)"]
+fn world_cheats_toggle_and_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JournalStore::new(dir.path().to_path_buf());
+    let lock = Arc::new(store.lock().unwrap());
+    let mut backend = GameBackend::new(None, store.clone(), lock);
+    let Find::Found(pid) = backend.find() else {
+        panic!("o jogo está aberto?");
+    };
+    let search = (backend.search_fn())(pid, None, None).unwrap();
+    if search.version_key != KNOWN_BUILD {
+        eprintln!("pulado: build diferente ({})", search.version_key);
+        return;
+    }
+    let defaults: Vec<(String, u64)> = search
+        .cheats
+        .iter()
+        .map(|c| (c.id.clone(), c.value.as_ref().map_or(0, |g| g.default_k)))
+        .collect();
+    assert!(matches!(backend.recover(), Recovered::Clean { .. }));
+    let mut session = backend.open(search, true).unwrap();
+    assert!(session.has_engine());
+    run_job(&mut session, JobKind::Index);
+    run_job(&mut session, JobKind::Controller);
+
+    let read = |addr: u64, len: usize| {
+        let mut b = vec![0u8; len];
+        MemReader::new(pid).read_exact(addr, &mut b).unwrap();
+        b
+    };
+    // Valor do jogo esperado de cada campo (da spec 007, 6.1) e o que o cheat escreve.
+    let one = 1.0f32.to_le_bytes().to_vec();
+    let quarter = 0.25f32.to_le_bytes().to_vec();
+    let cases: [(&str, Bytes, Bytes); 2] = [
+        (
+            "construir-sem-ingredientes",
+            vec![vec![1], vec![0]],
+            vec![vec![0], vec![1]],
+        ),
+        ("dano-recebido", vec![one], vec![quarter]),
+    ];
+    for (id, originals, written) in cases {
+        let k = defaults
+            .iter()
+            .find(|(d, _)| d == id)
+            .map_or(0, |(_, k)| *k);
+        let on = session.field_on(id, k);
+        assert!(matches!(on, OpOutcome::Done(_)), "{id}: {on:?}");
+        let report = session.field_tick(&[id.to_string()], Instant::now());
+        assert!(report.notes.is_empty(), "{id}: {:?}", report.notes);
+        let Loaded::Ok(journal) = store.peek().unwrap() else {
+            panic!("{id}: o diário devia ter as entradas do ajuste");
+        };
+        let entries: Vec<_> = journal
+            .data
+            .iter()
+            .filter(|e| e.id == id)
+            .cloned()
+            .collect();
+        assert_eq!(entries.len(), originals.len(), "{id}: entradas no diário");
+        for e in &entries {
+            eprintln!(
+                "{id}: {:#x} original {:02x?} escrito {:02x?}",
+                e.addr, e.original, e.written
+            );
+            assert!(originals.contains(&e.original), "{id}: original do jogo");
+            assert!(written.contains(&e.written), "{id}: valor do cheat");
             assert_eq!(
                 read(e.addr, e.written.len()),
                 e.written,
