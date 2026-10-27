@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use gt_core::mem::test_support::{ImageSegment, PROT_R, PROT_RW, PROT_RX, map_image, write_local};
+use gt_ue::UeLayout;
 use iced_x86::code_asm::{
     CodeAssembler, dword_ptr, eax, edx, esi, ptr, qword_ptr, r11, r14, rax, rbp, rbx, rcx, rdx,
     rsi, rsp, xmm1,
@@ -70,6 +71,8 @@ pub const ITEM_STACK: i32 = 0x2B8;
 pub const INVENTORY_TOTAL: i32 = 0x40;
 /// Contagem (`i32`) de chamadas de `add_item` no inventário.
 pub const INVENTORY_COUNT: i32 = 0x44;
+/// `MaxPowerCapacity` (`i32`) do analisador.
+pub const ANALYZER_MAX_POWER: i32 = 0x980;
 
 // Posições dos objetos dentro da `.data` (deslocamentos a partir do RVA da `.data`).
 const OBJ_RESEARCH: u32 = 0x0000;
@@ -80,6 +83,14 @@ const OBJ_INVENTORY_B: u32 = 0x0D00;
 const OBJ_ANALYZER: u32 = 0x1000;
 const OBJ_ITEM_A: u32 = 0x1A00;
 const OBJ_ITEM_B: u32 = 0x1D00;
+// Na cauda anônima da `.data` (ainda dentro do `VirtualSize`): um objeto de outra classe e as
+// classes sintéticas, com `ClassPrivate` e `SuperStruct` nos offsets de `UeLayout::observed()`.
+const OBJ_OTHER: u32 = 0x2000;
+const OBJ_CLASS_OBJECT: u32 = 0x2A00;
+const OBJ_CLASS_ITEM: u32 = 0x2A80;
+const OBJ_CLASS_ITEM_SUB: u32 = 0x2B00;
+const OBJ_CLASS_ANALYZER: u32 = 0x2B80;
+const OBJ_CLASS_OTHER: u32 = 0x2C00;
 /// Limites iniciais da tabela de níveis (em ordem; os testes podem reescrevê-la).
 pub const LEVEL_LIMITS: [i32; 6] = [100, 300, 700, 1500, 3000, 6000];
 
@@ -133,6 +144,12 @@ pub fn build() -> Result<Image> {
         ("analyzer_obj", OBJ_ANALYZER),
         ("item_a", OBJ_ITEM_A),
         ("item_b", OBJ_ITEM_B),
+        ("other_obj", OBJ_OTHER),
+        ("class_object", OBJ_CLASS_OBJECT),
+        ("class_item", OBJ_CLASS_ITEM),
+        ("class_item_sub", OBJ_CLASS_ITEM_SUB),
+        ("class_analyzer", OBJ_CLASS_ANALYZER),
+        ("class_other", OBJ_CLASS_OTHER),
     ] {
         symbols.push((name, DATA_RVA + off));
     }
@@ -454,6 +471,26 @@ pub fn initial_data(base: u64) -> Vec<(u64, Vec<u8>)> {
         at(OBJ_ITEM_B) + ITEM_STACK as u64,
         5i32.to_le_bytes().to_vec(),
     ));
+    // Classes: `Object` (raiz), `Item` e uma subclasse dele, o analisador e outra classe qualquer.
+    let layout = UeLayout::observed();
+    let class_at = |obj: u32| at(obj) + u64::from(layout.uobject.class);
+    let super_at = |cls: u32| at(cls) + u64::from(layout.ustruct.super_struct);
+    for (cls, parent) in [
+        (OBJ_CLASS_ITEM, OBJ_CLASS_OBJECT),
+        (OBJ_CLASS_ITEM_SUB, OBJ_CLASS_ITEM),
+        (OBJ_CLASS_ANALYZER, OBJ_CLASS_OBJECT),
+        (OBJ_CLASS_OTHER, OBJ_CLASS_OBJECT),
+    ] {
+        writes.push((super_at(cls), at(parent).to_le_bytes().to_vec()));
+    }
+    for (obj, cls) in [
+        (OBJ_ITEM_A, OBJ_CLASS_ITEM),
+        (OBJ_ITEM_B, OBJ_CLASS_ITEM_SUB),
+        (OBJ_ANALYZER, OBJ_CLASS_ANALYZER),
+        (OBJ_OTHER, OBJ_CLASS_OTHER),
+    ] {
+        writes.push((class_at(obj), at(cls).to_le_bytes().to_vec()));
+    }
     writes
 }
 

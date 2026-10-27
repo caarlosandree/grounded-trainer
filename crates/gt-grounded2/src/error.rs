@@ -52,6 +52,11 @@ pub enum Error {
     #[error("padrão incoerente: {reason}")]
     IncoherentPattern { reason: String },
 
+    /// O corpo de uma cave não pôde ser montado (campo da reflexão faltando, instrução do ponto
+    /// com outra forma, erro do montador).
+    #[error("cave não montada: {reason}")]
+    CaveBuild { reason: String },
+
     /// Erro do núcleo; a mensagem é a do próprio erro.
     #[error(transparent)]
     Core(#[from] gt_core::Error),

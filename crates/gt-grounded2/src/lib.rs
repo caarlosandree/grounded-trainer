@@ -1,6 +1,7 @@
 //! Conhecimento específico do Grounded 2: constantes do jogo e regra de casamento do processo.
 
 pub mod catalog;
+pub mod caves;
 pub mod error;
 #[cfg(feature = "write")]
 pub mod fields;
