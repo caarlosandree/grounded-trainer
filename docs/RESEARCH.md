@@ -685,6 +685,46 @@ Build `c935e799-0b27c000`, backup do save feito pelo dono, FLiNG fechado, traine
   descartou relação com o cheat. Se voltar a acontecer construindo muito com o cheat ligado, investigar memória de
   vídeo.
 
+## Sessão de 2026-10-27 (Fase 6): pontos da spec 008
+
+Build `c935e799-0b27c000`, partida carregada, FLiNG fechado. Leitura com `gt scan`, `gt disasm`, `gt ue class` e
+`scratch/p11/instances.py`. O spike da hora (escrita direta, original devolvido) foi feito sem o trainer.
+
+| O quê | Resultado |
+|---|---|
+| **Hora: caminho** | `BP_SurvivalGameState_C` → `SurvivalGameState.CalendarComponent` (`+0x3c0`) → `CalendarComponent` (instância viva com outer `BP_SurvivalGameState_C`; outras duas são dos CDOs `Default__SurvivalGameState` e `Default__BP_SurvivalGameState_C`) |
+| **Hora: campos** | `CurrentTime` (`DoubleProperty`, `+0x170`, segundos de jogo; 1496055 no dia 17, 14:34), `GameToRealTimeRatio` (`FloatProperty`, `+0x18c`, 30), `TimeMultiplier` (`FloatProperty`, `+0x190`, 1,0), `SecondsPerMinute` 60, `MinutesPerHour` 60, `HoursPerDay` 24, `StartGameHour` 7. Logo depois de `+0x170` (fora da reflexão) ficam dia, hora e minuto derivados (`int32` em `+0x178`, `+0x17c`, `+0x180`) |
+| **Hora: código** | `+58c8a0d` `mulss xmm7,[rbx+0x18c]`; `+58c8a2a` `addsd xmm0,[rbx+0x170]` / `movsd [rbx+0x170],xmm0` (o ponto do `aobdaytime` do FLiNG, `rbx` = `CalendarComponent`); em seguida `call +58a8190` recalcula a hora derivada |
+| **Spike: congelar** | `GameToRealTimeRatio = 0`: `CurrentTime` parado por 4 s; devolvido 30, voltou a andar (60 s de jogo em 2 s) |
+| **Spike: +1 hora** | `CurrentTime += 3600`: dia 17 14:46 → 15:47 em 1,5 s; a hora e o minuto derivados foram recalculados pelo jogo |
+| **Brain Power: função** | `+5970e80`, `rcx` = `PartyComponent`, `edx` = ganho. `+5970ec3` `mov esi,[rcx+0x514]` (6 bytes, `ResearchPoints`); `+5970ed0` `lea eax,[rsi+rdx]`; `+5970ed7` `mov [rcx+0x514],eax`. Depois `call +59e1390` devolve um objeto com a tabela de níveis (`[+0x118]` início, `[+0x120]` contagem, `0x30` bytes por nível, limite em `+0x10`); o laço acha o primeiro nível com `antigo < limite ≤ novo` (`+5970f18`, o ponto do `aobresearchlevelup`), faz `inc [rbx+0x518]` (nível) e soma a recompensa em `ScienceFound` (`+0x510`, `add [rbx+0x510],edi` em `+5970f83`). **Sobe no máximo um nível por chamada** |
+| **Analisador** | O padrão do `aobcharges` (`f3 0f 10 89 ?? ?? 00 00 f3 0f 58 ?? f3 0f 5c ?? ?? ?? ?? ?? f3 0f 2d ?? d1 f8 c3`) é único em `+57bd6d0`: é uma função inteira (`movss xmm1,[rcx+0x974]; addss; subss; cvtss2si; sar; ret`), getter arredondado das cargas. `+57bd6c0` é o getter de `MaxPowerCapacity` (`mov eax,[rcx+0x980]; ret`). `ResourceAnalyzerBuilding`: `PowerReservoir` (`+0x940`, 64 bytes), `MaxPowerCapacity` (`+0x980`), `InitialCharges` (`+0x984`), `HoursPerCharge` (`+0x990`) |
+| **Arrastar** | Função `+5bbfe70` (`mov [rsp+8],rbx`, 5 bytes, no começo); argumentos `rcx`, `edx`, `r8`, `r9d`; `+5bbfe8c` `mov rdi,rcx` é o ponto do `aobdragitemamount`. Qual item é o `rcx` não foi confirmado |
+| **Espaço** | `.data` com `VirtualSize` `0x6bbecc` a partir de `0x14a184000`: folga de `0x134` bytes até o fim da página (`0x14a840000`; `0x130` alinhando a 8), numa VMA anônima `rw-p` (`14a41d000-14a840000`) separada da parte mapeada do arquivo |
+
+- Os três desvios da spec 008 usam **uma instrução** de 5+ bytes (`+5970ec3`, `+57bd6d0`, `+5bbfe70`); os do FLiNG
+  em Brain Power e arrastar cobrem duas.
+- Os padrões `aobresearchlevelup` do FLiNG (duas variantes) não acham nada neste build (registrador base mudou para
+  `rbx`, já anotado na Fase 5).
+- **Ponto escolhido para o Brain Power: `+5970ee7`** `mov r14,[rax+0x118]` (7 bytes), logo depois de `call +59e1390`:
+  ali `rbx` = `PartyComponent`, `esi` = valor antigo, `[rbx+0x514]` = novo e `rax` = objeto da tabela, sem precisar
+  de `call` na cave. Padrão `4c 8b b0 ?? ?? 00 00 48 63 80 ?? ?? 00 00 48 8d 0c 40 48 c1 e1 04 49 03 ce 4c 3b f1`:
+  único. `+59e1390` inicializa um estático na primeira chamada (`call +14f5690` com guarda em `+a76aca0`).
+- **Chamadores de `+5970e80`**: um só, `call` em `+5971304` (função `+5971180`), que busca o ganho num mapa por chave
+  (ganho por fonte). Nenhuma referência por ponteiro (vtable).
+- **Arrastar**: padrão do começo da função `48 89 5c 24 08 48 89 6c 24 10 48 89 74 24 18 57 48 83 ec 20 41 8b e9 49
+  8b d8 8b f2 48 8b f9 48 85 c9 74 ?? e8`: único, em `+5bbfe70`.
+- **Coleta (`AddItem`)**: as `UFunction` do `InventoryComponent` têm o `Func` em `+0xd8` (lido por
+  `scratch/p12/funcs.py`, lista `Children` em `UStruct+0x48`, `Next` em `+0x28`). O `execAddItem` (`+5616c30`) chama a
+  interface em `InventoryComponent+0xe0`, entrada `0x50` da vtable: no inventário do jogador (`InventoryComponent`
+  com outer `BP_SurvivalPlayerCharacter_Gellarde_C`) é `+5942240`, ajuste de `this` (`-0xe0`) e `jmp +5941660`
+  (`AddItem` nativo, `rcx` = inventário, `rdx` = item). Outras: `ServerAddItem` `+56185c0`,
+  `ServerCreateAndAddItem` `+5618aa0`, `ServerCraftRecipe` `+5618690`, `ServerTransferItemFrom` `+5619580`.
+  Quem chama o `AddItem` em cada ação do jogo ainda não foi observado.
+- **Espaço para caves** (medido no `.exe` em disco pelo revisor da spec 008): só 4 sequências de `CC` com 64+ bytes
+  na `.text`: RVA `0xdd1cbe` (66), `0xddfd08` (248), `0xdfe8b1` (1871) e `0xe2889a` (102).
+- O motor já confere o `pc` de cada thread durante a pausa (`gt-core/src/patch.rs`, `is_dangerous`).
+
 ## Hipóteses descartadas
 
 - (2026-10-25) "Os patches em `+57BD6D0`/`+5BBFE8C` indicam que as opções de cargas e arrastar item estavam
