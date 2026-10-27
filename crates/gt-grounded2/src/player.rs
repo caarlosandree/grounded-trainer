@@ -499,12 +499,16 @@ fn resolve_field<M: ReadMem + ?Sized>(
             fields,
             kind,
             target,
+            ..
         } => ResolvedRule::Set {
             fields: fields
                 .iter()
                 .map(|name| match kind {
                     FieldKind::Float => float_field(index, mem, object_class, name),
                     FieldKind::Int => int_field(index, mem, object_class, name),
+                    // Até a resolução do `set` de `bool` (spec 007, Tarefa 3) o cheat fica
+                    // indisponível: nunca resolve, logo nunca escreve.
+                    FieldKind::Bool => Err(INCOHERENT.to_string()),
                 })
                 .collect::<Result<_, _>>()?,
             kind: *kind,
@@ -1112,6 +1116,8 @@ pub fn value_is_sane(kind: FieldKind, bytes: [u8; 4]) -> bool {
     let v = match kind {
         FieldKind::Float => f64::from(f32::from_le_bytes(bytes)),
         FieldKind::Int => f64::from(i32::from_le_bytes(bytes)),
+        // Sem leitura de `bool` ainda (Tarefa 3): nenhum valor é são, então nada é escrito.
+        FieldKind::Bool => return false,
     };
     v.is_finite() && (-SANE_LIMIT..=SANE_LIMIT).contains(&v)
 }
@@ -1122,6 +1128,8 @@ pub fn encode_value(kind: FieldKind, v: f64) -> [u8; 4] {
         // `as` satura nos limites do tipo e vira 0 para `NaN`, o que serve ao valor desejado.
         FieldKind::Int => (v.round() as i32).to_le_bytes(),
         FieldKind::Float => (v as f32).to_le_bytes(),
+        // Um byte só: `0x01` para verdadeiro, `0x00` para falso.
+        FieldKind::Bool => [u8::from(v != 0.0), 0, 0, 0],
     }
 }
 
@@ -1425,16 +1433,22 @@ pub(crate) fn format_value(grid: Option<&ValueGrid>, kind: FieldKind, v: f64) ->
         None => match kind {
             FieldKind::Int => format!("{v:.0}"),
             FieldKind::Float => format!("{v}"),
+            FieldKind::Bool => (v != 0.0).to_string(),
         },
     }
 }
 
 /// Os 4 bytes de um campo como número (para mostrar).
 pub(crate) fn decode_value(kind: FieldKind, bytes: &[u8]) -> f64 {
+    // O `bool` ocupa um byte só: o primeiro.
+    if kind == FieldKind::Bool {
+        return f64::from(bytes.first().copied().unwrap_or_default());
+    }
     let raw: [u8; 4] = bytes.try_into().unwrap_or_default();
     match kind {
         FieldKind::Int => f64::from(i32::from_le_bytes(raw)),
         FieldKind::Float => f64::from(f32::from_le_bytes(raw)),
+        FieldKind::Bool => f64::from(raw[0]),
     }
 }
 

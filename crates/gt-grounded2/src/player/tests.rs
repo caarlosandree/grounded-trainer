@@ -1177,6 +1177,7 @@ fn set_def(
             fields: fields.iter().map(|s| s.to_string()).collect(),
             kind,
             target: Some(target),
+            bools: None,
         },
     }
 }
@@ -1516,6 +1517,18 @@ fn plan_set_nan_and_negative_zero() {
 fn encode_value_is_little_endian() {
     assert_eq!(encode_value(FieldKind::Int, 1000.0), 1000i32.to_le_bytes());
     assert_eq!(encode_value(FieldKind::Float, 0.5), 0.5f32.to_le_bytes());
+}
+
+#[test]
+fn bool_kind_is_inert_until_resolution_exists() {
+    // Até a Tarefa 3 nenhum byte de `bool` é são, então nada é escrito.
+    assert!(!value_is_sane(FieldKind::Bool, [0, 0, 0, 0]));
+    assert!(!value_is_sane(FieldKind::Bool, [1, 0, 0, 0]));
+    assert_eq!(encode_value(FieldKind::Bool, 1.0), [1, 0, 0, 0]);
+    assert_eq!(encode_value(FieldKind::Bool, 0.0), [0, 0, 0, 0]);
+    assert_eq!(decode_value(FieldKind::Bool, &[1]), 1.0);
+    assert_eq!(format_value(None, FieldKind::Bool, 1.0), "true");
+    assert_eq!(format_value(None, FieldKind::Bool, 0.0), "false");
 }
 
 #[test]

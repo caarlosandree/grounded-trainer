@@ -418,3 +418,38 @@ step = 0.1
 default = 0.5
 unit = "x"
 decimals = 1
+
+# Spec 007: cheats do mundo, lidos e escritos no GameModeSettings do GameState.
+[[field]]
+id = "construir-sem-ingredientes"
+name = "Construir sem ingredientes"
+category = "itens"
+description = "Constrói e crafta sem gastar ingredientes; os valores originais voltam ao desligar"
+object = "SurvivalModeManagerComponent.GameModeSettings"
+object_class = "/Script/Maine.SurvivalGameModeSettings"
+root = "game_state"
+rule = "set"
+fields = ["bRecipesRequireIngredients", "bAutoCompleteBuildings"]
+kind = "bool"
+bools = [false, true]
+
+[[field]]
+id = "dano-recebido"
+name = "Dano recebido"
+category = "sobrevivencia"
+description = "Multiplica o dano dos inimigos no jogador; o original volta ao desligar"
+object = "SurvivalModeManagerComponent.GameModeSettings"
+object_class = "/Script/Maine.SurvivalGameModeSettings"
+root = "game_state"
+rule = "set"
+fields = ["EnemyDamageMultiplier"]
+kind = "float"
+
+[field.value]
+type = "f32"
+min = 0
+max = 1
+step = 0.05
+default = 0.25
+unit = "x"
+decimals = 2

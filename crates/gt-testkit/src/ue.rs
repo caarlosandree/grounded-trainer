@@ -462,6 +462,7 @@ fn set_rule(fields: &[&str], kind: FieldKind, target: Option<f64>) -> FieldRule 
         fields: fields.iter().map(|f| f.to_string()).collect(),
         kind,
         target,
+        bools: None,
     }
 }
 

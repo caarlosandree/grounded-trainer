@@ -23,6 +23,8 @@ use crate::GAME_EXE;
 use crate::error::{Error, Result};
 
 const GENERIC_FILE: &str = "generic.toml";
+/// Motivo da recusa de `bools` fora de `rule = "set"` com `kind = "bool"` (spec 007, 6.4).
+const BOOLS_ONLY: &str = "só vale com rule = \"set\" e kind = \"bool\"";
 
 /// Arquivos embutidos: nome e conteúdo.
 const EMBEDDED: &[(&str, &str)] = &[
@@ -179,10 +181,12 @@ pub enum FieldKind {
     Float,
     /// `IntProperty` (4 bytes, com sinal).
     Int,
+    /// `BoolProperty` de byte inteiro (1 byte, `0` ou `1`; spec 007, 6.4).
+    Bool,
 }
 
 /// Raiz do caminho até o objeto de um `[[field]]` (spec 006, 6.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum FieldRoot {
     /// O personagem (padrão, como na spec 005).
     #[default]
@@ -205,11 +209,14 @@ pub enum FieldRule {
     /// Limpa os bits dos campos `bool`, restaurando o original ao desligar.
     ClearBits { fields: Vec<String> },
     /// Escreve o mesmo valor nos campos e devolve o original ao desligar (spec 006, 6.4). Com
-    /// `[field.value]` o `target` é `None`; com `target` constante o `value` é `None`.
+    /// `[field.value]` o `target` é `None`; com `target` constante o `value` é `None`. Com
+    /// `kind = Bool` o valor de cada campo vem de `bools` (mesmo tamanho de `fields`); nos outros
+    /// `bools` é `None` (spec 007, 6.4).
     Set {
         fields: Vec<String>,
         kind: FieldKind,
         target: Option<f64>,
+        bools: Option<Vec<bool>>,
     },
     /// Soma a quantidade da grade a um campo `int`, sem diário nem desfazer (spec 006, 6.6).
     Add { field: String, result_max: i64 },
@@ -417,6 +424,7 @@ struct GenericField {
     root: Option<String>,
     value: Option<ValueBlock>,
     result_max: Option<toml::Value>,
+    bools: Option<Vec<bool>>,
 }
 
 #[derive(Deserialize)]
@@ -1068,6 +1076,8 @@ fn field_number64(
                 return Err(err(format!("{n} não cabe em um f32")));
             }
         }
+        // O `bool` não tem número: `build_field` recusa `target`, `min` e `max` antes de chegar aqui.
+        FieldKind::Bool => return Err(err("kind = \"bool\" não tem número".into())),
     }
     Ok(n)
 }
@@ -1126,6 +1136,9 @@ fn build_field(file: &str, raw: GenericField) -> Result<FieldDef> {
                 if present {
                     return Err(err(field, "não vale com rule = \"lock\""));
                 }
+            }
+            if raw.bools.is_some() {
+                return Err(err("bools", BOOLS_ONLY));
             }
             let field = match raw.field.as_deref() {
                 None => return Err(err("field", "campo obrigatório ausente")),
@@ -1198,6 +1211,7 @@ fn build_field(file: &str, raw: GenericField) -> Result<FieldDef> {
                 (raw.max.is_some(), "max", "lock"),
                 (raw.value.is_some(), "value", "set"),
                 (raw.result_max.is_some(), "result_max", "add"),
+                (raw.bools.is_some(), "bools", "set\" e kind = \"bool"),
             ] {
                 if present {
                     return Err(err(field, &format!("só vale com rule = \"{only}\"")));
@@ -1229,12 +1243,42 @@ fn build_field(file: &str, raw: GenericField) -> Result<FieldDef> {
                 None => return Err(err("kind", "campo obrigatório ausente")),
                 Some("float") => FieldKind::Float,
                 Some("int") => FieldKind::Int,
+                Some("bool") => FieldKind::Bool,
                 Some(other) => {
-                    return Err(err("kind", &format!("`{other}` não é int nem float (set)")));
+                    return Err(err(
+                        "kind",
+                        &format!("`{other}` não é int, float nem bool (set)"),
+                    ));
                 }
             };
             let fields = field_names(file, id, raw.fields)?;
+            let bools_given = raw.bools.is_some();
+            let mut bools = None;
             let target = match (raw.value.as_ref(), raw.target.as_ref()) {
+                _ if kind == FieldKind::Bool => {
+                    // O valor de cada campo vem de `bools`: nada de grade, alvo nem faixa.
+                    for (present, field) in [
+                        (raw.value.is_some(), "value"),
+                        (raw.target.is_some(), "target"),
+                        (raw.min.is_some(), "min"),
+                        (raw.max.is_some(), "max"),
+                    ] {
+                        if present {
+                            return Err(err(field, "não vale com kind = \"bool\""));
+                        }
+                    }
+                    match raw.bools {
+                        None => return Err(err("bools", "obrigatório com kind = \"bool\"")),
+                        Some(list) if list.len() != fields.len() => {
+                            return Err(err(
+                                "bools",
+                                &format!("{} valores para {} campos", list.len(), fields.len()),
+                            ));
+                        }
+                        Some(list) => bools = Some(list),
+                    }
+                    None
+                }
                 (Some(_), Some(_)) => {
                     return Err(err("target", "value e target não podem vir juntos"));
                 }
@@ -1249,7 +1293,7 @@ fn build_field(file: &str, raw: GenericField) -> Result<FieldDef> {
                     }
                     let expected = match kind {
                         FieldKind::Int => ValueType::I32,
-                        FieldKind::Float => ValueType::F32,
+                        FieldKind::Float | FieldKind::Bool => ValueType::F32,
                     };
                     value = Some(build_field_grid(file, id, block, expected)?);
                     None
@@ -1273,10 +1317,14 @@ fn build_field(file: &str, raw: GenericField) -> Result<FieldDef> {
                     Some(t)
                 }
             };
+            if kind != FieldKind::Bool && bools_given {
+                return Err(err("bools", BOOLS_ONLY));
+            }
             FieldRule::Set {
                 fields,
                 kind,
                 target,
+                bools,
             }
         }
         Some("add") => {
@@ -1291,6 +1339,9 @@ fn build_field(file: &str, raw: GenericField) -> Result<FieldDef> {
                 if present {
                     return Err(err(field, "não vale com rule = \"add\""));
                 }
+            }
+            if raw.bools.is_some() {
+                return Err(err("bools", BOOLS_ONLY));
             }
             let field = match raw.field.as_deref() {
                 None => return Err(err("field", "campo obrigatório ausente")),
@@ -1341,8 +1392,11 @@ fn build_field(file: &str, raw: GenericField) -> Result<FieldDef> {
     };
 
     if root == FieldRoot::GameState {
-        if !matches!(rule, FieldRule::Add { .. }) {
-            return Err(err("root", "game_state só vale com rule = \"add\""));
+        if !matches!(rule, FieldRule::Add { .. } | FieldRule::Set { .. }) {
+            return Err(err(
+                "root",
+                "game_state só vale com rule = \"add\" ou \"set\"",
+            ));
         }
         if raw.object == "pawn" {
             return Err(err(
@@ -1369,7 +1423,7 @@ fn build_field(file: &str, raw: GenericField) -> Result<FieldDef> {
 /// guardaria o valor do outro como original).
 fn check_field_set(file: &str, fields: &[FieldDef], ue: Option<&GenericUe>) -> Result<()> {
     let has_game_state = ue.is_some_and(|ue| ue.player.game_state.is_some());
-    let mut sets: HashSet<(&str, &str)> = HashSet::new();
+    let mut sets: HashSet<(FieldRoot, &str, &str)> = HashSet::new();
     for def in fields {
         if def.root == FieldRoot::GameState && !has_game_state {
             return Err(sig_err(
@@ -1383,7 +1437,7 @@ fn check_field_set(file: &str, fields: &[FieldDef], ue: Option<&GenericUe>) -> R
         }
         if let FieldRule::Set { fields: names, .. } = &def.rule {
             for name in names {
-                if !sets.insert((def.object.as_str(), name.as_str())) {
+                if !sets.insert((def.root, def.object.as_str(), name.as_str())) {
                     return Err(sig_err(
                         file,
                         "fields",
@@ -1893,7 +1947,8 @@ offset = 3
                 "pet-stamina-infinita",
             ]
         );
-        assert_eq!(ids.len(), 17);
+        // Os dois cheats do mundo (spec 007) vêm depois, conferidos em `real_generic_has_world_cheats`.
+        assert_eq!(ids.len(), 19);
         let category = |id: &str| {
             if id.starts_with("pet-") {
                 Category::Pet
@@ -3111,6 +3166,7 @@ game_state_class = "/Script/Maine.InGameGameState"
                 fields: vec!["Capacity".into()],
                 kind: FieldKind::Int,
                 target: None,
+                bools: None,
             }
         );
         let grid = def.value.unwrap();
@@ -3184,14 +3240,93 @@ game_state_class = "/Script/Maine.InGameGameState"
         assert_eq!(field_err(&max), "max");
     }
 
+    /// `set` de `bool` (spec 007, 6.4): `bools` do tamanho de `fields`, sem grade nem faixa.
+    const SET_BOOL: &str = r#"
+[[field]]
+id = "construir"
+name = "Construir sem ingredientes"
+category = "itens"
+description = "Constrói sem ingredientes"
+object = "pawn"
+object_class = "/Script/Engine.Character"
+rule = "set"
+fields = ["A", "B"]
+kind = "bool"
+bools = [false, true]
+"#;
+
     #[test]
-    fn set_bool_refused() {
+    fn set_bool_with_bools_loads() {
+        let def = only_field(SET_BOOL);
+        assert_eq!(def.value, None);
         assert_eq!(
-            field_err(&SET_TARGET.replace("kind = \"int\"", "kind = \"bool\"")),
+            def.rule,
+            FieldRule::Set {
+                fields: vec!["A".into(), "B".into()],
+                kind: FieldKind::Bool,
+                target: None,
+                bools: Some(vec![false, true]),
+            }
+        );
+    }
+
+    #[test]
+    fn set_bool_refusals() {
+        // Sem `bools`.
+        assert_eq!(
+            field_err(&SET_BOOL.replace("bools = [false, true]\n", "")),
+            "bools"
+        );
+        // Tamanho diferente de `fields`.
+        assert_eq!(
+            field_err(&SET_BOOL.replace("bools = [false, true]", "bools = [false]")),
+            "bools"
+        );
+        // Com grade.
+        let value = format!(
+            "{SET_BOOL}\n[field.value]\ntype = \"f32\"\nmin = 0\nmax = 1\nstep = 1\ndefault = 0\n"
+        );
+        assert_eq!(field_err(&value), "value");
+        // Com `target`, `min` ou `max`.
+        let with = |extra: &str| {
+            SET_BOOL.replace(
+                "bools = [false, true]\n",
+                &format!("bools = [false, true]\n{extra}"),
+            )
+        };
+        assert_eq!(field_err(&with("target = 1\n")), "target");
+        assert_eq!(field_err(&with("min = 0\n")), "min");
+        assert_eq!(field_err(&with("max = 1\n")), "max");
+        // `bools` com outro `kind`.
+        let int = SET_TARGET.replace("max = 1000\n", "max = 1000\nbools = [true]\n");
+        assert_eq!(field_err(&int), "bools");
+        let float = SET_VALUE.replace("kind = \"int\"\n", "kind = \"float\"\nbools = [true]\n");
+        assert_eq!(
+            field_err(&float.replace("type = \"i32\"", "type = \"f32\"")),
+            "bools"
+        );
+        // `bools` em `lock`, `clear_bits` e `add`.
+        assert_eq!(
+            field_err(
+                &LOCK_FIELD.replace("kind = \"float\"\n", "kind = \"float\"\nbools = [true]\n")
+            ),
+            "bools"
+        );
+        assert_eq!(
+            field_err(
+                &BITS_FIELD.replace("kind = \"bool\"\n", "kind = \"bool\"\nbools = [true]\n")
+            ),
+            "bools"
+        );
+        let add = ADD_FIELD.replace("kind = \"int\"\n", "kind = \"int\"\nbools = [true]\n");
+        assert_eq!(field_err(&with_ue(&add, true)), "bools");
+        // `kind` ausente ou desconhecido continua recusado.
+        assert_eq!(
+            field_err(&SET_TARGET.replace("kind = \"int\"\n", "")),
             "kind"
         );
         assert_eq!(
-            field_err(&SET_TARGET.replace("kind = \"int\"\n", "")),
+            field_err(&SET_TARGET.replace("kind = \"int\"", "kind = \"double\"")),
             "kind"
         );
     }
@@ -3451,10 +3586,33 @@ game_state_class = "/Script/Maine.InGameGameState"
     }
 
     #[test]
-    fn game_state_only_with_add() {
+    fn game_state_with_add_or_set() {
+        // `set` (inclusive `bool`) e `add` valem no `game_state`.
         let root = "kind = \"int\"\nroot = \"game_state\"\n";
         let set = SET_VALUE.replace("kind = \"int\"\n", root);
-        assert_eq!(field_err(&with_ue(&set, true)), "root");
+        assert_eq!(
+            only_field_in(&with_ue(&set, true)).root,
+            FieldRoot::GameState
+        );
+        let bool_set = SET_BOOL.replace(
+            "kind = \"bool\"\n",
+            "kind = \"bool\"\nroot = \"game_state\"\n",
+        );
+        let bool_set = bool_set.replace("object = \"pawn\"", "object = \"Settings\"");
+        let def = only_field_in(&with_ue(&bool_set, true));
+        assert_eq!(def.root, FieldRoot::GameState);
+        assert!(matches!(
+            def.rule,
+            FieldRule::Set {
+                kind: FieldKind::Bool,
+                ..
+            }
+        ));
+        assert_eq!(
+            only_field_in(&with_ue(ADD_FIELD, true)).root,
+            FieldRoot::GameState
+        );
+        // `lock` e `clear_bits` não.
         let lock = LOCK_FIELD.replace(
             "kind = \"float\"\n",
             "kind = \"float\"\nroot = \"game_state\"\n",
@@ -3465,6 +3623,36 @@ game_state_class = "/Script/Maine.InGameGameState"
             "kind = \"bool\"\nroot = \"game_state\"\n",
         );
         assert_eq!(field_err(&with_ue(&bits, true)), "root");
+        // `object = "pawn"` com `game_state` continua recusado, também no `set`.
+        let pawn = SET_BOOL.replace(
+            "kind = \"bool\"\n",
+            "kind = \"bool\"\nroot = \"game_state\"\n",
+        );
+        assert_eq!(field_err(&with_ue(&pawn, true)), "object");
+    }
+
+    #[test]
+    fn same_object_in_other_root_is_not_a_duplicate() {
+        let in_pawn = SET_VALUE.replace("object = \"HaulingComponent\"", "object = \"Comum\"");
+        let in_state = in_pawn
+            .replace("id = \"carga\"", "id = \"carga-2\"")
+            .replace(
+                "kind = \"int\"\n",
+                "kind = \"int\"\nroot = \"game_state\"\n",
+            );
+        let both = with_ue(&format!("{in_pawn}{in_state}"), true);
+        let sigs = parse(&[("generic.toml", &both)]).unwrap();
+        assert_eq!(sigs.fields().len(), 2);
+        // Na mesma raiz continua recusado.
+        let twice = with_ue(
+            &format!("{in_state}{}", in_state.replace("carga-2", "carga-3")),
+            true,
+        );
+        assert_eq!(field_err(&twice), "fields");
+        assert_eq!(
+            field_err(&format!("{in_pawn}{}", in_pawn.replace("carga", "carga-3"))),
+            "fields"
+        );
     }
 
     #[test]
@@ -3532,7 +3720,7 @@ game_state_class = "/Script/Maine.InGameGameState"
     #[test]
     fn real_generic_toml_loads_six_new_fields() {
         let sigs = Signatures::embedded().unwrap();
-        let fields = &sigs.fields()[11..];
+        let fields = &sigs.fields()[11..17];
         let ids: Vec<&str> = fields.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -3550,6 +3738,7 @@ game_state_class = "/Script/Maine.InGameGameState"
             fields: names.iter().map(|n| n.to_string()).collect(),
             kind,
             target,
+            bools: None,
         };
         // (object, object_class, root, categoria, regra)
         let expected = [
@@ -3646,5 +3835,60 @@ game_state_class = "/Script/Maine.InGameGameState"
                 game_state_class: "/Script/Maine.InGameGameState".into(),
             })
         );
+    }
+
+    #[test]
+    fn real_generic_has_world_cheats() {
+        let sigs = Signatures::embedded().unwrap();
+        let fields = sigs.fields();
+        assert_eq!(fields.len(), 19);
+        let object = "SurvivalModeManagerComponent.GameModeSettings";
+        let class = "/Script/Maine.SurvivalGameModeSettings";
+
+        let build = &fields[17];
+        assert_eq!(build.id, "construir-sem-ingredientes");
+        assert_eq!(build.category, Category::Itens);
+        assert_eq!(build.root, FieldRoot::GameState);
+        assert_eq!(
+            (build.object.as_str(), build.object_class.as_str()),
+            (object, class)
+        );
+        assert_eq!(build.value, None);
+        assert_eq!(
+            build.rule,
+            FieldRule::Set {
+                fields: vec![
+                    "bRecipesRequireIngredients".into(),
+                    "bAutoCompleteBuildings".into()
+                ],
+                kind: FieldKind::Bool,
+                target: None,
+                bools: Some(vec![false, true]),
+            }
+        );
+
+        let damage = &fields[18];
+        assert_eq!(damage.id, "dano-recebido");
+        assert_eq!(damage.category, Category::Sobrevivencia);
+        assert_eq!(damage.root, FieldRoot::GameState);
+        assert_eq!(
+            (damage.object.as_str(), damage.object_class.as_str()),
+            (object, class)
+        );
+        assert_eq!(
+            damage.rule,
+            FieldRule::Set {
+                fields: vec!["EnemyDamageMultiplier".into()],
+                kind: FieldKind::Float,
+                target: None,
+                bools: None,
+            }
+        );
+        let grid = damage.value.as_ref().unwrap();
+        assert_eq!(grid.ty, ValueType::F32);
+        assert_eq!((grid.min, grid.max, grid.step), (0.0, 1.0, 0.05));
+        assert!((grid.value(grid.default_k) - 0.25).abs() < 1e-9);
+        assert_eq!(grid.unit.as_deref(), Some("x"));
+        assert_eq!(grid.decimals, 2);
     }
 }
