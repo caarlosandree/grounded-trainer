@@ -56,7 +56,8 @@ lê a spec e este plano.
   `Quantidade ao arrastar: expirou`, `armado: <N>`, `Pular 1 hora: não pegou, aperte de novo`,
   `(o relógio andou mais que o esperado)`, `+1h`.
 - **Git:** branch `spec-008-code-caves` no worktree `../grounded-trainer-f6`. Commit por tarefa, depois da validação
-  verde, em Conventional Commits pt-BR. A Tarefa 14 só começa depois de a 007 estar na `main` (rebase do branch).
+  verde, em Conventional Commits pt-BR. O branch está rebaseado sobre o `spec-007-construcao`; antes de mesclar na
+  `main`, a 007 entra primeiro.
 - **Tarefas com o jogo** (10 e 17) rodam na sessão principal, com o dono, FLiNG fechado e **backup do save** pedido
   antes. Nunca `sudo` nem mudar o `ptrace_scope`.
 - **Despacho** (`CLAUDE.md` global): Tarefas 1, 9 e 16 → `haiku`/`sonnet`; 2, 3, 5, 6, 7, 11, 13, 14 e 15 →
@@ -420,7 +421,8 @@ Com backup do save e o FLiNG fechado, usando o `gt-patch observe`:
 
 **Spec:** 6.8.1.
 
-- [ ] **Step 0:** `git rebase main` com a 007 mesclada; resolver conflitos; validação verde.
+- [ ] **Step 0:** o branch já está sobre o `spec-007-construcao` (`5a91236`). Se a 007 tiver commits novos (ou já
+  estiver na `main`), `git rebase spec-007-construcao` (ou `main`); resolver conflitos; validação verde.
 - [ ] **Step 1: teste** `freeze_time_set_and_restore` (calendário sintético: `GameToRealTimeRatio` 30 → 0, desligar
   → 30; jogo mudando o campo vira original novo, regra da 006).
 - [ ] **Step 2–4:** `[[field]] congelar-hora` (`set`, `kind = "float"`, `target = 0.0`, mesmo salto da Tarefa 13);
