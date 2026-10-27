@@ -269,6 +269,23 @@ pub fn data_key(e: &DataEntry) -> (&str, u64) {
     (e.id.as_str(), e.addr)
 }
 
+/// Região de variáveis das caves na folga da `.data` (spec 008, 6.4): o diário guarda só o
+/// endereço e o tamanho, nunca os valores. Na saída e na recuperação a região inteira volta a zeros.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VarRegion {
+    #[serde(with = "hex_addr")]
+    pub addr: u64,
+    /// Tamanho em bytes.
+    pub len: u64,
+}
+
+impl VarRegion {
+    /// Intervalo de endereços da região.
+    pub fn range(&self) -> Range<u64> {
+        self.addr..self.addr.saturating_add(self.len)
+    }
+}
+
 /// Conteúdo do diário: identidade do processo e os patches ativos.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Journal {
@@ -282,6 +299,9 @@ pub struct Journal {
     /// Bits limpos em dados (Fase 5). Diários antigos não têm a chave.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub data: Vec<DataEntry>,
+    /// Regiões de variáveis das caves (spec 008). Diários antigos não têm a chave.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vars: Vec<VarRegion>,
 }
 
 /// Resultado da leitura do diário.
@@ -649,6 +669,7 @@ mod tests {
             paused_by_us: false,
             entries,
             data: Vec::new(),
+            vars: Vec::new(),
         }
     }
 
@@ -750,6 +771,28 @@ mod tests {
         let text = serde_json::to_string(&with).unwrap();
         assert!(text.contains("\"data\""), "{text}");
         assert!(text.contains("\"0x7fff0000011d\""), "{text}");
+        assert_eq!(serde_json::from_str::<Journal>(&text).unwrap(), with);
+    }
+
+    #[test]
+    fn old_journal_without_vars_reads() {
+        let j = journal(vec![entry(&[0x48], &[0x90])]);
+        let text = serde_json::to_string(&j).unwrap();
+        assert!(!text.contains("\"vars\""), "{text}");
+        // Diário antigo (sem a chave) carrega com `vars` vazio.
+        let back: Journal = serde_json::from_str(&text).unwrap();
+        assert!(back.vars.is_empty());
+        // Com a região, a chave aparece, o endereço é hexadecimal e o diário volta igual.
+        let with = Journal {
+            vars: vec![VarRegion {
+                addr: 0x1_4a41_d000,
+                len: 280,
+            }],
+            ..j
+        };
+        let text = serde_json::to_string(&with).unwrap();
+        assert!(text.contains("\"vars\""), "{text}");
+        assert!(text.contains("\"0x14a41d000\""), "{text}");
         assert_eq!(serde_json::from_str::<Journal>(&text).unwrap(), with);
     }
 

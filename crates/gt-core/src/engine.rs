@@ -46,6 +46,16 @@
 //! resolver (senão o desvio ainda aponta para ela): ela fica no registro como pendente e no
 //! diário. A cave que não pôde ser desfeita (`ThreadsInPatch`) também vira pendente.
 //!
+//! # Variáveis das caves (spec 008, 6.4)
+//!
+//! Um terceiro tipo de escrita, **sem pausa**: a folga entre o fim da `.data` e o fim da página,
+//! que [`Engine::claim_vars`] reclama (região `rw-` no `maps`, toda zerada, gravada no diário
+//! antes de qualquer escrita). [`Engine::write_var`] e [`Engine::read_var`] só tocam dentro
+//! dela. O diário guarda a região, não os valores. No fim do [`Engine::undo_all`], no `Drop` e
+//! na recuperação a região inteira volta a zeros ([`Engine::clear_vars`]), **se** nenhum
+//! desvio (`Code`) nosso está ativo ou pendente e o `maps` ainda mostra a região `rw-`;
+//! senão ela fica no diário. Toda cave é segura com as variáveis zeradas.
+//!
 //! # Escrita em dados (spec 005, 6.6)
 //!
 //! Um segundo tipo de escrita, **sem pausa**: campos de dados do jogo, numa região permitida
@@ -57,6 +67,7 @@
 //! recuperação devolvem os bits da máscara (ou o valor inteiro) ao original ([`decide_data`]).
 //! Uma entrada viva por par (`id`, endereço) ([`data_key`]).
 
+use std::ops::Range;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -64,7 +75,7 @@ use nix::sys::signal::Signal;
 
 use crate::journal::{
     DataAction, DataEntry, DataMode, EntryAction, GuardBytes, Journal, JournalEntry, JournalLock,
-    JournalStore, data_key, decide_data, decide_entry,
+    JournalStore, VarRegion, data_key, decide_data, decide_entry,
 };
 use crate::maps::{MapRegion, read_maps};
 use crate::mem::{MemWriter, Pidfd};
@@ -92,6 +103,9 @@ pub const CAVE_PAUSE_ATTEMPTS: u32 = 5;
 
 /// Espera entre as tentativas da pausa ao desfazer caves (spec 008, 6.3).
 pub const CAVE_PAUSE_WAIT: Duration = Duration::from_millis(100);
+
+/// Maior região de variáveis aceita, em bytes (uma página: a folga da `.data` é menor).
+pub const MAX_VARS_LEN: u64 = 4096;
 
 /// Parâmetros do motor.
 #[derive(Debug, Clone)]
@@ -357,6 +371,8 @@ pub struct Engine {
     data_pending: Vec<DataEntry>,
     /// Falha injetada nas escritas em dados (só para testes).
     data_fault: Option<DataFault>,
+    /// Regiões de variáveis reclamadas (spec 008, 6.4), ainda sem zerar.
+    vars: Vec<VarRegion>,
 }
 
 impl Engine {
@@ -407,6 +423,7 @@ impl Engine {
             data: Vec::new(),
             data_pending: Vec::new(),
             data_fault: None,
+            vars: Vec::new(),
         })
     }
 
@@ -426,8 +443,9 @@ impl Engine {
 
     /// Desfaz todos os patches ativos e restaura os bits de todas as entradas de dados (os
     /// restaurados e os já originais vão em `restored`; os descartados, em `foreign`). As
-    /// duas partes são tentadas mesmo que a primeira falhe; o primeiro erro volta. Os patches
-    /// saem em duas fases: os desvios (`Code`) e depois as caves (spec 008, 6.3).
+    /// partes são tentadas mesmo que a anterior falhe; o primeiro erro volta. Os patches
+    /// saem em duas fases: os desvios (`Code`) e depois as caves (spec 008, 6.3). Por último
+    /// as variáveis voltam a zeros ([`Engine::clear_vars`]).
     pub fn undo_all(&mut self) -> Result<BatchReport> {
         self.retry_resume()?;
         let patches = self.undo_all_patches();
@@ -440,8 +458,16 @@ impl Engine {
             let result = self.restore_data_inner(|_| true);
             self.finish(result)
         };
+        // Por último, as variáveis (spec 008, 6.3): só se nenhum desvio nosso continua vivo.
+        let vars = if self.vars.is_empty() {
+            Ok(())
+        } else {
+            let result = self.clear_vars_inner();
+            self.finish(result)
+        };
         let mut report = patches?;
         let data = data?;
+        vars?;
         report.restored.extend(data.restored);
         report.restored.extend(data.dropped);
         report.foreign.extend(data.foreign);
@@ -608,6 +634,65 @@ impl Engine {
         &self.data
     }
 
+    /// Reclama a região de variáveis das caves na folga da `.data` (spec 008, 6.4): confere a
+    /// identidade do processo, que a região inteira é `rw-` (sem execução) no `maps` atual e que
+    /// todos os bytes são zero, e grava a região no diário **antes** de qualquer escrita nela.
+    /// Reclamar de novo a mesma região é um no-op; uma região que a cobre em parte é
+    /// [`Error::BadPatch`]. Que a região é a folga da imagem do jogo quem a calcula garante
+    /// (`gt_grounded2::policy::var_region`).
+    pub fn claim_vars(&mut self, region: Range<u64>) -> Result<()> {
+        self.retry_resume()?;
+        let result = self.claim_vars_inner(region);
+        self.finish(result)
+    }
+
+    /// Escreve `bytes` numa variável, **sem pausa** e sem guarda de objeto: identidade do
+    /// processo → o trecho inteiro dentro de uma região reclamada ([`Error::VarOutsideRegion`])
+    /// → escrita e releitura.
+    pub fn write_var(&mut self, addr: u64, bytes: &[u8]) -> Result<()> {
+        self.retry_resume()?;
+        let result = self.write_var_inner(addr, bytes);
+        self.finish(result)
+    }
+
+    /// Lê `len` bytes de uma variável, só dentro de uma região reclamada
+    /// ([`Error::VarOutsideRegion`]).
+    pub fn read_var(&self, addr: u64, len: usize) -> Result<Vec<u8>> {
+        if !self.in_vars(addr, len) {
+            return Err(Error::VarOutsideRegion { addr });
+        }
+        let mut buf = vec![0u8; len];
+        self.writer.read_exact(addr, &mut buf)?;
+        Ok(buf)
+    }
+
+    /// Regiões de variáveis reclamadas e ainda não zeradas.
+    pub fn vars(&self) -> &[VarRegion] {
+        &self.vars
+    }
+
+    /// Põe regiões vindas do diário (a recuperação) entre as reclamadas, **sem** ler nem
+    /// escrever: elas passam a constar do diário que o motor grava e [`Engine::clear_vars`] as
+    /// zera quando nenhum desvio nosso continua vivo.
+    pub fn adopt_vars(&mut self, regions: &[VarRegion]) {
+        for r in regions {
+            if !self.vars.contains(r) {
+                self.vars.push(*r);
+            }
+        }
+    }
+
+    /// Zera todas as regiões de variáveis (spec 008, 6.4), **se** nenhum desvio (`Code`) nosso
+    /// está ativo ou pendente, a identidade do processo bate e o `maps` ainda mostra a região
+    /// `rw-`. Não confere os valores (ninguém mais usa a folga). Quando alguma condição falha, a
+    /// região fica no registro e no diário e nada é escrito. Uma escrita que falha mantém a
+    /// região e devolve o primeiro erro. Sem pausa.
+    pub fn clear_vars(&mut self) -> Result<()> {
+        self.retry_resume()?;
+        let result = self.clear_vars_inner();
+        self.finish(result)
+    }
+
     /// Troca os bytes do patch ativo `id` por `new` numa pausa (spec 003 6.7).
     ///
     /// Os bytes originais continuam sendo os de antes do patch; `new` precisa ter o mesmo
@@ -764,6 +849,7 @@ impl Engine {
             self.pending.clear();
             self.data.clear();
             self.data_pending.clear();
+            self.vars.clear();
             self.stuck = false;
             if let Err(e) = self.store.clear() {
                 tracing::error!(erro = %e, "falha ao limpar o diário");
@@ -1187,6 +1273,117 @@ impl Engine {
             Some(err) => Err(err),
             None => Ok(report),
         }
+    }
+
+    /// O trecho `[addr, addr + len)` cabe inteiro numa região de variáveis reclamada.
+    fn in_vars(&self, addr: u64, len: usize) -> bool {
+        let Some(end) = addr.checked_add(len as u64) else {
+            return false;
+        };
+        len > 0
+            && self
+                .vars
+                .iter()
+                .any(|v| v.addr <= addr && end <= v.range().end)
+    }
+
+    fn claim_vars_inner(&mut self, region: Range<u64>) -> Result<()> {
+        let bad = |reason: String| Error::BadPatch {
+            id: "variáveis".to_owned(),
+            reason,
+        };
+        check_alive(&self.identity)?;
+        let len = region.end.saturating_sub(region.start);
+        if len == 0 || len > MAX_VARS_LEN || !region.start.is_multiple_of(8) {
+            return Err(bad(format!(
+                "região de variáveis {:#x}..{:#x} (1 a {MAX_VARS_LEN} bytes, alinhada a 8)",
+                region.start, region.end
+            )));
+        }
+        let wanted = VarRegion {
+            addr: region.start,
+            len,
+        };
+        if self.vars.contains(&wanted) {
+            return Ok(());
+        }
+        if self
+            .vars
+            .iter()
+            .any(|v| v.addr < region.end && region.start < v.range().end)
+        {
+            return Err(bad("a região se sobrepõe a outra já reclamada".to_owned()));
+        }
+        let maps = read_maps(self.pid)?;
+        if !rw_policy(&maps).allows(&region) {
+            return Err(Error::VarsNotWritable { addr: region.start });
+        }
+        let mut now = vec![0u8; len as usize];
+        match self.writer.read_exact(region.start, &mut now) {
+            Ok(()) => {}
+            Err(Error::Unmapped { .. }) => {
+                return Err(Error::VarsNotWritable { addr: region.start });
+            }
+            Err(e) => return Err(e),
+        }
+        if let Some(i) = now.iter().position(|b| *b != 0) {
+            return Err(Error::VarsNotZero {
+                addr: region.start + i as u64,
+            });
+        }
+        // A região entra no diário antes de qualquer escrita nela.
+        self.vars.push(wanted);
+        if let Err(e) = self.save_journal(false) {
+            self.vars.retain(|v| *v != wanted);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn write_var_inner(&mut self, addr: u64, bytes: &[u8]) -> Result<()> {
+        check_alive(&self.identity)?;
+        if !self.in_vars(addr, bytes.len()) {
+            return Err(Error::VarOutsideRegion { addr });
+        }
+        self.write_verified("variável", addr, bytes)
+    }
+
+    fn clear_vars_inner(&mut self) -> Result<()> {
+        if self.vars.is_empty() {
+            return Ok(());
+        }
+        if self
+            .journal_entries()
+            .iter()
+            .any(|e| e.kind == PatchKind::Code)
+        {
+            tracing::warn!("há desvio ativo ou pendente; as variáveis ficam como estão");
+            return Ok(());
+        }
+        check_alive(&self.identity)?;
+        let maps = read_maps(self.pid)?;
+        let rw = rw_policy(&maps);
+        let mut failed: Option<Error> = None;
+        for v in self.vars.clone() {
+            if !rw.allows(&v.range()) {
+                tracing::warn!(
+                    addr = v.addr,
+                    "a região de variáveis não é mais `rw-`; mantida no diário"
+                );
+                continue;
+            }
+            let zeros = vec![0u8; usize::try_from(v.len).unwrap_or(0)];
+            match self.write_verified("variáveis", v.addr, &zeros) {
+                Ok(()) => self.vars.retain(|x| *x != v),
+                Err(e @ Error::ProcessGone { .. }) => return Err(e),
+                Err(e) => {
+                    tracing::error!(addr = v.addr, erro = %e, "falha ao zerar as variáveis; mantidas no diário");
+                    failed.get_or_insert(e);
+                }
+            }
+        }
+        self.save_final();
+        failed.map_or(Ok(()), Err)
     }
 
     fn apply_inner(&mut self, batch: Vec<Validated>) -> Result<BatchReport> {
@@ -1893,7 +2090,7 @@ impl Engine {
             .chain(self.data_pending.iter())
             .cloned()
             .collect();
-        if entries.is_empty() && data.is_empty() && !paused_by_us {
+        if entries.is_empty() && data.is_empty() && self.vars.is_empty() && !paused_by_us {
             return self.store.clear();
         }
         self.store.save(&Journal {
@@ -1904,6 +2101,7 @@ impl Engine {
             paused_by_us,
             entries,
             data,
+            vars: self.vars.clone(),
         })
     }
 
@@ -1941,7 +2139,7 @@ impl Drop for Engine {
             Err(Error::ProcessGone { .. }) => return,
             Err(e) => tracing::error!(erro = %e, "falha ao retomar o jogo na saída"),
         }
-        if !self.active.is_empty() || !self.data.is_empty() {
+        if !self.active.is_empty() || !self.data.is_empty() || !self.vars.is_empty() {
             match self.undo_all() {
                 Ok(_) => {}
                 Err(Error::ProcessGone { .. }) => return,
@@ -1964,7 +2162,18 @@ impl Drop for Engine {
                 Err(e) => tracing::error!(erro = %e, "falha ao restaurar os bits do diário"),
             }
         }
-        if !self.journal_entries().is_empty() || !self.data_pending.is_empty() {
+        // Depois de resolver o resto: se um desvio pendente saiu agora, as variáveis também.
+        if !self.vars.is_empty() {
+            match self.clear_vars() {
+                Ok(()) => {}
+                Err(Error::ProcessGone { .. }) => return,
+                Err(e) => tracing::error!(erro = %e, "falha ao zerar as variáveis na saída"),
+            }
+        }
+        if !self.journal_entries().is_empty()
+            || !self.data_pending.is_empty()
+            || !self.vars.is_empty()
+        {
             tracing::error!(
                 "alguns patches não puderam ser restaurados; a próxima execução do trainer vai restaurar"
             );
@@ -1988,6 +2197,17 @@ fn entry_of(v: &Validated) -> JournalEntry {
 /// resolver, porque um desvio vivo aponta para a cave.
 fn caves_may_resolve(unresolved: &[JournalEntry]) -> bool {
     unresolved.iter().all(|e| e.kind != PatchKind::Code)
+}
+
+/// Regiões `rw-` privadas (sem execução, sem compartilhamento) do `maps`: onde as variáveis
+/// das caves podem morar.
+fn rw_policy(maps: &[MapRegion]) -> WritePolicy {
+    WritePolicy::new(
+        maps.iter()
+            .filter(|r| r.perms.read && r.perms.write && !r.perms.exec && !r.perms.shared)
+            .map(|r| r.start..r.end)
+            .collect(),
+    )
 }
 
 fn has_lost(v: &Validated, danger: Danger) -> bool {
@@ -2064,6 +2284,37 @@ mod tests {
             replacement: vec![0xCC],
             next: None,
             kind,
+        }
+    }
+
+    #[test]
+    fn rw_policy_takes_private_rw_regions_only() {
+        use crate::maps::{MapPath, Perms};
+        let region = |start: u64, end: u64, r, w, x, shared| MapRegion {
+            start,
+            end,
+            perms: Perms {
+                read: r,
+                write: w,
+                exec: x,
+                shared,
+            },
+            offset: 0,
+            path: MapPath::Anonymous,
+        };
+        let maps = [
+            region(0x1000, 0x2000, true, true, false, false),
+            region(0x2000, 0x3000, true, true, false, false),
+            region(0x3000, 0x4000, true, false, false, false),
+            region(0x4000, 0x5000, true, true, true, false),
+            region(0x5000, 0x6000, true, true, false, true),
+        ];
+        let p = rw_policy(&maps);
+        // Vizinhas `rw-` fundem; leitura, `rwx` e compartilhada ficam de fora.
+        assert!(p.allows(&(0x1ff8..0x2008)));
+        assert!(!p.allows(&(0x2ff8..0x3008)));
+        for out in [0x3000..0x3008, 0x4000..0x4008, 0x5000..0x5008] {
+            assert!(!p.allows(&out), "{out:?}");
         }
     }
 

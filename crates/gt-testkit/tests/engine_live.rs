@@ -2291,3 +2291,335 @@ fn undo_all_and_drop_restore_whole() {
     assert_eq!(word_bytes(&t, obj.word), OLD);
     assert_eq!(env.store.peek().unwrap(), Loaded::Missing);
 }
+
+// ---------------------------------------------------------------------------
+// Variáveis das caves na folga da `.data` (plano 008, tarefa 3)
+// ---------------------------------------------------------------------------
+
+/// Região de variáveis de teste: 280 bytes (o total do orçamento) em `big_region`, que é
+/// `rw-` e zerada.
+fn vars_region(t: &TestTarget) -> Range<u64> {
+    let start = t.big_region + 0x800;
+    start..start + 280
+}
+
+fn vars_in_journal(env: &Env) -> Vec<gt_core::journal::VarRegion> {
+    match env.store.peek().unwrap() {
+        Loaded::Ok(j) => j.vars,
+        Loaded::Missing => Vec::new(),
+        other => panic!("diário inesperado: {other:?}"),
+    }
+}
+
+#[test]
+fn claim_vars_requires_zero() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let region = vars_region(&t);
+    let mut engine = open_engine(t.pid, &env, Vec::new(), None);
+    // Um byte diferente de zero no meio: recusa, sem diário e sem região reclamada.
+    poke(&t, region.start + 100, &[0x01]);
+    let err = engine.claim_vars(region.clone()).unwrap_err();
+    assert!(
+        matches!(err, Error::VarsNotZero { addr } if addr == region.start + 100),
+        "{err:?}"
+    );
+    assert!(engine.vars().is_empty());
+    assert_eq!(env.store.peek().unwrap(), Loaded::Missing);
+    // Zerado: reclama, e a região vai ao diário (só endereço e tamanho).
+    poke(&t, region.start + 100, &[0x00]);
+    engine.claim_vars(region.clone()).unwrap();
+    assert_eq!(
+        vars_in_journal(&env),
+        vec![gt_core::journal::VarRegion {
+            addr: region.start,
+            len: 280
+        }]
+    );
+    // A mesma região de novo é um no-op; uma que a corta em parte é recusada.
+    engine.claim_vars(region.clone()).unwrap();
+    assert_eq!(engine.vars().len(), 1);
+    let err = engine
+        .claim_vars(region.start + 8..region.end + 8)
+        .unwrap_err();
+    assert!(matches!(err, Error::BadPatch { .. }), "{err:?}");
+    assert_eq!(engine.vars().len(), 1);
+}
+
+#[test]
+fn claim_vars_refuses_non_rw_and_bad_shapes() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let mut engine = open_engine(t.pid, &env, Vec::new(), None);
+    // Página executável (`r-x`) e página ilegível (`---`): não são `rw-`.
+    for start in [t.exec2, t.region_start + t.page] {
+        let err = engine.claim_vars(start..start + 64).unwrap_err();
+        assert!(matches!(err, Error::VarsNotWritable { .. }), "{err:?}");
+    }
+    // Trecho que invade a página vizinha não `rw-`.
+    let err = engine
+        .claim_vars(t.region_start + t.page - 8..t.region_start + t.page + 8)
+        .unwrap_err();
+    assert!(matches!(err, Error::VarsNotWritable { .. }), "{err:?}");
+    // Vazia, desalinhada e grande demais.
+    let start = t.big_region + 0x800;
+    for bad in [start..start, start + 4..start + 32, start..start + 4104] {
+        let err = engine.claim_vars(bad).unwrap_err();
+        assert!(matches!(err, Error::BadPatch { .. }), "{err:?}");
+    }
+    assert!(engine.vars().is_empty());
+    assert_eq!(env.store.peek().unwrap(), Loaded::Missing);
+}
+
+#[test]
+fn write_var_outside_region_refused() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let region = vars_region(&t);
+    let mut engine = open_engine(t.pid, &env, Vec::new(), None);
+    // Antes de reclamar, nada é variável.
+    let err = engine.write_var(region.start, &[1]).unwrap_err();
+    assert!(matches!(err, Error::VarOutsideRegion { .. }), "{err:?}");
+    engine.claim_vars(region.clone()).unwrap();
+    // Dentro: escreve e lê de volta.
+    engine
+        .write_var(region.start + 8, &7i32.to_le_bytes())
+        .unwrap();
+    assert_eq!(
+        engine.read_var(region.start + 8, 4).unwrap(),
+        7i32.to_le_bytes()
+    );
+    engine
+        .write_var(region.end - 8, &9u64.to_le_bytes())
+        .unwrap();
+    // Fora (antes, cruzando o fim, depois) e vazia: recusa e não escreve nada.
+    for (addr, len) in [
+        (region.start - 1, 1),
+        (region.end - 4, 8),
+        (region.end, 1),
+        (region.start, 0),
+    ] {
+        let bytes = vec![0xEEu8; len];
+        let err = engine.write_var(addr, &bytes).unwrap_err();
+        assert!(matches!(err, Error::VarOutsideRegion { .. }), "{err:?}");
+        let err = engine.read_var(addr, len).unwrap_err();
+        assert!(matches!(err, Error::VarOutsideRegion { .. }), "{err:?}");
+    }
+    assert_eq!(bytes_at(t.pid, region.start - 1, 1), [0]);
+    assert_eq!(bytes_at(t.pid, region.end - 4, 4), [0, 0, 0, 0]);
+    assert_eq!(bytes_at(t.pid, region.end, 1), [0]);
+}
+
+#[test]
+fn undo_all_zeros_vars_after_caves() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let region = vars_region(&t);
+    let cave_addr = t.exec_page + 0x100;
+    let mut engine = open_engine(
+        t.pid,
+        &env,
+        vec![exec2_range(&t), page_range(&t, t.exec_page)],
+        None,
+    );
+    engine.claim_vars(region.clone()).unwrap();
+    engine.write_var(region.start, &5i32.to_le_bytes()).unwrap();
+    engine.write_var(region.end - 8, &[0xAA; 8]).unwrap();
+    engine
+        .apply(vec![
+            patch("p", t.exec2, &NOP3, &NOP2_NOP),
+            cave("c", cave_addr),
+        ])
+        .unwrap();
+    engine.undo_all().unwrap();
+    assert_eq!(bytes_at(t.pid, region.start, 280), vec![0u8; 280]);
+    assert_eq!(bytes_at(t.pid, cave_addr, 16), vec![0xCC; 16]);
+    assert!(engine.vars().is_empty());
+    assert!(missing(&env));
+    // Já zerada, a região pode ser reclamada de novo.
+    engine.claim_vars(region).unwrap();
+}
+
+#[test]
+fn drop_zeros_vars() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let region = vars_region(&t);
+    {
+        let mut engine = open_engine(t.pid, &env, Vec::new(), None);
+        engine.claim_vars(region.clone()).unwrap();
+        engine.write_var(region.start + 40, &[1; 8]).unwrap();
+        assert_eq!(vars_in_journal(&env).len(), 1);
+    }
+    assert_eq!(bytes_at(t.pid, region.start, 280), vec![0u8; 280]);
+    assert!(missing(&env));
+}
+
+#[test]
+fn vars_not_zeroed_while_code_active() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let region = vars_region(&t);
+    let mut engine = open_engine(t.pid, &env, vec![exec2_range(&t)], None);
+    engine.claim_vars(region.clone()).unwrap();
+    engine.write_var(region.start, &5i32.to_le_bytes()).unwrap();
+    engine
+        .apply(vec![patch("p", t.exec2, &NOP3, &NOP2_NOP)])
+        .unwrap();
+    // Com o desvio ativo, limpar não escreve nada e a região continua no diário.
+    engine.clear_vars().unwrap();
+    assert_eq!(bytes_at(t.pid, region.start, 4), 5i32.to_le_bytes());
+    assert_eq!(engine.vars().len(), 1);
+    assert_eq!(vars_in_journal(&env).len(), 1);
+    // Sem o desvio, zera.
+    engine.undo(&["p"]).unwrap();
+    engine.clear_vars().unwrap();
+    assert_eq!(bytes_at(t.pid, region.start, 4), [0; 4]);
+    assert!(engine.vars().is_empty());
+    assert!(missing(&env));
+}
+
+static DENY_POLICY_VARS: AtomicBool = AtomicBool::new(false);
+
+#[test]
+fn undo_all_and_drop_keep_vars_when_code_cannot_be_undone() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let region = vars_region(&t);
+    let range = exec2_range(&t);
+    let policy: PolicyFn = Box::new(move |_maps| {
+        if DENY_POLICY_VARS.load(Ordering::SeqCst) {
+            WritePolicy::new(Vec::new())
+        } else {
+            WritePolicy::new(vec![range.clone()])
+        }
+    });
+    let opts = EngineOptions {
+        version_key: "teste".into(),
+        pause: PauseConfig::default(),
+    };
+    let mut engine = Engine::open(t.pid, None, env.store.clone(), &env.lock, policy, opts).unwrap();
+    engine.claim_vars(region.clone()).unwrap();
+    engine.write_var(region.start, &5i32.to_le_bytes()).unwrap();
+    engine
+        .apply(vec![patch("p", t.exec2, &NOP3, &NOP2_NOP)])
+        .unwrap();
+    DENY_POLICY_VARS.store(true, Ordering::SeqCst);
+    engine.undo_all().unwrap_err();
+    assert_eq!(bytes_at(t.pid, region.start, 4), 5i32.to_le_bytes());
+    drop(engine);
+    // O desvio ficou (a política recusou): a variável também, e as duas no diário.
+    assert_eq!(bytes_at(t.pid, t.exec2, 3), NOP2_NOP);
+    assert_eq!(bytes_at(t.pid, region.start, 4), 5i32.to_le_bytes());
+    match env.store.peek().unwrap() {
+        Loaded::Ok(j) => {
+            assert_eq!(j.entries.len(), 1);
+            assert_eq!(j.vars.len(), 1);
+        }
+        other => panic!("diário inesperado: {other:?}"),
+    }
+    // A próxima execução (política normal) desfaz o desvio e zera as variáveis.
+    DENY_POLICY_VARS.store(false, Ordering::SeqCst);
+    let report = recover(&env.store, &env.lock, &PauseConfig::default()).unwrap();
+    assert_eq!(report.restored, vec!["p".to_string()], "{report:?}");
+    assert!(report.kept.is_empty(), "{report:?}");
+    assert_eq!(bytes_at(t.pid, t.exec2, 3), NOP3);
+    assert_eq!(bytes_at(t.pid, region.start, 4), [0; 4]);
+    assert!(missing(&env));
+}
+
+#[test]
+fn recovery_zeros_vars_after_crash() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let region = vars_region(&t);
+    let cave_addr = t.exec_page + 0x100;
+    let mut engine = open_engine(
+        t.pid,
+        &env,
+        vec![exec2_range(&t), page_range(&t, t.exec_page)],
+        None,
+    );
+    engine.claim_vars(region.clone()).unwrap();
+    engine.write_var(region.start + 24, &[3; 8]).unwrap();
+    engine
+        .apply(vec![
+            patch("p", t.exec2, &NOP3, &NOP2_NOP),
+            cave("c", cave_addr),
+        ])
+        .unwrap();
+    // Simula o SIGKILL: o motor some sem desfazer nada, o diário fica.
+    std::mem::forget(engine);
+    assert_eq!(vars_in_journal(&env).len(), 1);
+    let report = recover(&env.store, &env.lock, &PauseConfig::default()).unwrap();
+    let mut restored = report.restored.clone();
+    restored.sort();
+    assert_eq!(
+        restored,
+        vec!["c".to_string(), "p".to_string()],
+        "{report:?}"
+    );
+    assert!(report.kept.is_empty(), "{report:?}");
+    assert_eq!(bytes_at(t.pid, t.exec2, 3), NOP3);
+    assert_eq!(bytes_at(t.pid, cave_addr, 16), vec![0xCC; 16]);
+    assert_eq!(bytes_at(t.pid, region.start, 280), vec![0u8; 280]);
+    assert!(missing(&env));
+}
+
+#[test]
+fn recovery_keeps_vars_when_region_is_not_rw_anymore() {
+    let t = TestTarget::spawn();
+    let env = env();
+    // Diário de um processo igual, mas a região já não é `rw-` (página executável).
+    let id = identity(t.pid).unwrap();
+    env.store
+        .save(&gt_core::journal::Journal {
+            boot_id: id.boot_id,
+            pid: id.pid,
+            start_time: id.start_time,
+            version_key: "teste".into(),
+            paused_by_us: false,
+            entries: Vec::new(),
+            data: Vec::new(),
+            vars: vec![gt_core::journal::VarRegion {
+                addr: t.exec2,
+                len: 64,
+            }],
+        })
+        .unwrap();
+    let report = recover(&env.store, &env.lock, &PauseConfig::default()).unwrap();
+    assert_eq!(report.kept, vec!["variáveis".to_string()], "{report:?}");
+    assert_eq!(bytes_at(t.pid, t.exec2, 4), [0x90; 4]);
+    assert_eq!(
+        vars_in_journal(&env),
+        vec![gt_core::journal::VarRegion {
+            addr: t.exec2,
+            len: 64
+        }]
+    );
+}
+
+#[test]
+fn clear_vars_keeps_region_while_code_pending() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let region = vars_region(&t);
+    // A política só cobre a página da cave: o desvio fica fora e continua pendente.
+    let mut engine = open_engine(t.pid, &env, vec![page_range(&t, t.exec_page)], None);
+    engine.claim_vars(region.clone()).unwrap();
+    engine.write_var(region.start, &5i32.to_le_bytes()).unwrap();
+    let code = JournalEntry {
+        id: "p".into(),
+        addr: t.exec2,
+        original: NOP3.to_vec(),
+        replacement: NOP2_NOP.to_vec(),
+        next: None,
+        kind: gt_core::patch::PatchKind::Code,
+    };
+    let report = engine.restore_entries(vec![code]).unwrap();
+    assert_eq!(report.outside_policy, vec!["p".to_string()]);
+    engine.clear_vars().unwrap();
+    assert_eq!(bytes_at(t.pid, region.start, 4), 5i32.to_le_bytes());
+    assert_eq!(engine.vars().len(), 1);
+    assert_eq!(vars_in_journal(&env).len(), 1);
+}

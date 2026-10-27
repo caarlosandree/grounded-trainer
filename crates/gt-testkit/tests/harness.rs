@@ -379,6 +379,7 @@ fn restore_discards_dead_process_journal() {
                 kind: gt_core::patch::PatchKind::Code,
             }],
             data: Vec::new(),
+            vars: Vec::new(),
         })
         .unwrap();
     let out = restore(dir.path());
@@ -421,6 +422,7 @@ fn restore_skips_entry_outside_exec_region() {
                 kind: gt_core::patch::PatchKind::Code,
             }],
             data: Vec::new(),
+            vars: Vec::new(),
         })
         .unwrap();
     let out = restore(dir.path());

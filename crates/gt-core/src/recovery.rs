@@ -13,6 +13,11 @@
 //! com a pausa mais paciente e só se nenhum desvio ficou sem resolver (ver
 //! [`Engine::restore_entries`]).
 //!
+//! As regiões de variáveis das caves (`vars` do diário) entram no motor antes de tudo e só
+//! são zeradas no fim, se nenhum desvio ficou sem resolver e o `maps` ainda as mostra `rw-`
+//! (a recuperação é genérica e não conhece o módulo: vale a identidade do processo do diário).
+//! Região mantida aparece como [`VARS_ID`] em `kept`.
+//!
 //! As entradas de dados (bits, spec 005 6.6; valor inteiro, spec 006 6.8) não passam por essa
 //! política: cada uma é decidida por [`crate::journal::decide_data`], com a guarda do objeto
 //! relida e o intervalo inteiro
@@ -32,6 +37,9 @@ use crate::patch::{MAX_CAVE_LEN, MAX_PATCH_LEN, PatchKind, WritePolicy};
 use crate::procinfo::{Identity, ProcStat, boot_id, read_stat};
 use crate::suspend::{PauseConfig, open_checked};
 use crate::{Error, Result};
+
+/// `id` com que as regiões de variáveis não zeradas aparecem em [`RecoveryReport::kept`].
+pub const VARS_ID: &str = "variáveis";
 
 /// O que a recuperação fez.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -161,7 +169,7 @@ pub fn recover(
         );
         report.foreign.push(e.id);
     }
-    if eligible.is_empty() && journal.data.is_empty() {
+    if eligible.is_empty() && journal.data.is_empty() && journal.vars.is_empty() {
         store.clear()?;
         return Ok(report);
     }
@@ -195,6 +203,9 @@ pub fn recover(
         Err(Error::ProcessGone { .. }) => return finish_gone(store, report),
         Err(e) => return Err(e),
     };
+    // As regiões de variáveis entram no registro do motor antes de tudo: o diário que ele
+    // regrava as mantém mesmo que uma falha abandone a recuperação no meio.
+    engine.adopt_vars(&journal.vars);
     // O motor regrava o diário só com as entradas que ainda não resolveu (as de fora
     // de memória executável já saíram) e o apaga quando não sobra nenhuma. As de dados
     // entram como pendentes do motor e saem quando resolvidas.
@@ -228,6 +239,21 @@ pub fn recover(
                 tracing::warn!(erro = %e, "bits não restaurados agora");
                 report.kept.extend(engine.pending_ids());
             }
+        }
+    }
+    // Por último (spec 008, 6.3): as variáveis, que só são zeradas se nenhum desvio nosso
+    // continua sem resolver.
+    if !journal.vars.is_empty() {
+        match engine.clear_vars() {
+            Ok(()) => {}
+            Err(Error::ProcessGone { .. }) => {
+                report.discarded = Some(DiscardReason::ProcessGone);
+                return Ok(report);
+            }
+            Err(e) => tracing::warn!(erro = %e, "variáveis não zeradas agora"),
+        }
+        if !engine.vars().is_empty() {
+            report.kept.push(VARS_ID.to_owned());
         }
     }
     if !report.kept.is_empty() {

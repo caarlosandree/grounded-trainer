@@ -466,6 +466,7 @@ mod tests {
                     kind: gt_core::patch::PatchKind::Code,
                 }],
                 data: Vec::new(),
+                vars: Vec::new(),
             })
             .unwrap();
         let end = RunEnd {

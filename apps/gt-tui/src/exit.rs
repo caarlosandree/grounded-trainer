@@ -97,6 +97,7 @@ mod tests {
             paused_by_us,
             entries,
             data: Vec::new(),
+            vars: Vec::new(),
         }
     }
 

@@ -518,6 +518,7 @@ rva = 0x1000
                 kind: gt_core::patch::PatchKind::Code,
             }],
             data: Vec::new(),
+            vars: Vec::new(),
         }
     }
 
