@@ -2540,9 +2540,9 @@ offset = 3
                 "pet-stamina-infinita",
             ]
         );
-        // Os dois cheats do mundo (spec 007) e o `pular-hora` (spec 008) vêm depois, conferidos em
-        // `real_generic_has_world_cheats` e `real_generic_has_pular_hora`.
-        assert_eq!(ids.len(), 20);
+        // Os dois cheats do mundo (spec 007), o `pular-hora` e o `congelar-hora` (spec 008) vêm depois, conferidos em
+        // `real_generic_has_world_cheats`, `real_generic_has_pular_hora` e `real_generic_has_congelar_hora`.
+        assert_eq!(ids.len(), 21);
         let category = |id: &str| {
             if id.starts_with("pet-") {
                 Category::Pet
@@ -4639,7 +4639,7 @@ label = "+1h"
     fn real_generic_has_world_cheats() {
         let sigs = Signatures::embedded().unwrap();
         let fields = sigs.fields();
-        assert_eq!(fields.len(), 20);
+        assert_eq!(fields.len(), 21);
         let object = "SurvivalModeManagerComponent.GameModeSettings";
         let class = "/Script/Maine.SurvivalGameModeSettings";
 
@@ -4718,6 +4718,35 @@ label = "+1h"
         assert_eq!(grid.ty, ValueType::F64);
         assert_eq!(grid.points.as_deref(), Some(&[3600.0][..]));
         assert_eq!((grid.steps(), grid.value(grid.default_k)), (0, 3600.0));
+    }
+
+    #[test]
+    fn real_generic_has_congelar_hora() {
+        let sigs = Signatures::embedded().unwrap();
+        let def = &sigs.fields()[20];
+        assert_eq!(def.id, "congelar-hora");
+        assert_eq!(def.name, "Congelar hora do dia");
+        assert_eq!(def.category, Category::Progressao);
+        assert_eq!(def.root, FieldRoot::GameState);
+        assert_eq!(
+            (def.object.as_str(), def.object_class.as_str()),
+            ("CalendarComponent", "/Script/Maine.CalendarComponent")
+        );
+        assert_eq!(
+            def.owner_class.as_deref(),
+            Some("/Script/Maine.SurvivalGameState")
+        );
+        // Sem valor ajustável: alvo fixo em 0 (a razão do tempo para), sem grade nem `label`.
+        assert_eq!((def.value.as_ref(), def.label.as_deref()), (None, None));
+        assert_eq!(
+            def.rule,
+            FieldRule::Set {
+                fields: vec!["GameToRealTimeRatio".into()],
+                kind: FieldKind::Float,
+                target: Some(0.0),
+                bools: None,
+            }
+        );
     }
 
     // ---- [[hook]] (spec 008, 6.2 e 12) ----

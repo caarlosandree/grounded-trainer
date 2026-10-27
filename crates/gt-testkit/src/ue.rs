@@ -83,6 +83,9 @@ pub const CALENDAR_OFF: u32 = 0x70;
 pub const CURRENT_TIME_OFF: u32 = 0x38;
 /// Relógio inicial da cena, em segundos.
 pub const CLOCK_START: f64 = 5000.25;
+/// `CalendarComponent.GameToRealTimeRatio` (`float`, spec 008, 6.8.1) e o valor inicial da cena (o jogo anda a 30).
+pub const TIME_RATIO_OFF: u32 = 0x40;
+pub const TIME_RATIO_START: f32 = 30.0;
 
 /// Valores iniciais dos campos novos (o personagem sem nenhum cheat).
 pub const CAPACITY_START: i32 = 10;
@@ -342,7 +345,10 @@ pub fn build(arena: u64, len: usize) -> (SynthImage, UeAddrs) {
         "CalendarComponent",
         Some(object_c),
         0x48,
-        &[double("CurrentTime", CURRENT_TIME_OFF)],
+        &[
+            double("CurrentTime", CURRENT_TIME_OFF),
+            float("GameToRealTimeRatio", TIME_RATIO_OFF),
+        ],
     );
     let party_c = s.add_class(
         maine,
@@ -388,6 +394,7 @@ pub fn build(arena: u64, len: usize) -> (SynthImage, UeAddrs) {
     let calendar = s.add_object(calendar_c, "Calendar", game_state);
     s.set(game_state, CALENDAR_OFF, &calendar.to_le_bytes());
     s.set(calendar, CURRENT_TIME_OFF, &CLOCK_START.to_le_bytes());
+    s.set(calendar, TIME_RATIO_OFF, &TIME_RATIO_START.to_le_bytes());
     s.set(level, WORLD_OFF, &world.to_le_bytes());
     s.set(world, GAME_STATE_OFF, &game_state.to_le_bytes());
     s.set(game_state, PARTY_OFF, &party.to_le_bytes());
@@ -616,34 +623,55 @@ fn world_defs() -> Vec<FieldDef> {
     ]
 }
 
-/// O `pular-hora` da spec 008, 6.8.2, com o id, a classe dona e a grade do `generic.toml`.
+/// Os dois cheats de hora da spec 008 (6.8): `pular-hora` e `congelar-hora`, com o id, a classe dona e a grade
+/// do `generic.toml`.
 fn clock_defs() -> Vec<FieldDef> {
-    vec![FieldDef {
-        id: "pular-hora".into(),
-        name: "Pular 1 hora".into(),
-        category: Category::Progressao,
-        description: String::new(),
-        object: "CalendarComponent".into(),
-        object_class: format!("{MAINE}.CalendarComponent"),
-        root: FieldRoot::GameState,
-        owner_class: Some(format!("{MAINE}.SurvivalGameState")),
-        label: Some("+1h".into()),
-        value: Some(ValueGrid {
-            ty: ValueType::F64,
-            min: 3600.0,
-            max: 3600.0,
-            step: 0.0,
-            default_k: 0,
-            unit: None,
-            decimals: 0,
-            points: Some(vec![3600.0]),
-        }),
-        rule: FieldRule::Add {
-            field: "CurrentTime".into(),
-            result_max: 1_000_000_000,
-            at_least: true,
+    vec![
+        FieldDef {
+            id: "pular-hora".into(),
+            name: "Pular 1 hora".into(),
+            category: Category::Progressao,
+            description: String::new(),
+            object: "CalendarComponent".into(),
+            object_class: format!("{MAINE}.CalendarComponent"),
+            root: FieldRoot::GameState,
+            owner_class: Some(format!("{MAINE}.SurvivalGameState")),
+            label: Some("+1h".into()),
+            value: Some(ValueGrid {
+                ty: ValueType::F64,
+                min: 3600.0,
+                max: 3600.0,
+                step: 0.0,
+                default_k: 0,
+                unit: None,
+                decimals: 0,
+                points: Some(vec![3600.0]),
+            }),
+            rule: FieldRule::Add {
+                field: "CurrentTime".into(),
+                result_max: 1_000_000_000,
+                at_least: true,
+            },
         },
-    }]
+        FieldDef {
+            id: "congelar-hora".into(),
+            name: "Congelar hora do dia".into(),
+            category: Category::Progressao,
+            description: String::new(),
+            object: "CalendarComponent".into(),
+            object_class: format!("{MAINE}.CalendarComponent"),
+            root: FieldRoot::GameState,
+            owner_class: Some(format!("{MAINE}.SurvivalGameState")),
+            label: None,
+            value: None,
+            rule: FieldRule::Set {
+                fields: vec!["GameToRealTimeRatio".into()],
+                kind: FieldKind::Float,
+                target: Some(0.0),
+                bools: None,
+            },
+        },
+    ]
 }
 
 /// Os seis cheats da spec 006, 6.7, com os nomes do jogo e as grades do `generic.toml`.

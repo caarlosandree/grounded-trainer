@@ -19,7 +19,7 @@ use gt_testkit::ue::{
     AUTO_COMPLETE_OFF, CACHED_OFF, CAPACITY_OFF, CLOCK_START, CURRENT_TIME_OFF, DAMAGE_MULT_OFF,
     DAMAGE_OFF, DIE_BYTE, ENEMY_DAMAGE_OFF, GRAVITY_OFF, GROUND_MULT_OFF, HAULING_OFF, HEALTH_OFF,
     JUMP_OFF, MODE_MANAGER_OFF, PARTY_OFF, RECIPES_OFF, SCIENCE_OFF, SETTINGS_OFF, SWIM_MULT_OFF,
-    WORLD_OFF,
+    TIME_RATIO_OFF, TIME_RATIO_START, WORLD_OFF,
 };
 use gt_testkit::{TargetOpts, TestTarget, UeAddrs, synth_signatures};
 use gt_ue::{Names, ObjectArray, ReflectionIndex, ScanBudget, UeLayout};
@@ -136,6 +136,11 @@ impl Scene {
 
     fn clock(&self) -> u64 {
         self.ue.calendar + u64::from(CURRENT_TIME_OFF)
+    }
+
+    /// `CalendarComponent.GameToRealTimeRatio` (o `congelar-hora`, spec 008, 6.8.1).
+    fn ratio(&self) -> u64 {
+        self.ue.calendar + u64::from(TIME_RATIO_OFF)
     }
 
     fn f64_at(&self, addr: u64) -> f64 {
@@ -1432,4 +1437,56 @@ fn world_bool_game_rewrite_becomes_new_original() {
     assert_eq!(s.u8_at(s.recipes()), 1);
     assert_eq!(s.u8_at(s.auto_complete()), 0);
     assert_eq!(s.store.peek().unwrap(), Loaded::Missing);
+}
+
+// ---- `congelar-hora` (spec 008, 6.8.1): `set` do `GameToRealTimeRatio` para 0, raiz `game_state` ----
+
+#[test]
+fn freeze_time_set_and_restore() {
+    let mut s = scene();
+    let on = ["congelar-hora"];
+    assert_eq!(s.f32_at(s.ratio()), TIME_RATIO_START);
+    // Liga: o relógio para (razão 0) sem nota nem evento do cheat; o mundo na primeira leitura não é transição.
+    let first = s.tick(&on);
+    assert_eq!(first.world, Some(WorldState::Found));
+    assert!(first.notes.is_empty(), "{:?}", first.notes);
+    assert_eq!(s.f32_at(s.ratio()), 0.0);
+    assert_eq!(journal_data_len(&s), 1);
+    // Os ciclos seguintes não escrevem nada de novo.
+    let again = s.tick(&on);
+    assert!(again.notes.is_empty() && again.events.is_empty());
+    assert_eq!(journal_data_len(&s), 1);
+    // `pular-hora` não mexe na razão: os dois convivem.
+    let c = Some(s.ue.controller);
+    assert!(matches!(s.skip(c, SKIP), ActionOutcome::Done { .. }));
+    assert_eq!(s.f32_at(s.ratio()), 0.0);
+    // Desliga: volta o original.
+    let r = s.runtime.turn_off(&mut s.engine, "congelar-hora").unwrap();
+    assert_eq!(r.restored, vec!["congelar-hora".to_string()]);
+    assert_eq!(s.f32_at(s.ratio()), TIME_RATIO_START);
+    assert_eq!(s.store.peek().unwrap(), Loaded::Missing);
+}
+
+#[test]
+fn freeze_time_game_change_becomes_new_original() {
+    let mut s = scene();
+    let on = ["congelar-hora"];
+    s.tick(&on);
+    assert_eq!(s.f32_at(s.ratio()), 0.0);
+    // O jogo mexe no campo (por exemplo, ao dormir): vira o original novo e o cheat volta a congelar.
+    s.poke(s.ratio(), &120.0f32.to_le_bytes());
+    let changed = s.tick(&on);
+    assert_eq!(s.f32_at(s.ratio()), 0.0);
+    assert!(
+        changed
+            .events
+            .iter()
+            .any(|e| e.contains("Congelar hora do dia") && e.contains("novo original")),
+        "{:?}",
+        changed.events
+    );
+    assert!(changed.notes.is_empty(), "{:?}", changed.notes);
+    // Ao desligar, volta o valor que o jogo escreveu, não o de antes do cheat.
+    s.runtime.turn_off(&mut s.engine, "congelar-hora").unwrap();
+    assert_eq!(s.f32_at(s.ratio()), 120.0);
 }

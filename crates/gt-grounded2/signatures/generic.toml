@@ -487,6 +487,25 @@ points = [3600.0]
 default = 3600.0
 label = "+1h"
 
+# Congelar a hora do dia (spec 008, 6.8.1): `set` do `GameToRealTimeRatio` para 0, sem valor ajustável; o original
+# volta ao desligar. O campo mora no `CalendarComponent` do `SurvivalGameState` (mesma classe dona do `pular-hora`).
+# `min`/`max` só validam o `target` na carga. Risco: dormir com a hora congelada (spec 6.8.1).
+[[field]]
+id = "congelar-hora"
+name = "Congelar hora do dia"
+category = "progressao"
+description = "Para o relógio do jogo; a razão original do tempo volta ao desligar"
+object = "CalendarComponent"
+object_class = "/Script/Maine.CalendarComponent"
+root = "game_state"
+owner_class = "/Script/Maine.SurvivalGameState"
+rule = "set"
+fields = ["GameToRealTimeRatio"]
+kind = "float"
+target = 0.0
+min = 0.0
+max = 1000.0
+
 # Fase 6 (spec 008): desvios com cave. Cada [[hook]] troca UMA instrução de 5+ bytes, decodificada na
 # ocorrência do padrão em `offset` (sem `expected`: o padrão único já fixa os bytes que importam e o motor
 # relê a instrução na pausa). `body` nomeia o corpo da cave, escrito em Rust. O valor (`[hook.value]`) é uma
