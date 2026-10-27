@@ -539,12 +539,9 @@ mod tests {
     use gt_testkit::synth_signatures;
     use gt_ue::synth::SparseMem;
 
-    /// Definições da cena sem o `construir-sem-ingredientes`: o `kind = "bool"` só resolve na
-    /// Tarefa 3 do plano 007 (depois dela, este filtro sai).
+    /// Definições da cena sintética.
     fn synth_defs() -> Vec<FieldDef> {
-        let (_, mut defs) = synth_signatures();
-        defs.retain(|d| d.id != "construir-sem-ingredientes");
-        defs
+        synth_signatures().1
     }
 
     /// Índice e catálogo da cena sintética do alvo de teste, resolvido com `defs`.

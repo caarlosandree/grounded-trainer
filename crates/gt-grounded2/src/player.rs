@@ -54,6 +54,8 @@ pub enum ResolvedRule {
         fields: Vec<Field>,
         kind: FieldKind,
         target: Option<f64>,
+        /// Valor de cada campo, só no `kind = "bool"` (spec 007, 6.4).
+        bools: Option<Vec<bool>>,
     },
     /// Soma a um campo `int`, sem diário (spec 006, 6.6).
     Add { field: Field, result_max: i64 },
@@ -371,6 +373,42 @@ fn int_field<M: ReadMem + ?Sized>(
     }
 }
 
+/// Campo `bool` de byte inteiro (`bool` nativo do C++): `BoolProperty` de 1 byte, máscara
+/// `0xff` e o byte da máscara igual ao `offset` (spec 007, 6.4). Bits de verdade ficam para o
+/// [`bool_field`] do `clear_bits`.
+fn byte_bool_field<M: ReadMem + ?Sized>(
+    index: &ReflectionIndex,
+    mem: &M,
+    class: u64,
+    name: &str,
+) -> Result<Field, String> {
+    let field = index.find_field_path(mem, class, name).map_err(|e| {
+        tracing::debug!("campo {name}: {e}");
+        match e {
+            UeError::NotFound(_) => format!("campo {name} não encontrado"),
+            _ => INCOHERENT.to_string(),
+        }
+    })?;
+    match field.bits {
+        Some(bits)
+            if field.kind == "BoolProperty"
+                && field.size == 1
+                && bits.mask == 0xff
+                && bits.byte == field.offset =>
+        {
+            Ok(field)
+        }
+        _ => {
+            tracing::debug!(
+                "campo {name} é {} de {} bytes, esperado bool de byte inteiro",
+                field.kind,
+                field.size
+            );
+            Err(INCOHERENT.to_string())
+        }
+    }
+}
+
 /// Campo `bool` com máscara não nula.
 fn bool_field<M: ReadMem + ?Sized>(
     index: &ReflectionIndex,
@@ -499,20 +537,19 @@ fn resolve_field<M: ReadMem + ?Sized>(
             fields,
             kind,
             target,
-            ..
+            bools,
         } => ResolvedRule::Set {
             fields: fields
                 .iter()
                 .map(|name| match kind {
                     FieldKind::Float => float_field(index, mem, object_class, name),
                     FieldKind::Int => int_field(index, mem, object_class, name),
-                    // Até a resolução do `set` de `bool` (spec 007, Tarefa 3) o cheat fica
-                    // indisponível: nunca resolve, logo nunca escreve.
-                    FieldKind::Bool => Err(INCOHERENT.to_string()),
+                    FieldKind::Bool => byte_bool_field(index, mem, object_class, name),
                 })
                 .collect::<Result<_, _>>()?,
             kind: *kind,
             target: *target,
+            bools: bools.clone(),
         },
         FieldRule::Add { field, result_max } => ResolvedRule::Add {
             field: int_field(index, mem, object_class, field)?,
@@ -634,10 +671,10 @@ pub enum FieldValues {
         obj: u64,
         bytes: Vec<BitByte>,
     },
-    /// Endereço e bytes atuais de cada campo de um `set`.
+    /// Endereço e bytes atuais de cada campo de um `set` (`FieldKind::size` bytes cada).
     Set {
         obj: u64,
-        fields: Vec<(u64, [u8; 4])>,
+        fields: Vec<(u64, Vec<u8>)>,
     },
 }
 
@@ -724,11 +761,10 @@ impl<M: ReadMem + ?Sized> Reader<'_, M> {
         Ok(f32::from_bits(raw))
     }
 
-    /// Os 4 bytes do campo, como estão na memória.
-    fn raw4(&mut self, obj: u64, field: &Field) -> Result<[u8; 4], Absent> {
-        self.check_fits(obj, &field.name, field.offset, field.size)?;
-        let raw = read_u32(self.mem, obj + u64::from(field.offset)).map_err(unreadable)?;
-        Ok(raw.to_le_bytes())
+    /// Os `len` bytes do campo, como estão na memória.
+    fn raw(&mut self, obj: u64, field: &Field, len: u32) -> Result<Vec<u8>, Absent> {
+        self.check_fits(obj, &field.name, field.offset, len)?;
+        read_vec(self.mem, obj + u64::from(field.offset), len as usize).map_err(unreadable)
     }
 
     /// Registra o objeto no caminho (com a guarda), uma vez.
@@ -798,10 +834,11 @@ impl<M: ReadMem + ?Sized> Reader<'_, M> {
                 }
                 FieldValues::Bits { obj, bytes }
             }
-            ResolvedRule::Set { fields, .. } => {
+            ResolvedRule::Set { fields, kind, .. } => {
+                let len = kind.size();
                 let mut out = Vec::with_capacity(fields.len());
                 for f in fields {
-                    out.push((obj + u64::from(f.offset), self.raw4(obj, f)?));
+                    out.push((obj + u64::from(f.offset), self.raw(obj, f, len)?));
                 }
                 FieldValues::Set { obj, fields: out }
             }
@@ -1111,26 +1148,51 @@ pub fn plan_tick(
 /// Faixa de um valor do jogo são: finito e dentro de `[-1e9, 1e9]` (spec 006, 6.4).
 const SANE_LIMIT: f64 = 1.0e9;
 
-/// `true` se os 4 bytes lidos do jogo são um valor são para `kind` (também vale para `int`).
-pub fn value_is_sane(kind: FieldKind, bytes: [u8; 4]) -> bool {
+/// `true` se os bytes lidos do jogo são um valor são para `kind` (tamanho certo; vale também
+/// para `int`). No `bool` o byte é `0` ou `1` (spec 007, 6.4).
+pub fn value_is_sane(kind: FieldKind, bytes: &[u8]) -> bool {
     let v = match kind {
-        FieldKind::Float => f64::from(f32::from_le_bytes(bytes)),
-        FieldKind::Int => f64::from(i32::from_le_bytes(bytes)),
-        // Sem leitura de `bool` ainda (Tarefa 3): nenhum valor é são, então nada é escrito.
-        FieldKind::Bool => return false,
+        FieldKind::Float => match <[u8; 4]>::try_from(bytes) {
+            Ok(raw) => f64::from(f32::from_le_bytes(raw)),
+            Err(_) => return false,
+        },
+        FieldKind::Int => match <[u8; 4]>::try_from(bytes) {
+            Ok(raw) => f64::from(i32::from_le_bytes(raw)),
+            Err(_) => return false,
+        },
+        FieldKind::Bool => return matches!(bytes, [0] | [1]),
     };
     v.is_finite() && (-SANE_LIMIT..=SANE_LIMIT).contains(&v)
 }
 
-/// Os 4 bytes (little-endian) de `v` como `kind`. O `int` é arredondado ao inteiro mais próximo.
-pub fn encode_value(kind: FieldKind, v: f64) -> [u8; 4] {
+/// Os bytes (little-endian) de `v` como `kind`: 4 para `float`/`int` e 1 para `bool`. O `int` é
+/// arredondado ao inteiro mais próximo; o `bool` é `0x01` para `v != 0` e `0x00` senão.
+pub fn encode_value(kind: FieldKind, v: f64) -> Vec<u8> {
     match kind {
         // `as` satura nos limites do tipo e vira 0 para `NaN`, o que serve ao valor desejado.
-        FieldKind::Int => (v.round() as i32).to_le_bytes(),
-        FieldKind::Float => (v as f32).to_le_bytes(),
-        // Um byte só: `0x01` para verdadeiro, `0x00` para falso.
-        FieldKind::Bool => [u8::from(v != 0.0), 0, 0, 0],
+        FieldKind::Int => (v.round() as i32).to_le_bytes().to_vec(),
+        FieldKind::Float => (v as f32).to_le_bytes().to_vec(),
+        FieldKind::Bool => vec![u8::from(v != 0.0)],
     }
+}
+
+/// Os bytes desejados de cada campo de um `set`: no `bool` cada campo tem o seu valor (`bools`);
+/// nos outros todos recebem `value`. `None` se falta o valor (o ciclo pula o cheat).
+pub fn desired_bytes(rule: &ResolvedRule, value: Option<f64>) -> Option<Vec<Vec<u8>>> {
+    let ResolvedRule::Set {
+        fields,
+        kind,
+        bools,
+        ..
+    } = rule
+    else {
+        return None;
+    };
+    if let Some(bools) = bools {
+        return Some(bools.iter().map(|&b| vec![u8::from(b)]).collect());
+    }
+    let one = encode_value(*kind, value?);
+    Some(vec![one; fields.len()])
 }
 
 /// O que o `set` precisa saber de um campo neste ciclo.
@@ -1144,16 +1206,18 @@ pub struct SetStep {
 }
 
 /// Um passo por campo do `set`, sem decidir nada: quem executa usa os endereços e a sanidade.
-pub fn plan_set(values: &FieldValues, desired: [u8; 4], kind: FieldKind) -> Vec<SetStep> {
+/// `desired` traz os bytes de cada campo, na ordem.
+pub fn plan_set(values: &FieldValues, desired: &[Vec<u8>], kind: FieldKind) -> Vec<SetStep> {
     let FieldValues::Set { fields, .. } = values else {
         return Vec::new();
     };
     fields
         .iter()
-        .map(|&(addr, current)| SetStep {
-            addr,
+        .zip(desired)
+        .map(|((addr, current), want)| SetStep {
+            addr: *addr,
             sane: value_is_sane(kind, current),
-            same: current == desired,
+            same: current == want,
         })
         .collect()
 }
@@ -1205,7 +1269,7 @@ pub enum FieldReportValue {
     Bits {
         bits: Vec<BitReport>,
     },
-    /// Campos de um `set`: endereço e valor bruto (`u32` little-endian) de cada um.
+    /// Campos de um `set`: endereço e valor bruto (bytes zero-estendidos para `u32`) de cada um.
     Set {
         fields: Vec<SetFieldReport>,
     },
@@ -1222,7 +1286,7 @@ pub struct SetFieldReport {
     /// Nome do campo na reflexão.
     pub name: String,
     pub addr: u64,
-    /// Bytes atuais (`u32` little-endian).
+    /// Bytes atuais (little-endian, zero-estendidos para `u32`; um `bool` ocupa o byte baixo).
     pub raw: u32,
     /// Valor atual formatado pela grade do cheat (ou simples, sem grade).
     pub value: String,
@@ -1404,11 +1468,16 @@ fn report_value(snapshot: &PlayerSnapshot, entry: &CatalogEntry) -> FieldReportV
             fields: fields
                 .iter()
                 .zip(defs)
-                .map(|(&(addr, bytes), def)| SetFieldReport {
-                    name: def.name.clone(),
-                    addr,
-                    raw: u32::from_le_bytes(bytes),
-                    value: format_value(entry.grid.as_ref(), *kind, decode_value(*kind, &bytes)),
+                .map(|((addr, bytes), def)| {
+                    let mut raw = [0u8; 4];
+                    let n = bytes.len().min(4);
+                    raw[..n].copy_from_slice(&bytes[..n]);
+                    SetFieldReport {
+                        name: def.name.clone(),
+                        addr: *addr,
+                        raw: u32::from_le_bytes(raw),
+                        value: format_value(entry.grid.as_ref(), *kind, decode_value(*kind, bytes)),
+                    }
                 })
                 .collect(),
         },
@@ -1438,17 +1507,12 @@ pub(crate) fn format_value(grid: Option<&ValueGrid>, kind: FieldKind, v: f64) ->
     }
 }
 
-/// Os 4 bytes de um campo como número (para mostrar).
+/// Os bytes de um campo como número (para mostrar); `bool` é `0.0` ou `1.0`.
 pub(crate) fn decode_value(kind: FieldKind, bytes: &[u8]) -> f64 {
-    // O `bool` ocupa um byte só: o primeiro.
-    if kind == FieldKind::Bool {
-        return f64::from(bytes.first().copied().unwrap_or_default());
-    }
-    let raw: [u8; 4] = bytes.try_into().unwrap_or_default();
     match kind {
-        FieldKind::Int => f64::from(i32::from_le_bytes(raw)),
-        FieldKind::Float => f64::from(f32::from_le_bytes(raw)),
-        FieldKind::Bool => f64::from(raw[0]),
+        FieldKind::Bool => f64::from(u8::from(bytes.first().is_some_and(|&b| b != 0))),
+        FieldKind::Int => f64::from(i32::from_le_bytes(bytes.try_into().unwrap_or_default())),
+        FieldKind::Float => f64::from(f32::from_le_bytes(bytes.try_into().unwrap_or_default())),
     }
 }
 

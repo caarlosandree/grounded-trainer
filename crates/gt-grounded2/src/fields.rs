@@ -19,7 +19,7 @@ use gt_ue::{ObjectArray, ReflectionIndex};
 
 use crate::player::{
     Absent, AddRefusal, FieldAction, FieldCatalog, FieldValues, GameStateAbsent, MissingKind,
-    PlayerSnapshot, ResolvedField, ResolvedRule, decode_value, encode_value, format_value,
+    PlayerSnapshot, ResolvedField, ResolvedRule, decode_value, desired_bytes, format_value,
     missing_kind, plan_add, plan_tick, read_game_state, read_player, value_is_sane,
 };
 use crate::signatures::{FieldKind, LockMode};
@@ -115,16 +115,15 @@ fn write_set_field(
     engine: &mut Engine,
     id: &str,
     addr: u64,
-    desired: [u8; 4],
+    desired: &[u8],
     guard: &[GuardBytes],
     kind: FieldKind,
 ) -> gt_core::Result<SetOutcome> {
-    let accept =
-        move |bytes: &[u8]| <[u8; 4]>::try_from(bytes).is_ok_and(|raw| value_is_sane(kind, raw));
-    match engine.set_word(id, addr, &desired, guard, &accept) {
+    let accept = move |bytes: &[u8]| value_is_sane(kind, bytes);
+    match engine.set_word(id, addr, desired, guard, &accept) {
         Err(CoreError::DataEntryOtherObject { .. }) => {
             engine.restore_field(id)?;
-            engine.set_word(id, addr, &desired, guard, &accept)
+            engine.set_word(id, addr, desired, guard, &accept)
         }
         other => other,
     }
@@ -177,10 +176,9 @@ pub struct FieldRuntime {
 #[derive(Clone, Copy)]
 struct SetJob<'a> {
     id: &'a str,
-    kind: FieldKind,
-    target: Option<f64>,
+    rule: &'a ResolvedRule,
     obj: u64,
-    fields: &'a [(u64, [u8; 4])],
+    fields: &'a [(u64, Vec<u8>)],
 }
 
 /// Objeto dono de uma guarda (o primeiro trecho é a vtable, em `+0`).
@@ -384,13 +382,12 @@ impl FieldRuntime {
             else {
                 continue;
             };
-            let ResolvedRule::Set { kind, target, .. } = &resolved.rule else {
+            if !matches!(resolved.rule, ResolvedRule::Set { .. }) {
                 continue;
-            };
+            }
             let job = SetJob {
                 id,
-                kind: *kind,
-                target: *target,
+                rule: &resolved.rule,
                 obj: *obj,
                 fields,
             };
@@ -450,15 +447,30 @@ impl FieldRuntime {
     ) -> Option<Note> {
         let SetJob {
             id,
-            kind,
-            target,
+            rule,
             obj,
             fields,
         } = *job;
+        let ResolvedRule::Set {
+            kind,
+            target,
+            bools,
+            ..
+        } = rule
+        else {
+            return None;
+        };
+        let kind = *kind;
         if fight.blocked {
             return None;
         }
-        let desired = encode_value(kind, self.desired_value(id, target)?);
+        // O `bool` leva o valor de cada campo da definição e não passa por `desired_value`.
+        let value = if bools.is_some() {
+            None
+        } else {
+            Some(self.desired_value(id, *target)?)
+        };
+        let desired = desired_bytes(rule, value)?;
         let guard = guard_of(snapshot, obj);
         let name = self.catalog.name(id).unwrap_or(id).to_string();
         let grid = self.catalog.grid(id);
@@ -484,8 +496,9 @@ impl FieldRuntime {
         }
 
         let (mut failed, mut invalid) = (false, false);
-        for &(addr, _) in fields {
-            match write_set_field(engine, id, addr, desired, &guard, kind) {
+        for ((addr, _), want) in fields.iter().zip(&desired) {
+            let addr = *addr;
+            match write_set_field(engine, id, addr, want, &guard, kind) {
                 Ok(SetOutcome::Rejected(_)) => invalid = true,
                 Ok(SetOutcome::NewOriginal(old)) => {
                     let shown = format_value(grid, kind, decode_value(kind, &old));

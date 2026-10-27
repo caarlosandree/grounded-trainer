@@ -185,6 +185,16 @@ pub enum FieldKind {
     Bool,
 }
 
+impl FieldKind {
+    /// Bytes que o campo ocupa na memória do jogo.
+    pub fn size(self) -> u32 {
+        match self {
+            FieldKind::Bool => 1,
+            FieldKind::Int | FieldKind::Float => 4,
+        }
+    }
+}
+
 /// Raiz do caminho até o objeto de um `[[field]]` (spec 006, 6.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum FieldRoot {

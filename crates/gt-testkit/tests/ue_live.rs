@@ -63,9 +63,7 @@ fn live_find_controller_and_read_player() {
     let (t, ue) = spawn();
     let reader = MemReader::new(t.pid);
     let (objects, index) = indexed(&reader, &ue);
-    let (sigs, mut defs) = synth_signatures();
-    // O `kind = "bool"` só resolve na Tarefa 3 do plano 007; até lá o cheat fica de fora.
-    defs.retain(|d| d.id != "construir-sem-ingredientes");
+    let (sigs, defs) = synth_signatures();
     let catalog = FieldCatalog::resolve(&index, &reader, &sigs.player, &defs);
     for def in &defs {
         assert_eq!(catalog.avail(&def.id), Ok(()), "{}", def.id);
