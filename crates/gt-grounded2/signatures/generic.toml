@@ -453,3 +453,55 @@ step = 0.05
 default = 0.25
 unit = "x"
 decimals = 2
+
+# Fase 6 (spec 008): desvios com cave. Cada [[hook]] troca UMA instrução de 5+ bytes, decodificada na
+# ocorrência do padrão em `offset` (sem `expected`: o padrão único já fixa os bytes que importam e o motor
+# relê a instrução na pausa). `body` nomeia o corpo da cave, escrito em Rust. O valor (`[hook.value]`) é uma
+# lista de pontos. Pontos achados por nós em 2026-10-27 (RESEARCH.md, "Sessão de 2026-10-27 (Fase 6)").
+
+# Brain Power rápido (spec 6.6.1). Padrão estendido de `mov esi,[rcx+R]` (ResearchPoints antigo) até
+# `cmp eax,[rbx+R]`, para conferir os registradores que a cave usa e o deslocamento de ResearchPoints (os três
+# acessos têm de ser iguais, e iguais ao da reflexão). O desvio é `mov r14,[rax+T0]` (7 bytes, offset 36): ali
+# `rax` é o objeto da tabela de níveis, com o início em T0, a contagem em T1 e o limite de cada nível em L.
+[[hook]]
+id = "brain-power"
+name = "Brain Power rápido"
+category = "progressao"
+description = "Multiplica a ciência de Brain Power ganha, sem pular nível"
+pattern = "8b b1 ?? ?? 00 00 4d 89 73 ?? 89 75 ?? 8d 04 16 48 8b 51 ?? 89 81 ?? ?? 00 00 e8 ?? ?? ?? ?? e8 ?? ?? ?? ?? 4c 8b b0 ?? ?? 00 00 48 63 80 ?? ?? 00 00 48 8d 0c 40 48 c1 e1 04 49 03 ce 4c 3b f1 0f 84 ?? ?? ?? ?? 0f 1f 80 00 00 00 00 41 8b 46 ?? 3b f0 7d ?? 3b 83 ?? ?? 00 00"
+offset = 36
+body = "brain"
+
+[hook.value]
+type = "i32"
+points = [2, 3, 5, 10]
+default = 2
+unit = "x"
+
+# Analisador infinito (spec 6.7.1): `movss xmm1,[rcx+charges]`, primeira instrução do getter das cargas. O
+# deslocamento das cargas é o disp32 da própria instrução (curinga do padrão).
+[[hook]]
+id = "analisador-infinito"
+name = "Analisador infinito"
+category = "itens"
+description = "O analisador de recursos não gasta cargas"
+pattern = "f3 0f 10 89 ?? ?? 00 00 f3 0f 58 ?? f3 0f 5c ?? ?? ?? ?? ?? f3 0f 2d ?? d1 f8 c3"
+offset = 0
+body = "analyzer"
+
+# Quantidade ao arrastar (spec 6.7.2): `mov [rsp+8],rbx`, primeira instrução da função. Ação por tecla com
+# desvio: arma a quantidade, o jogo a aplica uma vez no próximo item arrastado.
+[[hook]]
+id = "quantidade-arrastar"
+name = "Quantidade ao arrastar"
+category = "itens"
+description = "Define a quantidade da pilha do próximo item arrastado (uso único)"
+pattern = "48 89 5c 24 08 48 89 6c 24 10 48 89 74 24 18 57 48 83 ec 20 41 8b e9 49 8b d8 8b f2 48 8b f9 48 85 c9 74 ?? e8"
+offset = 0
+body = "drag"
+action = true
+
+[hook.value]
+type = "i32"
+points = [10, 50, 100, 250, 500, 999]
+default = 100

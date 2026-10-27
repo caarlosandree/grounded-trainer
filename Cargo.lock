@@ -628,6 +628,7 @@ version = "0.1.0"
 dependencies = [
  "gt-core",
  "gt-ue",
+ "iced-x86",
  "serde",
  "tempfile",
  "thiserror 2.0.21",

@@ -44,6 +44,14 @@ pub enum Error {
     #[error("patch {id} indisponível: {state}")]
     Unavailable { id: String, state: String },
 
+    /// A instrução do desvio de um `[[hook]]` não serve (menos de 5 bytes, inválida ou cortada).
+    #[error("instrução do desvio inválida: {reason}")]
+    BadHookInsn { reason: String },
+
+    /// Os bytes da ocorrência de um padrão de desvio não batem entre si (spec 008, 6.6.1).
+    #[error("padrão incoerente: {reason}")]
+    IncoherentPattern { reason: String },
+
     /// Erro do núcleo; a mensagem é a do próprio erro.
     #[error(transparent)]
     Core(#[from] gt_core::Error),

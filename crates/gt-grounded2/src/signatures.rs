@@ -17,6 +17,7 @@ use gt_ue::{
     FBoolLayout, FFieldLayout, FPropLayout, FStructLayout, ObjectsLayout, UObjectLayout,
     UStructLayout, UeLayout,
 };
+use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 use serde::Deserialize;
 
 use crate::GAME_EXE;
@@ -251,6 +252,58 @@ pub struct FieldDef {
     pub value: Option<ValueGrid>,
 }
 
+/// Corpo da cave de um `[[hook]]` (spec 008, 6.7 e 12). O código de cada corpo mora em Rust; o TOML só nomeia.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaveBody {
+    /// Brain Power rápido (6.6.1).
+    Brain,
+    /// Analisador infinito (6.7.1).
+    Analyzer,
+    /// Quantidade ao arrastar (6.7.2).
+    Drag,
+    /// Coleta multiplicada (6.7.4).
+    Collect,
+}
+
+impl CaveBody {
+    fn parse(text: &str) -> Option<CaveBody> {
+        match text {
+            "brain" => Some(CaveBody::Brain),
+            "analyzer" => Some(CaveBody::Analyzer),
+            "drag" => Some(CaveBody::Drag),
+            "collect" => Some(CaveBody::Collect),
+            _ => None,
+        }
+    }
+}
+
+/// Tamanho mínimo da instrução trocada por um desvio (`jmp rel32`), em bytes.
+const HOOK_MIN_INSN: usize = 5;
+
+/// Definição de um desvio com cave (`[[hook]]`), já validada pela regra de carga (spec 008, 6.2).
+///
+/// Não tem `expected` nem `replacement`: a instrução trocada é decodificada na ocorrência, em
+/// `offset` ([`hook_insn`]), e o motor relê os bytes dela na pausa.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HookDef {
+    pub id: String,
+    /// Nome curto, mostrado na lista.
+    pub name: String,
+    pub category: Category,
+    pub description: String,
+    /// Módulo onde o desvio vale (nesta fase, só o exe do jogo).
+    pub module: String,
+    /// Bytes originais em volta do ponto, com curingas (os curingas são lidos pela cave).
+    pub pattern: Pattern,
+    /// Distância do início da ocorrência até o início da instrução do desvio.
+    pub offset: usize,
+    pub body: CaveBody,
+    /// Grade por lista de pontos do valor ajustável, se o corpo tem valor.
+    pub value: Option<ValueGrid>,
+    /// Ação por tecla com desvio (hoje só o arrastar): não conta como ligada no topo.
+    pub action: bool,
+}
+
 /// Conjunto das assinaturas carregadas: o genérico e uma lista de definições por versão.
 #[derive(Debug, Clone)]
 pub struct Signatures {
@@ -258,6 +311,7 @@ pub struct Signatures {
     versions: BTreeMap<String, VersionSigs>,
     ue: Option<GenericUe>,
     fields: Vec<FieldDef>,
+    hooks: Vec<HookDef>,
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +347,8 @@ struct GenericFile {
     ue: Option<GenericUeBlock>,
     #[serde(default)]
     field: Vec<GenericField>,
+    #[serde(default)]
+    hook: Vec<GenericHook>,
 }
 
 /// Bloco `[ue]` do `generic.toml`.
@@ -437,6 +493,23 @@ struct GenericField {
     bools: Option<Vec<bool>>,
 }
 
+/// Bloco `[[hook]]` (spec 008, 12). Sem `expected`: a instrução é decodificada na ocorrência.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GenericHook {
+    id: String,
+    // Obrigatórios, mas a falta é reportada pela regra de carga (com o campo certo).
+    name: Option<String>,
+    category: Option<String>,
+    description: String,
+    module: Option<String>,
+    pattern: String,
+    offset: usize,
+    body: Option<String>,
+    action: Option<bool>,
+    value: Option<ValueBlock>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GenericPatch {
@@ -468,6 +541,8 @@ struct ValueBlock {
     default: Option<toml::Value>,
     unit: Option<toml::Value>,
     decimals: Option<toml::Value>,
+    /// Lista de pontos no lugar de `min`/`max`/`step` (spec 008, 6.9); por ora só nos `[[hook]]`.
+    points: Option<toml::Value>,
 }
 
 #[derive(Deserialize)]
@@ -601,6 +676,13 @@ fn value_type(file: &str, block: &ValueBlock) -> Result<ValueType> {
 
 /// Monta a grade do bloco de valor (tudo menos o `slot`) e confere as regras de carga (6.3).
 fn build_grid(file: &str, block: &ValueBlock, ty: ValueType) -> Result<ValueGrid> {
+    if block.points.is_some() {
+        return Err(sig_err(
+            file,
+            "value.points",
+            "a lista de pontos só vale no valor de um [[hook]]",
+        ));
+    }
     let min = value_number(file, "value.min", block.min.as_ref(), ty)?;
     let max = value_number(file, "value.max", block.max.as_ref(), ty)?;
     let step = value_number(file, "value.step", block.step.as_ref(), ty)?;
@@ -678,6 +760,83 @@ fn build_grid(file: &str, block: &ValueBlock, ty: ValueType) -> Result<ValueGrid
         points: None,
     };
     grid.check().map_err(|e| sig_err(file, "value", e))?;
+    Ok(grid)
+}
+
+/// Grade por lista de pontos do `[hook.value]` (spec 008, 6.9): `points` no lugar de `min`/`max`/`step`,
+/// com o `default` dentro da lista. Um ponto só é aceito.
+fn build_points_grid(file: &str, id: &str, block: &ValueBlock) -> Result<ValueGrid> {
+    let err = |field: &str, reason: String| sig_err(file, field, format!("`{id}`: {reason}"));
+    if block.slot.is_some() {
+        return Err(err("value.slot", "o [hook.value] não tem slot".into()));
+    }
+    for (name, present) in [
+        ("min", block.min.is_some()),
+        ("max", block.max.is_some()),
+        ("step", block.step.is_some()),
+    ] {
+        if present {
+            return Err(err(
+                &format!("value.{name}"),
+                "não vale junto de points".into(),
+            ));
+        }
+    }
+    let ty = value_type(file, block)?;
+    let Some(points) = block.points.as_ref() else {
+        return Err(err("value.points", "campo obrigatório ausente".into()));
+    };
+    let toml::Value::Array(items) = points else {
+        return Err(err("value.points", "esperava uma lista de números".into()));
+    };
+    let mut list = Vec::with_capacity(items.len());
+    for item in items {
+        list.push(value_number(file, "value.points", Some(item), ty)?);
+    }
+    if list.is_empty() {
+        return Err(err("value.points", "a lista de pontos está vazia".into()));
+    }
+    let default = value_number(file, "value.default", block.default.as_ref(), ty)?;
+    let Some(default_k) = list.iter().position(|p| (p - default).abs() < 1e-9) else {
+        return Err(err(
+            "value.default",
+            format!("{default} não está na lista de pontos"),
+        ));
+    };
+    let unit = match block.unit.as_ref() {
+        None => None,
+        Some(toml::Value::String(u)) => Some(u.clone()),
+        Some(_) => return Err(err("value.unit", "esperava um texto".into())),
+    };
+    let decimals = match (block.decimals.as_ref(), ty) {
+        (None, ValueType::F32 | ValueType::F64) => list
+            .iter()
+            .map(|p| decimals_for(*p))
+            .max()
+            .unwrap_or_default(),
+        (None, _) => 0,
+        (Some(_), ValueType::I32 | ValueType::U32) => {
+            return Err(err("value.decimals", "só vale para f32".into()));
+        }
+        (Some(toml::Value::Integer(d)), ValueType::F32 | ValueType::F64) => u8::try_from(*d)
+            .ok()
+            .filter(|&d| d <= 9)
+            .ok_or_else(|| err("value.decimals", "precisa estar entre 0 e 9".into()))?,
+        (Some(_), ValueType::F32 | ValueType::F64) => {
+            return Err(err("value.decimals", "esperava um inteiro".into()));
+        }
+    };
+    let grid = ValueGrid {
+        ty,
+        min: list.first().copied().unwrap_or(0.0),
+        max: list.last().copied().unwrap_or(0.0),
+        step: 0.0,
+        default_k: default_k as u64,
+        unit,
+        decimals,
+        points: Some(list),
+    };
+    grid.check().map_err(|e| err("value", e))?;
     Ok(grid)
 }
 
@@ -795,6 +954,226 @@ fn build(file: &str, raw: RawDef) -> Result<PatchDef> {
         replacement,
         rva: raw.rva,
         value,
+    })
+}
+
+/// Instrução do desvio dentro de uma ocorrência: decodifica a instrução em `occurrence[offset..]` e
+/// devolve os bytes dela (o `expected` do desvio, spec 008, 6.2). Erro se a instrução for inválida,
+/// ficar cortada pelo fim da ocorrência ou tiver menos de 5 bytes (o `jmp rel32` não cabe).
+pub fn hook_insn(occurrence: &[u8], offset: usize) -> Result<Vec<u8>> {
+    let bad = |reason: String| Error::BadHookInsn { reason };
+    let Some(tail) = occurrence.get(offset..).filter(|t| !t.is_empty()) else {
+        return Err(bad(format!(
+            "o offset {offset} fica fora da ocorrência de {} bytes",
+            occurrence.len()
+        )));
+    };
+    let insn = Decoder::new(64, tail, DecoderOptions::NONE).decode();
+    if insn.is_invalid() {
+        return Err(bad(format!(
+            "os bytes no offset {offset} não são uma instrução inteira"
+        )));
+    }
+    if insn.len() < HOOK_MIN_INSN {
+        return Err(bad(format!(
+            "a instrução no offset {offset} tem {} bytes (precisa de {HOOK_MIN_INSN} ou mais)",
+            insn.len()
+        )));
+    }
+    Ok(tail[..insn.len()].to_vec())
+}
+
+/// Aplica a regra de carga (spec 008, 12) a um `[[hook]]`.
+fn build_hook(file: &str, raw: GenericHook) -> Result<HookDef> {
+    let id = raw.id.as_str();
+    check_not_blank(file, "id", id)?;
+    let err = |field: &str, reason: &str| sig_err(file, field, format!("`{id}`: {reason}"));
+    let name = check_name(file, raw.name.clone())?;
+    let category = check_category(file, raw.category.as_deref())?;
+    let module = raw.module.clone().unwrap_or_else(|| GAME_EXE.to_string());
+    if module != GAME_EXE {
+        return Err(err(
+            "module",
+            &format!("só `{GAME_EXE}` é aceito nesta fase, veio `{module}`"),
+        ));
+    }
+    let pattern =
+        Pattern::parse(&raw.pattern).map_err(|e| sig_err(file, "pattern", e.to_string()))?;
+    if raw.offset >= pattern.len() {
+        return Err(err(
+            "offset",
+            &format!(
+                "{} fica fora do pattern de {} posições",
+                raw.offset,
+                pattern.len()
+            ),
+        ));
+    }
+    // A instrução tem de caber no padrão e ter 5+ bytes; os curingas valem 0 só para medir o tamanho.
+    let sample: Vec<u8> = (0..pattern.len())
+        .map(|i| pattern.token(i).flatten().unwrap_or(0))
+        .collect();
+    hook_insn(&sample, raw.offset).map_err(|e| err("offset", &e.to_string()))?;
+    let body = match raw.body.as_deref() {
+        None => return Err(err("body", "campo obrigatório ausente")),
+        Some(text) => CaveBody::parse(text).ok_or_else(|| {
+            err(
+                "body",
+                &format!("`{text}` não é brain, analyzer, drag nem collect"),
+            )
+        })?,
+    };
+    let action = raw.action.unwrap_or(false);
+    if action && body != CaveBody::Drag {
+        return Err(err("action", "só vale no corpo drag"));
+    }
+    let value = match (&raw.value, body) {
+        (Some(_), CaveBody::Analyzer) => {
+            return Err(err("value", "o corpo analyzer não tem valor"));
+        }
+        (None, CaveBody::Analyzer) => None,
+        (None, _) => return Err(err("value", "campo obrigatório ausente")),
+        (Some(block), _) => Some(build_points_grid(file, id, block)?),
+    };
+    Ok(HookDef {
+        id: raw.id,
+        name,
+        category,
+        description: raw.description,
+        module,
+        pattern,
+        offset: raw.offset,
+        body,
+        value,
+        action,
+    })
+}
+
+/// Deslocamentos que a cave do Brain Power lê da ocorrência do padrão (spec 008, 6.6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrainCaptures {
+    /// `R`: deslocamento de `PartyComponent.ResearchPoints` (igual nos três acessos do padrão).
+    pub research: u32,
+    /// `T0`: deslocamento do início da tabela de níveis no objeto da tabela.
+    pub table: u32,
+    /// `T1`: deslocamento da contagem de níveis no objeto da tabela.
+    pub count: u32,
+    /// `L`: deslocamento do limite dentro de cada nível.
+    pub limit: u32,
+}
+
+fn incoherent(reason: impl Into<String>) -> Error {
+    Error::IncoherentPattern {
+        reason: reason.into(),
+    }
+}
+
+/// Deslocamento de memória da instrução, se couber em `u32` (o do jogo é sempre positivo).
+fn disp_u32(insn: &Instruction) -> Option<u32> {
+    u32::try_from(insn.memory_displacement64()).ok()
+}
+
+/// `insn` é `mov/cmp ..., [base + disp]` com o operando de memória no índice `mem_op`.
+fn mem_base(insn: &Instruction, mem_op: u32) -> Option<Register> {
+    (insn.op_count() > mem_op
+        && insn.op_kind(mem_op) == OpKind::Memory
+        && insn.memory_index() == Register::None)
+        .then(|| insn.memory_base())
+}
+
+/// Lê `R`, `T0`, `T1` e `L` dos bytes da ocorrência inteira do padrão do Brain Power e confere a
+/// forma do trecho (spec 008, 6.6.1): `esi` = valor antigo, `rbx` = o objeto, `rax` = a tabela, passo
+/// de `0x30` bytes por nível, e os três acessos a `ResearchPoints` com o mesmo deslocamento.
+///
+/// Erro [`Error::IncoherentPattern`] (`padrão incoerente`) se os bytes não decodificam, se faltar
+/// uma das instruções esperadas ou se os três deslocamentos de `R` diferirem. A comparação com o
+/// deslocamento da reflexão é de quem resolve o desvio.
+pub fn brain_captures_from_hit(occurrence: &[u8]) -> Result<BrainCaptures> {
+    let mut insns = Vec::new();
+    for insn in &mut Decoder::with_ip(64, occurrence, 0, DecoderOptions::NONE) {
+        if insn.is_invalid() {
+            return Err(incoherent("os bytes da ocorrência não decodificam"));
+        }
+        insns.push(insn);
+    }
+    let find = |what: &str, pick: fn(&Instruction) -> Option<u32>| -> Result<u32> {
+        insns
+            .iter()
+            .find_map(pick)
+            .ok_or_else(|| incoherent(format!("não achei {what}")))
+    };
+    // `mov esi,[rcx+R]`: o valor antigo.
+    let first = find("mov esi,[rcx+R]", |i| {
+        (i.mnemonic() == Mnemonic::Mov
+            && i.op0_register() == Register::ESI
+            && mem_base(i, 1) == Some(Register::RCX))
+        .then(|| disp_u32(i))
+        .flatten()
+    })?;
+    // `mov [rcx+R],eax`: grava o novo total.
+    let store = find("mov [rcx+R],eax", |i| {
+        (i.mnemonic() == Mnemonic::Mov
+            && mem_base(i, 0) == Some(Register::RCX)
+            && i.op1_register() == Register::EAX)
+            .then(|| disp_u32(i))
+            .flatten()
+    })?;
+    // `cmp eax,[rbx+R]`: o objeto lido de novo, no laço.
+    let compare = find("cmp eax,[rbx+R]", |i| {
+        (i.mnemonic() == Mnemonic::Cmp
+            && i.op0_register() == Register::EAX
+            && mem_base(i, 1) == Some(Register::RBX))
+        .then(|| disp_u32(i))
+        .flatten()
+    })?;
+    if first != store || store != compare {
+        return Err(incoherent(format!(
+            "os três deslocamentos de ResearchPoints diferem ({first:#x}, {store:#x}, {compare:#x})"
+        )));
+    }
+    let table = find("mov r14,[rax+T0]", |i| {
+        (i.mnemonic() == Mnemonic::Mov
+            && i.op0_register() == Register::R14
+            && mem_base(i, 1) == Some(Register::RAX))
+        .then(|| disp_u32(i))
+        .flatten()
+    })?;
+    let count = find("movsxd rax,[rax+T1]", |i| {
+        (i.mnemonic() == Mnemonic::Movsxd
+            && i.op0_register() == Register::RAX
+            && mem_base(i, 1) == Some(Register::RAX))
+        .then(|| disp_u32(i))
+        .flatten()
+    })?;
+    let limit = find("mov eax,[r14+L]", |i| {
+        (i.mnemonic() == Mnemonic::Mov
+            && i.op0_register() == Register::EAX
+            && mem_base(i, 1) == Some(Register::R14))
+        .then(|| disp_u32(i))
+        .flatten()
+    })?;
+    // Passo de 0x30 bytes por nível: `lea rcx,[rax+rax*2]; shl rcx,4` (3 × 16).
+    let lea = insns.iter().any(|i| {
+        i.mnemonic() == Mnemonic::Lea
+            && i.op0_register() == Register::RCX
+            && i.memory_base() == Register::RAX
+            && i.memory_index() == Register::RAX
+            && i.memory_index_scale() == 2
+    });
+    let shl = insns.iter().any(|i| {
+        i.mnemonic() == Mnemonic::Shl
+            && i.op0_register() == Register::RCX
+            && i.op1_kind() == OpKind::Immediate8
+            && i.immediate8() == 4
+    });
+    if !(lea && shl) {
+        return Err(incoherent("o passo de 0x30 bytes por nível não confere"));
+    }
+    Ok(BrainCaptures {
+        research: first,
+        table,
+        count,
+        limit,
     })
 }
 
@@ -1517,7 +1896,7 @@ impl Signatures {
             .ue
             .map(|block| build_generic_ue(GENERIC_FILE, block))
             .transpose()?;
-        // O `id` é único entre `[[patch]]` e `[[field]]`: `seen` já tem os dos patches.
+        // O `id` é único entre `[[patch]]`, `[[field]]` e `[[hook]]`: `seen` já tem os dos patches.
         let mut fields = Vec::new();
         for f in parsed.field {
             if !seen.insert(f.id.clone()) {
@@ -1530,6 +1909,17 @@ impl Signatures {
             fields.push(build_field(GENERIC_FILE, f)?);
         }
         check_field_set(GENERIC_FILE, &fields, ue.as_ref())?;
+        let mut hooks = Vec::new();
+        for h in parsed.hook {
+            if !seen.insert(h.id.clone()) {
+                return Err(sig_err(
+                    GENERIC_FILE,
+                    "id",
+                    format!("`{}` repetido entre [[patch]], [[field]] e [[hook]]", h.id),
+                ));
+            }
+            hooks.push(build_hook(GENERIC_FILE, h)?);
+        }
 
         let mut versions = BTreeMap::new();
         for (name, text) in version_files {
@@ -1622,6 +2012,7 @@ impl Signatures {
             versions,
             ue,
             fields,
+            hooks,
         })
     }
 
@@ -1676,6 +2067,11 @@ impl Signatures {
     /// Os cheats de valor (`[[field]]`), na ordem do arquivo. Valem para qualquer versão.
     pub fn fields(&self) -> &[FieldDef] {
         &self.fields
+    }
+
+    /// Os desvios com cave (`[[hook]]`), na ordem do arquivo. Valem para qualquer versão.
+    pub fn hooks(&self) -> &[HookDef] {
+        &self.hooks
     }
 }
 
@@ -3902,5 +4298,310 @@ bools = [false, true]
         assert!((grid.value(grid.default_k) - 0.25).abs() < 1e-9);
         assert_eq!(grid.unit.as_deref(), Some("x"));
         assert_eq!(grid.decimals, 2);
+    }
+
+    // ---- [[hook]] (spec 008, 6.2 e 12) ----
+
+    /// Pedaço de TOML de um `[[hook]]` com `extra` no fim (padrão de 8 bytes, instrução de 5 em 0).
+    fn hook_toml(extra: &str) -> String {
+        format!(
+            "[[hook]]\nid = \"h\"\nname = \"H\"\ncategory = \"itens\"\ndescription = \"d\"\n\
+             pattern = \"48 89 5c 24 08 48 ?? c3\"\noffset = 0\n{extra}"
+        )
+    }
+
+    const POINTS: &str = "[hook.value]\ntype = \"i32\"\npoints = [2, 3, 5]\ndefault = 3\n";
+
+    fn hook_err(extra: &str) -> String {
+        parse(&[("generic.toml", &hook_toml(extra))])
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn hooks_load() {
+        let sigs = Signatures::embedded().unwrap();
+        let hooks = sigs.hooks();
+        let ids: Vec<&str> = hooks.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["brain-power", "analisador-infinito", "quantidade-arrastar"]
+        );
+        // Os hooks não entram na lista de patches.
+        assert!(sigs.ids().iter().all(|id| !ids.contains(id)));
+
+        let brain = &hooks[0];
+        assert_eq!(brain.body, CaveBody::Brain);
+        assert_eq!((brain.offset, brain.pattern.len()), (36, 91));
+        assert!(!brain.action);
+        let grid = brain.value.as_ref().unwrap();
+        assert_eq!(grid.points.as_deref(), Some(&[2.0, 3.0, 5.0, 10.0][..]));
+        assert_eq!((grid.default_k, grid.steps()), (0, 3));
+        assert_eq!(grid.format(grid.default_k), "2x");
+        assert_eq!(grid.ty, ValueType::I32);
+
+        let analyzer = &hooks[1];
+        assert_eq!(analyzer.body, CaveBody::Analyzer);
+        assert_eq!(analyzer.offset, 0);
+        assert!(analyzer.value.is_none() && !analyzer.action);
+
+        let drag = &hooks[2];
+        assert_eq!(drag.body, CaveBody::Drag);
+        assert!(drag.action);
+        let grid = drag.value.as_ref().unwrap();
+        assert_eq!(
+            grid.points.as_deref(),
+            Some(&[10.0, 50.0, 100.0, 250.0, 500.0, 999.0][..])
+        );
+        assert_eq!(grid.value(grid.default_k), 100.0);
+        assert_eq!(grid.unit, None);
+        // Todos com módulo do jogo e a instrução do desvio com 5+ bytes (conferido na carga).
+        for h in hooks {
+            assert_eq!(h.module, crate::GAME_EXE);
+        }
+    }
+
+    #[test]
+    fn hook_insn_too_short() {
+        // `mov rax,rbx` (3 bytes) no offset 2 da ocorrência.
+        let occurrence = [0x90, 0x90, 0x48, 0x89, 0xD8, 0x90, 0x90, 0x90];
+        let err = hook_insn(&occurrence, 2).unwrap_err();
+        assert!(matches!(err, Error::BadHookInsn { .. }), "{err}");
+        assert!(err.to_string().contains("3 bytes"), "{err}");
+        // A de 5 bytes serve, e o resultado são os bytes dela (não os do que vem depois).
+        let occurrence = [0x48, 0x89, 0x5C, 0x24, 0x08, 0x90, 0x90];
+        assert_eq!(
+            hook_insn(&occurrence, 0).unwrap(),
+            vec![0x48, 0x89, 0x5C, 0x24, 0x08]
+        );
+        // Instrução cortada pelo fim da ocorrência, e offset fora dela.
+        assert!(hook_insn(&[0x48, 0x89, 0x5C, 0x24], 0).is_err());
+        assert!(hook_insn(&occurrence, occurrence.len()).is_err());
+        // Na carga: o padrão com a instrução curta é recusado, no campo `offset`.
+        let text = "[[hook]]\nid = \"h\"\nname = \"H\"\ncategory = \"itens\"\ndescription = \"d\"\n\
+                    pattern = \"90 48 89 d8 90 90 c3\"\noffset = 1\nbody = \"analyzer\"\n";
+        let err = parse(&[("generic.toml", text)]).unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature { field, .. } if field == "offset"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn hook_action_only_drag() {
+        let ok = parse(&[(
+            "generic.toml",
+            &hook_toml(&format!("body = \"drag\"\naction = true\n{POINTS}")),
+        )])
+        .unwrap();
+        assert!(ok.hooks()[0].action);
+        // Sem `action`, o padrão é falso.
+        let plain = parse(&[(
+            "generic.toml",
+            &hook_toml(&format!("body = \"drag\"\n{POINTS}")),
+        )])
+        .unwrap();
+        assert!(!plain.hooks()[0].action);
+        for body in ["brain", "collect"] {
+            let err = hook_err(&format!("body = \"{body}\"\naction = true\n{POINTS}"));
+            assert!(err.contains("action"), "{err}");
+        }
+        let err = hook_err("body = \"analyzer\"\naction = true\n");
+        assert!(err.contains("action"), "{err}");
+    }
+
+    #[test]
+    fn hook_id_collides_with_patch() {
+        let patch_id = "[[patch]]\nid = \"h\"\nname = \"P\"\ncategory = \"itens\"\ndescription = \"d\"\n\
+                        pattern = \"48 8B F9\"\noffset = 0\nexpected = \"48 8B F9\"\nreplacement = \"48 89 CF\"\n\n";
+        let text = format!("{patch_id}{}", hook_toml("body = \"analyzer\"\n"));
+        let err = parse(&[("generic.toml", &text)]).unwrap_err().to_string();
+        assert!(err.contains("`h` repetido"), "{err}");
+        // Dois hooks com o mesmo id também.
+        let one = hook_toml("body = \"analyzer\"\n");
+        let err = parse(&[("generic.toml", &format!("{one}\n{one}"))])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`h` repetido"), "{err}");
+    }
+
+    #[test]
+    fn hook_load_rules() {
+        // `offset` dentro do padrão.
+        let text = hook_toml("body = \"analyzer\"\n").replace("offset = 0", "offset = 8");
+        let err = parse(&[("generic.toml", &text)]).unwrap_err().to_string();
+        assert!(
+            err.contains("offset") && err.contains("fora do pattern"),
+            "{err}"
+        );
+        // `body` obrigatório e conhecido; `value` obrigatório fora do analisador.
+        assert!(hook_err("").contains("body"));
+        assert!(hook_err("body = \"voa\"\n").contains("voa"));
+        assert!(hook_err("body = \"brain\"\n").contains("value"));
+        let err = hook_err(&format!("body = \"analyzer\"\n{POINTS}"));
+        assert!(err.contains("analyzer não tem valor"), "{err}");
+        // `module` só o exe do jogo; campos desconhecidos recusados.
+        assert!(hook_err("body = \"analyzer\"\nmodule = \"x.dll\"\n").contains("x.dll"));
+        assert!(hook_err("body = \"analyzer\"\nexpected = \"48\"\n").contains("expected"));
+    }
+
+    #[test]
+    fn hook_points_grid_rules() {
+        let load = |value: &str| {
+            parse(&[(
+                "generic.toml",
+                &hook_toml(&format!("body = \"brain\"\n[hook.value]\n{value}")),
+            )])
+        };
+        let grid = |value: &str| load(value).unwrap().hooks()[0].value.clone().unwrap();
+        let g = grid("type = \"i32\"\npoints = [2, 3, 5]\ndefault = 5\nunit = \"x\"\n");
+        assert_eq!(g.default_k, 2);
+        assert_eq!(g.format(2), "5x");
+        // Um ponto só é aceito.
+        assert_eq!(
+            grid("type = \"i32\"\npoints = [7]\ndefault = 7\n").steps(),
+            0
+        );
+        // f32 aceita decimais.
+        let g = grid("type = \"f32\"\npoints = [0.5, 1.5]\ndefault = 1.5\n");
+        assert_eq!(g.format(1), "1.5");
+        let bad = |value: &str, want: &str| {
+            let err = load(value).unwrap_err().to_string();
+            assert!(err.contains(want), "{value}: {err}");
+        };
+        bad(
+            "type = \"i32\"\npoints = [2, 3]\ndefault = 4\n",
+            "não está na lista",
+        );
+        bad(
+            "type = \"i32\"\npoints = [3, 2]\ndefault = 3\n",
+            "crescentes",
+        );
+        bad("type = \"i32\"\npoints = []\ndefault = 3\n", "vazia");
+        bad(
+            "type = \"i32\"\npoints = [2, 2.5]\ndefault = 2\n",
+            "inteiro",
+        );
+        bad(
+            "type = \"i32\"\npoints = [2, 3]\ndefault = 2\nmin = 2\n",
+            "points",
+        );
+        bad(
+            "type = \"i32\"\npoints = [2, 3]\ndefault = 2\nslot = 1\n",
+            "slot",
+        );
+        bad("type = \"i32\"\npoints = 3\ndefault = 3\n", "lista");
+        bad("type = \"i32\"\ndefault = 3\n", "points");
+        bad(
+            "type = \"i32\"\npoints = [2, 3]\ndefault = 2\ndecimals = 1\n",
+            "f32",
+        );
+    }
+
+    #[test]
+    fn points_refused_outside_hook() {
+        let patch = "[[patch]]\nid = \"p\"\nname = \"N\"\ncategory = \"itens\"\ndescription = \"d\"\n\
+                     pattern = \"48 8B F9 11 22 33 44\"\noffset = 3\nexpected = \"11 22 33 44\"\nreplacement = \"01 00 00 00\"\n\
+                     [patch.value]\ntype = \"i32\"\nslot = 0\npoints = [1, 2]\ndefault = 1\n";
+        let err = parse(&[("generic.toml", patch)]).unwrap_err().to_string();
+        assert!(
+            err.contains("value.points") || err.contains("[[hook]]"),
+            "{err}"
+        );
+    }
+
+    /// Ocorrência sintética do padrão do Brain Power: os curingas valem 0, exceto os que o teste fixa.
+    fn brain_occurrence() -> Vec<u8> {
+        let sigs = Signatures::embedded().unwrap();
+        let pattern = &sigs.hooks()[0].pattern;
+        (0..pattern.len())
+            .map(|i| pattern.token(i).flatten().unwrap_or(0))
+            .collect()
+    }
+
+    /// A função de produção (o teste de mesmo nome a esconde).
+    fn captures_of(bytes: &[u8]) -> Result<BrainCaptures> {
+        super::brain_captures_from_hit(bytes)
+    }
+
+    /// Escreve `value` (16 bits baixos) nos dois bytes do curinga em `at`.
+    fn put16(bytes: &mut [u8], at: usize, value: u16) {
+        bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    /// Ocorrência com `R` nos três acessos e `T0`, `T1`, `L` distintos.
+    fn brain_filled(r: u16) -> Vec<u8> {
+        let mut bytes = brain_occurrence();
+        for at in [2, 22, 87] {
+            put16(&mut bytes, at, r);
+        }
+        put16(&mut bytes, 39, 0x118);
+        put16(&mut bytes, 46, 0x120);
+        bytes[80] = 0x10;
+        bytes
+    }
+
+    #[test]
+    fn brain_captures_from_hit() {
+        let caps = captures_of(&brain_filled(0x514)).unwrap();
+        assert_eq!(
+            caps,
+            BrainCaptures {
+                research: 0x514,
+                table: 0x118,
+                count: 0x120,
+                limit: 0x10,
+            }
+        );
+        // Outros valores saem iguais: nada é fixo no código.
+        let mut bytes = brain_filled(0x6A0);
+        put16(&mut bytes, 39, 0x200);
+        put16(&mut bytes, 46, 0x208);
+        bytes[80] = 0x18;
+        let caps = captures_of(&bytes).unwrap();
+        assert_eq!(
+            (caps.research, caps.table, caps.count, caps.limit),
+            (0x6A0, 0x200, 0x208, 0x18)
+        );
+        // A instrução do desvio do `[[hook]]` é a de T0 (7 bytes, `mov r14,[rax+T0]`).
+        let sigs = Signatures::embedded().unwrap();
+        let insn = hook_insn(&brain_filled(0x514), sigs.hooks()[0].offset).unwrap();
+        assert_eq!(insn, vec![0x4C, 0x8B, 0xB0, 0x18, 0x01, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn brain_pattern_incoherent_disp() {
+        for (which, at) in [(0, 2), (1, 22), (2, 87)] {
+            let mut bytes = brain_filled(0x514);
+            put16(&mut bytes, at, 0x518);
+            let err = captures_of(&bytes).unwrap_err();
+            assert!(
+                matches!(err, Error::IncoherentPattern { .. }),
+                "{which}: {err}"
+            );
+            assert!(
+                err.to_string().contains("padrão incoerente"),
+                "{which}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn brain_captures_reject_other_shapes() {
+        // O passo de 0x30 por nível (`shl rcx,4`) trocado por outro não confere.
+        let mut bytes = brain_filled(0x514);
+        bytes[57] = 0x05;
+        let err = captures_of(&bytes).unwrap_err().to_string();
+        assert!(
+            err.contains("padrão incoerente") && err.contains("0x30"),
+            "{err}"
+        );
+        // `esi` trocado por outro registrador no primeiro `mov` (8b b1 -> 8b 99, `ebx`).
+        let mut bytes = brain_filled(0x514);
+        bytes[1] = 0x99;
+        assert!(captures_of(&bytes).is_err());
+        // Bytes que não são código.
+        assert!(captures_of(&[0x06; 4]).is_err());
+        assert!(captures_of(&[]).is_err());
     }
 }
