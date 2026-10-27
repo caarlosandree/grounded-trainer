@@ -2,10 +2,11 @@
 
 use std::ops::Range;
 
+use gt_core::cave::{CaveAllocator, cc_runs};
 use gt_core::maps::MapRegion;
 use gt_core::modules::Module;
 use gt_core::patch::WritePolicy;
-use gt_core::pe::PeHeaders;
+use gt_core::pe::{DiskImage, PeHeaders};
 
 /// Seções executáveis do `disk` (cabeçalho do arquivo, não o da memória), em endereços do
 /// processo e cortadas na extensão do módulo.
@@ -78,6 +79,28 @@ pub fn var_region(module: &Module, disk: &PeHeaders, maps: &[MapRegion]) -> Opti
     );
     let region = start..end;
     rw.allows(&region).then_some(region)
+}
+
+/// Tamanho mínimo, em bytes, das sequências de `CC` que servem para caves (spec 008, 6.4): a
+/// menor cave é a de observação (~70 bytes) e a margem de 16 fica por conta do alocador; sequências
+/// menores só atrapalhariam as listagens.
+pub const CAVE_MIN_RUN: usize = 64;
+
+/// Sequências de `CC` de pelo menos `min_len` bytes na `.text` do **disco** (`disk`), em
+/// endereços do processo. `None` se a imagem não tem `.text` ou ela sai dos limites do arquivo.
+///
+/// O disco é a fonte porque a memória pode já ter caves nossas ou de outros nas sequências: o que
+/// está em uso se descobre lendo a memória por cima desta lista.
+pub fn text_cc_runs(module: &Module, disk: &DiskImage, min_len: usize) -> Option<Vec<Range<u64>>> {
+    let text = disk.headers.section(".text")?;
+    let bytes = disk.bytes(text.rva, usize::try_from(text.virtual_size).ok()?)?;
+    let start = module.base.checked_add(u64::from(text.rva))?;
+    Some(cc_runs(bytes, start, min_len))
+}
+
+/// Alocador de caves sobre as sequências de [`CAVE_MIN_RUN`] bytes ou mais da `.text` do disco.
+pub fn cave_allocator(module: &Module, disk: &DiskImage) -> Option<CaveAllocator> {
+    text_cc_runs(module, disk, CAVE_MIN_RUN).map(CaveAllocator::new)
 }
 
 /// Onde o motor pode escrever em dados (spec 005, 6.4): regiões `rw-` do `maps` (sem execução),

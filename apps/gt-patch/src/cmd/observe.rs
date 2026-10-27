@@ -15,7 +15,7 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
-use gt_core::cave::{CAVE_MARGIN, CaveAllocator, cc_runs, hook_bytes};
+use gt_core::cave::{CAVE_MARGIN, hook_bytes};
 use gt_core::engine::Engine;
 use gt_core::guard;
 use gt_core::mem::{MemReader, ReadMem};
@@ -28,7 +28,7 @@ use gt_core::session::Shutdown;
 use gt_grounded2::GAME_EXE;
 use gt_grounded2::catalog;
 use gt_grounded2::caves::{self, CaveCtx, Register, var};
-use gt_grounded2::policy::{exec_ranges, var_region};
+use gt_grounded2::policy::{cave_allocator, exec_ranges, var_region};
 use gt_grounded2::resolve::Target;
 use gt_grounded2::signatures::{Signatures, hook_insn};
 use gt_grounded2::ue::UE_ID;
@@ -48,8 +48,6 @@ const POLL: Duration = Duration::from_millis(100);
 const PRINT: Duration = Duration::from_secs(1);
 /// Bytes lidos no ponto para decodificar a instrução trocada (o tamanho máximo de uma instrução x86).
 const MAX_INSN: usize = 15;
-/// Menor sequência de `CC` considerada pelo alocador (o resto é conferido pela margem e pelo tamanho).
-const MIN_RUN: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Achar e conferir o ponto
@@ -167,11 +165,9 @@ impl Plan {
             .filter(|r| r.end - r.start >= var::TOTAL)
             .context("indisponível (sem espaço para variáveis)")?;
 
-        let text_bytes = disk
-            .bytes(text.rva, text.virtual_size as usize)
-            .context("a seção .text sai dos limites da imagem em disco")?;
         let text_start = module.base + u64::from(text.rva);
-        let mut alloc = CaveAllocator::new(cc_runs(text_bytes, text_start, MIN_RUN));
+        let mut alloc = cave_allocator(module, disk)
+            .context("a seção .text sai dos limites da imagem em disco")?;
         let ctx = |cave_at: u64| CaveCtx {
             hook_at,
             cave_at,

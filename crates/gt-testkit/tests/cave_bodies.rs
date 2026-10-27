@@ -711,6 +711,39 @@ fn observe_counts_and_rings_without_side_effects() {
 // Conferência estática de todos os corpos
 // ---------------------------------------------------------------------------
 
+/// `insn` e `captures` têm de vir do mesmo achado: a instrução trocada é o `mov r14,[rax+T0]` do
+/// padrão, com o mesmo `T0` das capturas.
+#[test]
+fn brain_refuses_an_insn_from_another_hit() {
+    let r = rig();
+    let len = Pattern::parse(BRAIN_PATTERN).unwrap().len();
+    let captures = r.bytes(r.t.symbol("level_pattern"), len);
+    let point = r.t.symbol("level_point");
+    let cave_at = r.text_start + 0x900;
+    // A instrução certa monta.
+    let ctx = r.ctx(point, 7, cave_at, captures.clone());
+    assert!(caves::build(CaveBody::Brain, &ctx).is_ok());
+    // Outra instrução (o `mov [rsp+8],rbx` de `sum`, de 5 bytes): incoerente.
+    let ctx = r.ctx(r.t.symbol("sum"), 5, cave_at, captures.clone());
+    let err = caves::build(CaveBody::Brain, &ctx).unwrap_err();
+    assert!(
+        matches!(err, gt_grounded2::Error::IncoherentPattern { .. }),
+        "{err}"
+    );
+    // O mesmo `mov r14,[rax+X]`, mas com outro `X` que o `T0` das capturas.
+    let mut ctx = r.ctx(point, 7, cave_at, captures.clone());
+    ctx.insn[3] ^= 0x08;
+    let err = caves::build(CaveBody::Brain, &ctx).unwrap_err();
+    assert!(
+        matches!(err, gt_grounded2::Error::IncoherentPattern { .. }),
+        "{err}"
+    );
+    // Outra base (`mov r14,[rcx+T0]`).
+    let mut ctx = r.ctx(point, 7, cave_at, captures);
+    ctx.insn[2] = 0xb1;
+    assert!(caves::build(CaveBody::Brain, &ctx).is_err());
+}
+
 #[test]
 fn all_bodies_pass_check() {
     let r = rig();

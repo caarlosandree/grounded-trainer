@@ -6,7 +6,7 @@
 //! - na memória, a cabeça vem do arquivo (`r--` no cabeçalho, `r-x` na `.text`, `rw-` no começo da
 //!   `.data`) e a cauda da `.data` é uma VMA **anônima** `rw-p` até o fim da página, com o
 //!   `VirtualSize` terminando no meio dela (folga de [`SLACK_LEN`] bytes, como no jogo);
-//! - a `.text` traz duas sequências de `CC` (300 e 70 bytes) e funções-alvo montadas com
+//! - a `.text` traz duas sequências de `CC` (800 e 70 bytes) e funções-alvo montadas com
 //!   `iced-x86`, que as caves das próximas tarefas desviam. Todas seguem a convenção x64 do
 //!   Windows (`rcx`, `rdx`, `r8`, `r9`; resultado em `rax`), como o jogo, e usam só endereçamento
 //!   relativo ao `rip`: a imagem não precisa de realocação.
@@ -64,7 +64,7 @@ pub const PDATA_FUNCTIONS: [&str; 8] = [
 const TIME_DATE_STAMP: u32 = 0x5A5A_5A5A;
 
 /// Tamanho das duas sequências de `CC` da `.text`.
-pub const CC_RUN_LONG: usize = 300;
+pub const CC_RUN_LONG: usize = 800;
 /// Idem (a curta).
 pub const CC_RUN_SHORT: usize = 70;
 
@@ -649,7 +649,7 @@ mod tests {
                 .filter(|l| **l >= 64)
                 .copied()
                 .collect::<Vec<_>>(),
-            [300, 70]
+            [800, 70]
         );
         // Cada função-alvo começa com uma instrução de 5+ bytes que pode ser desviada.
         for (name, first) in [

@@ -15,6 +15,7 @@
 use iced_x86::code_asm::{
     dword_ptr, eax, edx, esi, qword_ptr, r8, r9, r9d, r10, r11, rax, rbx, rcx, rdi, rdx, rsi,
 };
+use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
 
 use super::{CaveCtx, FIELD_RESEARCH_POINTS, asm_err, assembler, disp, finish, restore, save, var};
 use crate::error::{Error, Result};
@@ -25,6 +26,32 @@ pub const MAX_TABLE_ENTRIES: i32 = 256;
 
 /// Bytes por entrada da tabela de níveis: fixo no padrão (`lea rcx,[rax+rax*2]; shl rcx,4`).
 const TABLE_STRIDE: i32 = 0x30;
+
+/// Confere que a instrução trocada pelo desvio é `mov r14,[rax+T0]` com o mesmo `T0` das capturas:
+/// a cave assume `rax` = tabela e `r14` = início dela, e executa a instrução original depois.
+/// Uma instrução de outra forma (ou de outro `T0`) é o sinal de que `insn` e `captures` não vêm do
+/// mesmo achado do padrão.
+fn check_insn(insn: &[u8], table: u32) -> Result<()> {
+    let mut decoder = Decoder::new(64, insn, DecoderOptions::NONE);
+    let decoded = decoder.decode();
+    let ok = !decoded.is_invalid()
+        && decoded.len() == insn.len()
+        && decoded.mnemonic() == Mnemonic::Mov
+        && decoded.op0_register() == Register::R14
+        && decoded.op1_kind() == OpKind::Memory
+        && decoded.memory_base() == Register::RAX
+        && decoded.memory_index() == Register::None
+        && decoded.memory_displacement64() == u64::from(table);
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::IncoherentPattern {
+            reason: format!(
+                "a instrução do desvio não é `mov r14,[rax+{table:#x}]` como o padrão manda"
+            ),
+        })
+    }
+}
 
 pub(super) fn build(ctx: &CaveCtx) -> Result<Vec<u8>> {
     let caps = brain_captures_from_hit(&ctx.captures)?;
@@ -37,6 +64,7 @@ pub(super) fn build(ctx: &CaveCtx) -> Result<Vec<u8>> {
             ),
         });
     }
+    check_insn(&ctx.insn, caps.table)?;
     let start = disp(u64::from(caps.table))?;
     let count_off = disp(u64::from(caps.count))?;
     let limit = disp(u64::from(caps.limit))?;

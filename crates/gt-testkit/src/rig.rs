@@ -6,7 +6,7 @@ use std::ops::Range;
 
 use std::collections::HashMap;
 
-use gt_core::cave::{CaveAllocator, cc_runs, hook_bytes};
+use gt_core::cave::{CaveAllocator, hook_bytes};
 use gt_core::engine::Engine;
 use gt_core::journal::{JournalLock, JournalStore};
 use gt_core::mem::MemReader;
@@ -99,12 +99,7 @@ pub struct InstalledHook {
 impl SynthRig {
     /// Alocador de caves sobre as sequências de `CC` (64 bytes ou mais) da `.text` do "disco".
     pub fn cave_allocator(&self) -> CaveAllocator {
-        let text = self.disk.headers.section(".text").unwrap();
-        let bytes = self
-            .disk
-            .bytes(text.rva, text.virtual_size as usize)
-            .unwrap();
-        CaveAllocator::new(cc_runs(bytes, self.module.base + u64::from(text.rva), 64))
+        gt_grounded2::policy::cave_allocator(&self.module, &self.disk).unwrap()
     }
 
     /// Instala a cave de observação de `reg` num desvio no começo da função `function` (símbolo do

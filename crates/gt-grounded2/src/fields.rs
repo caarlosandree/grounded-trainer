@@ -161,6 +161,9 @@ pub struct TickReport {
     pub events: Vec<String>,
     /// Desde quando o `Pawn` está nulo (para a nova procura do controller, spec 6.3).
     pub pawn_null_since: Option<Instant>,
+    /// O pawn (personagem) lido neste ciclo; `None` se o personagem não está achado. É o que o
+    /// `HookRuntime` usa para achar o inventário do jogador (spec 008, 6.7.4).
+    pub pawn: Option<u64>,
     /// Estado do caminho do `game_state`; `None` se nenhum `set` dessa raiz está ligado (ou o
     /// controller falhou antes de o mundo ser lido). `player` segue só o pawn.
     pub world: Option<WorldState>,
@@ -330,6 +333,7 @@ impl FieldRuntime {
             notes: HashMap::new(),
             events: Vec::new(),
             pawn_null_since: None,
+            pawn: None,
             world: None,
         };
         // Os `set` da raiz `game_state` em `on`: o que o mundo mantém.
@@ -405,6 +409,7 @@ impl FieldRuntime {
             report.events.push("personagem encontrado".to_string());
         }
         self.found = Some(true);
+        report.pawn = Some(snapshot.pawn);
         if self.last_pawn != Some(snapshot.pawn) {
             // Objeto novo: o `maps` é relido antes de escrever nele.
             if let Err(e) = engine.refresh_data_maps() {

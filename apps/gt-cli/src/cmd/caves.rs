@@ -5,21 +5,17 @@
 use std::io::Write;
 
 use anyhow::Context;
-use gt_core::cave::cc_runs;
 use gt_core::guard;
 use gt_core::journal::{Journal, JournalEntry};
 use gt_core::modules::require_trusted;
 use gt_core::patch::{CAVE_FILL, PatchKind};
-use gt_grounded2::policy::var_region;
+use gt_grounded2::policy::{CAVE_MIN_RUN, text_cc_runs, var_region};
 use serde::Serialize;
 
 use super::Global;
 use super::ours::{self, Diary};
 use crate::context::Target;
 use crate::output::emit;
-
-/// Menor sequência de `CC` listada (o padrão): o alocador de caves precisa de 16 de margem mais a cave.
-const MIN_RUN: usize = 64;
 
 /// Opções do `caves` além das globais.
 pub struct Options {
@@ -29,7 +25,9 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Self { min_len: MIN_RUN }
+        Self {
+            min_len: CAVE_MIN_RUN,
+        }
     }
 }
 
@@ -110,13 +108,10 @@ fn build(
         .headers
         .section(".text")
         .context("o executável não tem a seção .text")?;
-    let text_bytes = disk
-        .bytes(text.rva, text.virtual_size as usize)
-        .context("a seção .text sai dos limites da imagem em disco")?;
-    let text_start = module.base + u64::from(text.rva);
     let journal = diary.journal();
 
-    let runs = cc_runs(text_bytes, text_start, opts.min_len)
+    let runs = text_cc_runs(module, &disk, opts.min_len)
+        .context("o executável não tem a seção .text ou ela sai dos limites da imagem em disco")?
         .into_iter()
         .map(|run| {
             let len = (run.end - run.start) as usize;
@@ -334,7 +329,7 @@ mod tests {
         let before = report(&rig);
         // Sem nada instalado: as duas sequências do módulo sintético, intactas, e a folga vazia.
         let lens: Vec<usize> = before.runs.iter().map(|r| r.len).collect();
-        assert_eq!(lens, [300, 70]);
+        assert_eq!(lens, [800, 70]);
         assert!(before.runs.iter().all(|r| r.used == Some(0)));
         assert!(before.runs.iter().all(|r| r.ours.is_empty()));
         assert_eq!(
@@ -411,7 +406,7 @@ mod tests {
         let diary = Diary::Missing;
         let only_long = build(&rig.target, MODULE_NAME, &Options { min_len: 100 }, &diary).unwrap();
         assert_eq!(only_long.runs.len(), 1);
-        assert_eq!(only_long.runs[0].len, 300);
+        assert_eq!(only_long.runs[0].len, 800);
         // Módulo sem folga: o texto pede o motivo da spec.
         let mut broken = report(&rig);
         broken.slack = SlackOutput {

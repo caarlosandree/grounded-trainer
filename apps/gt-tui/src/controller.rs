@@ -4286,6 +4286,7 @@ mod tests {
             notes: notes.iter().map(|(id, n)| (id.to_string(), *n)).collect(),
             events: Vec::new(),
             pawn_null_since: None,
+            pawn: None,
             world: None,
         }
     }

@@ -94,7 +94,7 @@ fn synthetic_text_has_cc_runs_and_pointers() {
         .unwrap();
     let runs = cc_runs(&text, t.module_base() + 0x1000, 64);
     let lens: Vec<u64> = runs.iter().map(|r| r.end - r.start).collect();
-    assert_eq!(lens, vec![300, 70]);
+    assert_eq!(lens, vec![800, 70]);
     assert_eq!(runs[0].start, t.symbol("cc300"));
     assert_eq!(runs[1].start, t.symbol("cc70"));
     // Cada função-alvo é seguida de `CC`.

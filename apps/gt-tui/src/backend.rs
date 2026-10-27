@@ -271,6 +271,7 @@ pub fn idle_tick() -> TickReport {
         notes: HashMap::new(),
         events: Vec::new(),
         pawn_null_since: None,
+        pawn: None,
         world: None,
     }
 }
