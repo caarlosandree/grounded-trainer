@@ -48,6 +48,9 @@ pub const IMAGE_SIZE: u32 = DATA_RVA + DATA_HEAD_LEN + PAGE;
 pub const PDATA_RVA: u32 = 0x800;
 /// Bytes de uma `RUNTIME_FUNCTION` (início, fim e dados de desenrolamento, três `u32`).
 pub const RUNTIME_FUNCTION_LEN: u32 = 12;
+/// RVA do `UNWIND_INFO` comum das entradas da `.pdata` (na página do cabeçalho, depois das
+/// entradas): versão 1 e nenhum flag, ou seja, sem `UNW_FLAG_CHAININFO`.
+pub const UNWIND_RVA: u32 = 0x900;
 /// Funções que entram na `.pdata`, em ordem de RVA: cada uma vai do símbolo ao próximo (a última,
 /// `spin`, tem 2 bytes). `mark_dirty` e `get_table` são os auxiliares de `level_gain`.
 pub const PDATA_FUNCTIONS: [&str; 8] = [
@@ -257,8 +260,9 @@ fn write_headers(f: &mut [u8], text_len: u32, pdata: &[(u32, u32)]) {
         let at = PDATA_RVA as usize + i * RUNTIME_FUNCTION_LEN as usize;
         put_u32(f, at, *start);
         put_u32(f, at + 4, *end);
-        put_u32(f, at + 8, 0); // UnwindData: ninguém desenrola a pilha do módulo sintético
+        put_u32(f, at + 8, UNWIND_RVA); // ninguém desenrola a pilha do módulo sintético
     }
+    f[UNWIND_RVA as usize] = 0x01; // versão 1, sem flags, sem códigos de desenrolamento
     let sections = [
         SectionHeader {
             name: b".text",
@@ -306,6 +310,7 @@ fn assemble_text() -> Result<(Vec<u8>, Symbols)> {
     let mut drag_out = a.create_label();
     let mut add_item = a.create_label();
     let mut spin = a.create_label();
+    let mut leaf = a.create_label();
     let mut cc_long = a.create_label();
     let mut cc_short = a.create_label();
     let mut loop_top = a.create_label();
@@ -456,6 +461,13 @@ fn assemble_text() -> Result<(Vec<u8>, Symbols)> {
     a.jmp(spin).map_err(asm_err)?;
     a.int3().map_err(asm_err)?;
 
+    // leaf(item) -> i32: `StackSize` do item. Função folha: não mexe na pilha, **não tem entrada na
+    // `.pdata`** e vem logo depois do `int3` de `spin` (a regra 2 do ponto aceito, spec 6.7.3).
+    a.set_label(&mut leaf).map_err(asm_err)?;
+    a.mov(eax, dword_ptr(rcx + ITEM_STACK)).map_err(asm_err)?;
+    a.ret().map_err(asm_err)?;
+    a.int3().map_err(asm_err)?;
+
     // Constante do getter e as duas sequências de `CC`, separadas por bytes zero.
     a.db(&[0; 4]).map_err(asm_err)?;
     a.set_label(&mut half).map_err(asm_err)?;
@@ -491,6 +503,7 @@ fn assemble_text() -> Result<(Vec<u8>, Symbols)> {
         ("drag", rva(&drag)?),
         ("add_item", rva(&add_item)?),
         ("spin", rva(&spin)?),
+        ("leaf", rva(&leaf)?),
         ("cc300", rva(&cc_long)?),
         ("cc70", rva(&cc_short)?),
     ];
@@ -676,14 +689,21 @@ mod tests {
                 "{name} deveria começar uma função da .pdata"
             );
         }
-        // Meio de função, a sequência de `CC` e o `level_point` (no meio de `level_gain`) não.
-        for name in ["level_point", "level_pattern", "cc300", "cc70"] {
+        // Meio de função, a sequência de `CC`, o `level_point` (no meio de `level_gain`) e a função
+        // folha `leaf` (sem entrada) não.
+        for name in ["level_point", "level_pattern", "cc300", "cc70", "leaf"] {
             let rva = image.rva(name).unwrap();
             assert!(
                 !functions.iter().any(|f| f.start == rva),
                 "{name} não começa função"
             );
         }
+        // Nenhuma entrada tem unwind encadeado; `leaf` fica fora de todas, logo depois de um `CC`.
+        let runtime = disk.runtime_functions().unwrap();
+        assert!(runtime.iter().all(|f| !f.chained));
+        let leaf = image.rva("leaf").unwrap();
+        assert!(!runtime.iter().any(|f| f.start <= leaf && leaf < f.end));
+        assert_eq!(text_of(&image)[(leaf - TEXT_RVA) as usize - 1], 0xCC);
         // As faixas não se sobrepõem e cobrem a `.text` das funções até o laço `spin`.
         assert!(functions.windows(2).all(|w| w[0].end <= w[1].start));
         // A página do cabeçalho segue legível e as seções não mudaram.

@@ -171,6 +171,21 @@ fn parse_headers(header_bytes: &[u8]) -> Result<ParsedHeaders> {
     })
 }
 
+/// Flag de `UNWIND_INFO` que encadeia a entrada a outra (`UNW_FLAG_CHAININFO`).
+const UNW_FLAG_CHAININFO: u8 = 0x4;
+
+/// Uma entrada da `.pdata` (`RUNTIME_FUNCTION`): a faixa da função e se o `UNWIND_INFO` dela é
+/// encadeado (um pedaço de outra função, não um começo de função de verdade).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeFunction {
+    /// RVA do começo.
+    pub start: u32,
+    /// RVA do fim (exclusivo).
+    pub end: u32,
+    /// `UNW_FLAG_CHAININFO` ligado (ou unwind ilegível: sem prova de que não é).
+    pub chained: bool,
+}
+
 /// Imagem do arquivo `.exe` montada no layout de RVA, como o loader do Windows faria.
 ///
 /// Aloca `SizeOfImage` bytes (≈187 MB no Grounded 2).
@@ -323,6 +338,30 @@ impl DiskImage {
     /// em ordem crescente. Cada entrada `RUNTIME_FUNCTION` tem 12 bytes; entradas vazias ou
     /// com fim antes do início são ignoradas. Sem diretório de exceção, a lista é vazia.
     pub fn functions(&self) -> Result<Vec<Range<u32>>> {
+        Ok(self
+            .runtime_entries()?
+            .into_iter()
+            .map(|(range, _)| range)
+            .collect())
+    }
+
+    /// Como [`DiskImage::functions`], mais o flag de unwind encadeado de cada entrada (lido do
+    /// `UNWIND_INFO` na imagem). Entrada de unwind que não dá para ler (fora da imagem) ou indireta
+    /// (bit 0 do `UnwindData` ligado) conta como encadeada: sem prova de que não é.
+    pub fn runtime_functions(&self) -> Result<Vec<RuntimeFunction>> {
+        Ok(self
+            .runtime_entries()?
+            .into_iter()
+            .map(|(range, unwind)| RuntimeFunction {
+                start: range.start,
+                end: range.end,
+                chained: self.unwind_is_chained(unwind),
+            })
+            .collect())
+    }
+
+    /// `(faixa, UnwindData)` de cada `RUNTIME_FUNCTION` válida, em ordem de início.
+    fn runtime_entries(&self) -> Result<Vec<(Range<u32>, u32)>> {
         let Some((dir_rva, dir_size)) = self.exception_dir else {
             return Ok(Vec::new());
         };
@@ -331,13 +370,30 @@ impl DiskImage {
             .ok_or_else(|| Error::BadPe("diretório de exceção fora da imagem".to_string()))?;
         // Sobra menor que uma entrada é preenchimento.
         let (entries, _) = dir.as_chunks::<12>();
-        let mut functions: Vec<Range<u32>> = entries
+        let mut functions: Vec<(Range<u32>, u32)> = entries
             .iter()
-            .map(|entry| read_u32(&entry[0..4])..read_u32(&entry[4..8]))
-            .filter(|f| f.start < f.end)
+            .map(|entry| {
+                (
+                    read_u32(&entry[0..4])..read_u32(&entry[4..8]),
+                    read_u32(&entry[8..12]),
+                )
+            })
+            .filter(|(f, _)| f.start < f.end)
             .collect();
-        functions.sort_by_key(|f| f.start);
+        functions.sort_by_key(|(f, _)| f.start);
         Ok(functions)
+    }
+
+    /// O `UNWIND_INFO` em `unwind` tem `UNW_FLAG_CHAININFO`? Sem como ler, diz que sim.
+    fn unwind_is_chained(&self, unwind: u32) -> bool {
+        if unwind & 1 != 0 {
+            return true;
+        }
+        match self.bytes(unwind, 1) {
+            // Versão nos 3 bits baixos, flags nos 5 altos.
+            Some(&[first]) => (first >> 3) & UNW_FLAG_CHAININFO != 0,
+            _ => true,
+        }
     }
 
     /// `ProductVersion` do recurso de versão (ex. `Augusta-CL-3207493`), se existir.
@@ -595,6 +651,51 @@ pub(crate) mod tests {
         bad[dir..dir + 4].copy_from_slice(&0x2ff8u32.to_le_bytes());
         let img = DiskImage::from_file_bytes(&bad).unwrap();
         assert!(matches!(img.functions(), Err(Error::BadPe(_))));
+    }
+
+    #[test]
+    fn runtime_functions_report_chained_unwind() {
+        // Quatro entradas (uma fora de ordem). O unwind info mora na mesma seção, em 0x2080:
+        // versão 1 sem flags (`0x01`), versão 1 com `UNW_FLAG_CHAININFO` (`0x21`); a terceira
+        // aponta para fora da imagem e a quarta tem o bit 0 ligado (unwind indireto).
+        let entries = [
+            (0x1040u32, 0x1080u32, 0x2084u32),
+            (0x1000, 0x1040, 0x2080),
+            (0x1080, 0x10c0, 0x5000),
+            (0x10c0, 0x1100, 0x2081),
+        ];
+        let mut pdata = vec![0u8; 0x88];
+        for (i, (begin, end, unwind)) in entries.iter().enumerate() {
+            pdata[i * 12..i * 12 + 4].copy_from_slice(&begin.to_le_bytes());
+            pdata[i * 12 + 4..i * 12 + 8].copy_from_slice(&end.to_le_bytes());
+            pdata[i * 12 + 8..i * 12 + 12].copy_from_slice(&unwind.to_le_bytes());
+        }
+        pdata[0x80] = 0x01;
+        pdata[0x84] = 0x21;
+        let mut section = sec(".pdata", 0x2000, 0x100, 0x4000_0040, 0);
+        section.data = pdata;
+        let mut file = fake_pe(&[text_with_ptr(), section], 0x1_4000_0000, 1, 0x3000, None);
+        let dir = 0x58 + 112 + 3 * 8;
+        file[dir..dir + 4].copy_from_slice(&0x2000u32.to_le_bytes());
+        file[dir + 4..dir + 8].copy_from_slice(&(4u32 * 12).to_le_bytes());
+        let img = DiskImage::from_file_bytes(&file).unwrap();
+        let got: Vec<(u32, u32, bool)> = img
+            .runtime_functions()
+            .unwrap()
+            .iter()
+            .map(|f| (f.start, f.end, f.chained))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (0x1000, 0x1040, false),
+                (0x1040, 0x1080, true),
+                (0x1080, 0x10c0, true),
+                (0x10c0, 0x1100, true),
+            ]
+        );
+        // `functions()` continua devolvendo só as faixas.
+        assert_eq!(img.functions().unwrap().len(), 4);
     }
 
     #[test]

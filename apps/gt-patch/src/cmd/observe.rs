@@ -2,8 +2,9 @@
 //! 6.7.3), ferramenta de pesquisa.
 //!
 //! Instala uma cave que só **conta** as passagens por um ponto e guarda, num anel de variáveis, o
-//! endereço de retorno (`[rsp]`) e o valor de um registrador. O ponto tem de ser o **começo de uma
-//! função**, conferido pela `.pdata` do disco: só ali `[rsp]` é o retorno. O trainer lê o anel de
+//! endereço de retorno (`[rsp]`) e o valor de um registrador. O ponto tem de ser aceito por uma das
+//! três regras da spec (6.7.3), todas provadas pela `.pdata` e pelos bytes do disco: começo de
+//! função da `.pdata`, começo de função folha, ou prefixo sem pilha. Só ali `[rsp]` é o retorno. O trainer lê o anel de
 //! fora a cada 100 ms, mostra a cada segundo os chamadores distintos com a contagem e a classe do
 //! valor do registrador (o nome pela reflexão, quando houver), e devolve tudo ao sair (normal,
 //! Ctrl+C, SIGTERM): desvio, cave e variáveis. Uma observação por vez: a trava do diário já
@@ -15,6 +16,7 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
+use gt_core::asm::check_stack_free_prefix;
 use gt_core::cave::{CAVE_MARGIN, hook_bytes};
 use gt_core::engine::Engine;
 use gt_core::guard;
@@ -22,7 +24,7 @@ use gt_core::mem::{MemReader, ReadMem};
 use gt_core::memscan::{Verdict, scan_memory};
 use gt_core::modules::{Module, require_trusted};
 use gt_core::patch::{CAVE_FILL, PatchKind, PatchSpec, validate};
-use gt_core::pe::DiskImage;
+use gt_core::pe::{DiskImage, RuntimeFunction};
 use gt_core::scan::Pattern;
 use gt_core::session::Shutdown;
 use gt_grounded2::GAME_EXE;
@@ -85,22 +87,114 @@ pub fn locate(
     }
 }
 
-/// O RVA é o começo de uma função da `.pdata` (`functions`, em ordem crescente).
-pub fn check_function_start(functions: &[Range<u32>], rva: u32) -> anyhow::Result<()> {
+/// Prefixo sem pilha: no máximo este tanto de bytes entre o começo da função e o ponto.
+const MAX_PREFIX: u32 = 64;
+
+/// Por qual das três regras o ponto foi aceito (spec 008, 6.7.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointKind {
+    /// Regra 1: o ponto é o `start` de uma entrada da `.pdata` (sem unwind encadeado).
+    PdataStart,
+    /// Regra 2: começo de função folha (fora da `.pdata`, depois de `CC` ou de um `ret`).
+    LeafEntry,
+    /// Regra 3: prefixo sem pilha de uma função da `.pdata`.
+    StackFreePrefix,
+}
+
+/// Decide se `rva` serve de ponto da observação, ou diz qual regra falhou. A observação guarda
+/// `[rsp]`, que só nos pontos aceitos é o endereço de retorno. `functions` é a `.pdata` do disco
+/// (em ordem de início) e `text` a `.text` do disco, que começa em `text_rva`. Nunca aceita sem
+/// prova pela desmontagem ou pelos bytes do disco.
+pub fn accept_point(
+    functions: &[RuntimeFunction],
+    text: &[u8],
+    text_rva: u32,
+    rva: u32,
+) -> Result<PointKind, String> {
     if functions.is_empty() {
-        bail!(
-            "o executável em disco não tem .pdata (diretório de exceção): não dá para conferir o \
-             começo da função"
+        return Err(
+            "o executável em disco não tem .pdata (diretório de exceção): não dá para \
+                    provar que o ponto é o começo de uma função"
+                .to_string(),
         );
     }
-    if functions.iter().any(|f| f.start == rva) {
-        Ok(())
+    let offset = rva
+        .checked_sub(text_rva)
+        .map(|d| d as usize)
+        .filter(|d| *d < text.len())
+        .ok_or_else(|| "o ponto não está na seção .text".to_string())?;
+    // A entrada da `.pdata` que cobre o ponto (a de maior início que ainda o alcança).
+    let covering = functions
+        .iter()
+        .rev()
+        .find(|f| f.start <= rva)
+        .filter(|f| rva < f.end);
+    let Some(function) = covering else {
+        return leaf_entry(text, offset);
+    };
+    if function.chained {
+        return Err(format!(
+            "regra 1: a função da .pdata que cobre o ponto (começa no RVA {:#x}) tem unwind \
+             encadeado (UNW_FLAG_CHAININFO): é um pedaço de outra função, e o [rsp] dela não é o \
+             endereço de retorno",
+            function.start
+        ));
+    }
+    if function.start == rva {
+        return Ok(PointKind::PdataStart);
+    }
+    stack_free_prefix(function, text, text_rva, rva)
+}
+
+/// Regra 2: o ponto fica fora de toda entrada da `.pdata` e o byte antes dele é `CC` ou o fim de
+/// um `ret`.
+fn leaf_entry(text: &[u8], offset: usize) -> Result<PointKind, String> {
+    let before = |n: usize| offset.checked_sub(n).and_then(|at| text.get(at)).copied();
+    let after_padding = before(1) == Some(0xCC);
+    // `ret` (`c3`, também em `repz ret`) ou `ret imm16` (`c2 lo hi`).
+    let after_ret = before(1) == Some(0xC3) || before(3) == Some(0xC2);
+    if after_padding || after_ret {
+        Ok(PointKind::LeafEntry)
     } else {
-        bail!(
-            "o ponto não é o começo de uma função (pela .pdata do disco): a observação guarda \
-             [rsp], que só ali é o endereço de retorno; use o offset do início da função"
+        Err(
+            "o ponto não é o começo de uma função: não começa uma entrada da .pdata, não fica \
+             dentro de nenhuma (regra 3) e o byte antes dele não é CC nem o fim de um ret \
+             (regra 2, função folha); a observação guarda [rsp], que só no começo da função é o \
+             endereço de retorno"
+                .to_string(),
         )
     }
+}
+
+/// Regra 3: o ponto fica dentro de `function`, depois do `start`, num prefixo sem pilha.
+fn stack_free_prefix(
+    function: &RuntimeFunction,
+    text: &[u8],
+    text_rva: u32,
+    rva: u32,
+) -> Result<PointKind, String> {
+    let distance = rva - function.start;
+    if distance > MAX_PREFIX {
+        return Err(format!(
+            "regra 3: o ponto fica a {distance} bytes do começo da função, mais que o limite de \
+             {MAX_PREFIX} do prefixo sem pilha"
+        ));
+    }
+    let slice = |from: u32, to: u32| text.get((from - text_rva) as usize..(to - text_rva) as usize);
+    let Some(code) = slice(function.start, function.end) else {
+        return Err(
+            "regra 3: a função da .pdata passa do fim da .text; não dá para desmontá-la"
+                .to_string(),
+        );
+    };
+    check_stack_free_prefix(code, u64::from(function.start), distance as usize)
+        .map(|()| PointKind::StackFreePrefix)
+        .map_err(|why| {
+            format!(
+                "regra 3: o ponto não é um prefixo sem pilha da função que começa no RVA {:#x}: {why}",
+                function.start
+            )
+        })
 }
 
 /// Tudo que a observação precisa, conferido antes de escrever qualquer byte no jogo.
@@ -121,7 +215,7 @@ pub struct Plan {
 
 impl Plan {
     /// Confere o ponto `hook_at` e monta a cave (o `layout` é exigido pelo contexto das caves; a
-    /// observação não o usa). Recusa se o ponto não é começo de função, se a
+    /// observação não o usa). Recusa se nenhuma regra de `accept_point` aceita o ponto, se a
     /// instrução tem menos de 5 bytes ou difere do disco, ou se falta espaço (variáveis ou cave).
     pub fn new(
         target: &Target,
@@ -135,8 +229,6 @@ impl Plan {
             .checked_sub(module.base)
             .and_then(|d| u32::try_from(d).ok())
             .context("o ponto fica fora do módulo")?;
-        check_function_start(&disk.functions()?, rva)?;
-
         let text = disk
             .headers
             .section(".text")
@@ -144,6 +236,12 @@ impl Plan {
         if !(text.rva..text.rva.saturating_add(text.virtual_size)).contains(&rva) {
             bail!("o ponto não está na seção .text");
         }
+        let text_bytes = disk
+            .bytes(text.rva, text.virtual_size as usize)
+            .context("a seção .text sai dos limites da imagem em disco")?;
+        let kind = accept_point(&disk.runtime_functions()?, text_bytes, text.rva, rva)
+            .map_err(anyhow::Error::msg)?;
+        tracing::info!("ponto aceito pela regra {kind:?}");
         guard::check(
             &target.maps,
             &target.modules,
@@ -694,16 +792,217 @@ mod tests {
         assert_eq!(lines[3], "       1  jogo+20  (nulo)");
     }
 
+    // ---- `accept_point`: as três regras do ponto aceito (spec 008, 6.7.3) ----
+
+    /// Base da `.text` sintética dos testes puros.
+    const TEXT_RVA: u32 = 0x1000;
+
+    fn rf(start: u32, end: u32) -> RuntimeFunction {
+        RuntimeFunction {
+            start,
+            end,
+            chained: false,
+        }
+    }
+
+    /// `.text` de 0x200 bytes todos `CC`, com `code` gravado nos RVAs dados.
+    fn text_with(code: &[(u32, &[u8])]) -> Vec<u8> {
+        let mut text = vec![0xCC; 0x200];
+        for (rva, bytes) in code {
+            let at = (rva - TEXT_RVA) as usize;
+            text[at..at + bytes.len()].copy_from_slice(bytes);
+        }
+        text
+    }
+
+    fn accept(functions: &[RuntimeFunction], text: &[u8], rva: u32) -> Result<PointKind, String> {
+        accept_point(functions, text, TEXT_RVA, rva)
+    }
+
+    /// A forma do `AddItem`: `test rdx,rdx; je far; mov [rsp+0x18],r8b`, com o ponto no `mov`
+    /// (`0x1009`); o resto da função são `nop`s e um `ret`.
+    fn add_item_like() -> Vec<u8> {
+        let mut text = text_with(&[
+            (0x1000, &[0x48, 0x85, 0xd2]),
+            // je 0x1039 (rel32 = 0x30)
+            (0x1003, &[0x0f, 0x84, 0x30, 0x00, 0x00, 0x00]),
+            (0x1009, &[0x44, 0x88, 0x44, 0x24, 0x18]),
+        ]);
+        for b in &mut text[0xe..0x39] {
+            *b = 0x90;
+        }
+        text[0x39] = 0xc3;
+        text
+    }
+
     #[test]
-    fn function_start_comes_from_the_pdata_only() {
-        let functions = [0x1000..0x1020, 0x1020..0x1080];
-        assert!(check_function_start(&functions, 0x1020).is_ok());
-        let mid = check_function_start(&functions, 0x1024)
-            .unwrap_err()
-            .to_string();
-        assert!(mid.contains("não é o começo de uma função"), "{mid}");
-        let none = check_function_start(&[], 0x1000).unwrap_err().to_string();
-        assert!(none.contains("não tem .pdata"), "{none}");
+    fn accepts_pdata_start() {
+        let text = text_with(&[(0x1000, &[0x53, 0xc3])]);
+        let functions = [rf(0x1000, 0x1040)];
+        assert_eq!(accept(&functions, &text, 0x1000), Ok(PointKind::PdataStart));
+    }
+
+    #[test]
+    fn rejects_chained_unwind_start() {
+        let text = text_with(&[(0x1000, &[0x53, 0xc3])]);
+        let functions = [RuntimeFunction {
+            chained: true,
+            ..rf(0x1000, 0x1040)
+        }];
+        let err = accept(&functions, &text, 0x1000).unwrap_err();
+        assert!(err.contains("encadeado"), "{err}");
+        assert!(err.contains("regra 1"), "{err}");
+    }
+
+    #[test]
+    fn accepts_leaf_after_cc() {
+        // Folha em 0x1050, fora da `.pdata` e logo depois do preenchimento `CC`.
+        let text = text_with(&[(0x1050, &[0x8b, 0x81, 0xb8, 0x02, 0x00, 0x00, 0xc3])]);
+        let functions = [rf(0x1000, 0x1040)];
+        assert_eq!(accept(&functions, &text, 0x1050), Ok(PointKind::LeafEntry));
+    }
+
+    #[test]
+    fn accepts_leaf_after_ret() {
+        let body = [0x8b, 0x81, 0xb8, 0x02, 0x00, 0x00, 0xc3];
+        let functions = [rf(0x1000, 0x1040)];
+        // O byte antes é o `ret` (`c3`) de outra função folha, sem preenchimento.
+        let text = text_with(&[(0x104f, &[0xc3]), (0x1050, &body)]);
+        assert_eq!(accept(&functions, &text, 0x1050), Ok(PointKind::LeafEntry));
+        // `ret imm16` (`c2 08 00`) também fecha uma função.
+        let text = text_with(&[(0x104d, &[0xc2, 0x08, 0x00]), (0x1050, &body)]);
+        assert_eq!(accept(&functions, &text, 0x1050), Ok(PointKind::LeafEntry));
+    }
+
+    #[test]
+    fn rejects_leaf_without_padding() {
+        let functions = [rf(0x1000, 0x1040)];
+        let text = text_with(&[(0x104f, &[0x90]), (0x1050, &[0x8b, 0x81, 0xb8, 0x02, 0, 0])]);
+        let err = accept(&functions, &text, 0x1050).unwrap_err();
+        assert!(err.contains("regra 2"), "{err}");
+        assert!(err.contains("CC"), "{err}");
+        // O primeiro byte da `.text` não tem byte antes.
+        let err = accept(&[rf(0x1008, 0x1040)], &text, 0x1000).unwrap_err();
+        assert!(err.contains("regra 2"), "{err}");
+    }
+
+    #[test]
+    fn rejects_point_without_pdata_or_outside_text() {
+        let text = add_item_like();
+        let err = accept(&[], &text, 0x1000).unwrap_err();
+        assert!(err.contains("não tem .pdata"), "{err}");
+        let err = accept(&[rf(0x1000, 0x1040)], &text, 0x2000).unwrap_err();
+        assert!(err.contains(".text"), "{err}");
+    }
+
+    #[test]
+    fn accepts_stack_free_prefix_with_jcc() {
+        let text = add_item_like();
+        let functions = [rf(0x1000, 0x1040)];
+        assert_eq!(
+            accept(&functions, &text, 0x1009),
+            Ok(PointKind::StackFreePrefix)
+        );
+        // O `je` do prefixo também é um ponto aceitável (3 bytes depois do `test`).
+        assert_eq!(
+            accept(&functions, &text, 0x1003),
+            Ok(PointKind::StackFreePrefix)
+        );
+    }
+
+    #[test]
+    fn rejects_prefix_with_push() {
+        // push rbx; mov rbx,rcx; ponto no `mov`: o `push` muda o `rsp`.
+        let text = text_with(&[(0x1000, &[0x53, 0x48, 0x89, 0xcb, 0xc3])]);
+        let functions = [rf(0x1000, 0x1040)];
+        let err = accept(&functions, &text, 0x1001).unwrap_err();
+        assert!(err.contains("regra 3"), "{err}");
+        assert!(err.contains("rsp"), "{err}");
+        assert!(err.contains("push"), "{err}");
+        // `sub rsp,0x28` (destino `rsp`) e `call` também.
+        for (name, code) in [
+            ("sub", &[0x48u8, 0x83, 0xec, 0x28, 0x90][..]),
+            ("call", &[0xe8, 0x00, 0x00, 0x00, 0x00, 0x90][..]),
+            ("leave", &[0xc9, 0x90][..]),
+        ] {
+            let text = text_with(&[(0x1000, code)]);
+            let at = 0x1000 + code.len() as u32 - 1;
+            let err = accept(&functions, &text, at).unwrap_err();
+            assert!(err.contains("rsp"), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_prefix_not_on_boundary() {
+        let text = add_item_like();
+        let functions = [rf(0x1000, 0x1040)];
+        // 0x100b cai no meio do `mov [rsp+0x18],r8b`.
+        let err = accept(&functions, &text, 0x100b).unwrap_err();
+        assert!(err.contains("regra 3"), "{err}");
+        assert!(err.contains("fronteira"), "{err}");
+    }
+
+    #[test]
+    fn rejects_prefix_over_64_bytes() {
+        // 70 `nop`s: sem pilha, mas o ponto em +65 passa dos 64 bytes.
+        let mut text = vec![0x90; 70];
+        text.resize(0x200, 0xCC);
+        let functions = [rf(0x1000, 0x1080)];
+        assert_eq!(
+            accept(&functions, &text, 0x1000 + 64),
+            Ok(PointKind::StackFreePrefix)
+        );
+        let err = accept(&functions, &text, 0x1000 + 65).unwrap_err();
+        assert!(err.contains("regra 3"), "{err}");
+        assert!(err.contains("64"), "{err}");
+    }
+
+    #[test]
+    fn rejects_point_targeted_by_inner_branch() {
+        // nop x8; nop (ponto 0x1008)...; um `jmp rel8` em 0x1010 cai no ponto.
+        let mut text = vec![0x90u8; 0x20];
+        text.resize(0x200, 0xCC);
+        // jmp 0x1008: eb f6 em 0x1010 (0x1010 + 2 - 10 = 0x1008)
+        text[0x10] = 0xeb;
+        text[0x11] = 0xf6;
+        let functions = [rf(0x1000, 0x1020)];
+        let err = accept(&functions, &text, 0x1008).unwrap_err();
+        assert!(err.contains("regra 3"), "{err}");
+        assert!(err.contains("desvio"), "{err}");
+        // Um desvio para o `start` (laço) não conta; um para depois do ponto também não.
+        text[0x11] = 0xee; // 0x1012 - 0x12 = 0x1000
+        assert_eq!(
+            accept(&functions, &text, 0x1008),
+            Ok(PointKind::StackFreePrefix)
+        );
+        text[0x11] = 0x04; // 0x1016
+        assert_eq!(
+            accept(&functions, &text, 0x1008),
+            Ok(PointKind::StackFreePrefix)
+        );
+        // Um `jcc` rel32 para o meio do prefixo também recusa.
+        text[0x10..0x16].copy_from_slice(&[0x0f, 0x84, 0xf2, 0xff, 0xff, 0xff]); // 0x1016 - 14 = 0x1008
+        let err = accept(&functions, &text, 0x1008).unwrap_err();
+        assert!(err.contains("desvio"), "{err}");
+    }
+
+    #[test]
+    fn rejects_function_it_cannot_disassemble_or_find() {
+        // `06` é inválido em 64 bits: sem desmontar a função inteira não há prova.
+        let text = text_with(&[(0x1000, &[0x90, 0x90, 0x06, 0x90])]);
+        let err = accept(&[rf(0x1000, 0x1040)], &text, 0x1001).unwrap_err();
+        assert!(err.contains("regra 3"), "{err}");
+        assert!(err.contains("desmont"), "{err}");
+        // Função que passa do fim da `.text`.
+        let err = accept(&[rf(0x1000, 0x2000)], &text, 0x1001).unwrap_err();
+        assert!(err.contains("regra 3"), "{err}");
+        // Unwind encadeado dentro da função: o `start` não é entrada de função de verdade.
+        let chained = [RuntimeFunction {
+            chained: true,
+            ..rf(0x1000, 0x1040)
+        }];
+        let err = accept(&chained, &add_item_like(), 0x1009).unwrap_err();
+        assert!(err.contains("encadeado"), "{err}");
     }
 
     #[test]
@@ -806,23 +1105,28 @@ mod tests {
     fn observe_refuses_mid_function() {
         let rig = SynthRig::new();
         let reg = Register::RCX;
-        // O ponto do Brain Power é a 36ª posição de uma função, não o começo dela.
+        // O ponto do Brain Power é a 36ª posição de uma função, depois de `push`es: nenhuma regra
+        // o aceita.
         for name in ["level_point", "level_pattern"] {
             let err = plan_for(&rig, rig.t.symbol(name), reg)
                 .unwrap_err()
                 .to_string();
-            assert!(
-                err.contains("não é o começo de uma função"),
-                "{name}: {err}"
-            );
+            assert!(err.contains("regra 3"), "{name}: {err}");
         }
-        // Uma instrução depois do começo de `sum` também.
+        // No meio de uma instrução de `sum` (depois do `mov [rsp+8],rbx`): fora da fronteira.
+        let err = plan_for(&rig, rig.t.symbol("sum") + 3, reg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("fronteira"), "{err}");
+        // Uma instrução depois do começo de `sum`: o prefixo (`mov [rsp+8],rbx`) não mexe no `rsp`,
+        // então o ponto passa pelas regras; quem recusa é a instrução de 3 bytes (`lea`).
         let err = plan_for(&rig, rig.t.symbol("sum") + 5, reg)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("não é o começo de uma função"), "{err}");
-        // Os começos de função servem.
-        for name in ["sum", "add_item", "drag", "getter"] {
+        assert!(!err.contains("regra"), "{err}");
+        assert!(err.contains("precisa de 5"), "{err}");
+        // Os começos de função (pela `.pdata` e folha) servem.
+        for name in ["sum", "add_item", "drag", "getter", "leaf"] {
             plan_for(&rig, rig.t.symbol(name), reg).unwrap_or_else(|e| panic!("{name}: {e}"));
         }
         // Fora do módulo.
@@ -832,6 +1136,44 @@ mod tests {
         let (mem, disk) = text_pair(&rig);
         assert_eq!(mem, disk);
         assert_eq!(rig.store.peek().unwrap(), gt_core::journal::Loaded::Missing);
+    }
+
+    #[test]
+    fn observe_counts_on_leaf_entry() {
+        // `leaf` não tem entrada na `.pdata` (função folha) e vem depois de um `CC`.
+        let mut rig = SynthRig::new();
+        let leaf = rig.t.symbol("leaf");
+        let functions = rig.disk.functions().unwrap();
+        let leaf_rva = (leaf - rig.module.base) as u32;
+        assert!(
+            !functions
+                .iter()
+                .any(|f| f.start <= leaf_rva && leaf_rva < f.end)
+        );
+        let plan = plan_for(&rig, leaf, Register::RCX).unwrap();
+        let mut engine = rig.engine();
+        let observation = Observation::start(&mut engine, &plan).unwrap();
+        let item = rig.t.symbol("item_b");
+        for _ in 0..3 {
+            // `leaf(item)` devolve o `StackSize` do item (5): a cave não muda o resultado.
+            assert_eq!(rig.t.call("leaf", &[item]) as i32, 5);
+        }
+        let snap = observation.poll(&engine).unwrap();
+        assert_eq!(snap.count, 3);
+        let reflection = Reflection::new(&rig.target.reader, layout(), None);
+        let mut tally = Tally::default();
+        tally.absorb(&snap, true, &mut |v| reflection.class_label(v));
+        let rows = tally.rows();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].2, 3);
+        assert!(
+            !(rig.module.base..rig.module.end()).contains(&rows[0].0),
+            "o retorno é o do chamador, fora do módulo"
+        );
+        engine.undo_all().unwrap();
+        let (mem, disk) = text_pair(&rig);
+        assert_eq!(mem, disk);
+        assert_eq!(rig.t.call("leaf", &[item]) as i32, 5);
     }
 
     #[test]
