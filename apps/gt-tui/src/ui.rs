@@ -298,6 +298,7 @@ fn cheat_line(
     let note = match row.note {
         Some(Note::Waiting) => " aguardando o personagem",
         Some(Note::WaitingPet) => " aguardando o pet",
+        Some(Note::WaitingWorld) => " aguardando o mundo",
         Some(Note::InvalidTarget) => " alvo inválido",
         Some(Note::InvalidGameValue) => " valor do jogo inválido",
         Some(Note::GameRefuses) => " o jogo não deixa",

@@ -727,6 +727,33 @@ fn set_word_sigkill_then_recover() {
     assert_eq!(journal(dir.path()), Loaded::Missing);
 }
 
+/// Um `set` de 1 byte (o `bool` do mundo, spec 007): SIGKILL e `restore` pelo diário devolvem só
+/// o byte original, sem tocar nos vizinhos.
+#[test]
+fn world_sigkill_restores_by_journal() {
+    let t = TestTarget::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = spawn(word_cmd(&t, dir.path(), &[], &["00"]));
+    let _reader = wait_line(&mut child, "ativo");
+    let word = t.big_region + 0x200;
+    assert_eq!(bytes_at(t.pid, word, 4), [0, 2, 3, 4]);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    match journal(dir.path()) {
+        Loaded::Ok(j) => {
+            assert_eq!(j.data.len(), 1);
+            assert_eq!(j.data[0].original, vec![WORD_OLD[0]]);
+            assert_eq!(j.data[0].written, vec![0]);
+        }
+        other => panic!("diário inesperado: {other:?}"),
+    }
+    let out = restore(dir.path());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("restaurado: carga"), "{stdout}");
+    assert_eq!(bytes_at(t.pid, word, 4), WORD_OLD);
+    assert_eq!(journal(dir.path()), Loaded::Missing);
+}
+
 #[test]
 fn set_word_sigkill_between_next_and_write() {
     let t = TestTarget::spawn();
