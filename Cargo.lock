@@ -658,6 +658,7 @@ dependencies = [
  "gt-core",
  "gt-grounded2",
  "gt-ue",
+ "iced-x86",
  "nix 0.31.3",
  "serde_json",
  "tempfile",
