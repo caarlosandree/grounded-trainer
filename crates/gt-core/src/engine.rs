@@ -705,7 +705,9 @@ impl Engine {
         rejected
     }
 
-    /// Regrava o diário com o estado em memória (a recuperação usa depois de recusar regiões).
+    /// Regrava o diário com o estado em memória. Cuidado: entradas e dados só entram no registro
+    /// do motor quando são restaurados; chamar antes disso tira-os do disco. A recuperação só
+    /// usa quando não há nada a restaurar.
     pub fn save_journal_now(&self) {
         self.save_final();
     }

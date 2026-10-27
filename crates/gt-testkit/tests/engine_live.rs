@@ -2812,3 +2812,56 @@ fn open_ignores_vars_of_another_process_and_malformed_ones() {
     assert_eq!(engine.vars(), [good]);
     std::mem::forget(engine);
 }
+
+#[test]
+fn recovery_keeps_eligible_entry_when_vars_are_malformed_and_restore_fails() {
+    use gt_core::journal::{Journal, VarRegion};
+    let t = TestTarget::spawn();
+    let env = env();
+    let region = vars_region(&t);
+    poke(&t, region.start, &[7; 8]);
+    // Mesmo desvio "invertido" do teste de adoção: a thread parada na `syscall` o impede de
+    // ser desfeito (`ThreadsInPatch`). Junto vão uma região boa e uma malformada.
+    let addr = t.syscall_page + 20;
+    let entry = JournalEntry {
+        id: "sys".into(),
+        addr,
+        original: vec![0x66, 0x66, 0x66, 0x66, 0x66, 0x90],
+        replacement: vec![0x0F, 0x05, 0x90, 0x90, 0x90, 0x90],
+        next: None,
+        kind: gt_core::patch::PatchKind::Code,
+    };
+    let id = identity(t.pid).unwrap();
+    let bad = VarRegion {
+        addr: region.start + 0x400,
+        len: 1 << 40,
+    };
+    let good = VarRegion {
+        addr: region.start,
+        len: 64,
+    };
+    env.store
+        .save(&Journal {
+            boot_id: id.boot_id,
+            pid: id.pid,
+            start_time: id.start_time,
+            version_key: "teste".into(),
+            paused_by_us: false,
+            entries: vec![entry.clone()],
+            data: Vec::new(),
+            vars: vec![bad, good],
+        })
+        .unwrap();
+    let err = recover(&env.store, &env.lock, &PauseConfig::default()).unwrap_err();
+    assert!(matches!(err, Error::ThreadsInPatch { .. }), "{err:?}");
+    // A entrada elegível continua no diário (nunca foi tirada do disco antes de restaurada) e
+    // a região boa também; nada foi zerado, porque o desvio segue pendente.
+    match env.store.peek().unwrap() {
+        Loaded::Ok(j) => {
+            assert_eq!(j.entries, vec![entry]);
+            assert!(j.vars.contains(&good), "{:?}", j.vars);
+        }
+        other => panic!("diário inesperado: {other:?}"),
+    }
+    assert_eq!(bytes_at(t.pid, region.start, 8), [7; 8]);
+}

@@ -210,7 +210,12 @@ pub fn recover(
     let rejected = engine.adopt_vars(&journal.vars);
     if !rejected.is_empty() {
         report.foreign.push(VARS_ID.to_owned());
-        engine.save_journal_now();
+        // Regravar agora, com o registro do motor ainda vazio, tiraria do disco as entradas e
+        // os dados que ainda não foram restaurados ("diário primeiro"). Só vale quando não há
+        // nada a restaurar; senão a gravação das próximas etapas já tira as regiões recusadas.
+        if eligible.is_empty() && journal.data.is_empty() {
+            engine.save_journal_now();
+        }
     }
     // O motor regrava o diário só com as entradas que ainda não resolveu (as de fora
     // de memória executável já saíram) e o apaga quando não sobra nenhuma. As de dados
