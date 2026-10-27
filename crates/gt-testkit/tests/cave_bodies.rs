@@ -525,16 +525,18 @@ fn analyzer_off_passes_through() {
 fn class_walk_stops_at_16_levels() {
     let mut r = analyzer_rig();
     let layout = UeLayout::observed();
-    // Uma cadeia de 18 classes na cauda livre da `.data` (depois de `other_obj`): a classe do
-    // objeto é a 0, cada uma tem a seguinte como `SuperStruct`.
-    let chain: Vec<u64> = (0..18)
-        .map(|i| r.t.symbol("other_obj") + 0xA00 + i * 0x50)
-        .collect();
+    // Uma cadeia de 18 classes: a classe do objeto é a 0, cada uma tem a seguinte como
+    // `SuperStruct`. A subida só lê o `SuperStruct` (`+0x40`), então as "classes" podem se
+    // sobrepor com passo 8. Ficam entre a última classe fixa do módulo (`class_other`) e o começo
+    // da folga das variáveis, sem tocar nenhuma das duas.
+    let super_off = u64::from(layout.ustruct.super_struct);
+    let first = r.t.symbol("class_other") + 0x80;
+    let chain: Vec<u64> = (0..18).map(|i| first + i * 8).collect();
+    let written = chain[0] + super_off..chain[17] + super_off + 8;
+    assert!(written.start >= r.t.symbol("class_other") + super_off + 8);
+    assert!(written.end <= r.region.start, "a cadeia entra na folga");
     for w in chain.windows(2) {
-        r.poke(
-            w[0] + u64::from(layout.ustruct.super_struct),
-            &w[1].to_le_bytes(),
-        );
+        r.poke(w[0] + super_off, &w[1].to_le_bytes());
     }
     let obj = r.t.symbol("other_obj");
     r.poke(
