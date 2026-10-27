@@ -1809,6 +1809,7 @@ pub(crate) fn format_value(grid: Option<&ValueGrid>, kind: FieldKind, v: f64) ->
             max: v,
             step: 1.0,
             default_k: 0,
+            points: None,
             ..g.clone()
         }
         .format(0),

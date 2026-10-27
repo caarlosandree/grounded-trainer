@@ -517,6 +517,7 @@ fn grid(
             ValueType::F32 => 2,
             _ => 0,
         },
+        points: None,
     }
 }
 

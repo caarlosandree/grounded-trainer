@@ -611,18 +611,18 @@ fn build_grid(file: &str, block: &ValueBlock, ty: ValueType) -> Result<ValueGrid
         Some(_) => return Err(sig_err(file, "value.unit", "esperava um texto")),
     };
     let decimals = match (block.decimals.as_ref(), ty) {
-        (None, ValueType::F32) => None,
+        (None, ValueType::F32 | ValueType::F64) => None,
         (None, _) => Some(0),
         (Some(_), ValueType::I32 | ValueType::U32) => {
             return Err(sig_err(file, "value.decimals", "só vale para f32"));
         }
-        (Some(toml::Value::Integer(d)), ValueType::F32) => Some(
+        (Some(toml::Value::Integer(d)), ValueType::F32 | ValueType::F64) => Some(
             u8::try_from(*d)
                 .ok()
                 .filter(|&d| d <= 9)
                 .ok_or_else(|| sig_err(file, "value.decimals", "precisa estar entre 0 e 9"))?,
         ),
-        (Some(_), ValueType::F32) => {
+        (Some(_), ValueType::F32 | ValueType::F64) => {
             return Err(sig_err(file, "value.decimals", "esperava um inteiro"));
         }
     };
@@ -675,6 +675,7 @@ fn build_grid(file: &str, block: &ValueBlock, ty: ValueType) -> Result<ValueGrid
         default_k: k.max(0.0) as u64,
         unit,
         decimals: decimals.unwrap_or_else(|| decimals_for(step)),
+        points: None,
     };
     grid.check().map_err(|e| sig_err(file, "value", e))?;
     Ok(grid)

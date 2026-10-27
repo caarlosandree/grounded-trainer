@@ -2116,6 +2116,7 @@ mod tests {
             default_k: 2,
             unit: None,
             decimals: 0,
+            points: None,
         }
     }
 

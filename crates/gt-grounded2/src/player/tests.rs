@@ -2301,6 +2301,7 @@ fn report_catalog(w: &World) -> FieldCatalog {
                 default_k: 5,
                 unit: Some("x".into()),
                 decimals: 2,
+                points: None,
             });
         }
         d

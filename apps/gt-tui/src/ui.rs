@@ -526,6 +526,7 @@ mod tests {
             default_k: 2,
             unit: Some("x".into()),
             decimals: 1,
+            points: None,
         }
     }
 
@@ -943,6 +944,7 @@ mod tests {
             default_k: 9,
             unit: None,
             decimals: 0,
+            points: None,
         }
     }
 

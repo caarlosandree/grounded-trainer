@@ -902,6 +902,7 @@ mod tests {
             default_k: 6,
             unit: Some("x".into()),
             decimals: 2,
+            points: None,
         };
         assert_eq!(format_value(Some(&grid), FieldKind::Float, 1.0), "1.00x");
         // Fora da faixa da grade: o valor do jogo aparece como é, sem ser preso a ela.

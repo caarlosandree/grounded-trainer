@@ -1,4 +1,5 @@
-//! Valores ajustáveis de um patch: grade `min + k·step`, codificação e conferência do imediato.
+//! Valores ajustáveis de um patch: grade `min + k·step` ou lista de pontos, codificação e
+//! conferência do imediato.
 //!
 //! Tudo aqui é puro (sem processo). O valor é sempre um ponto da grade, calculado por `k`
 //! (nunca somando `step` repetidas vezes), para o `f32` não acumular erro.
@@ -8,10 +9,10 @@ use crate::asm::immediate_slot;
 /// Folga relativa a `step` ao decidir se um ponto ainda cabe em `max`.
 const GRID_SLACK: f64 = 1e-4;
 
-/// Tamanho, em bytes, de todos os tipos de valor.
-const VALUE_SIZE: usize = 4;
+/// Tamanho, em bytes, do imediato de um patch com `slot` (sempre 4).
+const SLOT_SIZE: usize = 4;
 
-/// Tipo do valor guardado no imediato (little-endian, 4 bytes).
+/// Tipo do valor (little-endian): 4 bytes, exceto `F64` (8 bytes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueType {
     /// Inteiro de 32 bits com sinal.
@@ -20,19 +21,28 @@ pub enum ValueType {
     U32,
     /// Ponto flutuante de 32 bits.
     F32,
+    /// Ponto flutuante de 64 bits (só em grades por lista de pontos, fora de patches com `slot`).
+    F64,
 }
 
 impl ValueType {
-    /// Tamanho do valor em bytes (sempre 4).
+    /// Tamanho do valor em bytes: 4, ou 8 para `F64`.
     pub fn size(self) -> usize {
-        VALUE_SIZE
+        match self {
+            Self::I32 | Self::U32 | Self::F32 => 4,
+            Self::F64 => 8,
+        }
     }
 }
 
-/// Grade de um valor ajustável: `min + k·step`, tipo, formatação e codificação.
+/// Grade de um valor ajustável: `min + k·step` (ou uma lista de pontos), tipo, formatação e
+/// codificação.
 ///
-/// Os números em `f64` cobrem `i32`, `u32` e `f32` exatamente o bastante. A igualdade entre
-/// definições usa `default_k` (o índice na grade), não o valor do default.
+/// Os números em `f64` cobrem `i32`, `u32`, `f32` e `f64` exatamente o bastante. A igualdade
+/// entre definições usa `default_k` (o índice na grade), não o valor do default.
+///
+/// Com `points`, a grade anda pela lista: `steps() == len - 1`, `value(k) == points[k]`, e
+/// `min`/`max`/`step` ficam com o primeiro ponto, o último e `0.0` (sem uso).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValueGrid {
     /// Tipo do valor.
@@ -47,13 +57,19 @@ pub struct ValueGrid {
     pub default_k: u64,
     /// Sufixo mostrado depois do número (ex.: `x`).
     pub unit: Option<String>,
-    /// Casas decimais mostradas (só `F32`).
+    /// Casas decimais mostradas (só `F32` e `F64`).
     pub decimals: u8,
+    /// Lista de pontos estritamente crescente no lugar de `min`/`max`/`step`.
+    pub points: Option<Vec<f64>>,
 }
 
 impl ValueGrid {
-    /// Maior `k` com `min + k·step <= max` (com folga de `step · 1e-4`).
+    /// Maior `k` da grade: `len - 1` da lista de pontos, ou o maior `k` com
+    /// `min + k·step <= max` (com folga de `step · 1e-4`).
     pub fn steps(&self) -> u64 {
+        if let Some(points) = &self.points {
+            return points.len().saturating_sub(1) as u64;
+        }
         let k = ((self.max - self.min) / self.step + GRID_SLACK).floor();
         if k.is_finite() && k > 0.0 {
             // Conversão saturante: `k` já é inteiro e não negativo.
@@ -66,6 +82,14 @@ impl ValueGrid {
     /// Valor do ponto `k` da grade (`k` limitado a `steps()`; nunca passa de `max`).
     pub fn value(&self, k: u64) -> f64 {
         let k = k.min(self.steps());
+        if let Some(points) = &self.points {
+            // `k <= len - 1`; lista vazia só existe em grade que `check()` recusa.
+            return usize::try_from(k)
+                .ok()
+                .and_then(|i| points.get(i))
+                .copied()
+                .unwrap_or(self.min);
+        }
         (self.min + k as f64 * self.step).min(self.max)
     }
 
@@ -73,6 +97,17 @@ impl ValueGrid {
     pub fn nearest_k(&self, v: f64) -> u64 {
         if v.is_nan() {
             return 0;
+        }
+        if let Some(points) = &self.points {
+            // Ponto de menor distância; num empate, o menor `k`.
+            let mut best = (0u64, f64::INFINITY);
+            for (i, p) in points.iter().enumerate() {
+                let dist = (p - v).abs();
+                if dist < best.1 {
+                    best = (i as u64, dist);
+                }
+            }
+            return best.0;
         }
         let k = ((v - self.min) / self.step).round();
         if k <= 0.0 {
@@ -83,7 +118,9 @@ impl ValueGrid {
         }
     }
 
-    /// Codificação little-endian do ponto `k`: `I32`/`U32` arredondam o valor; `F32` converte.
+    /// Codificação de 4 bytes do ponto `k`, para patches com `slot`: `I32`/`U32` arredondam o
+    /// valor; `F32` converte. `F64` não cabe em 4 bytes: devolve zeros (`check_slot` recusa
+    /// `F64`; use `encode_bytes`).
     pub fn encode(&self, k: u64) -> [u8; 4] {
         let v = self.value(k);
         match self.ty {
@@ -91,6 +128,15 @@ impl ValueGrid {
             ValueType::I32 => (v.round() as i32).to_le_bytes(),
             ValueType::U32 => (v.round() as u32).to_le_bytes(),
             ValueType::F32 => (v as f32).to_le_bytes(),
+            ValueType::F64 => [0; 4],
+        }
+    }
+
+    /// Codificação little-endian do ponto `k` com o tamanho do tipo: 4 bytes, ou 8 para `F64`.
+    pub fn encode_bytes(&self, k: u64) -> Vec<u8> {
+        match self.ty {
+            ValueType::F64 => self.value(k).to_le_bytes().to_vec(),
+            ValueType::I32 | ValueType::U32 | ValueType::F32 => self.encode(k).to_vec(),
         }
     }
 
@@ -98,7 +144,7 @@ impl ValueGrid {
     pub fn format(&self, k: u64) -> String {
         let v = self.value(k);
         let mut text = match self.ty {
-            ValueType::F32 => format!("{v:.*}", usize::from(self.decimals)),
+            ValueType::F32 | ValueType::F64 => format!("{v:.*}", usize::from(self.decimals)),
             ValueType::I32 | ValueType::U32 => format!("{v:.0}"),
         };
         // Um resíduo negativo minúsculo (ex.: -5e-17) vira "-0.0": mostra "0.0".
@@ -112,8 +158,12 @@ impl ValueGrid {
     }
 
     /// Confere os números: finitos, `min <= max`, `step > 0`, representáveis no tipo e
-    /// `default_k <= steps()`.
+    /// `default_k <= steps()`. Com `points`: lista não vazia, finita, estritamente crescente e,
+    /// em `I32`/`U32`, de inteiros da faixa do tipo (um ponto só é aceito).
     pub fn check(&self) -> Result<(), String> {
+        if let Some(points) = &self.points {
+            return self.check_points(points);
+        }
         for (name, v) in [("min", self.min), ("max", self.max), ("step", self.step)] {
             if !v.is_finite() {
                 return Err(format!("{name} não é um número finito"));
@@ -150,7 +200,55 @@ impl ValueGrid {
                     return Err("valores fora da faixa de f32".to_owned());
                 }
             }
+            // Já finitos acima; `f64` representa qualquer um deles.
+            ValueType::F64 => {}
         }
+        self.check_default()
+    }
+
+    /// `check()` da grade por lista de pontos.
+    fn check_points(&self, points: &[f64]) -> Result<(), String> {
+        if points.is_empty() {
+            return Err("a lista de pontos está vazia".to_owned());
+        }
+        if let Some(p) = points.iter().find(|p| !p.is_finite()) {
+            return Err(format!("o ponto {p} não é um número finito"));
+        }
+        if let Some(w) = points.windows(2).find(|w| w[0] >= w[1]) {
+            return Err(format!(
+                "os pontos precisam ser estritamente crescentes ({} antes de {})",
+                w[0], w[1]
+            ));
+        }
+        match self.ty {
+            ValueType::I32 | ValueType::U32 => {
+                let (lo, hi) = if self.ty == ValueType::I32 {
+                    (f64::from(i32::MIN), f64::from(i32::MAX))
+                } else {
+                    (0.0, f64::from(u32::MAX))
+                };
+                for &p in points {
+                    if p.fract() != 0.0 {
+                        return Err(format!("o ponto {p} precisa ser inteiro neste tipo"));
+                    }
+                    if p < lo || p > hi {
+                        return Err(format!("o ponto {p} fora do tipo ({lo}..{hi})"));
+                    }
+                }
+            }
+            ValueType::F32 => {
+                let limit = f64::from(f32::MAX);
+                if let Some(p) = points.iter().find(|p| p.abs() > limit) {
+                    return Err(format!("o ponto {p} fora da faixa de f32"));
+                }
+            }
+            ValueType::F64 => {}
+        }
+        self.check_default()
+    }
+
+    /// `default_k <= steps()`.
+    fn check_default(&self) -> Result<(), String> {
         if self.default_k > self.steps() {
             return Err(format!(
                 "default_k {} além do fim da grade ({})",
@@ -180,7 +278,7 @@ impl ValueSpec {
         let mut out = replacement.to_vec();
         if let Some(dst) = self
             .slot
-            .checked_add(VALUE_SIZE)
+            .checked_add(SLOT_SIZE)
             .and_then(|end| out.get_mut(self.slot..end))
         {
             dst.copy_from_slice(&self.grid.encode(k));
@@ -193,20 +291,23 @@ impl ValueSpec {
     ///
     /// Com `U32` num imediato estendido com sinal até 64 bits, `max` precisa caber em `i32::MAX`.
     pub fn check_slot(&self, replacement: &[u8]) -> Result<(), String> {
-        let end = self.slot.checked_add(VALUE_SIZE);
+        if self.grid.ty == ValueType::F64 {
+            return Err("f64 não cabe num imediato de 4 bytes".to_owned());
+        }
+        let end = self.slot.checked_add(SLOT_SIZE);
         let Some(current) = end.and_then(|end| replacement.get(self.slot..end)) else {
             return Err(format!(
-                "slot {} + {VALUE_SIZE} não cabe nos {} bytes de replacement",
+                "slot {} + {SLOT_SIZE} não cabe nos {} bytes de replacement",
                 self.slot,
                 replacement.len()
             ));
         };
         let Some(imm) = immediate_slot(replacement, 0)
             .into_iter()
-            .find(|i| i.offset == self.slot && i.size == VALUE_SIZE)
+            .find(|i| i.offset == self.slot && i.size == SLOT_SIZE)
         else {
             return Err(format!(
-                "o slot {} não coincide com um imediato de {VALUE_SIZE} bytes de uma instrução",
+                "o slot {} não coincide com um imediato de {SLOT_SIZE} bytes de uma instrução",
                 self.slot
             ));
         };
@@ -249,6 +350,7 @@ mod tests {
             default_k,
             unit: None,
             decimals: 1,
+            points: None,
         }
     }
 
@@ -261,6 +363,7 @@ mod tests {
             default_k: 0,
             unit: None,
             decimals: 0,
+            points: None,
         }
     }
 
@@ -324,6 +427,7 @@ mod tests {
             default_k: 9,
             unit: None,
             decimals: 0,
+            points: None,
         };
         assert_eq!(g.check(), Ok(()));
         assert_eq!(g.format(g.default_k), "1000");
@@ -394,6 +498,7 @@ mod tests {
                 default_k: 1,
                 unit: None,
                 decimals: 0,
+                points: None,
             },
             slot: 3,
         };
@@ -434,5 +539,98 @@ mod tests {
             assert_eq!(v.replacement_starts, base.replacement_starts, "k = {k}");
             assert_eq!(v.expected_starts, base.expected_starts, "k = {k}");
         }
+    }
+
+    fn points_grid(ty: ValueType, points: &[f64], default_k: u64) -> ValueGrid {
+        ValueGrid {
+            ty,
+            min: points.first().copied().unwrap_or(0.0),
+            max: points.last().copied().unwrap_or(0.0),
+            step: 0.0,
+            default_k,
+            unit: None,
+            decimals: 0,
+            points: Some(points.to_vec()),
+        }
+    }
+
+    #[test]
+    fn points_grid_walks_list() {
+        let g = points_grid(ValueType::I32, &[2.0, 3.0, 5.0, 10.0], 0);
+        assert_eq!(g.check(), Ok(()));
+        assert_eq!(g.steps(), 3);
+        assert_eq!(g.value(0), 2.0);
+        assert_eq!(g.value(2), 5.0);
+        // k acima do fim é limitado ao último ponto.
+        assert_eq!(g.value(99), 10.0);
+        assert_eq!(g.nearest_k(4.0), 1);
+        assert_eq!(g.nearest_k(4.1), 2);
+        assert_eq!(g.nearest_k(-5.0), 0);
+        assert_eq!(g.nearest_k(1000.0), 3);
+        assert_eq!(g.nearest_k(f64::NAN), 0);
+        assert_eq!(g.encode(2), 5i32.to_le_bytes());
+    }
+
+    #[test]
+    fn points_single_has_no_steps() {
+        let g = points_grid(ValueType::F64, &[3600.0], 0);
+        assert_eq!(g.check(), Ok(()));
+        assert_eq!(g.steps(), 0);
+        assert_eq!(g.value(0), 3600.0);
+        assert_eq!(g.value(7), 3600.0);
+        assert_eq!(g.nearest_k(1.0), 0);
+    }
+
+    #[test]
+    fn points_rejects_unsorted() {
+        assert!(
+            points_grid(ValueType::I32, &[2.0, 2.0, 5.0], 0)
+                .check()
+                .is_err()
+        );
+        assert!(points_grid(ValueType::I32, &[5.0, 2.0], 0).check().is_err());
+        assert!(points_grid(ValueType::I32, &[], 0).check().is_err());
+        assert!(
+            points_grid(ValueType::F64, &[1.0, f64::NAN], 0)
+                .check()
+                .is_err()
+        );
+        assert!(
+            points_grid(ValueType::F64, &[1.0, f64::INFINITY], 0)
+                .check()
+                .is_err()
+        );
+        // default_k fora da lista
+        assert!(points_grid(ValueType::I32, &[2.0, 3.0], 2).check().is_err());
+    }
+
+    #[test]
+    fn points_rejects_non_integer_i32() {
+        assert!(points_grid(ValueType::I32, &[2.0, 2.5], 0).check().is_err());
+        assert!(points_grid(ValueType::I32, &[1.0, 3e9], 0).check().is_err());
+        assert!(points_grid(ValueType::F32, &[2.0, 2.5], 0).check().is_ok());
+    }
+
+    #[test]
+    fn f64_encodes_8_bytes() {
+        let g = points_grid(ValueType::F64, &[3600.0], 0);
+        assert_eq!(ValueType::F64.size(), 8);
+        assert_eq!(ValueType::I32.size(), 4);
+        assert_eq!(g.encode_bytes(0), 3600f64.to_le_bytes().to_vec());
+        let i = int_grid(ValueType::I32, -10.0, 10.0, 1.0);
+        assert_eq!(i.encode_bytes(9), vec![0xFF; 4]);
+        // f64 não serve a um patch com slot.
+        let spec = ValueSpec { grid: g, slot: 1 };
+        assert!(spec.check_slot(&[0xB8, 0, 0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn format_unit_suffix() {
+        let mut g = points_grid(ValueType::I32, &[2.0, 3.0, 5.0, 10.0], 0);
+        g.unit = Some("x".into());
+        assert_eq!(g.format(2), "5x");
+        let mut f = points_grid(ValueType::F64, &[3600.0], 0);
+        f.decimals = 1;
+        assert_eq!(f.format(0), "3600.0");
     }
 }
