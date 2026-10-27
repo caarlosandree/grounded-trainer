@@ -139,6 +139,10 @@ pub enum Error {
     #[error("variável em {addr:#x} fora da região reclamada")]
     VarOutsideRegion { addr: u64 },
 
+    /// Código de cave, desvio ou relocação que não pode ser montado ou não passou na conferência.
+    #[error("cave inválida: {reason}")]
+    BadCave { reason: String },
+
     /// Outro `gt-patch` já segura a trava do diário.
     #[error("outro gt-patch ou gt-tui já está em execução")]
     AlreadyRunning,

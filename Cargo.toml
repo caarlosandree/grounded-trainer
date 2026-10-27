@@ -16,7 +16,7 @@ gt-ue = { path = "crates/gt-ue" }
 gt-grounded2 = { path = "crates/gt-grounded2" }
 gt-testkit = { path = "crates/gt-testkit" }
 
-iced-x86 = "1.21.0"
+iced-x86 = { version = "1.21.0", features = ["code_asm"] }
 goblin = "0.10.7"
 nix = { version = "0.31.3", features = ["uio", "process", "fs", "feature", "signal", "poll"] }
 ratatui = "0.30.2"
