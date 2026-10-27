@@ -1046,12 +1046,12 @@ fn world_settings_swap_same_addr_resolves_old_first() {
     let mut s = scene();
     s.tick(&WORLD_IDS);
     assert_eq!(journal_data_len(&s), 3);
-    // Outras configurações no mesmo endereço (guarda diferente): os originais são os do objeto
-    // novo, `[1]`/`[0]` e 1,0.
+    // Outras configurações no mesmo endereço (guarda diferente), com originais diferentes dos
+    // antigos (`[1]`, `[0]` e 1,0): `[0]`, `[1]` e 0,5. O original novo vem do objeto novo.
     s.poke(s.index_of(s.ue.settings), &0x0000_7777u32.to_le_bytes());
-    s.poke(s.recipes(), &[1]);
-    s.poke(s.auto_complete(), &[0]);
-    s.poke(s.enemy_damage(), &1.0f32.to_le_bytes());
+    s.poke(s.recipes(), &[0]);
+    s.poke(s.auto_complete(), &[1]);
+    s.poke(s.enemy_damage(), &0.5f32.to_le_bytes());
     let swapped = s.tick(&WORLD_IDS);
     assert!(swapped.notes.is_empty(), "{:?}", swapped.notes);
     assert_eq!(s.u8_at(s.recipes()), 0);
@@ -1062,9 +1062,10 @@ fn world_settings_swap_same_addr_resolves_old_first() {
     for id in WORLD_IDS {
         s.runtime.turn_off(&mut s.engine, id).unwrap();
     }
-    assert_eq!(s.u8_at(s.recipes()), 1);
-    assert_eq!(s.u8_at(s.auto_complete()), 0);
-    assert_eq!(s.f32_at(s.enemy_damage()), 1.0);
+    // Voltam os originais do objeto novo, e não os do antigo (`[1]`, `[0]`, 1,0).
+    assert_eq!(s.u8_at(s.recipes()), 0);
+    assert_eq!(s.u8_at(s.auto_complete()), 1);
+    assert_eq!(s.f32_at(s.enemy_damage()), 0.5);
     assert_eq!(s.store.peek().unwrap(), Loaded::Missing);
 }
 
