@@ -81,6 +81,8 @@ pub enum ActionOutcome {
 struct Fight {
     /// Objeto a que a janela se refere.
     obj: u64,
+    /// Guarda do objeto: o mesmo endereço com outra guarda é outro objeto (mundo recarregado).
+    guard: Vec<GuardBytes>,
     /// Quando o jogo mudou o valor (originais novos) dentro da janela.
     news: VecDeque<Instant>,
     /// O cheat desistiu de escrever neste objeto.
@@ -88,9 +90,10 @@ struct Fight {
 }
 
 impl Fight {
-    fn new(obj: u64) -> Self {
+    fn new(obj: u64, guard: Vec<GuardBytes>) -> Self {
         Self {
             obj,
+            guard,
             ..Self::default()
         }
     }
@@ -600,7 +603,8 @@ impl FieldRuntime {
     ) {
         let (id, obj) = (job.id, job.obj);
         let mut fight = self.fights.remove(id).unwrap_or_default();
-        if fight.obj != obj {
+        let guard = guard_of(objects, obj);
+        if fight.obj != obj || fight.guard != guard {
             // Objeto novo: a janela e o bloqueio do anterior não valem mais.
             if fight.blocked {
                 let name = self.catalog.name(id).unwrap_or(id);
@@ -608,7 +612,7 @@ impl FieldRuntime {
                     .events
                     .push(format!("{name}: o jogo voltou a deixar"));
             }
-            fight = Fight::new(obj);
+            fight = Fight::new(obj, guard);
         }
         let outcome = self.run_set_fields(engine, objects, job, &mut fight, now, report);
         if fight.blocked {
@@ -659,6 +663,11 @@ impl FieldRuntime {
         let guard = guard_of(objects, obj);
         let name = self.catalog.name(id).unwrap_or(id).to_string();
         let grid = self.catalog.grid(id);
+        // A marca de espera vem do tipo do cheat: mundo, pet ou personagem.
+        let waiting = match self.catalog.get(id) {
+            Some(Ok(resolved)) => missing_note(missing_kind(resolved)),
+            _ => Note::Waiting,
+        };
 
         // Objeto novo (outro pawn): a entrada antiga é resolvida antes de o novo ganhar a dele.
         if engine
@@ -675,7 +684,7 @@ impl FieldRuntime {
                 ),
                 Err(e) => {
                     tracing::debug!(id, "entrada do objeto anterior não resolvida: {e}");
-                    return Some(Note::Waiting);
+                    return Some(waiting);
                 }
             }
         }
@@ -718,7 +727,7 @@ impl FieldRuntime {
                 .push(format!("{name}: valor do jogo válido de novo"));
         }
         if failed {
-            Some(Note::Waiting)
+            Some(waiting)
         } else if invalid {
             Some(Note::InvalidGameValue)
         } else {
@@ -859,7 +868,7 @@ mod tests {
     #[test]
     fn fight_counts_more_than_five_in_ten_seconds() {
         let t0 = Instant::now();
-        let mut fight = Fight::new(1);
+        let mut fight = Fight::new(1, Vec::new());
         // Cinco em 10 s ainda é tolerado; o sexto passa do limite.
         for i in 0..5 {
             assert!(!fight.record(t0 + Duration::from_secs(i)), "{i}");
@@ -870,13 +879,13 @@ mod tests {
     #[test]
     fn fight_window_slides() {
         let t0 = Instant::now();
-        let mut fight = Fight::new(1);
+        let mut fight = Fight::new(1, Vec::new());
         // Um a cada 3 s: nunca mais de quatro dentro de 10 s.
         for i in 0..20 {
             assert!(!fight.record(t0 + Duration::from_secs(3 * i)), "{i}");
         }
         // Exatamente 10 s depois, o mais antigo já saiu da janela.
-        let mut edge = Fight::new(1);
+        let mut edge = Fight::new(1, Vec::new());
         for _ in 0..5 {
             edge.record(t0);
         }

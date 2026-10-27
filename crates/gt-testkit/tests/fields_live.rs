@@ -866,6 +866,11 @@ impl Scene {
         self.ue.game_state + u64::from(MODE_MANAGER_OFF)
     }
 
+    /// Campo `GameModeSettings` do gerenciador do modo de jogo.
+    fn mode_manager_field_settings(&self) -> u64 {
+        self.ue.mode_manager + u64::from(SETTINGS_OFF)
+    }
+
     /// `InternalIndex` de um objeto (parte da guarda).
     fn index_of(&self, obj: u64) -> u64 {
         obj + u64::from(UeLayout::observed().uobject.index)
@@ -1147,4 +1152,127 @@ fn world_maps_refreshed_only_for_a_new_object() {
     }
     s.tick(&WORLD_IDS);
     assert_eq!(s.policy_calls.get(), start + 4);
+}
+
+#[test]
+fn world_write_failure_waits_with_world_note() {
+    let mut s = scene();
+    // A página do campo do mundo fica fora da política de escrita; o objeto está certo.
+    let recipes = s.recipes();
+    s.forbidden.set((recipes, recipes + 1));
+    let report = s.tick(&["construir-sem-ingredientes", "vida-infinita"]);
+    assert_eq!(report.player, PlayerState::Found);
+    assert_eq!(report.world, Some(WorldState::Found));
+    // O mundo está bom: a marca é a do mundo, e nunca a do personagem.
+    assert_eq!(
+        report.notes["construir-sem-ingredientes"],
+        Note::WaitingWorld
+    );
+    assert!(
+        !report.notes.contains_key("vida-infinita"),
+        "{:?}",
+        report.notes
+    );
+    assert_eq!(s.u8_at(recipes), 1);
+    // Liberada a região, o cheat escreve e a marca some.
+    s.forbidden.set((0, 0));
+    s.engine.refresh_data_maps().unwrap();
+    let again = s.tick(&["construir-sem-ingredientes"]);
+    assert!(again.notes.is_empty(), "{:?}", again.notes);
+    assert_eq!(s.u8_at(recipes), 0);
+}
+
+#[test]
+fn world_block_cleared_by_settings_swap_same_addr() {
+    let mut s = scene();
+    let id = "dano-recebido";
+    s.tick(&[id]);
+    assert_eq!(s.f32_at(s.enemy_damage()), 0.25);
+    // O jogo reescreve o dano a cada ciclo até o cheat desistir.
+    let mut last = None;
+    for i in 0..6 {
+        s.poke(s.enemy_damage(), &(0.5f32 + i as f32 * 0.05).to_le_bytes());
+        last = Some(s.tick(&[id]));
+    }
+    let sixth = last.unwrap();
+    assert_eq!(sixth.notes[id], Note::GameRefuses);
+    assert!(
+        sixth.events.iter().any(|e| e.ends_with("o jogo não deixa")),
+        "{:?}",
+        sixth.events
+    );
+    // Outras configurações no mesmo endereço (guarda diferente): o bloqueio acaba.
+    s.poke(s.index_of(s.ue.settings), &0x0000_7777u32.to_le_bytes());
+    let swapped = s.tick(&[id]);
+    assert!(swapped.notes.is_empty(), "{:?}", swapped.notes);
+    assert!(
+        swapped
+            .events
+            .iter()
+            .any(|e| e.ends_with("o jogo voltou a deixar")),
+        "{:?}",
+        swapped.events
+    );
+    assert_eq!(s.f32_at(s.enemy_damage()), 0.25);
+    s.runtime.turn_off(&mut s.engine, id).unwrap();
+}
+
+#[test]
+fn world_settings_swap_other_addr_resolves_old_first() {
+    let mut s = scene();
+    s.tick(&WORLD_IDS);
+    assert_eq!(journal_data_len(&s), 3);
+    let (old, new) = (s.ue.settings, s.ue.cdo_settings);
+    // O outro objeto deixa de ser CDO e tem originais próprios: `[1]`, `[0]` e 0,5.
+    let flags = UeLayout::observed().uobject.flags;
+    s.poke(new + u64::from(flags), &0u32.to_le_bytes());
+    s.poke(new + u64::from(ENEMY_DAMAGE_OFF), &0.5f32.to_le_bytes());
+    s.poke(s.mode_manager_field_settings(), &new.to_le_bytes());
+    let swapped = s.tick(&WORLD_IDS);
+    assert!(swapped.notes.is_empty(), "{:?}", swapped.notes);
+    // O antigo voltou aos originais dele; o novo recebeu os valores do cheat.
+    assert_eq!(s.u8_at(old + u64::from(RECIPES_OFF)), 1);
+    assert_eq!(s.u8_at(old + u64::from(AUTO_COMPLETE_OFF)), 0);
+    assert_eq!(s.f32_at(old + u64::from(ENEMY_DAMAGE_OFF)), 1.0);
+    assert_eq!(s.u8_at(new + u64::from(RECIPES_OFF)), 0);
+    assert_eq!(s.u8_at(new + u64::from(AUTO_COMPLETE_OFF)), 1);
+    assert_eq!(s.f32_at(new + u64::from(ENEMY_DAMAGE_OFF)), 0.25);
+    assert_eq!(journal_data_len(&s), 3);
+    for id in WORLD_IDS {
+        s.runtime.turn_off(&mut s.engine, id).unwrap();
+    }
+    // Os originais do objeto novo voltam nele; o antigo não é tocado de novo.
+    assert_eq!(s.u8_at(new + u64::from(RECIPES_OFF)), 1);
+    assert_eq!(s.u8_at(new + u64::from(AUTO_COMPLETE_OFF)), 0);
+    assert_eq!(s.f32_at(new + u64::from(ENEMY_DAMAGE_OFF)), 0.5);
+    assert_eq!(s.u8_at(old + u64::from(RECIPES_OFF)), 1);
+    assert_eq!(s.store.peek().unwrap(), Loaded::Missing);
+}
+
+#[test]
+fn world_bool_game_rewrite_becomes_new_original() {
+    let mut s = scene();
+    let id = "construir-sem-ingredientes";
+    s.tick(&[id]);
+    assert_eq!(s.u8_at(s.recipes()), 0);
+    // O jogo reescreve `bRecipesRequireIngredients` para 1: vira o novo original e o cheat volta a 0.
+    s.poke(s.recipes(), &[1]);
+    let report = s.tick(&[id]);
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+    assert_eq!(
+        report
+            .events
+            .iter()
+            .filter(|e| e.contains("novo original"))
+            .count(),
+        1,
+        "{:?}",
+        report.events
+    );
+    assert_eq!(s.u8_at(s.recipes()), 0);
+    assert_eq!(s.u8_at(s.auto_complete()), 1);
+    s.runtime.turn_off(&mut s.engine, id).unwrap();
+    assert_eq!(s.u8_at(s.recipes()), 1);
+    assert_eq!(s.u8_at(s.auto_complete()), 0);
+    assert_eq!(s.store.peek().unwrap(), Loaded::Missing);
 }
