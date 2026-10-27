@@ -669,8 +669,21 @@ dos três campos, originais guardados e devolvidos), sem o trainer.
 | Save (`PropertyFlags`) | Nenhum dos campos tem `CPF_SaveGame`; `GameModeSettings` (no componente) é `Transient`, como `CurrentGameMode` e `CustomSettings`. Indício de que o objeto é recriado a partir do modo ao carregar |
 | **Efeito na hora** (spike, `0`/`1`/`0,25`) | **Funciona, confirmado pelo dono**: construção desbloqueada colocada sem materiais fica pronta na hora; a bancada cria sem ingredientes; o dano recebido de inimigos cai; nada não desbloqueado aparece. O jogo lê os três campos na hora, sem recarregar o mundo |
 
-Ainda não testado (fica para o critério de pronto da spec 007): consertar, construção em andamento antes de ligar,
-efeito do `EnemyDamageMultiplier` no pet e nas construções, e se um save feito com os valores ligados os grava.
+### Critério de pronto da spec 007 no jogo (2026-10-27)
+
+Build `c935e799-0b27c000`, backup do save feito pelo dono, FLiNG fechado, trainer do branch `spec-007-construcao`.
+
+- Testes `#[ignore]` de `apps/gt-tui/tests/game.rs` (5, 325 s), inclusive `world_cheats_toggle_and_restore`: verdes;
+  no fim, `gt ue player` mostrou os originais (`true`, `false`, `1.0`). Uma rodada de `cargo test --workspace --
+  --ignored` inteira passou de 10 min e foi interrompida pelo `timeout`, sem deixar valor nosso no jogo.
+- Teste à mão com a TUI: os dois cheats disponíveis nas categorias certas; construir sem ingredientes e dano recebido
+  funcionam e voltam ao normal ao desligar. O dono confirmou "tudo funcionando"; os detalhes de consertar, construção
+  em andamento, efeito no pet/construções e save com os cheats ligados não foram anotados um a um.
+- **Crash do jogo durante o teste (12:51:49 UTC), não atribuído ao trainer:** o kernel registrou
+  `NVRM: ... Out of memory [NV_ERR_NO_MEMORY]` quatro vezes um segundo antes (RTX 3060 Laptop, 6 GB; 4,7 GB em uso com
+  o jogo aberto). O log da TUI não tem erro de escrita antes do "o jogo fechou"; o jogo não gravou dump. O dono
+  descartou relação com o cheat. Se voltar a acontecer construindo muito com o cheat ligado, investigar memória de
+  vídeo.
 
 ## Hipóteses descartadas
 

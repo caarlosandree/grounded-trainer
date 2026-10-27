@@ -3,7 +3,7 @@
 | Campo | Valor |
 |---|---|
 | Fase | Complemento da Fase 5 (cheats de valor por reflexão), antes da Fase 6 (ver `docs/ROADMAP.md`) |
-| Estado | Aprovada pelo dono em 2026-10-27; implementada no branch, aguardando o teste no jogo |
+| Estado | Implementada e confirmada no jogo pelo dono em 2026-10-27 |
 | Data | 2026-10-26 |
 
 ## 1. Intenção
