@@ -395,7 +395,9 @@ impl ValueCheats {
                 let (controller, state) = next_controller(self.controller, &data);
                 self.controller = controller;
                 if std::mem::take(&mut self.action_search) {
-                    // Sem estado novo, o controller guardado segue em uso: há personagem.
+                    // Sem estado novo, o controller guardado segue em uso: há personagem. Ramo
+                    // defensivo: `action_search` só liga junto com `controller = None`, e só este
+                    // `merge` repõe o controller; na prática o guardado não existe aqui.
                     self.controller_news =
                         Some(state.as_ref().is_none_or(|s| *s == PlayerState::Found));
                 }
