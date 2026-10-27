@@ -163,6 +163,8 @@ sobrevivência. Com esta spec:
 - A linha `personagem:` do topo continua mostrando o personagem (pawn), e não o estado do jogo; depois de uma procura,
   ela segue o controller guardado também sem cheat ligado (6.6).
 
+> **Nota (spec 007, 6.2):** a spec 007 libera `set` na raiz `game_state` (para as configurações do modo de jogo), com manutenção e isolamento por raiz; `lock` e `clear_bits` continuam recusados nela.
+
 Combinações: nesta spec, `root = "game_state"` só é aceito com `rule = "add"`; com `lock`, `clear_bits` ou `set` é
 erro de carga, para não ter caminho sem uso e sem teste. `object = "pawn"` com `root = "game_state"` também é erro de
 carga. `add` com `root = "pawn"` é aceito (sem uso nesta spec). Dois `set` sobre o mesmo campo (mesmo `object` e
@@ -179,6 +181,8 @@ Um `[[field]]` com `rule = "set"` tem:
   nenhum, é erro de carga;
 - com `target`, `min`/`max` obrigatórios e o `target` dentro deles. É **só conferência de carga** (o valor escrito é
   sempre o `target`); `min`/`max` não limitam o valor lido do jogo, que segue a regra de "valor do jogo são"; com `[field.value]`, `min`/`max` soltos são erro de carga (a faixa é a da grade).
+
+> **Nota (spec 007, 6.2):** a spec 007 libera `set` com `kind = "bool"` (byte inteiro, um valor por campo em `bools`, só liga/desliga, sem `[field.value]` nem `target`).
 
 Outros erros de carga: `set` com `kind = "bool"`; `fields` vazio ou com nome repetido; `target` não inteiro com
 `kind = "int"`; `[field.value]` em `lock` ou `clear_bits`; `lock` com `kind = "int"`.

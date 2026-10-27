@@ -12,12 +12,13 @@ use gt_core::journal::{DataEntry, JournalLock, JournalStore, Loaded};
 use gt_core::mem::{MemReader, MemWriter};
 use gt_core::patch::WritePolicy;
 use gt_core::suspend::PauseConfig;
-use gt_grounded2::fields::{ActionOutcome, FieldRuntime, Note, PlayerState};
-use gt_grounded2::player::{FieldCatalog, FieldValues, read_player};
+use gt_grounded2::fields::{ActionOutcome, FieldRuntime, Note, PlayerState, WorldState};
+use gt_grounded2::player::{Absent, FieldCatalog, FieldValues, read_player};
 use gt_grounded2::policy::data_policy;
 use gt_testkit::ue::{
-    CAPACITY_OFF, DAMAGE_MULT_OFF, DAMAGE_OFF, DIE_BYTE, GRAVITY_OFF, GROUND_MULT_OFF, HAULING_OFF,
-    HEALTH_OFF, JUMP_OFF, PARTY_OFF, SCIENCE_OFF, SWIM_MULT_OFF, WORLD_OFF,
+    AUTO_COMPLETE_OFF, CACHED_OFF, CAPACITY_OFF, DAMAGE_MULT_OFF, DAMAGE_OFF, DIE_BYTE,
+    ENEMY_DAMAGE_OFF, GRAVITY_OFF, GROUND_MULT_OFF, HAULING_OFF, HEALTH_OFF, JUMP_OFF,
+    MODE_MANAGER_OFF, PARTY_OFF, RECIPES_OFF, SCIENCE_OFF, SETTINGS_OFF, SWIM_MULT_OFF, WORLD_OFF,
 };
 use gt_testkit::{TargetOpts, TestTarget, UeAddrs, synth_signatures};
 use gt_ue::{Names, ObjectArray, ReflectionIndex, ScanBudget, UeLayout};
@@ -841,4 +842,437 @@ fn action_refreshes_maps_on_new_object() {
     assert!(matches!(out, ActionOutcome::Done { .. }), "{out:?}");
     assert_eq!(calls(&s), start + 2);
     assert_eq!(s.i32_at(other + u64::from(SCIENCE_OFF)), 800);
+}
+
+// ---- Cheats do mundo (raiz `game_state`, spec 007, 6.3) ----
+
+const WORLD_IDS: [&str; 2] = ["construir-sem-ingredientes", "dano-recebido"];
+
+impl Scene {
+    fn recipes(&self) -> u64 {
+        self.ue.settings + u64::from(RECIPES_OFF)
+    }
+
+    fn auto_complete(&self) -> u64 {
+        self.ue.settings + u64::from(AUTO_COMPLETE_OFF)
+    }
+
+    fn enemy_damage(&self) -> u64 {
+        self.ue.settings + u64::from(ENEMY_DAMAGE_OFF)
+    }
+
+    /// Ponteiro do `GameState` para o gerenciador do modo de jogo.
+    fn mode_manager_field(&self) -> u64 {
+        self.ue.game_state + u64::from(MODE_MANAGER_OFF)
+    }
+
+    /// Campo `GameModeSettings` do gerenciador do modo de jogo.
+    fn mode_manager_field_settings(&self) -> u64 {
+        self.ue.mode_manager + u64::from(SETTINGS_OFF)
+    }
+
+    /// `InternalIndex` de um objeto (parte da guarda).
+    fn index_of(&self, obj: u64) -> u64 {
+        obj + u64::from(UeLayout::observed().uobject.index)
+    }
+
+    /// Estrago no controller: o item da tabela deixa de apontar para ele.
+    fn break_controller(&self) {
+        self.poke(
+            self.index_of(self.ue.controller),
+            &0xFFFF_FF00u32.to_le_bytes(),
+        );
+    }
+
+    fn mend_controller(&self, index: [u8; 4]) {
+        self.poke(self.index_of(self.ue.controller), &index);
+    }
+}
+
+fn events_named(report: &gt_grounded2::fields::TickReport, text: &str) -> usize {
+    report.events.iter().filter(|e| e.as_str() == text).count()
+}
+
+#[test]
+fn world_set_writes_and_turn_off_restores() {
+    let mut s = scene();
+    let first = s.tick(&WORLD_IDS);
+    assert_eq!(first.player, PlayerState::Found);
+    assert_eq!(first.world, Some(WorldState::Found));
+    assert!(first.notes.is_empty(), "{:?}", first.notes);
+    // Só o personagem achado gera evento: o mundo na primeira leitura não é transição.
+    assert_eq!(first.events, vec!["personagem encontrado".to_string()]);
+    assert_eq!(s.u8_at(s.recipes()), 0);
+    assert_eq!(s.u8_at(s.auto_complete()), 1);
+    assert_eq!(s.f32_at(s.enemy_damage()), 0.25);
+    assert_eq!(journal_data_len(&s), 3);
+    // Os ciclos seguintes não escrevem nem falam nada.
+    let again = s.tick(&WORLD_IDS);
+    assert!(again.notes.is_empty() && again.events.is_empty());
+    assert_eq!(journal_data_len(&s), 3);
+    for id in WORLD_IDS {
+        let r = s.runtime.turn_off(&mut s.engine, id).unwrap();
+        assert_eq!(r.restored, vec![id.to_string()]);
+    }
+    assert_eq!(s.u8_at(s.recipes()), 1);
+    assert_eq!(s.u8_at(s.auto_complete()), 0);
+    assert_eq!(s.f32_at(s.enemy_damage()), 1.0);
+    assert_eq!(s.store.peek().unwrap(), Loaded::Missing);
+}
+
+#[test]
+fn world_cheats_survive_pawn_null_and_wrong_class() {
+    let mut s = scene();
+    let on = [
+        "construir-sem-ingredientes",
+        "dano-recebido",
+        "vida-infinita",
+    ];
+    // `Pawn` nulo: os do mundo escrevem, o do personagem espera.
+    s.poke(s.ue.pawn_field_addr, &0u64.to_le_bytes());
+    let null = s.tick(&on);
+    assert_eq!(null.player, PlayerState::Absent(Absent::PawnNull));
+    assert_eq!(null.world, Some(WorldState::Found));
+    assert_eq!(null.notes.len(), 1, "{:?}", null.notes);
+    assert_eq!(null.notes["vida-infinita"], Note::Waiting);
+    assert!(null.events.is_empty(), "{:?}", null.events);
+    assert_eq!(s.u8_at(s.recipes()), 0);
+    assert_eq!(s.u8_at(s.auto_complete()), 1);
+    assert_eq!(s.f32_at(s.enemy_damage()), 0.25);
+    // Montaria no `Pawn` e no campo alternativo: nenhum personagem do jogador, e o mundo segue.
+    s.poke(s.ue.pawn_field_addr, &s.ue.creature.to_le_bytes());
+    s.poke(
+        s.ue.controller + u64::from(CACHED_OFF),
+        &s.ue.creature.to_le_bytes(),
+    );
+    let wrong = s.tick(&on);
+    assert_eq!(wrong.player, PlayerState::Absent(Absent::PawnWrongClass));
+    assert_eq!(wrong.world, Some(WorldState::Found));
+    assert_eq!(wrong.notes.len(), 1, "{:?}", wrong.notes);
+    assert_eq!(wrong.notes["vida-infinita"], Note::Waiting);
+    assert!(wrong.events.is_empty(), "{:?}", wrong.events);
+    // E o jogo mexendo nas configurações é acompanhado mesmo sem personagem.
+    s.poke(s.enemy_damage(), &0.75f32.to_le_bytes());
+    let again = s.tick(&on);
+    assert_eq!(s.f32_at(s.enemy_damage()), 0.25);
+    assert!(
+        again.events.iter().any(|e| e.contains("novo original")),
+        "{:?}",
+        again.events
+    );
+    assert_eq!(again.notes.len(), 1, "{:?}", again.notes);
+}
+
+#[test]
+fn controller_invalid_waits_both_roots_without_world_event() {
+    let mut s = scene();
+    let on = [
+        "construir-sem-ingredientes",
+        "dano-recebido",
+        "vida-infinita",
+    ];
+    let index = s.u64_at(s.index_of(s.ue.controller)).to_le_bytes();
+    let index = [index[0], index[1], index[2], index[3]];
+    let ok = s.tick(&on);
+    assert_eq!(ok.world, Some(WorldState::Found));
+    // Controller inválido: os três esperam o personagem; o mundo nem é lido.
+    s.break_controller();
+    let bad = s.tick(&on);
+    assert_eq!(bad.player, PlayerState::Absent(Absent::ControllerInvalid));
+    assert_eq!(bad.world, None);
+    for id in on {
+        assert_eq!(bad.notes[id], Note::Waiting, "{id}");
+    }
+    assert_eq!(bad.events, vec!["personagem perdido".to_string()]);
+    let still = s.tick(&on);
+    assert!(still.events.is_empty(), "{:?}", still.events);
+    // De volta: só o personagem é "encontrado"; o mundo nunca saiu.
+    s.mend_controller(index);
+    let back = s.tick(&on);
+    assert_eq!(back.events, vec!["personagem encontrado".to_string()]);
+    assert!(back.notes.is_empty(), "{:?}", back.notes);
+}
+
+#[test]
+fn world_hop_missing_notes_and_resumes() {
+    let mut s = scene();
+    let on = [
+        "construir-sem-ingredientes",
+        "dano-recebido",
+        "vida-infinita",
+    ];
+    s.tick(&on);
+    // O gerenciador de modo some: só o mundo espera, com uma linha para os dois cheats.
+    s.poke(s.mode_manager_field(), &0u64.to_le_bytes());
+    let lost = s.tick(&on);
+    assert_eq!(lost.player, PlayerState::Found);
+    assert!(
+        matches!(lost.world, Some(WorldState::Absent(_))),
+        "{:?}",
+        lost.world
+    );
+    assert_eq!(lost.notes.len(), 2, "{:?}", lost.notes);
+    for id in WORLD_IDS {
+        assert_eq!(lost.notes[id], Note::WaitingWorld, "{id}");
+    }
+    assert_eq!(lost.events, vec!["mundo perdido".to_string()]);
+    // A marca persiste, a linha não.
+    s.poke(s.enemy_damage(), &0.75f32.to_le_bytes());
+    let still = s.tick(&on);
+    assert_eq!(still.notes.len(), 2);
+    assert!(still.events.is_empty(), "{:?}", still.events);
+    assert_eq!(s.f32_at(s.enemy_damage()), 0.75);
+    // O ponteiro volta: escreve de novo e uma única linha.
+    s.poke(s.mode_manager_field(), &s.ue.mode_manager.to_le_bytes());
+    let found = s.tick(&on);
+    assert_eq!(found.world, Some(WorldState::Found));
+    assert!(found.notes.is_empty(), "{:?}", found.notes);
+    assert_eq!(events_named(&found, "mundo encontrado"), 1);
+    assert_eq!(events_named(&found, "mundo perdido"), 0);
+    assert_eq!(s.f32_at(s.enemy_damage()), 0.25);
+    assert!(s.tick(&on).events.is_empty());
+}
+
+#[test]
+fn world_first_read_absent_is_not_an_event() {
+    let mut s = scene();
+    s.poke(s.mode_manager_field(), &0u64.to_le_bytes());
+    let first = s.tick(&WORLD_IDS);
+    assert_eq!(first.notes["dano-recebido"], Note::WaitingWorld);
+    assert_eq!(first.events, vec!["personagem encontrado".to_string()]);
+    // Aparecer depois de ausente desde o início já é "encontrado".
+    s.poke(s.mode_manager_field(), &s.ue.mode_manager.to_le_bytes());
+    let found = s.tick(&WORLD_IDS);
+    assert_eq!(found.events, vec!["mundo encontrado".to_string()]);
+}
+
+#[test]
+fn world_settings_swap_same_addr_resolves_old_first() {
+    let mut s = scene();
+    s.tick(&WORLD_IDS);
+    assert_eq!(journal_data_len(&s), 3);
+    // Outras configurações no mesmo endereço (guarda diferente), com originais diferentes dos
+    // antigos (`[1]`, `[0]` e 1,0): `[0]`, `[1]` e 0,5. O original novo vem do objeto novo.
+    s.poke(s.index_of(s.ue.settings), &0x0000_7777u32.to_le_bytes());
+    s.poke(s.recipes(), &[0]);
+    s.poke(s.auto_complete(), &[1]);
+    s.poke(s.enemy_damage(), &0.5f32.to_le_bytes());
+    let swapped = s.tick(&WORLD_IDS);
+    assert!(swapped.notes.is_empty(), "{:?}", swapped.notes);
+    assert_eq!(s.u8_at(s.recipes()), 0);
+    assert_eq!(s.u8_at(s.auto_complete()), 1);
+    assert_eq!(s.f32_at(s.enemy_damage()), 0.25);
+    // Uma entrada por campo, todas do objeto novo: a antiga foi resolvida antes.
+    assert_eq!(journal_data_len(&s), 3);
+    for id in WORLD_IDS {
+        s.runtime.turn_off(&mut s.engine, id).unwrap();
+    }
+    // Voltam os originais do objeto novo, e não os do antigo (`[1]`, `[0]`, 1,0).
+    assert_eq!(s.u8_at(s.recipes()), 0);
+    assert_eq!(s.u8_at(s.auto_complete()), 1);
+    assert_eq!(s.f32_at(s.enemy_damage()), 0.5);
+    assert_eq!(s.store.peek().unwrap(), Loaded::Missing);
+}
+
+#[test]
+fn world_bool_garbage_note_and_resume() {
+    let mut s = scene();
+    s.poke(s.recipes(), &[0x02]);
+    let first = s.tick(&["construir-sem-ingredientes"]);
+    assert_eq!(
+        first.notes["construir-sem-ingredientes"],
+        Note::InvalidGameValue
+    );
+    assert!(
+        first
+            .events
+            .iter()
+            .any(|e| e.contains("valor do jogo inválido")),
+        "{:?}",
+        first.events
+    );
+    // O byte com lixo não é tocado nem vai ao diário.
+    assert_eq!(s.u8_at(s.recipes()), 0x02);
+    assert!(
+        s.engine
+            .data_entries()
+            .iter()
+            .all(|e| e.addr != s.recipes())
+    );
+    // A marca persiste, o evento não.
+    let second = s.tick(&["construir-sem-ingredientes"]);
+    assert_eq!(
+        second.notes["construir-sem-ingredientes"],
+        Note::InvalidGameValue
+    );
+    assert!(second.events.is_empty(), "{:?}", second.events);
+    // O byte volta a ser são: escreve no ciclo seguinte e a marca some.
+    s.poke(s.recipes(), &[0x01]);
+    let third = s.tick(&["construir-sem-ingredientes"]);
+    assert!(third.notes.is_empty(), "{:?}", third.notes);
+    assert_eq!(s.u8_at(s.recipes()), 0);
+    s.runtime
+        .turn_off(&mut s.engine, "construir-sem-ingredientes")
+        .unwrap();
+    assert_eq!(s.u8_at(s.recipes()), 1);
+}
+
+#[test]
+fn world_not_read_without_world_cheats() {
+    let mut s = scene();
+    // Sem as configurações, só os cheats do personagem ligados: o mundo nem é lido.
+    s.poke(
+        s.ue.mode_manager + u64::from(SETTINGS_OFF),
+        &0u64.to_le_bytes(),
+    );
+    s.poke(s.mode_manager_field(), &0u64.to_le_bytes());
+    let report = s.tick(&["vida-infinita", "nao-morrer"]);
+    assert_eq!(report.world, None);
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+    assert_eq!(report.events, vec!["personagem encontrado".to_string()]);
+    assert!(s.tick(&["vida-infinita"]).events.is_empty());
+}
+
+#[test]
+fn world_maps_refreshed_only_for_a_new_object() {
+    let mut s = scene();
+    let start = s.policy_calls.get();
+    // O personagem relê o `maps` uma vez; o objeto das configurações, mais uma (uma só para os dois).
+    s.tick(&WORLD_IDS);
+    assert_eq!(s.policy_calls.get(), start + 2);
+    s.tick(&WORLD_IDS);
+    assert_eq!(s.policy_calls.get(), start + 2);
+    // Outras configurações no mesmo endereço (guarda nova): o `maps` é relido antes de escrever.
+    s.poke(s.index_of(s.ue.settings), &0x0000_7777u32.to_le_bytes());
+    s.tick(&WORLD_IDS);
+    assert_eq!(s.policy_calls.get(), start + 3);
+    // Desligar e ligar de novo relê (a guarda do `id` foi esquecida).
+    for id in WORLD_IDS {
+        s.runtime.turn_off(&mut s.engine, id).unwrap();
+    }
+    s.tick(&WORLD_IDS);
+    assert_eq!(s.policy_calls.get(), start + 4);
+}
+
+#[test]
+fn world_write_failure_waits_with_world_note() {
+    let mut s = scene();
+    // A página do campo do mundo fica fora da política de escrita; o objeto está certo.
+    let recipes = s.recipes();
+    s.forbidden.set((recipes, recipes + 1));
+    let report = s.tick(&["construir-sem-ingredientes", "vida-infinita"]);
+    assert_eq!(report.player, PlayerState::Found);
+    assert_eq!(report.world, Some(WorldState::Found));
+    // O mundo está bom: a marca é a do mundo, e nunca a do personagem.
+    assert_eq!(
+        report.notes["construir-sem-ingredientes"],
+        Note::WaitingWorld
+    );
+    assert!(
+        !report.notes.contains_key("vida-infinita"),
+        "{:?}",
+        report.notes
+    );
+    assert_eq!(s.u8_at(recipes), 1);
+    // Liberada a região, o cheat escreve e a marca some.
+    s.forbidden.set((0, 0));
+    s.engine.refresh_data_maps().unwrap();
+    let again = s.tick(&["construir-sem-ingredientes"]);
+    assert!(again.notes.is_empty(), "{:?}", again.notes);
+    assert_eq!(s.u8_at(recipes), 0);
+}
+
+#[test]
+fn world_block_cleared_by_settings_swap_same_addr() {
+    let mut s = scene();
+    let id = "dano-recebido";
+    s.tick(&[id]);
+    assert_eq!(s.f32_at(s.enemy_damage()), 0.25);
+    // O jogo reescreve o dano a cada ciclo até o cheat desistir.
+    let mut last = None;
+    for i in 0..6 {
+        s.poke(s.enemy_damage(), &(0.5f32 + i as f32 * 0.05).to_le_bytes());
+        last = Some(s.tick(&[id]));
+    }
+    let sixth = last.unwrap();
+    assert_eq!(sixth.notes[id], Note::GameRefuses);
+    assert!(
+        sixth.events.iter().any(|e| e.ends_with("o jogo não deixa")),
+        "{:?}",
+        sixth.events
+    );
+    // Outras configurações no mesmo endereço (guarda diferente): o bloqueio acaba.
+    s.poke(s.index_of(s.ue.settings), &0x0000_7777u32.to_le_bytes());
+    let swapped = s.tick(&[id]);
+    assert!(swapped.notes.is_empty(), "{:?}", swapped.notes);
+    assert!(
+        swapped
+            .events
+            .iter()
+            .any(|e| e.ends_with("o jogo voltou a deixar")),
+        "{:?}",
+        swapped.events
+    );
+    assert_eq!(s.f32_at(s.enemy_damage()), 0.25);
+    s.runtime.turn_off(&mut s.engine, id).unwrap();
+}
+
+#[test]
+fn world_settings_swap_other_addr_resolves_old_first() {
+    let mut s = scene();
+    s.tick(&WORLD_IDS);
+    assert_eq!(journal_data_len(&s), 3);
+    let (old, new) = (s.ue.settings, s.ue.cdo_settings);
+    // O outro objeto deixa de ser CDO e tem originais próprios: `[1]`, `[0]` e 0,5.
+    let flags = UeLayout::observed().uobject.flags;
+    s.poke(new + u64::from(flags), &0u32.to_le_bytes());
+    s.poke(new + u64::from(ENEMY_DAMAGE_OFF), &0.5f32.to_le_bytes());
+    s.poke(s.mode_manager_field_settings(), &new.to_le_bytes());
+    let swapped = s.tick(&WORLD_IDS);
+    assert!(swapped.notes.is_empty(), "{:?}", swapped.notes);
+    // O antigo voltou aos originais dele; o novo recebeu os valores do cheat.
+    assert_eq!(s.u8_at(old + u64::from(RECIPES_OFF)), 1);
+    assert_eq!(s.u8_at(old + u64::from(AUTO_COMPLETE_OFF)), 0);
+    assert_eq!(s.f32_at(old + u64::from(ENEMY_DAMAGE_OFF)), 1.0);
+    assert_eq!(s.u8_at(new + u64::from(RECIPES_OFF)), 0);
+    assert_eq!(s.u8_at(new + u64::from(AUTO_COMPLETE_OFF)), 1);
+    assert_eq!(s.f32_at(new + u64::from(ENEMY_DAMAGE_OFF)), 0.25);
+    assert_eq!(journal_data_len(&s), 3);
+    for id in WORLD_IDS {
+        s.runtime.turn_off(&mut s.engine, id).unwrap();
+    }
+    // Os originais do objeto novo voltam nele; o antigo não é tocado de novo.
+    assert_eq!(s.u8_at(new + u64::from(RECIPES_OFF)), 1);
+    assert_eq!(s.u8_at(new + u64::from(AUTO_COMPLETE_OFF)), 0);
+    assert_eq!(s.f32_at(new + u64::from(ENEMY_DAMAGE_OFF)), 0.5);
+    assert_eq!(s.u8_at(old + u64::from(RECIPES_OFF)), 1);
+    assert_eq!(s.store.peek().unwrap(), Loaded::Missing);
+}
+
+#[test]
+fn world_bool_game_rewrite_becomes_new_original() {
+    let mut s = scene();
+    let id = "construir-sem-ingredientes";
+    s.tick(&[id]);
+    assert_eq!(s.u8_at(s.recipes()), 0);
+    // O jogo reescreve `bRecipesRequireIngredients` para 1: vira o novo original e o cheat volta a 0.
+    s.poke(s.recipes(), &[1]);
+    let report = s.tick(&[id]);
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+    assert_eq!(
+        report
+            .events
+            .iter()
+            .filter(|e| e.contains("novo original"))
+            .count(),
+        1,
+        "{:?}",
+        report.events
+    );
+    assert_eq!(s.u8_at(s.recipes()), 0);
+    assert_eq!(s.u8_at(s.auto_complete()), 1);
+    s.runtime.turn_off(&mut s.engine, id).unwrap();
+    assert_eq!(s.u8_at(s.recipes()), 1);
+    assert_eq!(s.u8_at(s.auto_complete()), 0);
+    assert_eq!(s.store.peek().unwrap(), Loaded::Missing);
 }

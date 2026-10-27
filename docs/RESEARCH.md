@@ -654,6 +654,37 @@ Build `c935e799-0b27c000`, backup do save feito pelo dono, FLiNG fechado. Plano 
   morte e menu, save com os ajustes ligados, reinício do jogo com a TUI aberta, saída e estabilidade do jogo e do save.
 - Nenhum cheat saiu da spec; a grade de velocidade (×0,5 a ×4) ficou como estava.
 
+## Sessão de 2026-10-26/27 (spec 007): configurações do modo de jogo
+
+Build `c935e799-0b27c000`, partida carregada (modo Normal), FLiNG fechado, backup do save feito pelo dono. Leitura por
+`gt ue class` e `scratch/p11/{instances,propflags}.py`; o teste de efeito foi um spike descartável (escrita direta
+dos três campos, originais guardados e devolvidos), sem o trainer.
+
+| O quê | Resultado |
+|---|---|
+| Caminho | `BP_SurvivalGameState_C` → `InGameGameState.SurvivalModeManagerComponent` (`+0x328`) → `SurvivalModeManagerComponent.GameModeSettings` (`+0x148`, o `[rax+0x148]` do FLiNG em `+593AF1C`) → `BP_NormalModeSettings_C` (outer `Augusta_Main`) |
+| Outras instâncias | Um `SurvivalModeManagerComponent` em cada CDO de `GameState` (`Default__InGameGameState`, `Default__SurvivalGameState`, `Default__BP_SurvivalGameState_C`, `Default__LobbyGameState`); só o do `GameState` vivo é o certo |
+| Campos | `bRecipesRequireIngredients` (`+0x3d`) e `bAutoCompleteBuildings` (`+0x3b`): `BoolProperty` de 1 byte, máscara `0xff`. `EnemyDamageMultiplier` (`+0x58`): `FloatProperty`. Na mesma classe: `bUnlockAllRecipes` (`+0x3a`), `PlayerDamageMultiplier` (`+0x54`), `TimeOfDaySpeedMultiplier` (`+0x80`) e outros |
+| Valores no modo Normal | `bRecipesRequireIngredients = 1`, `bAutoCompleteBuildings = 0`, `EnemyDamageMultiplier = 1,0`, `bUnlockAllRecipes = 0` |
+| Save (`PropertyFlags`) | Nenhum dos campos tem `CPF_SaveGame`; `GameModeSettings` (no componente) é `Transient`, como `CurrentGameMode` e `CustomSettings`. Indício de que o objeto é recriado a partir do modo ao carregar |
+| **Efeito na hora** (spike, `0`/`1`/`0,25`) | **Funciona, confirmado pelo dono**: construção desbloqueada colocada sem materiais fica pronta na hora; a bancada cria sem ingredientes; o dano recebido de inimigos cai; nada não desbloqueado aparece. O jogo lê os três campos na hora, sem recarregar o mundo |
+
+### Critério de pronto da spec 007 no jogo (2026-10-27)
+
+Build `c935e799-0b27c000`, backup do save feito pelo dono, FLiNG fechado, trainer do branch `spec-007-construcao`.
+
+- Testes `#[ignore]` de `apps/gt-tui/tests/game.rs` (5, 325 s), inclusive `world_cheats_toggle_and_restore`: verdes;
+  no fim, `gt ue player` mostrou os originais (`true`, `false`, `1.0`). Uma rodada de `cargo test --workspace --
+  --ignored` inteira passou de 10 min e foi interrompida pelo `timeout`, sem deixar valor nosso no jogo.
+- Teste à mão com a TUI: os dois cheats disponíveis nas categorias certas; construir sem ingredientes e dano recebido
+  funcionam e voltam ao normal ao desligar. O dono confirmou "tudo funcionando"; os detalhes de consertar, construção
+  em andamento, efeito no pet/construções e save com os cheats ligados não foram anotados um a um.
+- **Crash do jogo durante o teste (12:51:49 UTC), não atribuído ao trainer:** o kernel registrou
+  `NVRM: ... Out of memory [NV_ERR_NO_MEMORY]` quatro vezes um segundo antes (RTX 3060 Laptop, 6 GB; 4,7 GB em uso com
+  o jogo aberto). O log da TUI não tem erro de escrita antes do "o jogo fechou"; o jogo não gravou dump. O dono
+  descartou relação com o cheat. Se voltar a acontecer construindo muito com o cheat ligado, investigar memória de
+  vídeo.
+
 ## Hipóteses descartadas
 
 - (2026-10-25) "Os patches em `+57BD6D0`/`+5BBFE8C` indicam que as opções de cargas e arrastar item estavam

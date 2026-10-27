@@ -77,7 +77,7 @@ use std::time::{Duration, Instant};
 use gt_core::journal::Loaded;
 use gt_tui::backend::{JobKind, ReflectionJob};
 
-const FIELDS: [&str; 17] = [
+const FIELDS: [&str; 19] = [
     "vida-infinita",
     "stamina-infinita",
     "comida-infinita",
@@ -95,6 +95,8 @@ const FIELDS: [&str; 17] = [
     "velocidade",
     "pulos-infinitos",
     "gravidade",
+    "construir-sem-ingredientes",
+    "dano-recebido",
 ];
 
 /// Roda um trabalho da tarefa de reflexão nesta thread e junta o resultado na sessão.
@@ -254,6 +256,111 @@ fn game_set_round_trip() {
             .cloned()
             .collect();
         assert!(!entries.is_empty(), "{id}: sem entrada no diário");
+        for e in &entries {
+            eprintln!(
+                "{id}: {:#x} original {:02x?} escrito {:02x?}",
+                e.addr, e.original, e.written
+            );
+            assert_eq!(
+                read(e.addr, e.written.len()),
+                e.written,
+                "{id}: valor no jogo"
+            );
+        }
+        let off = session.field_off(id);
+        assert!(matches!(off, OpOutcome::Done(_)), "{id}: {off:?}");
+        for e in &entries {
+            assert_eq!(
+                read(e.addr, e.original.len()),
+                e.original,
+                "{id}: original de volta"
+            );
+        }
+    }
+    assert!(session.pending_ids().is_empty());
+    assert_eq!(store.peek().unwrap(), Loaded::Missing);
+}
+
+/// Par (original do jogo, valor escrito pelo cheat) de um campo, em bytes.
+type Pair = (Vec<u8>, Vec<u8>);
+
+/// Cheats do mundo da spec 007 (`construir-sem-ingredientes` e `dano-recebido`): liga e desliga cada
+/// um com o jogo aberto, confere o valor escrito nas configurações do modo e, no fim, que os
+/// originais voltaram: `bRecipesRequireIngredients = true`, `bAutoCompleteBuildings = false` e
+/// `EnemyDamageMultiplier = 1.0` (spec 007, 9).
+#[test]
+#[ignore = "exige o jogo aberto e escreve nele (faça o backup do save antes)"]
+fn world_cheats_toggle_and_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JournalStore::new(dir.path().to_path_buf());
+    let lock = Arc::new(store.lock().unwrap());
+    let mut backend = GameBackend::new(None, store.clone(), lock);
+    let Find::Found(pid) = backend.find() else {
+        panic!("o jogo está aberto?");
+    };
+    let search = (backend.search_fn())(pid, None, None).unwrap();
+    if search.version_key != KNOWN_BUILD {
+        eprintln!("pulado: build diferente ({})", search.version_key);
+        return;
+    }
+    let defaults: Vec<(String, u64)> = search
+        .cheats
+        .iter()
+        .map(|c| (c.id.clone(), c.value.as_ref().map_or(0, |g| g.default_k)))
+        .collect();
+    assert!(matches!(backend.recover(), Recovered::Clean { .. }));
+    let mut session = backend.open(search, true).unwrap();
+    assert!(session.has_engine());
+    run_job(&mut session, JobKind::Index);
+    run_job(&mut session, JobKind::Controller);
+
+    let read = |addr: u64, len: usize| {
+        let mut b = vec![0u8; len];
+        MemReader::new(pid).read_exact(addr, &mut b).unwrap();
+        b
+    };
+    // Pares (original do jogo, valor do cheat) esperados de cada cheat (spec 007, 6.1):
+    // bRecipesRequireIngredients (true -> false), bAutoCompleteBuildings (false -> true) e
+    // EnemyDamageMultiplier (1.0 -> 0.25). O diário não guarda o nome do campo, então a
+    // conferência é por multiconjunto de pares, ordenado: trocar ou repetir valores falha.
+    let cases: [(&str, Vec<Pair>); 2] = [
+        (
+            "construir-sem-ingredientes",
+            vec![(vec![0], vec![1]), (vec![1], vec![0])],
+        ),
+        (
+            "dano-recebido",
+            vec![(
+                1.0f32.to_le_bytes().to_vec(),
+                0.25f32.to_le_bytes().to_vec(),
+            )],
+        ),
+    ];
+    for (id, mut expected) in cases {
+        expected.sort();
+        let k = defaults
+            .iter()
+            .find(|(d, _)| d == id)
+            .map_or(0, |(_, k)| *k);
+        let on = session.field_on(id, k);
+        assert!(matches!(on, OpOutcome::Done(_)), "{id}: {on:?}");
+        let report = session.field_tick(&[id.to_string()], Instant::now());
+        assert!(report.notes.is_empty(), "{id}: {:?}", report.notes);
+        let Loaded::Ok(journal) = store.peek().unwrap() else {
+            panic!("{id}: o diário devia ter as entradas do ajuste");
+        };
+        let entries: Vec<_> = journal
+            .data
+            .iter()
+            .filter(|e| e.id == id)
+            .cloned()
+            .collect();
+        let mut pairs: Vec<Pair> = entries
+            .iter()
+            .map(|e| (e.original.clone(), e.written.clone()))
+            .collect();
+        pairs.sort();
+        assert_eq!(pairs, expected, "{id}: pares (original, escrito) do diário");
         for e in &entries {
             eprintln!(
                 "{id}: {:#x} original {:02x?} escrito {:02x?}",

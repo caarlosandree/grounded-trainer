@@ -235,6 +235,8 @@ O custo de uma varredura completa é medido no começo da pesquisa (6.1) e regis
 > passa a seguir o controller guardado depois dessa procura. O isolamento por cheat (o tratamento `missing`, antes só
 > do pet) vale agora para **todo** componente depois do pawn: um componente nulo ou de classe errada deixa em espera
 > só os cheats que dependem dele.
+>
+> **Nota (spec 007, 6.3):** a procura do controller por pawn nulo há mais de 30 s não descarta mais o controller guardado: ele só é trocado se a procura achar outro, para os cheats do `game_state` seguirem valendo no mundo carregado.
 
 **Quando a varredura roda.** A busca de padrões da conexão **não** varre objetos. Ela só resolve as duas globais e faz
 as conferências baratas do layout (nome 0, contagens, amostra de itens). Assim a conexão e os cheats de patch não

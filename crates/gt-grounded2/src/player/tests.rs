@@ -106,6 +106,13 @@ const WORLD_OFF: u32 = 0x40;
 const GAME_STATE_OFF: u32 = 0x48;
 const PARTY_OFF: u32 = 0x38;
 const SCIENCE_OFF: u32 = 0x30;
+/// `InGameGameState.SurvivalModeManagerComponent` e `SurvivalModeManagerComponent.GameModeSettings`.
+const MODE_MANAGER_OFF: u32 = 0x40;
+const SETTINGS_OFF: u32 = 0x30;
+/// `SurvivalGameModeSettings`: dois `bool` de byte inteiro e o multiplicador de dano.
+const RECIPES_OFF: u32 = 0x30;
+const AUTO_COMPLETE_OFF: u32 = 0x31;
+const ENEMY_DAMAGE_OFF: u32 = 0x34;
 
 /// Objetos de um mundo sintético.
 struct World {
@@ -133,6 +140,10 @@ struct World {
     party: u64,
     hauling: u64,
     movement: u64,
+    mode_manager: u64,
+    settings: u64,
+    /// Configurações de um CDO (bit `cdo_flag` nas `ObjectFlags`), da mesma classe das vivas.
+    cdo_settings: u64,
 }
 
 impl World {
@@ -417,8 +428,35 @@ fn world(omit: &[&str]) -> World {
         "InGameGameState",
         Some(actor),
         0x60,
-        &keep(vec![object("PartyComponent", PARTY_OFF)]),
+        &keep(vec![
+            object("PartyComponent", PARTY_OFF),
+            object("SurvivalModeManagerComponent", MODE_MANAGER_OFF),
+        ]),
     );
+    let mode_manager_c = s.add_class(
+        maine,
+        "SurvivalModeManagerComponent",
+        Some(object_c),
+        0x48,
+        &keep(vec![object("GameModeSettings", SETTINGS_OFF)]),
+    );
+    let settings_c = s.add_class(
+        maine,
+        "SurvivalGameModeSettings",
+        Some(object_c),
+        0x48,
+        &keep(vec![
+            boolean("bRecipesRequireIngredients", RECIPES_OFF, 0xff),
+            boolean("bAutoCompleteBuildings", AUTO_COMPLETE_OFF, 0xff),
+            float("EnemyDamageMultiplier", ENEMY_DAMAGE_OFF),
+        ]),
+    );
+    if !omit.contains(&"SurvivalModeManagerComponent") {
+        s.link_struct(game_state_c, "SurvivalModeManagerComponent", mode_manager_c);
+    }
+    if !omit.contains(&"GameModeSettings") {
+        s.link_struct(mode_manager_c, "GameModeSettings", settings_c);
+    }
     let party_c = s.add_class(
         maine,
         "PartyComponent",
@@ -507,6 +545,16 @@ fn world(omit: &[&str]) -> World {
     s.set(level, WORLD_OFF, &world.to_le_bytes());
     s.set(world, GAME_STATE_OFF, &game_state.to_le_bytes());
     s.set(game_state, PARTY_OFF, &party.to_le_bytes());
+    let mode_manager = s.add_object(mode_manager_c, "ModeManager", game_state);
+    let settings = s.add_object(settings_c, "ModeSettings", world);
+    s.set(game_state, MODE_MANAGER_OFF, &mode_manager.to_le_bytes());
+    s.set(mode_manager, SETTINGS_OFF, &settings.to_le_bytes());
+    let cdo_settings = s.add_object(settings_c, "Default__SurvivalGameModeSettings", maine);
+    s.set(
+        cdo_settings,
+        layout.uobject.flags,
+        &layout.uobject.cdo_flag.to_le_bytes(),
+    );
     let controller = s.add_object(survival_controller_c, "Controller_0", level);
     let second_controller = s.add_object(survival_controller_c, "Controller_1", level);
     let pawn = s.add_object(player_character_c, "Player_0", maine);
@@ -567,6 +615,9 @@ fn world(omit: &[&str]) -> World {
         party,
         hauling,
         movement,
+        mode_manager,
+        settings,
+        cdo_settings,
     };
     // Valores iniciais: tudo cheio, sem dano, temperatura neutra e bits ligados como no jogo.
     w.write_f32(stamina + u64::from(CUR_STAMINA), 100.0);
@@ -1177,6 +1228,7 @@ fn set_def(
             fields: fields.iter().map(|s| s.to_string()).collect(),
             kind,
             target: Some(target),
+            bools: None,
         },
     }
 }
@@ -1307,6 +1359,7 @@ fn resolves_new_fields_by_name() {
         fields,
         kind,
         target,
+        ..
     } = &carga.rule
     else {
         panic!("carga não é set");
@@ -1407,7 +1460,10 @@ fn hauling_null_only_waits_carga() {
             assert_eq!(*obj, w.hauling);
             assert_eq!(
                 fields,
-                &[(w.hauling + u64::from(CAPACITY_OFF), 20i32.to_le_bytes())]
+                &[(
+                    w.hauling + u64::from(CAPACITY_OFF),
+                    20i32.to_le_bytes().to_vec()
+                )]
             );
         }
         other => panic!("{other:?}"),
@@ -1470,20 +1526,25 @@ fn movement_null_waits_speed_and_gravity() {
     assert!(snap.values.contains_key("carga"));
 }
 
+/// Os mesmos bytes desejados para `n` campos.
+fn same_for(bytes: &[u8], n: usize) -> Vec<Vec<u8>> {
+    vec![bytes.to_vec(); n]
+}
+
 #[test]
 fn plan_set_nan_and_negative_zero() {
     let zero = 0.0f32.to_le_bytes();
     let values = FieldValues::Set {
         obj: 0x100,
         fields: vec![
-            (0x10, f32::NAN.to_le_bytes()),
-            (0x20, (-0.0f32).to_le_bytes()),
-            (0x30, 0.0f32.to_le_bytes()),
-            (0x40, f32::INFINITY.to_le_bytes()),
-            (0x50, 2.0e9f32.to_le_bytes()),
+            (0x10, f32::NAN.to_le_bytes().to_vec()),
+            (0x20, (-0.0f32).to_le_bytes().to_vec()),
+            (0x30, 0.0f32.to_le_bytes().to_vec()),
+            (0x40, f32::INFINITY.to_le_bytes().to_vec()),
+            (0x50, 2.0e9f32.to_le_bytes().to_vec()),
         ],
     };
-    let steps = plan_set(&values, zero, FieldKind::Float);
+    let steps = plan_set(&values, &same_for(&zero, 5), FieldKind::Float);
     let sane: Vec<bool> = steps.iter().map(|s| s.sane).collect();
     assert_eq!(sane, [false, true, true, false, false]);
     // `-0.0` tem os mesmos números que `0.0`, mas bytes diferentes: conta como diferente.
@@ -1495,11 +1556,11 @@ fn plan_set_nan_and_negative_zero() {
     let ints = FieldValues::Set {
         obj: 0x100,
         fields: vec![
-            (0x10, 2_000_000_000i32.to_le_bytes()),
-            (0x20, (-5i32).to_le_bytes()),
+            (0x10, 2_000_000_000i32.to_le_bytes().to_vec()),
+            (0x20, (-5i32).to_le_bytes().to_vec()),
         ],
     };
-    let sane: Vec<bool> = plan_set(&ints, 20i32.to_le_bytes(), FieldKind::Int)
+    let sane: Vec<bool> = plan_set(&ints, &same_for(&20i32.to_le_bytes(), 2), FieldKind::Int)
         .iter()
         .map(|s| s.sane)
         .collect();
@@ -1509,13 +1570,250 @@ fn plan_set_nan_and_negative_zero() {
         obj: 1,
         bytes: Vec::new(),
     };
-    assert!(plan_set(&lock, zero, FieldKind::Float).is_empty());
+    assert!(plan_set(&lock, &same_for(&zero, 1), FieldKind::Float).is_empty());
+}
+
+#[test]
+fn plan_set_bool_compares_each_field_by_its_own_byte() {
+    let values = FieldValues::Set {
+        obj: 0x100,
+        fields: vec![(0x10, vec![0]), (0x11, vec![0]), (0x12, vec![2])],
+    };
+    let desired = [vec![0u8], vec![1], vec![1]];
+    let steps = plan_set(&values, &desired, FieldKind::Bool);
+    let same: Vec<bool> = steps.iter().map(|s| s.same).collect();
+    let sane: Vec<bool> = steps.iter().map(|s| s.sane).collect();
+    assert_eq!(same, [true, false, false]);
+    assert_eq!(sane, [true, true, false]);
 }
 
 #[test]
 fn encode_value_is_little_endian() {
-    assert_eq!(encode_value(FieldKind::Int, 1000.0), 1000i32.to_le_bytes());
-    assert_eq!(encode_value(FieldKind::Float, 0.5), 0.5f32.to_le_bytes());
+    assert_eq!(
+        encode_value(FieldKind::Int, 1000.0),
+        1000i32.to_le_bytes().to_vec()
+    );
+    assert_eq!(
+        encode_value(FieldKind::Float, 0.5),
+        0.5f32.to_le_bytes().to_vec()
+    );
+}
+
+#[test]
+fn bool_value_codec() {
+    assert_eq!(encode_value(FieldKind::Bool, 1.0), vec![1]);
+    assert_eq!(encode_value(FieldKind::Bool, 0.0), vec![0]);
+    assert_eq!(encode_value(FieldKind::Bool, 0.5), vec![1]);
+    assert_eq!(decode_value(FieldKind::Bool, &[1]), 1.0);
+    assert_eq!(decode_value(FieldKind::Bool, &[0]), 0.0);
+    assert_eq!(format_value(None, FieldKind::Bool, 1.0), "true");
+    assert_eq!(format_value(None, FieldKind::Bool, 0.0), "false");
+    assert_eq!(FieldKind::Bool.size(), 1);
+    assert_eq!(FieldKind::Int.size(), 4);
+    assert_eq!(FieldKind::Float.size(), 4);
+}
+
+#[test]
+fn bool_sanity() {
+    assert!(value_is_sane(FieldKind::Bool, &[0]));
+    assert!(value_is_sane(FieldKind::Bool, &[1]));
+    assert!(!value_is_sane(FieldKind::Bool, &[2]));
+    assert!(!value_is_sane(FieldKind::Bool, &[0xff]));
+    assert!(!value_is_sane(FieldKind::Bool, &[]));
+    assert!(!value_is_sane(FieldKind::Bool, &[0, 0]));
+    // `float` e `int`: como antes, agora sobre fatias; tamanho errado nunca é são.
+    assert!(value_is_sane(FieldKind::Float, &1.5f32.to_le_bytes()));
+    assert!(!value_is_sane(FieldKind::Float, &f32::NAN.to_le_bytes()));
+    assert!(!value_is_sane(FieldKind::Float, &2.0e9f32.to_le_bytes()));
+    assert!(value_is_sane(FieldKind::Int, &(-5i32).to_le_bytes()));
+    assert!(!value_is_sane(
+        FieldKind::Int,
+        &2_000_000_000i32.to_le_bytes()
+    ));
+    assert!(!value_is_sane(FieldKind::Int, &[0]));
+    assert!(!value_is_sane(FieldKind::Float, &[0, 0, 0]));
+}
+
+/// Cheats do mundo da spec 007: raiz `game_state`, dois saltos até as configurações.
+fn world_defs() -> Vec<FieldDef> {
+    let base = |id: &str, rule: FieldRule| FieldDef {
+        id: id.into(),
+        name: id.into(),
+        category: Category::Itens,
+        description: String::new(),
+        object: "SurvivalModeManagerComponent.GameModeSettings".into(),
+        object_class: format!("{MAINE}.SurvivalGameModeSettings"),
+        root: FieldRoot::GameState,
+        value: None,
+        rule,
+    };
+    vec![
+        base(
+            "construir-sem-ingredientes",
+            FieldRule::Set {
+                fields: vec![
+                    "bRecipesRequireIngredients".into(),
+                    "bAutoCompleteBuildings".into(),
+                ],
+                kind: FieldKind::Bool,
+                target: None,
+                bools: Some(vec![false, true]),
+            },
+        ),
+        base(
+            "dano-recebido",
+            FieldRule::Set {
+                fields: vec!["EnemyDamageMultiplier".into()],
+                kind: FieldKind::Float,
+                target: Some(0.25),
+                bools: None,
+            },
+        ),
+    ]
+}
+
+#[test]
+fn world_set_resolves_two_hops() {
+    let w = world(&[]);
+    let catalog = FieldCatalog::resolve(&w.index, &w.mem, &cfg_gs(), &world_defs());
+    for id in ["construir-sem-ingredientes", "dano-recebido"] {
+        assert_eq!(catalog.avail(id), Ok(()), "{id}");
+        let Some(Ok(r)) = catalog.get(id) else {
+            panic!("{id} não resolvido");
+        };
+        assert_eq!(r.root, FieldRoot::GameState);
+        let hops: Vec<(&str, u32)> = r
+            .object_path
+            .iter()
+            .map(|h| (h.field.name.as_str(), h.field.offset))
+            .collect();
+        assert_eq!(
+            hops,
+            [
+                ("SurvivalModeManagerComponent", MODE_MANAGER_OFF),
+                ("GameModeSettings", SETTINGS_OFF)
+            ],
+            "{id}"
+        );
+    }
+    let Some(Ok(r)) = catalog.get("construir-sem-ingredientes") else {
+        panic!("sem ingredientes não resolvido");
+    };
+    let ResolvedRule::Set {
+        fields,
+        kind,
+        bools,
+        ..
+    } = &r.rule
+    else {
+        panic!("não é set");
+    };
+    let offsets: Vec<u32> = fields.iter().map(|f| f.offset).collect();
+    assert_eq!(offsets, [RECIPES_OFF, AUTO_COMPLETE_OFF]);
+    assert_eq!(*kind, FieldKind::Bool);
+    assert_eq!(bools.as_deref(), Some(&[false, true][..]));
+    // O objeto das configurações existe na cena.
+    assert_ne!(w.settings, 0);
+}
+
+#[test]
+fn byte_bool_field_accepts_native_bool_only() {
+    let w = world(&[]);
+    let settings_class = w.index.class_of(&w.mem, w.settings).unwrap();
+    let field = byte_bool_field(
+        &w.index,
+        &w.mem,
+        settings_class,
+        "bRecipesRequireIngredients",
+    )
+    .expect("bool de byte inteiro resolve");
+    assert_eq!((field.offset, field.size), (RECIPES_OFF, 1));
+
+    // Bit de verdade (máscara 0x01, 0x02 ou 0x04) não é bool de byte inteiro.
+    let health_class = w.health_class;
+    for name in ["bCanDieFromDamage", "bCanDieEver"] {
+        assert_eq!(
+            byte_bool_field(&w.index, &w.mem, health_class, name),
+            Err(INCOHERENT.to_string()),
+            "{name}"
+        );
+    }
+    let character_class = w.index.class_of(&w.mem, w.pawn).unwrap();
+    assert_eq!(
+        byte_bool_field(&w.index, &w.mem, character_class, "bTakeFallDamage"),
+        Err(INCOHERENT.to_string())
+    );
+    // Campo de outro tipo e campo que não existe.
+    assert_eq!(
+        byte_bool_field(&w.index, &w.mem, settings_class, "EnemyDamageMultiplier"),
+        Err(INCOHERENT.to_string())
+    );
+    assert_eq!(
+        byte_bool_field(&w.index, &w.mem, settings_class, "Nada"),
+        Err("campo Nada não encontrado".to_string())
+    );
+    // O `clear_bits` segue aceitando a máscara parcial.
+    assert!(bool_field(&w.index, &w.mem, health_class, "bCanDieEver").is_ok());
+}
+
+#[test]
+fn desired_bytes_per_field() {
+    let w = world(&[]);
+    let mut all = world_defs();
+    all.extend(new_defs());
+    let catalog = FieldCatalog::resolve(&w.index, &w.mem, &cfg_gs(), &all);
+    let rule = |id: &str| match catalog.get(id) {
+        Some(Ok(r)) => r.rule.clone(),
+        _ => panic!("{id} não resolvido"),
+    };
+    // `bool`: cada campo tem o seu, e o valor passado não importa.
+    let want = vec![vec![0u8], vec![1]];
+    assert_eq!(
+        desired_bytes(&rule("construir-sem-ingredientes"), None),
+        Some(want.clone())
+    );
+    assert_eq!(
+        desired_bytes(&rule("construir-sem-ingredientes"), Some(9.0)),
+        Some(want)
+    );
+    // `float` com dois campos: o mesmo valor repetido.
+    let two = 2.0f32.to_le_bytes().to_vec();
+    assert_eq!(
+        desired_bytes(&rule("velocidade"), Some(2.0)),
+        Some(vec![two.clone(), two])
+    );
+    // Sem valor, o `set` de número não tem o que escrever.
+    assert_eq!(desired_bytes(&rule("velocidade"), None), None);
+    // Regra que não é `set`.
+    assert_eq!(desired_bytes(&rule("somar-ciencia"), Some(1.0)), None);
+}
+
+#[test]
+fn world_set_values_read_one_byte_per_bool() {
+    let w = world(&[]);
+    let catalog = FieldCatalog::resolve(&w.index, &w.mem, &cfg_gs(), &world_defs());
+    let Some(Ok(r)) = catalog.get("construir-sem-ingredientes") else {
+        panic!("não resolvido");
+    };
+    w.mem.write(w.settings + u64::from(RECIPES_OFF), &[1]);
+    let mut reader = Reader {
+        mem: &w.mem,
+        index: &w.index,
+        catalog: &catalog,
+        props: HashMap::new(),
+        objects: Vec::new(),
+    };
+    let values = reader.values(w.settings, &r.rule).unwrap().unwrap();
+    assert_eq!(
+        values,
+        FieldValues::Set {
+            obj: w.settings,
+            fields: vec![
+                (w.settings + u64::from(RECIPES_OFF), vec![1]),
+                (w.settings + u64::from(AUTO_COMPLETE_OFF), vec![0]),
+            ],
+        }
+    );
 }
 
 #[test]
@@ -1703,24 +2001,33 @@ fn report_includes_set_and_add() {
     );
 }
 
+/// Entrada do relatório do `GameState` para o `PartyComponent` (a ação de somar ciência).
+fn party_entry(w: &World) -> GameStateReport {
+    GameStateReport {
+        level: Some(w.level),
+        world: Some(w.world),
+        game_state: Some(w.game_state),
+        path: "PartyComponent".into(),
+        hops: vec![HopReport {
+            name: "PartyComponent".into(),
+            addr: w.party,
+            class: "PartyComponent".into(),
+        }],
+        object: Some(w.party),
+        error: None,
+    }
+}
+
 #[test]
 fn report_game_state_path() {
     let w = world(&[]);
     let catalog = full_catalog(&w, &cfg_gs());
     let report = report_with(&w, &catalog);
-    assert_eq!(
-        report.game_state,
-        Some(GameStateReport {
-            level: Some(w.level),
-            world: Some(w.world),
-            game_state: Some(w.game_state),
-            object: Some(w.party),
-            error: None,
-        })
-    );
+    assert_eq!(report.game_state, vec![party_entry(&w)]);
+    assert_eq!(report.pawn_error, None);
     // Sem cheat de `game_state` no catálogo, não há caminho a mostrar.
     let plain = FieldCatalog::resolve(&w.index, &w.mem, &cfg_gs(), &defs());
-    assert_eq!(report_with(&w, &plain).game_state, None);
+    assert_eq!(report_with(&w, &plain).game_state, vec![]);
 }
 
 #[test]
@@ -1732,13 +2039,15 @@ fn report_game_state_missing_hop() {
     // Os saltos que deram certo continuam aparecendo; o que falhou vem como motivo.
     assert_eq!(
         report.game_state,
-        Some(GameStateReport {
+        vec![GameStateReport {
             level: Some(w.level),
             world: Some(w.world),
             game_state: None,
+            path: "PartyComponent".into(),
+            hops: vec![],
             object: None,
             error: Some("GameState ausente ou de classe inesperada".into()),
-        })
+        }]
     );
     match report_field(&report, "somar-ciencia") {
         FieldReportValue::Unavailable { reason } => {
@@ -1751,4 +2060,495 @@ fn report_game_state_missing_hop() {
         report_field(&report, "carga"),
         FieldReportValue::Set { .. }
     ));
+}
+
+/// Catálogo com os cheats do personagem e os do mundo (spec 007).
+fn world_catalog(w: &World) -> FieldCatalog {
+    let mut all = defs();
+    all.extend(world_defs());
+    FieldCatalog::resolve(&w.index, &w.mem, &cfg_gs(), &all)
+}
+
+fn read_world_of(w: &World, catalog: &FieldCatalog) -> Result<WorldSnapshot, GameStateAbsent> {
+    read_world(&w.mem, &w.index, catalog, &w.objects, w.controller)
+}
+
+/// Valores esperados dos dois cheats do mundo com as configurações em `obj`.
+fn expected_world_values(obj: u64, recipes: u8, auto: u8, damage: f32) -> [FieldValues; 2] {
+    [
+        FieldValues::Set {
+            obj,
+            fields: vec![
+                (obj + u64::from(RECIPES_OFF), vec![recipes]),
+                (obj + u64::from(AUTO_COMPLETE_OFF), vec![auto]),
+            ],
+        },
+        FieldValues::Set {
+            obj,
+            fields: vec![(
+                obj + u64::from(ENEMY_DAMAGE_OFF),
+                damage.to_le_bytes().to_vec(),
+            )],
+        },
+    ]
+}
+
+#[test]
+fn read_world_reads_both_world_cheats() {
+    let w = world(&[]);
+    let catalog = world_catalog(&w);
+    w.mem.write(w.settings + u64::from(RECIPES_OFF), &[1]);
+    w.mem.write(w.settings + u64::from(AUTO_COMPLETE_OFF), &[0]);
+    w.write_f32(w.settings + u64::from(ENEMY_DAMAGE_OFF), 1.0);
+    let snap = read_world_of(&w, &catalog).unwrap();
+    assert_eq!(snap.game_state, w.game_state);
+    assert!(snap.missing.is_empty());
+    let [build, damage] = expected_world_values(w.settings, 1, 0, 1.0);
+    assert_eq!(snap.values.get("construir-sem-ingredientes"), Some(&build));
+    assert_eq!(snap.values.get("dano-recebido"), Some(&damage));
+    // Só os `set` do mundo entram; os do pawn ficam de fora.
+    assert_eq!(snap.values.len(), 2);
+    let guard = snap.objects.iter().find(|o| o.addr == w.settings).unwrap();
+    assert_eq!(guard.guard.len(), 3);
+}
+
+#[test]
+fn read_world_ignores_pawn() {
+    let w = world(&[]);
+    let catalog = world_catalog(&w);
+    w.mem.write(w.settings + u64::from(RECIPES_OFF), &[1]);
+    w.write_f32(w.settings + u64::from(ENEMY_DAMAGE_OFF), 1.0);
+    let expected = read_world_of(&w, &catalog).unwrap();
+
+    // Pawn nulo: o `read_player` falha, o mundo não.
+    w.write_u64(w.controller + u64::from(PAWN_OFF), 0);
+    assert_eq!(w.read_with_catalog(&catalog), Err(Absent::PawnNull));
+    assert_eq!(read_world_of(&w, &catalog).unwrap(), expected);
+
+    // Pawn de classe errada (uma criatura): idem.
+    w.write_u64(w.controller + u64::from(PAWN_OFF), w.creature);
+    assert_eq!(w.read_with_catalog(&catalog), Err(Absent::PawnWrongClass));
+    assert_eq!(read_world_of(&w, &catalog).unwrap(), expected);
+}
+
+#[test]
+fn read_world_hop_missing_is_per_cheat() {
+    let w = world(&[]);
+    let catalog = world_catalog(&w);
+    let ids = ["construir-sem-ingredientes", "dano-recebido"];
+
+    // `SurvivalModeManagerComponent` nulo.
+    let at = w.game_state + u64::from(MODE_MANAGER_OFF);
+    w.write_u64(at, 0);
+    let snap = read_world_of(&w, &catalog).unwrap();
+    assert!(snap.values.is_empty());
+    for id in ids {
+        assert_eq!(
+            snap.missing.get(id),
+            Some(&GameStateAbsent::Missing(
+                "SurvivalModeManagerComponent".into()
+            )),
+            "{id}"
+        );
+    }
+    w.write_u64(at, w.mode_manager);
+
+    // `GameModeSettings` apontando para um objeto de classe errada.
+    let at = w.mode_manager + u64::from(SETTINGS_OFF);
+    w.write_u64(at, w.party);
+    let snap = read_world_of(&w, &catalog).unwrap();
+    assert!(snap.values.is_empty());
+    for id in ids {
+        assert_eq!(
+            snap.missing.get(id),
+            Some(&GameStateAbsent::Missing("GameModeSettings".into())),
+            "{id}"
+        );
+    }
+    w.write_u64(at, w.settings);
+    let snap = read_world_of(&w, &catalog).unwrap();
+    assert!(snap.missing.is_empty());
+    assert_eq!(snap.values.len(), 2);
+}
+
+#[test]
+fn read_world_walk_failure_is_err() {
+    let w = world(&[]);
+    let catalog = world_catalog(&w);
+    for (at, hop) in [
+        (w.level + u64::from(WORLD_OFF), "OwningWorld"),
+        (w.world + u64::from(GAME_STATE_OFF), "GameState"),
+    ] {
+        let good = gt_ue::read::read_u64(&w.mem, at).unwrap();
+        w.write_u64(at, 0);
+        assert_eq!(
+            read_world_of(&w, &catalog).map(|_| ()),
+            Err(GameStateAbsent::Missing(hop.into())),
+            "{hop}"
+        );
+        w.write_u64(at, good);
+        assert!(read_world_of(&w, &catalog).is_ok(), "{hop} restaurado");
+    }
+}
+
+#[test]
+fn read_world_never_reads_a_cdo() {
+    let w = world(&[]);
+    let catalog = world_catalog(&w);
+    w.write_u64(w.mode_manager + u64::from(SETTINGS_OFF), w.cdo_settings);
+    let snap = read_world_of(&w, &catalog).unwrap();
+    assert!(snap.values.is_empty());
+    for id in ["construir-sem-ingredientes", "dano-recebido"] {
+        assert_eq!(
+            snap.missing.get(id),
+            Some(&GameStateAbsent::Missing("GameModeSettings".into())),
+            "{id}"
+        );
+    }
+    // O CDO não fica entre os objetos do ciclo.
+    assert!(snap.objects.iter().all(|o| o.addr != w.cdo_settings));
+}
+
+#[test]
+fn read_world_controller_invalid() {
+    let w = world(&[]);
+    let catalog = world_catalog(&w);
+    let at = w.controller + u64::from(w.layout.uobject.index);
+    let good = gt_ue::read::read_u32(&w.mem, at).unwrap();
+    w.mem.write(at, &(good + 1).to_le_bytes());
+    assert_eq!(
+        read_world_of(&w, &catalog).map(|_| ()),
+        Err(GameStateAbsent::ControllerInvalid)
+    );
+}
+
+#[test]
+fn missing_kind_world_for_game_state_root() {
+    let w = world(&[]);
+    let mut all = defs();
+    all.extend(new_defs());
+    all.extend(world_defs());
+    all.extend(pet_defs());
+    let catalog = FieldCatalog::resolve(&w.index, &w.mem, &cfg_gs(), &all);
+    for id in [
+        "construir-sem-ingredientes",
+        "dano-recebido",
+        "somar-ciencia",
+    ] {
+        let Some(Ok(r)) = catalog.get(id) else {
+            panic!("{id} não resolvido");
+        };
+        assert_eq!(missing_kind(r), MissingKind::World, "{id}");
+    }
+    let Some(Ok(pet)) = catalog.get("pet-vida-infinita") else {
+        panic!("pet não resolvido");
+    };
+    assert_eq!(missing_kind(pet), MissingKind::Pet);
+}
+
+#[test]
+fn index_missing_class_only_hits_world_cheats() {
+    let w = world(&[]);
+    // Classe das configurações inexistente nos dois cheats do mundo.
+    let mut all = defs();
+    all.extend(world_defs().into_iter().map(|mut d| {
+        d.object_class = format!("{MAINE}.NaoExiste");
+        d
+    }));
+    let catalog = FieldCatalog::resolve(&w.index, &w.mem, &cfg_gs(), &all);
+    for id in ["construir-sem-ingredientes", "dano-recebido"] {
+        assert_eq!(
+            catalog.avail(id),
+            Err("classe NaoExiste não encontrada".to_string()),
+            "{id}"
+        );
+    }
+    for id in ["vida-infinita", "nao-morrer", "sem-dano-queda"] {
+        assert_eq!(catalog.avail(id), Ok(()), "{id}");
+    }
+
+    // Campo do primeiro salto que não existe.
+    let mut all = defs();
+    all.extend(world_defs().into_iter().map(|mut d| {
+        d.object = "Nada.GameModeSettings".into();
+        d
+    }));
+    let catalog = FieldCatalog::resolve(&w.index, &w.mem, &cfg_gs(), &all);
+    for id in ["construir-sem-ingredientes", "dano-recebido"] {
+        assert_eq!(
+            catalog.avail(id),
+            Err("campo Nada não encontrado".to_string()),
+            "{id}"
+        );
+    }
+    assert_eq!(catalog.avail("vida-infinita"), Ok(()));
+}
+
+// ---- relatório do caminho do mundo (spec 007, 6.7) ----
+
+/// Os cheats do personagem, o do `PartyComponent` e os dois do mundo; `dano-recebido` com a grade
+/// do `generic.toml` (`x`, duas casas).
+fn report_catalog(w: &World) -> FieldCatalog {
+    let mut all = defs();
+    all.extend(new_defs());
+    all.extend(world_defs().into_iter().map(|mut d| {
+        if d.id == "dano-recebido" {
+            d.value = Some(ValueGrid {
+                ty: gt_core::value::ValueType::F32,
+                min: 0.0,
+                max: 1.0,
+                step: 0.05,
+                default_k: 5,
+                unit: Some("x".into()),
+                decimals: 2,
+            });
+        }
+        d
+    }));
+    FieldCatalog::resolve(&w.index, &w.mem, &cfg_gs(), &all)
+}
+
+fn settings_entry(w: &World) -> GameStateReport {
+    GameStateReport {
+        level: Some(w.level),
+        world: Some(w.world),
+        game_state: Some(w.game_state),
+        path: "SurvivalModeManagerComponent.GameModeSettings".into(),
+        hops: vec![
+            HopReport {
+                name: "SurvivalModeManagerComponent".into(),
+                addr: w.mode_manager,
+                class: "SurvivalModeManagerComponent".into(),
+            },
+            HopReport {
+                name: "GameModeSettings".into(),
+                addr: w.settings,
+                // A cena local não tem a subclasse `BP_NormalModeSettings_C` do jogo: a instância
+                // é da própria classe das configurações.
+                class: "SurvivalGameModeSettings".into(),
+            },
+        ],
+        object: Some(w.settings),
+        error: None,
+    }
+}
+
+#[test]
+fn report_world_path_and_bools() {
+    let w = world(&[]);
+    let catalog = report_catalog(&w);
+    w.mem.write(w.settings + u64::from(RECIPES_OFF), &[1]);
+    w.mem.write(w.settings + u64::from(AUTO_COMPLETE_OFF), &[0]);
+    w.write_f32(w.settings + u64::from(ENEMY_DAMAGE_OFF), 1.0);
+    let report = report_with(&w, &catalog);
+
+    assert_eq!(report.pawn_error, None);
+    // Uma entrada por caminho distinto, na ordem dos cheats: ciência e configurações.
+    assert_eq!(report.game_state, vec![party_entry(&w), settings_entry(&w)]);
+
+    assert_eq!(
+        report_field(&report, "construir-sem-ingredientes"),
+        &FieldReportValue::Set {
+            fields: vec![
+                SetFieldReport {
+                    name: "bRecipesRequireIngredients".into(),
+                    addr: w.settings + u64::from(RECIPES_OFF),
+                    raw: 1,
+                    value: "true".into(),
+                },
+                SetFieldReport {
+                    name: "bAutoCompleteBuildings".into(),
+                    addr: w.settings + u64::from(AUTO_COMPLETE_OFF),
+                    raw: 0,
+                    value: "false".into(),
+                },
+            ]
+        }
+    );
+    assert_eq!(
+        report_field(&report, "dano-recebido"),
+        &FieldReportValue::Set {
+            fields: vec![SetFieldReport {
+                name: "EnemyDamageMultiplier".into(),
+                addr: w.settings + u64::from(ENEMY_DAMAGE_OFF),
+                raw: 1.0f32.to_bits(),
+                value: "1.00x".into(),
+            }]
+        }
+    );
+    // A ação e o pawn seguem como antes.
+    assert!(matches!(
+        report_field(&report, "somar-ciencia"),
+        FieldReportValue::Add { .. }
+    ));
+    assert!(matches!(
+        report_field(&report, "vida-infinita"),
+        FieldReportValue::Lock { .. }
+    ));
+}
+
+#[test]
+fn report_world_survives_pawn_null() {
+    let w = world(&[]);
+    let catalog = report_catalog(&w);
+    w.mem.write(w.settings + u64::from(RECIPES_OFF), &[1]);
+    w.write_u64(w.controller + u64::from(PAWN_OFF), 0);
+    let report = report_with(&w, &catalog);
+
+    assert_eq!(report.pawn_error.as_deref(), Some("Pawn nulo"));
+    assert_eq!(report.pawn, Some(0));
+    // Os cheats do pawn ficam indisponíveis com o motivo; os do mundo e a ação, não.
+    for id in ["vida-infinita", "nao-morrer", "carga", "velocidade"] {
+        assert_eq!(
+            report_field(&report, id),
+            &FieldReportValue::Unavailable {
+                reason: "Pawn nulo".into()
+            },
+            "{id}"
+        );
+    }
+    for id in ["construir-sem-ingredientes", "dano-recebido"] {
+        assert!(
+            matches!(report_field(&report, id), FieldReportValue::Set { .. }),
+            "{id}"
+        );
+    }
+    let FieldReportValue::Set { fields } = report_field(&report, "construir-sem-ingredientes")
+    else {
+        panic!("não é set");
+    };
+    assert_eq!(fields[0].value, "true");
+    assert!(matches!(
+        report_field(&report, "somar-ciencia"),
+        FieldReportValue::Add { .. }
+    ));
+    assert_eq!(report.game_state, vec![party_entry(&w), settings_entry(&w)]);
+}
+
+#[test]
+fn report_world_pawn_wrong_class_keeps_world() {
+    let w = world(&[]);
+    let catalog = report_catalog(&w);
+    w.write_u64(w.controller + u64::from(PAWN_OFF), w.creature);
+    let report = report_with(&w, &catalog);
+    assert_eq!(
+        report.pawn_error.as_deref(),
+        Some("o Pawn não é o personagem do jogador")
+    );
+    assert_eq!(report.game_state.len(), 2);
+    assert!(
+        report
+            .game_state
+            .iter()
+            .all(|g| g.error.is_none() && g.object.is_some())
+    );
+}
+
+#[test]
+fn report_world_hop_error() {
+    let w = world(&[]);
+    let catalog = report_catalog(&w);
+    w.write_u64(w.game_state + u64::from(MODE_MANAGER_OFF), 0);
+    let report = report_with(&w, &catalog);
+
+    let reason = "SurvivalModeManagerComponent ausente ou de classe inesperada";
+    assert_eq!(
+        report.game_state,
+        vec![
+            party_entry(&w),
+            GameStateReport {
+                object: None,
+                hops: vec![],
+                error: Some(reason.into()),
+                ..settings_entry(&w)
+            }
+        ]
+    );
+    for id in ["construir-sem-ingredientes", "dano-recebido"] {
+        assert_eq!(
+            report_field(&report, id),
+            &FieldReportValue::Unavailable {
+                reason: reason.into()
+            },
+            "{id}"
+        );
+    }
+    // O pawn e a ação não dependem disso.
+    assert_eq!(report.pawn_error, None);
+    assert!(matches!(
+        report_field(&report, "somar-ciencia"),
+        FieldReportValue::Add { .. }
+    ));
+}
+
+#[test]
+fn report_world_second_hop_error_keeps_first() {
+    let w = world(&[]);
+    let catalog = report_catalog(&w);
+    w.write_u64(w.mode_manager + u64::from(SETTINGS_OFF), 0);
+    let report = report_with(&w, &catalog);
+    let entry = &report.game_state[1];
+    assert_eq!(
+        entry.hops,
+        vec![HopReport {
+            name: "SurvivalModeManagerComponent".into(),
+            addr: w.mode_manager,
+            class: "SurvivalModeManagerComponent".into(),
+        }]
+    );
+    assert_eq!(entry.object, None);
+    assert_eq!(
+        entry.error.as_deref(),
+        Some("GameModeSettings ausente ou de classe inesperada")
+    );
+}
+
+#[test]
+fn report_world_cdo_is_not_an_object() {
+    let w = world(&[]);
+    let catalog = report_catalog(&w);
+    w.write_u64(w.mode_manager + u64::from(SETTINGS_OFF), w.cdo_settings);
+    let report = report_with(&w, &catalog);
+    let entry = &report.game_state[1];
+    assert_eq!(entry.object, None);
+    assert_eq!(entry.hops.len(), 1);
+    assert_eq!(
+        entry.error.as_deref(),
+        Some("GameModeSettings ausente ou de classe inesperada")
+    );
+    assert!(matches!(
+        report_field(&report, "dano-recebido"),
+        FieldReportValue::Unavailable { .. }
+    ));
+}
+
+#[test]
+fn report_controller_invalid_is_err() {
+    let w = world(&[]);
+    let catalog = report_catalog(&w);
+    let at = w.controller + u64::from(w.layout.uobject.index);
+    let good = gt_ue::read::read_u32(&w.mem, at).unwrap();
+    w.mem.write(at, &(good + 1).to_le_bytes());
+    assert_eq!(
+        player_report(&w.mem, &w.index, &catalog, &w.objects, w.controller).map(|_| ()),
+        Err(Absent::ControllerInvalid)
+    );
+}
+
+#[test]
+fn watch_player_reports_world_with_pawn_null() {
+    let mut w = world(&[]);
+    w.catalog = report_catalog(&w);
+    w.write_u64(w.controller + u64::from(PAWN_OFF), 0);
+    let mem = Counting {
+        inner: &w.mem,
+        batches: AtomicUsize::new(0),
+    };
+    let seen = watch(&w, &mem, Some(w.controller), 2, |_| {});
+    assert_eq!(seen.len(), 2);
+    for r in seen {
+        let report = r.unwrap();
+        assert_eq!(report.pawn_error.as_deref(), Some("Pawn nulo"));
+        assert_eq!(report.game_state.len(), 2);
+    }
 }

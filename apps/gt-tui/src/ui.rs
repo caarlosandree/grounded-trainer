@@ -298,6 +298,7 @@ fn cheat_line(
     let note = match row.note {
         Some(Note::Waiting) => " aguardando o personagem",
         Some(Note::WaitingPet) => " aguardando o pet",
+        Some(Note::WaitingWorld) => " aguardando o mundo",
         Some(Note::InvalidTarget) => " alvo inválido",
         Some(Note::InvalidGameValue) => " valor do jogo inválido",
         Some(Note::GameRefuses) => " o jogo não deixa",
@@ -873,6 +874,21 @@ mod tests {
         m.cheats = vec![r];
         let lines = screen(&m);
         assert!(line_with(&lines, "Vida infinita").contains("[ON ] aguardando o personagem"));
+    }
+
+    #[test]
+    fn on_with_waiting_world_note() {
+        let mut m = Model::new(false);
+        m.conn = connected();
+        let mut r = row("Dano recebido", Category::Sobrevivencia, ok());
+        r.field = true;
+        r.on = true;
+        r.note = Some(Note::WaitingWorld);
+        m.cheats = vec![r];
+        let lines = screen(&m);
+        let line = line_with(&lines, "Dano recebido");
+        assert!(line.contains("[ON ] aguardando o mundo"), "{line}");
+        assert!(!line.contains("personagem"), "{line}");
     }
 
     #[test]

@@ -74,10 +74,12 @@ fn live_find_controller_and_read_player() {
     );
     let snap = read_player(&reader, &index, &catalog, &objects, ue.controller).unwrap();
     assert_eq!(snap.pawn, ue.pawn);
-    // A soma (`add`) só é lida sob demanda, fora do ciclo.
+    // A soma (`add`) só é lida sob demanda, fora do ciclo; os cheats do mundo (raiz `game_state`)
+    // não entram no retrato do personagem.
     let cycle = defs
         .iter()
         .filter(|d| !matches!(d.rule, gt_grounded2::signatures::FieldRule::Add { .. }))
+        .filter(|d| d.root == gt_grounded2::signatures::FieldRoot::Pawn)
         .count();
     assert_eq!(snap.values.len(), cycle);
     // Tudo cheio na cena; só os bits ligados pedem escrita.

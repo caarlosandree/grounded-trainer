@@ -110,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             write_local(*addr, bytes)?;
         }
         format!(
-            ",\"ue\":{{\"gobjects\":\"{:#x}\",\"names\":\"{:#x}\",\"controller\":\"{:#x}\",\"pawn\":\"{:#x}\",\"creature\":\"{:#x}\",\"pawn_field_addr\":\"{:#x}\",\"health\":\"{:#x}\",\"alt_pawn\":\"{:#x}\",\"hauling\":\"{:#x}\",\"movement\":\"{:#x}\",\"creature_hauling\":\"{:#x}\",\"creature_movement\":\"{:#x}\",\"level\":\"{:#x}\",\"world\":\"{:#x}\",\"game_state\":\"{:#x}\",\"party\":\"{:#x}\"}}",
+            ",\"ue\":{{\"gobjects\":\"{:#x}\",\"names\":\"{:#x}\",\"controller\":\"{:#x}\",\"pawn\":\"{:#x}\",\"creature\":\"{:#x}\",\"pawn_field_addr\":\"{:#x}\",\"health\":\"{:#x}\",\"alt_pawn\":\"{:#x}\",\"hauling\":\"{:#x}\",\"movement\":\"{:#x}\",\"creature_hauling\":\"{:#x}\",\"creature_movement\":\"{:#x}\",\"level\":\"{:#x}\",\"world\":\"{:#x}\",\"game_state\":\"{:#x}\",\"party\":\"{:#x}\",\"mode_manager\":\"{:#x}\",\"settings\":\"{:#x}\",\"cdo_settings\":\"{:#x}\"}}",
             a.gobjects,
             a.names,
             a.controller,
@@ -126,7 +126,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             a.level,
             a.world,
             a.game_state,
-            a.party
+            a.party,
+            a.mode_manager,
+            a.settings,
+            a.cdo_settings
         )
     } else {
         String::new()

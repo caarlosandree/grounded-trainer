@@ -54,6 +54,8 @@ pub enum ResolvedRule {
         fields: Vec<Field>,
         kind: FieldKind,
         target: Option<f64>,
+        /// Valor de cada campo, só no `kind = "bool"` (spec 007, 6.4).
+        bools: Option<Vec<bool>>,
     },
     /// Soma a um campo `int`, sem diário (spec 006, 6.6).
     Add { field: Field, result_max: i64 },
@@ -95,11 +97,16 @@ pub enum MissingKind {
     Pet,
     /// Um componente do personagem: `aguardando o personagem`.
     Component,
+    /// O objeto do mundo (raiz `game_state`): `aguardando o mundo` (spec 007, 6.3).
+    World,
 }
 
 /// Tipo do objeto que falta no cheat `resolved` (a nota em si mora em `fields.rs`).
 pub fn missing_kind(resolved: &ResolvedField) -> MissingKind {
-    if resolved.is_secondary() {
+    // Na raiz `game_state` um caminho de vários saltos nunca é o pet.
+    if resolved.root == FieldRoot::GameState {
+        MissingKind::World
+    } else if resolved.is_secondary() {
         MissingKind::Pet
     } else {
         MissingKind::Component
@@ -371,6 +378,42 @@ fn int_field<M: ReadMem + ?Sized>(
     }
 }
 
+/// Campo `bool` de byte inteiro (`bool` nativo do C++): `BoolProperty` de 1 byte, máscara
+/// `0xff` e o byte da máscara igual ao `offset` (spec 007, 6.4). Bits de verdade ficam para o
+/// [`bool_field`] do `clear_bits`.
+fn byte_bool_field<M: ReadMem + ?Sized>(
+    index: &ReflectionIndex,
+    mem: &M,
+    class: u64,
+    name: &str,
+) -> Result<Field, String> {
+    let field = index.find_field_path(mem, class, name).map_err(|e| {
+        tracing::debug!("campo {name}: {e}");
+        match e {
+            UeError::NotFound(_) => format!("campo {name} não encontrado"),
+            _ => INCOHERENT.to_string(),
+        }
+    })?;
+    match field.bits {
+        Some(bits)
+            if field.kind == "BoolProperty"
+                && field.size == 1
+                && bits.mask == 0xff
+                && bits.byte == field.offset =>
+        {
+            Ok(field)
+        }
+        _ => {
+            tracing::debug!(
+                "campo {name} é {} de {} bytes, esperado bool de byte inteiro",
+                field.kind,
+                field.size
+            );
+            Err(INCOHERENT.to_string())
+        }
+    }
+}
+
 /// Campo `bool` com máscara não nula.
 fn bool_field<M: ReadMem + ?Sized>(
     index: &ReflectionIndex,
@@ -499,16 +542,19 @@ fn resolve_field<M: ReadMem + ?Sized>(
             fields,
             kind,
             target,
+            bools,
         } => ResolvedRule::Set {
             fields: fields
                 .iter()
                 .map(|name| match kind {
                     FieldKind::Float => float_field(index, mem, object_class, name),
                     FieldKind::Int => int_field(index, mem, object_class, name),
+                    FieldKind::Bool => byte_bool_field(index, mem, object_class, name),
                 })
                 .collect::<Result<_, _>>()?,
             kind: *kind,
             target: *target,
+            bools: bools.clone(),
         },
         FieldRule::Add { field, result_max } => ResolvedRule::Add {
             field: int_field(index, mem, object_class, field)?,
@@ -630,10 +676,10 @@ pub enum FieldValues {
         obj: u64,
         bytes: Vec<BitByte>,
     },
-    /// Endereço e bytes atuais de cada campo de um `set`.
+    /// Endereço e bytes atuais de cada campo de um `set` (`FieldKind::size` bytes cada).
     Set {
         obj: u64,
-        fields: Vec<(u64, [u8; 4])>,
+        fields: Vec<(u64, Vec<u8>)>,
     },
 }
 
@@ -720,11 +766,17 @@ impl<M: ReadMem + ?Sized> Reader<'_, M> {
         Ok(f32::from_bits(raw))
     }
 
-    /// Os 4 bytes do campo, como estão na memória.
-    fn raw4(&mut self, obj: u64, field: &Field) -> Result<[u8; 4], Absent> {
-        self.check_fits(obj, &field.name, field.offset, field.size)?;
-        let raw = read_u32(self.mem, obj + u64::from(field.offset)).map_err(unreadable)?;
-        Ok(raw.to_le_bytes())
+    /// Os `len` bytes do campo, como estão na memória.
+    fn raw(&mut self, obj: u64, field: &Field, len: u32) -> Result<Vec<u8>, Absent> {
+        self.check_fits(obj, &field.name, field.offset, len)?;
+        read_vec(self.mem, obj + u64::from(field.offset), len as usize).map_err(unreadable)
+    }
+
+    /// O objeto é um CDO (bit `cdo_flag` nas `ObjectFlags`)? Nunca se escreve num CDO (spec 007, 6.3).
+    fn is_cdo(&self, obj: u64) -> Result<bool, Absent> {
+        let u = &self.catalog.layout.uobject;
+        let flags = read_u32(self.mem, obj + u64::from(u.flags)).map_err(unreadable)?;
+        Ok(flags & u.cdo_flag != 0)
     }
 
     /// Registra o objeto no caminho (com a guarda), uma vez.
@@ -794,10 +846,11 @@ impl<M: ReadMem + ?Sized> Reader<'_, M> {
                 }
                 FieldValues::Bits { obj, bytes }
             }
-            ResolvedRule::Set { fields, .. } => {
+            ResolvedRule::Set { fields, kind, .. } => {
+                let len = kind.size();
                 let mut out = Vec::with_capacity(fields.len());
                 for f in fields {
-                    out.push((obj + u64::from(f.offset), self.raw4(obj, f)?));
+                    out.push((obj + u64::from(f.offset), self.raw(obj, f, len)?));
                 }
                 FieldValues::Set { obj, fields: out }
             }
@@ -861,6 +914,58 @@ pub fn read_game_state<M: ReadMem + ?Sized>(
     )
 }
 
+/// Converte a falha de uma leitura no `GameState` em `Missing(salto)`: o nome do campo que não
+/// confere, ou `hop` quando a leitura em si falhou.
+fn gone(hop: &str) -> impl Fn(Absent) -> GameStateAbsent {
+    let hop = hop.to_string();
+    move |absent: Absent| match absent {
+        Absent::ComponentWrongClass(name) | Absent::FieldOutsideObject(name) => {
+            GameStateAbsent::Missing(name)
+        }
+        _ => GameStateAbsent::Missing(hop.clone()),
+    }
+}
+
+/// Anda do controller (já conferido) até o `GameState`: `Outer` → `Level.OwningWorld` →
+/// `World.GameState`, anotando em `hops` cada salto que deu certo. Usada pela ação sob demanda
+/// ([`walk_game_state`]) e pela leitura do mundo no ciclo ([`read_world`]).
+fn walk_to_game_state<M: ReadMem + ?Sized>(
+    r: &mut Reader<'_, M>,
+    controller: u64,
+    gs: &GameStatePath,
+    hops: &mut GameStateReport,
+) -> Result<u64, GameStateAbsent> {
+    let missing = |hop: &str| GameStateAbsent::Missing(hop.to_string());
+    // O `Outer` do controller é o nível; ele mora no cabeçalho do `UObject`, não na reflexão.
+    let outer = read_u64(
+        r.mem,
+        controller + u64::from(r.catalog.layout.uobject.outer),
+    )
+    .map_err(|_| missing("Outer"))?;
+    if outer == 0
+        || !r
+            .catalog
+            .object_is_a(r.index, r.mem, outer, gs.level_class)
+            .map_err(|_| missing("Outer"))?
+    {
+        return Err(missing("Outer"));
+    }
+    hops.level = Some(outer);
+    let mut next = |from: u64, hop: &Field, class: u64| -> Result<u64, GameStateAbsent> {
+        let ptr = r.pointer(from, hop).map_err(gone(&hop.name))?;
+        let ok = ptr != 0
+            && r.catalog
+                .object_is_a(r.index, r.mem, ptr, class)
+                .map_err(gone(&hop.name))?;
+        if ok { Ok(ptr) } else { Err(missing(&hop.name)) }
+    };
+    let world = next(outer, &gs.world_field, gs.world_class)?;
+    hops.world = Some(world);
+    let state = next(world, &gs.game_state_field, gs.game_state_class)?;
+    hops.game_state = Some(state);
+    Ok(state)
+}
+
 /// Como [`read_game_state`], anotando em `hops` o endereço de cada salto que deu certo (para o
 /// relatório mostrar até onde o caminho chegou quando um deles falha).
 fn walk_game_state<M: ReadMem + ?Sized>(
@@ -893,39 +998,7 @@ fn walk_game_state<M: ReadMem + ?Sized>(
         props: HashMap::new(),
         objects: Vec::new(),
     };
-    let gone = |hop: &str| {
-        let hop = hop.to_string();
-        move |absent: Absent| match absent {
-            Absent::ComponentWrongClass(name) | Absent::FieldOutsideObject(name) => {
-                GameStateAbsent::Missing(name)
-            }
-            _ => GameStateAbsent::Missing(hop.clone()),
-        }
-    };
-
-    // O `Outer` do controller é o nível; ele mora no cabeçalho do `UObject`, não na reflexão.
-    let outer = read_u64(mem, controller + u64::from(catalog.layout.uobject.outer))
-        .map_err(|_| missing("Outer"))?;
-    if outer == 0
-        || !catalog
-            .object_is_a(index, mem, outer, gs.level_class)
-            .map_err(|_| missing("Outer"))?
-    {
-        return Err(missing("Outer"));
-    }
-    hops.level = Some(outer);
-    let mut next = |from: u64, hop: &Field, class: u64| -> Result<u64, GameStateAbsent> {
-        let ptr = r.pointer(from, hop).map_err(gone(&hop.name))?;
-        let ok = ptr != 0
-            && r.catalog
-                .object_is_a(r.index, r.mem, ptr, class)
-                .map_err(gone(&hop.name))?;
-        if ok { Ok(ptr) } else { Err(missing(&hop.name)) }
-    };
-    let world = next(outer, &gs.world_field, gs.world_class)?;
-    hops.world = Some(world);
-    let state = next(world, &gs.game_state_field, gs.game_state_class)?;
-    hops.game_state = Some(state);
+    let state = walk_to_game_state(&mut r, controller, gs, hops)?;
     let obj = r.object(state, resolved).map_err(gone(id))?;
     hops.object = Some(obj);
     r.check_fits(obj, &field.name, field.offset, field.size)
@@ -937,6 +1010,92 @@ fn walk_game_state<M: ReadMem + ?Sized>(
         .map(|o| o.guard.clone())
         .unwrap_or_default();
     Ok((obj, obj + u64::from(field.offset), guard))
+}
+
+/// Os `set` da raiz `game_state` lidos num ciclo (spec 007, 6.3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorldSnapshot {
+    /// O `GameState` vivo, de onde saem os caminhos.
+    pub game_state: u64,
+    pub objects: Vec<ObjSnap>,
+    /// Por `id`, só dos cheats do mundo resolvidos e com o objeto no lugar.
+    pub values: HashMap<String, FieldValues>,
+    /// Cheats do mundo cujo objeto não está disponível neste ciclo, com o salto que falhou.
+    pub missing: HashMap<String, GameStateAbsent>,
+}
+
+/// Lê os `set` de raiz `game_state` pelo caminho controller → `Outer` → `World` → `GameState`,
+/// sem tocar no pawn (spec 007, 6.3). Controller inválido ou um salto até o `GameState` falhando
+/// derrubam a leitura; um salto do objeto de um cheat (nulo, classe errada, ilegível, fora do
+/// objeto ou um CDO) só deixa aquele `id` em `missing`.
+pub fn read_world<M: ReadMem + ?Sized>(
+    mem: &M,
+    index: &ReflectionIndex,
+    catalog: &FieldCatalog,
+    objects: &ObjectArray,
+    controller: u64,
+) -> Result<WorldSnapshot, GameStateAbsent> {
+    let Ok(path) = &catalog.path else {
+        return Err(GameStateAbsent::ControllerInvalid);
+    };
+    check_controller(mem, index, catalog, objects, controller, path)
+        .map_err(|_| GameStateAbsent::ControllerInvalid)?;
+    let Ok(gs) = &catalog.game_state else {
+        return Err(GameStateAbsent::Missing("GameState".to_string()));
+    };
+    let mut r = Reader {
+        mem,
+        index,
+        catalog,
+        props: HashMap::new(),
+        objects: Vec::new(),
+    };
+    let state = walk_to_game_state(&mut r, controller, gs, &mut GameStateReport::default())?;
+
+    let mut values = HashMap::new();
+    let mut missing = HashMap::new();
+    for entry in &catalog.entries {
+        let Ok(resolved) = &entry.resolved else {
+            continue;
+        };
+        if resolved.root != FieldRoot::GameState
+            || !matches!(resolved.rule, ResolvedRule::Set { .. })
+        {
+            continue;
+        }
+        // Falha de leitura sem nome de campo: o último salto do caminho (as configurações).
+        let last = resolved
+            .object_path
+            .last()
+            .map_or(entry.id.as_str(), |h| h.field.name.as_str());
+        let before = r.objects.len();
+        let read = r
+            .object(state, resolved)
+            .and_then(|obj| match r.is_cdo(obj)? {
+                true => {
+                    tracing::debug!(id = %entry.id, obj, "objeto do mundo é um CDO");
+                    Err(Absent::ComponentWrongClass(last.to_string()))
+                }
+                false => r.values(obj, &resolved.rule),
+            });
+        match read {
+            Ok(Some(v)) => {
+                values.insert(entry.id.clone(), v);
+            }
+            Ok(None) => {}
+            Err(absent) => {
+                // Um objeto rejeitado não fica entre os do ciclo.
+                r.objects.truncate(before);
+                missing.insert(entry.id.clone(), gone(last)(absent));
+            }
+        }
+    }
+    Ok(WorldSnapshot {
+        game_state: state,
+        objects: r.objects,
+        values,
+        missing,
+    })
 }
 
 /// Lê o personagem a partir do controller guardado, revalidando o caminho inteiro (spec 6.3,
@@ -1107,22 +1266,51 @@ pub fn plan_tick(
 /// Faixa de um valor do jogo são: finito e dentro de `[-1e9, 1e9]` (spec 006, 6.4).
 const SANE_LIMIT: f64 = 1.0e9;
 
-/// `true` se os 4 bytes lidos do jogo são um valor são para `kind` (também vale para `int`).
-pub fn value_is_sane(kind: FieldKind, bytes: [u8; 4]) -> bool {
+/// `true` se os bytes lidos do jogo são um valor são para `kind` (tamanho certo; vale também
+/// para `int`). No `bool` o byte é `0` ou `1` (spec 007, 6.4).
+pub fn value_is_sane(kind: FieldKind, bytes: &[u8]) -> bool {
     let v = match kind {
-        FieldKind::Float => f64::from(f32::from_le_bytes(bytes)),
-        FieldKind::Int => f64::from(i32::from_le_bytes(bytes)),
+        FieldKind::Float => match <[u8; 4]>::try_from(bytes) {
+            Ok(raw) => f64::from(f32::from_le_bytes(raw)),
+            Err(_) => return false,
+        },
+        FieldKind::Int => match <[u8; 4]>::try_from(bytes) {
+            Ok(raw) => f64::from(i32::from_le_bytes(raw)),
+            Err(_) => return false,
+        },
+        FieldKind::Bool => return matches!(bytes, [0] | [1]),
     };
     v.is_finite() && (-SANE_LIMIT..=SANE_LIMIT).contains(&v)
 }
 
-/// Os 4 bytes (little-endian) de `v` como `kind`. O `int` é arredondado ao inteiro mais próximo.
-pub fn encode_value(kind: FieldKind, v: f64) -> [u8; 4] {
+/// Os bytes (little-endian) de `v` como `kind`: 4 para `float`/`int` e 1 para `bool`. O `int` é
+/// arredondado ao inteiro mais próximo; o `bool` é `0x01` para `v != 0` e `0x00` senão.
+pub fn encode_value(kind: FieldKind, v: f64) -> Vec<u8> {
     match kind {
         // `as` satura nos limites do tipo e vira 0 para `NaN`, o que serve ao valor desejado.
-        FieldKind::Int => (v.round() as i32).to_le_bytes(),
-        FieldKind::Float => (v as f32).to_le_bytes(),
+        FieldKind::Int => (v.round() as i32).to_le_bytes().to_vec(),
+        FieldKind::Float => (v as f32).to_le_bytes().to_vec(),
+        FieldKind::Bool => vec![u8::from(v != 0.0)],
     }
+}
+
+/// Os bytes desejados de cada campo de um `set`: no `bool` cada campo tem o seu valor (`bools`);
+/// nos outros todos recebem `value`. `None` se falta o valor (o ciclo pula o cheat).
+pub fn desired_bytes(rule: &ResolvedRule, value: Option<f64>) -> Option<Vec<Vec<u8>>> {
+    let ResolvedRule::Set {
+        fields,
+        kind,
+        bools,
+        ..
+    } = rule
+    else {
+        return None;
+    };
+    if let Some(bools) = bools {
+        return Some(bools.iter().map(|&b| vec![u8::from(b)]).collect());
+    }
+    let one = encode_value(*kind, value?);
+    Some(vec![one; fields.len()])
 }
 
 /// O que o `set` precisa saber de um campo neste ciclo.
@@ -1136,16 +1324,18 @@ pub struct SetStep {
 }
 
 /// Um passo por campo do `set`, sem decidir nada: quem executa usa os endereços e a sanidade.
-pub fn plan_set(values: &FieldValues, desired: [u8; 4], kind: FieldKind) -> Vec<SetStep> {
+/// `desired` traz os bytes de cada campo, na ordem.
+pub fn plan_set(values: &FieldValues, desired: &[Vec<u8>], kind: FieldKind) -> Vec<SetStep> {
     let FieldValues::Set { fields, .. } = values else {
         return Vec::new();
     };
     fields
         .iter()
-        .map(|&(addr, current)| SetStep {
-            addr,
+        .zip(desired)
+        .map(|((addr, current), want)| SetStep {
+            addr: *addr,
             sane: value_is_sane(kind, current),
-            same: current == desired,
+            same: current == want,
         })
         .collect()
 }
@@ -1197,7 +1387,7 @@ pub enum FieldReportValue {
     Bits {
         bits: Vec<BitReport>,
     },
-    /// Campos de um `set`: endereço e valor bruto (`u32` little-endian) de cada um.
+    /// Campos de um `set`: endereço e valor bruto (bytes zero-estendidos para `u32`) de cada um.
     Set {
         fields: Vec<SetFieldReport>,
     },
@@ -1214,20 +1404,35 @@ pub struct SetFieldReport {
     /// Nome do campo na reflexão.
     pub name: String,
     pub addr: u64,
-    /// Bytes atuais (`u32` little-endian).
+    /// Bytes atuais (little-endian, zero-estendidos para `u32`; um `bool` ocupa o byte baixo).
     pub raw: u32,
     /// Valor atual formatado pela grade do cheat (ou simples, sem grade).
     pub value: String,
 }
 
-/// Caminho controller → `Level` → `World` → `GameState` → objeto da ação, até onde foi lido. Um
-/// salto que falha deixa os seguintes em `None` e o motivo em `error`.
+/// Um salto do caminho do `GameState` até o objeto de um cheat, como a instância foi lida.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HopReport {
+    /// Nome do campo de objeto do salto.
+    pub name: String,
+    pub addr: u64,
+    /// Nome da classe da instância (a subclasse, quando houver), pela reflexão.
+    pub class: String,
+}
+
+/// Caminho controller → `Level` → `World` → `GameState` → objeto de um cheat, até onde foi lido.
+/// Um salto que falha deixa os seguintes em `None` e o motivo em `error`. Há uma entrada por
+/// caminho de objeto distinto entre os cheats de raiz `game_state` (spec 007, 6.7).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 pub struct GameStateReport {
     pub level: Option<u64>,
     pub world: Option<u64>,
     pub game_state: Option<u64>,
-    /// Objeto da ação (o `PartyComponent`, no jogo).
+    /// Campos de objeto do caminho, a partir do `GameState`, separados por ponto.
+    pub path: String,
+    /// Saltos do caminho que deram certo, na ordem.
+    pub hops: Vec<HopReport>,
+    /// Objeto final do caminho (o `PartyComponent`, as configurações do modo), se foi lido.
     pub object: Option<u64>,
     pub error: Option<String>,
 }
@@ -1248,11 +1453,16 @@ pub struct PlayerReport {
     pub character: Option<u64>,
     pub acknowledged_pawn: Option<u64>,
     pub fields: Vec<FieldReport>,
-    /// Caminho do `GameState`, quando há cheat de ação nessa raiz.
-    pub game_state: Option<GameStateReport>,
+    /// Por que o personagem não foi lido (`Pawn` nulo, montaria, ...); os cheats do pawn ficam
+    /// indisponíveis e o `game_state` continua valendo.
+    pub pawn_error: Option<String>,
+    /// Um caminho por objeto distinto entre os cheats de raiz `game_state`, na ordem do catálogo.
+    pub game_state: Vec<GameStateReport>,
 }
 
-/// Lê o personagem e monta o relatório do `gt ue player`.
+/// Lê o personagem e monta o relatório do `gt ue player`. Só um controller ausente ou inválido
+/// devolve `Err`; um pawn que falha vira `pawn_error` e a parte do `GameState` continua (spec 007,
+/// 6.7).
 pub fn player_report<M: ReadMem + ?Sized>(
     mem: &M,
     index: &ReflectionIndex,
@@ -1260,7 +1470,15 @@ pub fn player_report<M: ReadMem + ?Sized>(
     objects: &ObjectArray,
     controller: u64,
 ) -> Result<PlayerReport, Absent> {
-    let snapshot = read_player(mem, index, catalog, objects, controller)?;
+    let snapshot = match read_player(mem, index, catalog, objects, controller) {
+        Ok(snapshot) => Ok(snapshot),
+        Err(
+            absent @ (Absent::NoController
+            | Absent::ControllerAmbiguous
+            | Absent::ControllerInvalid),
+        ) => return Err(absent),
+        Err(absent) => Err(absent),
+    };
     let class = index.class_of(mem, controller).map_err(unreadable)?;
     let [pawn, character, acknowledged_pawn] = REPORT_POINTERS.map(|name| {
         index
@@ -1269,23 +1487,25 @@ pub fn player_report<M: ReadMem + ?Sized>(
             .filter(|f| is_object_family(&f.kind))
             .and_then(|f| read_u64(mem, controller + u64::from(f.offset)).ok())
     });
-    let mut game_state = None;
+
+    // Os `set` do mundo, lidos uma vez; só se houver algum resolvido.
+    let has_world_set = catalog.entries.iter().any(|e| world_set(e).is_some());
+    let world = has_world_set.then(|| read_world(mem, index, catalog, objects, controller));
+    let mut game_state = world_paths(mem, index, catalog, controller);
+
     let fields = catalog
         .entries
         .iter()
         .map(|entry| {
-            let value = match action_in_game_state(entry) {
-                Some(field) => {
-                    let mut hops = GameStateReport::default();
-                    let value = report_action(
-                        mem, index, catalog, objects, controller, entry, field, &mut hops,
-                    );
-                    // Um só caminho no relatório: o do primeiro cheat de ação.
-                    game_state.get_or_insert(hops);
-                    value
-                }
-                None => report_value(&snapshot, entry),
-            };
+            let value = report_entry(
+                mem,
+                index,
+                catalog,
+                entry,
+                snapshot.as_ref(),
+                world.as_ref(),
+                &mut game_state,
+            );
             FieldReport {
                 id: entry.id.clone(),
                 value,
@@ -1298,55 +1518,220 @@ pub fn player_report<M: ReadMem + ?Sized>(
         character,
         acknowledged_pawn,
         fields,
+        pawn_error: snapshot.err().map(|absent| absent.to_string()),
         game_state,
     })
 }
 
-/// O campo de uma ação (`add`) de raiz `game_state` resolvida, se `entry` for uma.
-fn action_in_game_state(entry: &CatalogEntry) -> Option<&Field> {
+/// O cheat de raiz `game_state` resolvido de `entry`, qualquer que seja a regra.
+fn game_state_resolved(entry: &CatalogEntry) -> Option<&ResolvedField> {
     match &entry.resolved {
-        Ok(ResolvedField {
-            root: FieldRoot::GameState,
-            rule: ResolvedRule::Add { field, .. },
-            ..
-        }) => Some(field),
+        Ok(resolved) if resolved.root == FieldRoot::GameState => Some(resolved),
         _ => None,
     }
 }
 
-/// Lê o valor atual de uma ação pelo caminho do `GameState`; a falha mostra o salto que faltou.
-#[allow(clippy::too_many_arguments)]
-fn report_action<M: ReadMem + ?Sized>(
+/// O `set` de raiz `game_state` resolvido de `entry` (o que `read_world` lê).
+fn world_set(entry: &CatalogEntry) -> Option<&ResolvedField> {
+    game_state_resolved(entry).filter(|r| matches!(r.rule, ResolvedRule::Set { .. }))
+}
+
+/// Campos de objeto do caminho de `resolved`, separados por ponto.
+fn path_key(resolved: &ResolvedField) -> String {
+    let names: Vec<&str> = resolved
+        .object_path
+        .iter()
+        .map(|h| h.field.name.as_str())
+        .collect();
+    names.join(".")
+}
+
+/// Uma entrada por caminho de objeto distinto entre os cheats de raiz `game_state`, na ordem do
+/// catálogo, cada uma com os saltos lidos até onde o caminho vai.
+fn world_paths<M: ReadMem + ?Sized>(
     mem: &M,
     index: &ReflectionIndex,
     catalog: &FieldCatalog,
-    objects: &ObjectArray,
     controller: u64,
-    entry: &CatalogEntry,
-    field: &Field,
-    hops: &mut GameStateReport,
-) -> FieldReportValue {
-    let fail = |reason: String, hops: &mut GameStateReport| {
-        hops.error = Some(reason.clone());
-        FieldReportValue::Unavailable { reason }
+) -> Vec<GameStateReport> {
+    let mut out: Vec<GameStateReport> = Vec::new();
+    for resolved in catalog.entries.iter().filter_map(game_state_resolved) {
+        let key = path_key(resolved);
+        if out.iter().all(|g| g.path != key) {
+            out.push(report_path(mem, index, catalog, controller, resolved, key));
+        }
+    }
+    out
+}
+
+/// Nome da classe da instância `obj`, pela reflexão (`?` se não der para ler).
+fn class_name<M: ReadMem + ?Sized>(index: &ReflectionIndex, mem: &M, obj: u64) -> String {
+    index
+        .class_of(mem, obj)
+        .and_then(|class| index.object_name(mem, class))
+        .unwrap_or_else(|_| "?".to_string())
+}
+
+/// Anda do controller (já validado) até o objeto de `resolved`, anotando cada salto que deu certo.
+/// O objeto final de um `set` que é um CDO não conta (nunca se escreve nele).
+fn report_path<M: ReadMem + ?Sized>(
+    mem: &M,
+    index: &ReflectionIndex,
+    catalog: &FieldCatalog,
+    controller: u64,
+    resolved: &ResolvedField,
+    path: String,
+) -> GameStateReport {
+    let mut report = GameStateReport {
+        path,
+        ..GameStateReport::default()
     };
-    match walk_game_state(mem, index, catalog, objects, controller, &entry.id, hops) {
-        Ok((_, addr, _)) => match read_u32(mem, addr) {
-            Ok(raw) => FieldReportValue::Add {
-                addr,
-                current: i32::from_le_bytes(raw.to_le_bytes()),
-            },
-            Err(_) => fail(format!("{} ilegível", field.name), hops),
-        },
-        Err(absent) => fail(absent.to_string(), hops),
+    let Ok(gs) = &catalog.game_state else {
+        report.error = Some(GameStateAbsent::Missing("GameState".to_string()).to_string());
+        return report;
+    };
+    let mut r = Reader {
+        mem,
+        index,
+        catalog,
+        props: HashMap::new(),
+        objects: Vec::new(),
+    };
+    let mut obj = match walk_to_game_state(&mut r, controller, gs, &mut report) {
+        Ok(state) => state,
+        Err(absent) => {
+            report.error = Some(absent.to_string());
+            return report;
+        }
+    };
+    let check_cdo = !matches!(resolved.rule, ResolvedRule::Add { .. });
+    let last = resolved.object_path.len().saturating_sub(1);
+    for (i, hop) in resolved.object_path.iter().enumerate() {
+        let name = hop.field.name.as_str();
+        let next = r.pointer(obj, &hop.field).and_then(|ptr| {
+            if ptr != 0 && catalog.object_is_a(index, mem, ptr, hop.class)? {
+                Ok(ptr)
+            } else {
+                Err(Absent::ComponentWrongClass(name.to_string()))
+            }
+        });
+        let cdo = |ptr: u64| i == last && check_cdo && r.is_cdo(ptr).unwrap_or(false);
+        match next {
+            Ok(ptr) if !cdo(ptr) => {
+                report.hops.push(HopReport {
+                    name: name.to_string(),
+                    addr: ptr,
+                    class: class_name(index, mem, ptr),
+                });
+                obj = ptr;
+            }
+            Ok(_) => {
+                report.error = Some(GameStateAbsent::Missing(name.to_string()).to_string());
+                return report;
+            }
+            Err(absent) => {
+                report.error = Some(gone(name)(absent).to_string());
+                return report;
+            }
+        }
+    }
+    report.object = Some(obj);
+    report
+}
+
+/// O estado de um cheat no relatório: pawn pelo snapshot (ou o erro dele), `game_state` pelo
+/// caminho e por `read_world`.
+fn report_entry<M: ReadMem + ?Sized>(
+    mem: &M,
+    index: &ReflectionIndex,
+    catalog: &FieldCatalog,
+    entry: &CatalogEntry,
+    snapshot: Result<&PlayerSnapshot, &Absent>,
+    world: Option<&Result<WorldSnapshot, GameStateAbsent>>,
+    paths: &mut [GameStateReport],
+) -> FieldReportValue {
+    let resolved = match &entry.resolved {
+        Ok(r) => r,
+        Err(reason) => {
+            return FieldReportValue::Unavailable {
+                reason: reason.clone(),
+            };
+        }
+    };
+    let unavailable = |reason: String| FieldReportValue::Unavailable { reason };
+    if resolved.root != FieldRoot::GameState {
+        return match snapshot {
+            Ok(snap) => report_value(
+                entry,
+                &snap.values,
+                snap.missing.get(&entry.id).map(ToString::to_string),
+            ),
+            Err(absent) => unavailable(absent.to_string()),
+        };
+    }
+    let key = path_key(resolved);
+    let Some(path) = paths.iter_mut().find(|g| g.path == key) else {
+        return unavailable(INCOHERENT.to_string());
+    };
+    // O motivo do caminho vale para o cheat: os dois mostram o mesmo salto.
+    if let Some(error) = &path.error {
+        return unavailable(error.clone());
+    }
+    match (&resolved.rule, path.object, world) {
+        (ResolvedRule::Add { field, .. }, Some(obj), _) => {
+            report_add(mem, index, catalog, obj, field, path)
+        }
+        (ResolvedRule::Set { .. }, _, Some(Ok(snap))) => report_value(
+            entry,
+            &snap.values,
+            snap.missing.get(&entry.id).map(ToString::to_string),
+        ),
+        (ResolvedRule::Set { .. }, _, Some(Err(absent))) => unavailable(absent.to_string()),
+        _ => unavailable(INCOHERENT.to_string()),
     }
 }
 
-fn report_value(snapshot: &PlayerSnapshot, entry: &CatalogEntry) -> FieldReportValue {
-    if let Some(absent) = snapshot.missing.get(&entry.id) {
-        return FieldReportValue::Unavailable {
-            reason: absent.to_string(),
-        };
+/// Valor atual do campo de uma ação (`add`) no objeto `obj`; a falha vira o `error` do caminho.
+fn report_add<M: ReadMem + ?Sized>(
+    mem: &M,
+    index: &ReflectionIndex,
+    catalog: &FieldCatalog,
+    obj: u64,
+    field: &Field,
+    path: &mut GameStateReport,
+) -> FieldReportValue {
+    let mut r = Reader {
+        mem,
+        index,
+        catalog,
+        props: HashMap::new(),
+        objects: Vec::new(),
+    };
+    let addr = obj + u64::from(field.offset);
+    let read = r
+        .check_fits(obj, &field.name, field.offset, field.size)
+        .map_err(|absent| gone(&field.name)(absent).to_string())
+        .and_then(|()| read_u32(mem, addr).map_err(|_| format!("{} ilegível", field.name)));
+    match read {
+        Ok(raw) => FieldReportValue::Add {
+            addr,
+            current: i32::from_le_bytes(raw.to_le_bytes()),
+        },
+        Err(reason) => {
+            path.error = Some(reason.clone());
+            FieldReportValue::Unavailable { reason }
+        }
+    }
+}
+
+/// Estado de um cheat lido por `values` (ou o motivo em `missing`).
+fn report_value(
+    entry: &CatalogEntry,
+    values: &HashMap<String, FieldValues>,
+    missing: Option<String>,
+) -> FieldReportValue {
+    if let Some(reason) = missing {
+        return FieldReportValue::Unavailable { reason };
     }
     let resolved = match &entry.resolved {
         Ok(r) => r,
@@ -1356,7 +1741,7 @@ fn report_value(snapshot: &PlayerSnapshot, entry: &CatalogEntry) -> FieldReportV
             };
         }
     };
-    match (&resolved.rule, snapshot.values.get(&entry.id)) {
+    match (&resolved.rule, values.get(&entry.id)) {
         (
             _,
             Some(&FieldValues::Lock {
@@ -1396,11 +1781,16 @@ fn report_value(snapshot: &PlayerSnapshot, entry: &CatalogEntry) -> FieldReportV
             fields: fields
                 .iter()
                 .zip(defs)
-                .map(|(&(addr, bytes), def)| SetFieldReport {
-                    name: def.name.clone(),
-                    addr,
-                    raw: u32::from_le_bytes(bytes),
-                    value: format_value(entry.grid.as_ref(), *kind, decode_value(*kind, &bytes)),
+                .map(|((addr, bytes), def)| {
+                    let mut raw = [0u8; 4];
+                    let n = bytes.len().min(4);
+                    raw[..n].copy_from_slice(&bytes[..n]);
+                    SetFieldReport {
+                        name: def.name.clone(),
+                        addr: *addr,
+                        raw: u32::from_le_bytes(raw),
+                        value: format_value(entry.grid.as_ref(), *kind, decode_value(*kind, bytes)),
+                    }
                 })
                 .collect(),
         },
@@ -1425,16 +1815,17 @@ pub(crate) fn format_value(grid: Option<&ValueGrid>, kind: FieldKind, v: f64) ->
         None => match kind {
             FieldKind::Int => format!("{v:.0}"),
             FieldKind::Float => format!("{v}"),
+            FieldKind::Bool => (v != 0.0).to_string(),
         },
     }
 }
 
-/// Os 4 bytes de um campo como número (para mostrar).
+/// Os bytes de um campo como número (para mostrar); `bool` é `0.0` ou `1.0`.
 pub(crate) fn decode_value(kind: FieldKind, bytes: &[u8]) -> f64 {
-    let raw: [u8; 4] = bytes.try_into().unwrap_or_default();
     match kind {
-        FieldKind::Int => f64::from(i32::from_le_bytes(raw)),
-        FieldKind::Float => f64::from(f32::from_le_bytes(raw)),
+        FieldKind::Bool => f64::from(u8::from(bytes.first().is_some_and(|&b| b != 0))),
+        FieldKind::Int => f64::from(i32::from_le_bytes(bytes.try_into().unwrap_or_default())),
+        FieldKind::Float => f64::from(f32::from_le_bytes(bytes.try_into().unwrap_or_default())),
     }
 }
 

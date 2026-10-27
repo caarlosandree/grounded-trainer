@@ -19,10 +19,11 @@ use gt_ue::{ObjectArray, ReflectionIndex};
 
 use crate::player::{
     Absent, AddRefusal, FieldAction, FieldCatalog, FieldValues, GameStateAbsent, MissingKind,
-    PlayerSnapshot, ResolvedField, ResolvedRule, decode_value, encode_value, format_value,
-    missing_kind, plan_add, plan_tick, read_game_state, read_player, value_is_sane,
+    ObjSnap, PlayerSnapshot, ResolvedField, ResolvedRule, decode_value, desired_bytes,
+    format_value, missing_kind, plan_add, plan_tick, read_game_state, read_player, read_world,
+    value_is_sane,
 };
-use crate::signatures::{FieldKind, LockMode};
+use crate::signatures::{FieldKind, FieldRoot, LockMode};
 
 /// Originais novos tolerados na janela antes de o jogo contar como "brigando" (spec 006, 6.4).
 const FIGHT_LIMIT: usize = 5;
@@ -36,6 +37,13 @@ pub enum PlayerState {
     Absent(Absent),
 }
 
+/// Onde está o caminho do `game_state` neste ciclo (spec 007, 6.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorldState {
+    Found,
+    Absent(GameStateAbsent),
+}
+
 /// Marca de um cheat ligado que não escreveu neste ciclo (spec 6.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Note {
@@ -43,6 +51,8 @@ pub enum Note {
     Waiting,
     /// `aguardando o pet`: o personagem está, mas o pet (outro ator) não.
     WaitingPet,
+    /// `aguardando o mundo`: o caminho até o objeto do `game_state` falha (spec 007, 6.3).
+    WaitingWorld,
     /// `alvo inválido`.
     InvalidTarget,
     /// `valor do jogo inválido`: o valor lido do jogo num `set` não é são; nada é escrito.
@@ -71,6 +81,8 @@ pub enum ActionOutcome {
 struct Fight {
     /// Objeto a que a janela se refere.
     obj: u64,
+    /// Guarda do objeto: o mesmo endereço com outra guarda é outro objeto (mundo recarregado).
+    guard: Vec<GuardBytes>,
     /// Quando o jogo mudou o valor (originais novos) dentro da janela.
     news: VecDeque<Instant>,
     /// O cheat desistiu de escrever neste objeto.
@@ -78,9 +90,10 @@ struct Fight {
 }
 
 impl Fight {
-    fn new(obj: u64) -> Self {
+    fn new(obj: u64, guard: Vec<GuardBytes>) -> Self {
         Self {
             obj,
+            guard,
             ..Self::default()
         }
     }
@@ -99,10 +112,9 @@ impl Fight {
     }
 }
 
-/// Guarda de identidade do objeto `obj` neste ciclo.
-fn guard_of(snapshot: &PlayerSnapshot, obj: u64) -> Vec<GuardBytes> {
-    snapshot
-        .objects
+/// Guarda de identidade do objeto `obj` entre os objetos lidos neste ciclo.
+fn guard_of(objects: &[ObjSnap], obj: u64) -> Vec<GuardBytes> {
+    objects
         .iter()
         .find(|o| o.addr == obj)
         .map(|o| o.guard.clone())
@@ -115,26 +127,27 @@ fn write_set_field(
     engine: &mut Engine,
     id: &str,
     addr: u64,
-    desired: [u8; 4],
+    desired: &[u8],
     guard: &[GuardBytes],
     kind: FieldKind,
 ) -> gt_core::Result<SetOutcome> {
-    let accept =
-        move |bytes: &[u8]| <[u8; 4]>::try_from(bytes).is_ok_and(|raw| value_is_sane(kind, raw));
-    match engine.set_word(id, addr, &desired, guard, &accept) {
+    let accept = move |bytes: &[u8]| value_is_sane(kind, bytes);
+    match engine.set_word(id, addr, desired, guard, &accept) {
         Err(CoreError::DataEntryOtherObject { .. }) => {
             engine.restore_field(id)?;
-            engine.set_word(id, addr, &desired, guard, &accept)
+            engine.set_word(id, addr, desired, guard, &accept)
         }
         other => other,
     }
 }
 
-/// A marca de um cheat ligado cujo objeto falta: `aguardando o pet` ou `aguardando o personagem`.
+/// A marca de um cheat ligado cujo objeto falta: `aguardando o pet`, `aguardando o mundo` ou
+/// `aguardando o personagem`.
 pub fn missing_note(kind: MissingKind) -> Note {
     match kind {
         MissingKind::Pet => Note::WaitingPet,
         MissingKind::Component => Note::Waiting,
+        MissingKind::World => Note::WaitingWorld,
     }
 }
 
@@ -148,6 +161,15 @@ pub struct TickReport {
     pub events: Vec<String>,
     /// Desde quando o `Pawn` está nulo (para a nova procura do controller, spec 6.3).
     pub pawn_null_since: Option<Instant>,
+    /// Estado do caminho do `game_state`; `None` se nenhum `set` dessa raiz está ligado (ou o
+    /// controller falhou antes de o mundo ser lido). `player` segue só o pawn.
+    pub world: Option<WorldState>,
+}
+
+/// O objeto final de um `set` do mundo mudou desde o último ciclo (ou é a primeira vez)?
+/// A guarda traz os endereços, então vale para endereço novo e para identidade nova.
+fn world_object_changed(prev: Option<&Vec<GuardBytes>>, now: &[GuardBytes]) -> bool {
+    prev.is_none_or(|p| p.as_slice() != now)
 }
 
 /// Estado dos cheats de valor de uma conexão.
@@ -171,16 +193,20 @@ pub struct FieldRuntime {
     bad_value: HashSet<String>,
     /// Último endereço do objeto de cada ação, para reler o `maps` quando ele muda.
     action_objects: HashMap<String, u64>,
+    /// O caminho do `game_state` estava ok no último ciclo em que foi lido (`None`: ainda não
+    /// lido, ou nenhum `set` do mundo ligado).
+    world_found: Option<bool>,
+    /// Guarda do último objeto final de cada `set` do mundo, por `id`: o `maps` é relido quando muda.
+    world_objects: HashMap<String, Vec<GuardBytes>>,
 }
 
 /// O que o ciclo precisa saber de um `set` ligado.
 #[derive(Clone, Copy)]
 struct SetJob<'a> {
     id: &'a str,
-    kind: FieldKind,
-    target: Option<f64>,
+    rule: &'a ResolvedRule,
     obj: u64,
-    fields: &'a [(u64, [u8; 4])],
+    fields: &'a [(u64, Vec<u8>)],
 }
 
 /// Objeto dono de uma guarda (o primeiro trecho é a vtable, em `+0`).
@@ -202,6 +228,8 @@ impl FieldRuntime {
             fights: HashMap::new(),
             bad_value: HashSet::new(),
             action_objects: HashMap::new(),
+            world_found: None,
+            world_objects: HashMap::new(),
         }
     }
 
@@ -277,8 +305,9 @@ impl FieldRuntime {
         self
     }
 
-    /// Um ciclo: lê o personagem pelo `controller` e escreve o que os cheats `on` pedem. Um
-    /// `id` com resto pendente no motor é pulado, sem nota nova (spec 6.6).
+    /// Um ciclo: lê o personagem e o mundo pelo `controller` e escreve o que os cheats `on`
+    /// pedem. As duas raízes são isoladas (spec 007, 6.3): só controller ausente ou inválido
+    /// afeta as duas. Um `id` com resto pendente no motor é pulado, sem nota nova (spec 6.6).
     #[allow(clippy::too_many_arguments)]
     pub fn tick<M: ReadMem + ?Sized>(
         &mut self,
@@ -301,10 +330,17 @@ impl FieldRuntime {
             notes: HashMap::new(),
             events: Vec::new(),
             pawn_null_since: None,
+            world: None,
         };
+        // Os `set` da raiz `game_state` em `on`: o que o mundo mantém.
+        let world_on: Vec<String> = on
+            .iter()
+            .filter(|id| self.is_world_set(id))
+            .cloned()
+            .collect();
 
-        let mut snapshot = match read_player(mem, index, &self.catalog, objects, controller) {
-            Ok(s) => s,
+        match read_player(mem, index, &self.catalog, objects, controller) {
+            Ok(snapshot) => self.tick_pawn(engine, snapshot, &on, now, &mut report),
             Err(absent) => {
                 if absent == Absent::PawnNull {
                     self.pawn_null_since.get_or_insert(now);
@@ -318,14 +354,52 @@ impl FieldRuntime {
                     tracing::info!("personagem indisponível: {absent}");
                 }
                 self.found = Some(false);
+                let controller_gone =
+                    matches!(absent, Absent::NoController | Absent::ControllerInvalid);
                 for id in &on {
-                    report.notes.insert(id.clone(), Note::Waiting);
+                    // Sem controller as duas raízes esperam; com o controller válido só o pawn.
+                    if controller_gone || !world_on.contains(id) {
+                        report.notes.insert(id.clone(), Note::Waiting);
+                    }
                 }
                 report.player = PlayerState::Absent(absent);
                 report.pawn_null_since = self.pawn_null_since;
-                return report;
+                if controller_gone {
+                    // O mundo não é lido nem muda de estado sem controller.
+                    return report;
+                }
             }
-        };
+        }
+        self.tick_world(
+            engine,
+            mem,
+            index,
+            objects,
+            controller,
+            &world_on,
+            now,
+            &mut report,
+        );
+        report
+    }
+
+    /// O `id` é um `set` de raiz `game_state` (a manutenção do mundo)?
+    fn is_world_set(&self, id: &str) -> bool {
+        matches!(
+            self.catalog.get(id),
+            Some(Ok(r)) if r.root == FieldRoot::GameState && matches!(r.rule, ResolvedRule::Set { .. })
+        )
+    }
+
+    /// A parte do personagem do ciclo, com o pawn lido.
+    fn tick_pawn(
+        &mut self,
+        engine: &mut Engine,
+        mut snapshot: PlayerSnapshot,
+        on: &[String],
+        now: Instant,
+        report: &mut TickReport,
+    ) {
         self.pawn_null_since = None;
         if self.found != Some(true) {
             report.events.push("personagem encontrado".to_string());
@@ -340,8 +414,8 @@ impl FieldRuntime {
         }
 
         let mut invalid_now = HashSet::new();
-        self.learn_targets(&mut snapshot, &on);
-        for action in plan_tick(&snapshot, &self.catalog, &on) {
+        self.learn_targets(&mut snapshot, on);
+        for action in plan_tick(&snapshot, &self.catalog, on) {
             match action {
                 FieldAction::WriteF32 {
                     id,
@@ -377,33 +451,144 @@ impl FieldRuntime {
             }
         }
         self.invalid = invalid_now;
-        let catalog = Arc::clone(&self.catalog);
-        for id in catalog.ids().filter(|id| on.iter().any(|o| o == id)) {
-            let (Some(Ok(resolved)), Some(FieldValues::Set { obj, fields })) =
-                (catalog.get(id), snapshot.values.get(id))
-            else {
-                continue;
-            };
-            let ResolvedRule::Set { kind, target, .. } = &resolved.rule else {
-                continue;
-            };
-            let job = SetJob {
-                id,
-                kind: *kind,
-                target: *target,
-                obj: *obj,
-                fields,
-            };
-            self.tick_set(engine, &snapshot, &job, now, &mut report);
-        }
+        self.run_sets(engine, &snapshot.objects, &snapshot.values, on, now, report);
         for id in snapshot.missing.keys().filter(|id| on.contains(id)) {
             let kind = match self.catalog.get(id) {
                 Some(Ok(resolved)) => missing_kind(resolved),
                 _ => MissingKind::Component,
             };
-            report.notes.insert(id.clone(), missing_note(kind));
+            report.notes.insert(id.to_string(), missing_note(kind));
         }
-        report
+    }
+
+    /// A parte do mundo do ciclo (spec 007, 6.3): lê o `game_state` pelo controller e mantém os
+    /// `set` dessa raiz, sem depender do pawn. Sem nenhum `set` do mundo ligado, nada é lido.
+    #[allow(clippy::too_many_arguments)]
+    fn tick_world<M: ReadMem + ?Sized>(
+        &mut self,
+        engine: &mut Engine,
+        mem: &M,
+        index: &ReflectionIndex,
+        objects: &ObjectArray,
+        controller: u64,
+        world_on: &[String],
+        now: Instant,
+        report: &mut TickReport,
+    ) {
+        if world_on.is_empty() {
+            self.world_found = None;
+            self.world_objects.clear();
+            return;
+        }
+        let world = match read_world(mem, index, &self.catalog, objects, controller) {
+            Ok(world) => world,
+            Err(GameStateAbsent::ControllerInvalid) => {
+                // O controller sumiu entre as duas leituras: como controller inválido, sem
+                // evento e sem mexer no estado do mundo.
+                for id in world_on {
+                    report.notes.insert(id.clone(), Note::Waiting);
+                }
+                report.world = Some(WorldState::Absent(GameStateAbsent::ControllerInvalid));
+                return;
+            }
+            Err(absent) => {
+                self.world_absent(absent, world_on, report);
+                return;
+            }
+        };
+        // Sem nenhum objeto no lugar, o mundo conta como ausente (o motivo é o do primeiro).
+        let first_missing = world_on.iter().find_map(|id| world.missing.get(id));
+        if let Some(absent) = first_missing
+            && world_on.iter().all(|id| world.missing.contains_key(id))
+        {
+            self.world_absent(absent.clone(), world_on, report);
+            return;
+        }
+        for id in world_on {
+            if world.missing.contains_key(id) {
+                report.notes.insert(id.clone(), Note::WaitingWorld);
+            }
+        }
+        self.set_world_found(true, report);
+        report.world = Some(WorldState::Found);
+
+        // Objeto final novo (outro mundo, outro endereço ou outra guarda): o `maps` é relido uma
+        // vez antes da primeira escrita nele.
+        let seen: Vec<(String, Vec<GuardBytes>)> = world_on
+            .iter()
+            .filter_map(|id| match world.values.get(id) {
+                Some(FieldValues::Set { obj, .. }) => {
+                    Some((id.clone(), guard_of(&world.objects, *obj)))
+                }
+                _ => None,
+            })
+            .filter(|(id, guard)| world_object_changed(self.world_objects.get(id), guard))
+            .collect();
+        if !seen.is_empty() {
+            match engine.refresh_data_maps() {
+                Ok(()) => self.world_objects.extend(seen),
+                Err(e) => tracing::warn!("falha ao reler o maps: {e}"),
+            }
+        }
+        self.run_sets(engine, &world.objects, &world.values, world_on, now, report);
+    }
+
+    /// O caminho do mundo falhou: os `set` do mundo esperam e a transição vira evento.
+    fn world_absent(
+        &mut self,
+        absent: GameStateAbsent,
+        world_on: &[String],
+        report: &mut TickReport,
+    ) {
+        for id in world_on {
+            report.notes.insert(id.clone(), Note::WaitingWorld);
+        }
+        self.set_world_found(false, report);
+        report.world = Some(WorldState::Absent(absent));
+    }
+
+    /// Anota o estado do mundo; a linha do registro sai só na transição entre ok e ausente
+    /// (a primeira leitura não é transição, a não ser que antes estivesse perdido).
+    fn set_world_found(&mut self, found: bool, report: &mut TickReport) {
+        match (self.world_found, found) {
+            (Some(true), false) => {
+                tracing::info!("mundo indisponível");
+                report.events.push("mundo perdido".to_string());
+            }
+            (Some(false), true) => report.events.push("mundo encontrado".to_string()),
+            _ => {}
+        }
+        self.world_found = Some(found);
+    }
+
+    /// Roda o `tick_set` de cada `set` de `on` com valores lidos neste ciclo, na ordem do catálogo.
+    fn run_sets(
+        &mut self,
+        engine: &mut Engine,
+        objects: &[ObjSnap],
+        values: &HashMap<String, FieldValues>,
+        on: &[String],
+        now: Instant,
+        report: &mut TickReport,
+    ) {
+        let catalog = Arc::clone(&self.catalog);
+        for id in catalog.ids().filter(|id| on.iter().any(|o| o == id)) {
+            let (Some(Ok(resolved)), Some(FieldValues::Set { obj, fields })) =
+                (catalog.get(id), values.get(id))
+            else {
+                continue;
+            };
+            if !matches!(resolved.rule, ResolvedRule::Set { .. }) {
+                continue;
+            }
+            let job = SetJob {
+                id,
+                rule: &resolved.rule,
+                obj: *obj,
+                fields,
+            };
+            self.tick_set(engine, objects, &job, now, report);
+        }
     }
 
     /// Um ciclo de um `set` ligado: escreve o valor desejado em cada campo, aprende o que o jogo
@@ -411,14 +596,15 @@ impl FieldRuntime {
     fn tick_set(
         &mut self,
         engine: &mut Engine,
-        snapshot: &PlayerSnapshot,
+        objects: &[ObjSnap],
         job: &SetJob<'_>,
         now: Instant,
         report: &mut TickReport,
     ) {
         let (id, obj) = (job.id, job.obj);
         let mut fight = self.fights.remove(id).unwrap_or_default();
-        if fight.obj != obj {
+        let guard = guard_of(objects, obj);
+        if fight.obj != obj || fight.guard != guard {
             // Objeto novo: a janela e o bloqueio do anterior não valem mais.
             if fight.blocked {
                 let name = self.catalog.name(id).unwrap_or(id);
@@ -426,9 +612,9 @@ impl FieldRuntime {
                     .events
                     .push(format!("{name}: o jogo voltou a deixar"));
             }
-            fight = Fight::new(obj);
+            fight = Fight::new(obj, guard);
         }
-        let outcome = self.run_set_fields(engine, snapshot, job, &mut fight, now, report);
+        let outcome = self.run_set_fields(engine, objects, job, &mut fight, now, report);
         if fight.blocked {
             self.bad_value.remove(id);
             report.notes.insert(id.to_string(), Note::GameRefuses);
@@ -442,7 +628,7 @@ impl FieldRuntime {
     fn run_set_fields(
         &mut self,
         engine: &mut Engine,
-        snapshot: &PlayerSnapshot,
+        objects: &[ObjSnap],
         job: &SetJob<'_>,
         fight: &mut Fight,
         now: Instant,
@@ -450,18 +636,38 @@ impl FieldRuntime {
     ) -> Option<Note> {
         let SetJob {
             id,
-            kind,
-            target,
+            rule,
             obj,
             fields,
         } = *job;
+        let ResolvedRule::Set {
+            kind,
+            target,
+            bools,
+            ..
+        } = rule
+        else {
+            return None;
+        };
+        let kind = *kind;
         if fight.blocked {
             return None;
         }
-        let desired = encode_value(kind, self.desired_value(id, target)?);
-        let guard = guard_of(snapshot, obj);
+        // O `bool` leva o valor de cada campo da definição e não passa por `desired_value`.
+        let value = if bools.is_some() {
+            None
+        } else {
+            Some(self.desired_value(id, *target)?)
+        };
+        let desired = desired_bytes(rule, value)?;
+        let guard = guard_of(objects, obj);
         let name = self.catalog.name(id).unwrap_or(id).to_string();
         let grid = self.catalog.grid(id);
+        // A marca de espera vem do tipo do cheat: mundo, pet ou personagem.
+        let waiting = match self.catalog.get(id) {
+            Some(Ok(resolved)) => missing_note(missing_kind(resolved)),
+            _ => Note::Waiting,
+        };
 
         // Objeto novo (outro pawn): a entrada antiga é resolvida antes de o novo ganhar a dele.
         if engine
@@ -478,14 +684,15 @@ impl FieldRuntime {
                 ),
                 Err(e) => {
                     tracing::debug!(id, "entrada do objeto anterior não resolvida: {e}");
-                    return Some(Note::Waiting);
+                    return Some(waiting);
                 }
             }
         }
 
         let (mut failed, mut invalid) = (false, false);
-        for &(addr, _) in fields {
-            match write_set_field(engine, id, addr, desired, &guard, kind) {
+        for ((addr, _), want) in fields.iter().zip(&desired) {
+            let addr = *addr;
+            match write_set_field(engine, id, addr, want, &guard, kind) {
                 Ok(SetOutcome::Rejected(_)) => invalid = true,
                 Ok(SetOutcome::NewOriginal(old)) => {
                     let shown = format_value(grid, kind, decode_value(kind, &old));
@@ -520,7 +727,7 @@ impl FieldRuntime {
                 .push(format!("{name}: valor do jogo válido de novo"));
         }
         if failed {
-            Some(Note::Waiting)
+            Some(waiting)
         } else if invalid {
             Some(Note::InvalidGameValue)
         } else {
@@ -628,6 +835,7 @@ impl FieldRuntime {
         self.invalid.remove(id);
         self.fights.remove(id);
         self.bad_value.remove(id);
+        self.world_objects.remove(id);
         self.learned.retain(|(learned, _), _| learned != id);
         let done = BatchReport {
             restored: vec![id.to_string()],
@@ -660,7 +868,7 @@ mod tests {
     #[test]
     fn fight_counts_more_than_five_in_ten_seconds() {
         let t0 = Instant::now();
-        let mut fight = Fight::new(1);
+        let mut fight = Fight::new(1, Vec::new());
         // Cinco em 10 s ainda é tolerado; o sexto passa do limite.
         for i in 0..5 {
             assert!(!fight.record(t0 + Duration::from_secs(i)), "{i}");
@@ -671,13 +879,13 @@ mod tests {
     #[test]
     fn fight_window_slides() {
         let t0 = Instant::now();
-        let mut fight = Fight::new(1);
+        let mut fight = Fight::new(1, Vec::new());
         // Um a cada 3 s: nunca mais de quatro dentro de 10 s.
         for i in 0..20 {
             assert!(!fight.record(t0 + Duration::from_secs(3 * i)), "{i}");
         }
         // Exatamente 10 s depois, o mais antigo já saiu da janela.
-        let mut edge = Fight::new(1);
+        let mut edge = Fight::new(1, Vec::new());
         for _ in 0..5 {
             edge.record(t0);
         }
@@ -707,5 +915,31 @@ mod tests {
     fn missing_note_follows_the_kind() {
         assert_eq!(missing_note(MissingKind::Pet), Note::WaitingPet);
         assert_eq!(missing_note(MissingKind::Component), Note::Waiting);
+        assert_eq!(missing_note(MissingKind::World), Note::WaitingWorld);
+    }
+
+    fn guard(addr: u64, bytes: &[u8]) -> Vec<GuardBytes> {
+        vec![GuardBytes {
+            addr,
+            bytes: bytes.to_vec(),
+        }]
+    }
+
+    #[test]
+    fn world_object_changed_detects_new_guard() {
+        let g1 = guard(0x1000, &[1, 2, 3, 4]);
+        // Primeira vez: sempre muda.
+        assert!(world_object_changed(None, &g1));
+        // Outra guarda (identidade nova no mesmo endereço, ou outro endereço).
+        assert!(world_object_changed(
+            Some(&g1),
+            &guard(0x1000, &[1, 2, 3, 5])
+        ));
+        assert!(world_object_changed(
+            Some(&g1),
+            &guard(0x2000, &[1, 2, 3, 4])
+        ));
+        // A mesma guarda: nada mudou.
+        assert!(!world_object_changed(Some(&g1), &g1.clone()));
     }
 }

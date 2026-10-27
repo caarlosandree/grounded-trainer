@@ -127,6 +127,7 @@ A fase foi dividida em duas specs:
   jogo com o dono (branch `fase-5-sobrevivencia`). Pendência: confirmar na próxima atualização do jogo que tudo
   continua funcionando sem mudar o trainer.
 - **Spec 006 — o resto da Fase 5:** carga, dano causado, ciência (como ação de somar) e movimento (velocidade, pulos infinitos, gravidade). **Fechada em 2026-10-26**: os seis cheats funcionaram no jogo com o dono (branch `fase-5-progressao`). Com isso a **Fase 5 está fechada**, com a pendência da spec 005: confirmar na próxima atualização do jogo que tudo continua funcionando sem mudar o trainer.
+- **Spec 007 — construção e defesa** (`docs/specs/007-construcao-e-defesa.md`): construir sem ingredientes (sem materiais e construção pronta na hora) e dano recebido (`EnemyDamageMultiplier`), como cheats do mundo pelas configurações do modo de jogo. **Concluída** (confirmada no jogo pelo dono em 2026-10-27): "multiplicador de defesa" e "construção sem requisitos" saíram da lista da Fase 6.
 
 ---
 
@@ -137,9 +138,9 @@ A fase foi dividida em duas specs:
 - Encontrar espaço livre no executável para código novo.
 - Montar o código com `iced-x86` e desviar a execução para ele.
 - Cheats:
-  - Sobrevivência: god mode por desvio (se a versão por valor da Fase 5 não servir), multiplicador de defesa.
+  - Sobrevivência: god mode por desvio (se a versão por valor da Fase 5 não servir).
   - Progressão: Brain Power rápido, congelar a hora do dia / velocidade do tempo.
-  - Itens: cargas infinitas do analisador, quantidade ao arrastar, construção sem requisitos.
+  - Itens: cargas infinitas do analisador, quantidade ao arrastar.
 
 **Pronto quando:** o Brain Power rápido funciona no jogo.
 **Você faz:** testar os cheats no jogo.

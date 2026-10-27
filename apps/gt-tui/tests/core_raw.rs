@@ -10,6 +10,7 @@ use gt_core::journal::{JournalStore, Loaded};
 use gt_core::mem::{MemReader, MemWriter};
 use gt_core::procinfo::identity;
 use gt_core::value::{ValueGrid, ValueSpec, ValueType};
+use gt_grounded2::fields::Note;
 use gt_grounded2::signatures::Category;
 use gt_testkit::{TargetOpts, TestTarget};
 use gt_tui::backend::{Backend, Find, OpOutcome, Recovered, Session};
@@ -1099,4 +1100,123 @@ fn action_needs_controller_marks_search() {
         }
     );
     assert_eq!(read_i32(u.target.pid, science), start + 1000);
+}
+
+/// Passa os ciclos de manutenção em `base + secs` e devolve o último relatório.
+fn tick_at(
+    u: &mut UeSession,
+    ids: &[&str],
+    base: Instant,
+    secs: u64,
+) -> gt_grounded2::fields::TickReport {
+    let ids: Vec<String> = ids.iter().map(ToString::to_string).collect();
+    u.s.field_tick(&ids, base + Duration::from_secs(secs))
+}
+
+fn poke_at(u: &UeSession, addr: u64, bytes: &[u8]) {
+    MemWriter::open(u.target.pid)
+        .unwrap()
+        .write(addr, bytes)
+        .unwrap();
+}
+
+fn note_of(report: &gt_grounded2::fields::TickReport, id: &str) -> Option<Note> {
+    report
+        .notes
+        .iter()
+        .find(|(i, _)| i.as_str() == id)
+        .map(|(_, n)| *n)
+}
+
+#[test]
+fn raw_pawn_null_over_30s_keeps_controller() {
+    let mut u = ue_session(true);
+    run_job(&mut u.s, JobKind::Controller);
+    let t0 = Instant::now();
+    let damage_at = |u: &UeSession| {
+        let health = u64::from_le_bytes(
+            read(
+                u.target.pid,
+                u.ue.pawn + u64::from(gt_testkit::ue::HEALTH_OFF),
+                8,
+            )
+            .try_into()
+            .unwrap(),
+        );
+        health + u64::from(DAMAGE_OFF)
+    };
+    let damage = damage_at(&u);
+    assert!(is_done(&u.s.field_on("vida-infinita", 0)));
+    let ids = ["vida-infinita"];
+    let r = tick_at(&mut u, &ids, t0, 0);
+    assert_eq!(note_of(&r, "vida-infinita"), None);
+    // Menu ou carregamento: `Pawn` nulo; o ciclo marca o início da espera.
+    poke_at(&u, u.ue.pawn_field_addr, &0u64.to_le_bytes());
+    tick_at(&mut u, &ids, t0, 1);
+    let r = tick_at(&mut u, &ids, t0, 31);
+    assert_eq!(note_of(&r, "vida-infinita"), Some(Note::Waiting));
+    tick_at(&mut u, &ids, t0, 32);
+    // Passou de 30 s: a procura é pedida, mas o controller guardado não é descartado.
+    assert!(u.s.needs_controller(t0 + Duration::from_secs(32)));
+    // O personagem volta sem nenhum trabalho de controller: retoma no ciclo seguinte.
+    poke_at(&u, u.ue.pawn_field_addr, &u.ue.pawn.to_le_bytes());
+    poke_at(&u, damage, &25f32.to_le_bytes());
+    let r = tick_at(&mut u, &ids, t0, 33);
+    assert_eq!(note_of(&r, "vida-infinita"), None);
+    assert_eq!(
+        f32::from_le_bytes(read(u.target.pid, damage, 4).try_into().unwrap()),
+        0.0
+    );
+}
+
+#[test]
+fn raw_pawn_null_over_30s_world_cheats_keep_writing() {
+    use gt_testkit::ue::{AUTO_COMPLETE_OFF, ENEMY_DAMAGE_OFF, RECIPES_OFF};
+    let mut u = ue_session(true);
+    run_job(&mut u.s, JobKind::Controller);
+    let t0 = Instant::now();
+    assert!(is_done(&u.s.field_on("construir-sem-ingredientes", 0)));
+    // `k = 5` na grade 0..1 de passo 0,05 é 0,25.
+    assert!(is_done(&u.s.field_on("dano-recebido", 5)));
+    assert!(is_done(&u.s.field_on("vida-infinita", 0)));
+    let ids = [
+        "construir-sem-ingredientes",
+        "dano-recebido",
+        "vida-infinita",
+    ];
+    tick_at(&mut u, &ids, t0, 0);
+    poke_at(&u, u.ue.pawn_field_addr, &0u64.to_le_bytes());
+    tick_at(&mut u, &ids, t0, 1);
+    let settings = u.ue.settings;
+    tick_at(&mut u, &ids, t0, 31);
+    tick_at(&mut u, &ids, t0, 32);
+    assert!(u.s.needs_controller(t0 + Duration::from_secs(32)));
+    // Depois de passar dos 30 s, o jogo devolve as configurações: o controller guardado segue em
+    // uso e elas voltam a ser forçadas no ciclo seguinte (o pawn continua nulo).
+    poke_at(&u, settings + u64::from(RECIPES_OFF), &[1]);
+    poke_at(
+        &u,
+        settings + u64::from(ENEMY_DAMAGE_OFF),
+        &1f32.to_le_bytes(),
+    );
+    let r = tick_at(&mut u, &ids, t0, 33);
+    assert_eq!(note_of(&r, "vida-infinita"), Some(Note::Waiting));
+    assert_eq!(note_of(&r, "construir-sem-ingredientes"), None);
+    assert_eq!(note_of(&r, "dano-recebido"), None);
+    assert_eq!(
+        read(u.target.pid, settings + u64::from(RECIPES_OFF), 1),
+        [0]
+    );
+    assert_eq!(
+        read(u.target.pid, settings + u64::from(AUTO_COMPLETE_OFF), 1),
+        [1]
+    );
+    assert_eq!(
+        f32::from_le_bytes(
+            read(u.target.pid, settings + u64::from(ENEMY_DAMAGE_OFF), 4)
+                .try_into()
+                .unwrap()
+        ),
+        0.25
+    );
 }

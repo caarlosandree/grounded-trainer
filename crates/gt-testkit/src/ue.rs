@@ -42,7 +42,7 @@ const FALL_BYTE: u32 = 0x68;
 const FALL_MASK: u8 = 0x04;
 const MAX_STAMINA: u32 = 0x34;
 /// `SurvivalComponent.HungerSettings`, `ThirstSettings` e `BreathSettings` (o máximo é `MaxValue`).
-const SETTINGS_OFF: [u32; 3] = [0x50, 0x60, 0x70];
+const TRAIT_SETTINGS_OFF: [u32; 3] = [0x50, 0x60, 0x70];
 /// `SurvivalPlayerController.CachedSurvivalPlayerCharacter`.
 pub const CACHED_OFF: u32 = 0x78;
 const CUR_TEMP: u32 = 0x30;
@@ -65,6 +65,17 @@ pub const WORLD_OFF: u32 = 0x40;
 pub const GAME_STATE_OFF: u32 = 0x48;
 pub const PARTY_OFF: u32 = 0x38;
 pub const SCIENCE_OFF: u32 = 0x30;
+
+/// Configurações do modo de jogo (spec 007): `InGameGameState.SurvivalModeManagerComponent`,
+/// `SurvivalModeManagerComponent.GameModeSettings` e os três campos de
+/// `SurvivalGameModeSettings` (offsets diferentes dos do jogo, de propósito).
+pub const MODE_MANAGER_OFF: u32 = 0x50;
+pub const SETTINGS_OFF: u32 = 0x38;
+pub const RECIPES_OFF: u32 = 0x31;
+pub const AUTO_COMPLETE_OFF: u32 = 0x33;
+pub const ENEMY_DAMAGE_OFF: u32 = 0x3c;
+/// Dano inimigo inicial das configurações da cena.
+pub const ENEMY_DAMAGE_START: f32 = 1.0;
 
 /// Valores iniciais dos campos novos (o personagem sem nenhum cheat).
 pub const CAPACITY_START: i32 = 10;
@@ -102,6 +113,12 @@ pub struct UeAddrs {
     pub world: u64,
     pub game_state: u64,
     pub party: u64,
+    /// `SurvivalModeManagerComponent` do `GameState`.
+    pub mode_manager: u64,
+    /// `GameModeSettings` em uso (instância da subclasse de Blueprint).
+    pub settings: u64,
+    /// Outra instância da subclasse, com o bit de CDO, fora do caminho.
+    pub cdo_settings: u64,
 }
 
 fn field(name: &'static str, kind: &'static str, offset: u32, size: u32) -> SynthField {
@@ -224,7 +241,7 @@ pub fn build(arena: u64, len: usize) -> (SynthImage, UeAddrs) {
         &[float("MaxValue", 0x0), float("InitialValue", 0x4)],
     );
     let breath_settings = s.add_struct(maine, "BreathSettings", 0x8, &[float("MaxValue", 0x0)]);
-    let [hunger, thirst, breath] = SETTINGS_OFF;
+    let [hunger, thirst, breath] = TRAIT_SETTINGS_OFF;
     let survival_c = s.add_class(
         maine,
         "SurvivalComponent",
@@ -286,7 +303,10 @@ pub fn build(arena: u64, len: usize) -> (SynthImage, UeAddrs) {
         "InGameGameState",
         Some(actor),
         0x60,
-        &[object("PartyComponent", PARTY_OFF)],
+        &[
+            object("PartyComponent", PARTY_OFF),
+            object("SurvivalModeManagerComponent", MODE_MANAGER_OFF),
+        ],
     );
     let party_c = s.add_class(
         maine,
@@ -295,6 +315,34 @@ pub fn build(arena: u64, len: usize) -> (SynthImage, UeAddrs) {
         0x40,
         &[int("ScienceFound", SCIENCE_OFF)],
     );
+    let mode_manager_c = s.add_class(
+        maine,
+        "SurvivalModeManagerComponent",
+        Some(object_c),
+        0x48,
+        &[object("GameModeSettings", SETTINGS_OFF)],
+    );
+    let settings_c = s.add_class(
+        maine,
+        "SurvivalGameModeSettings",
+        Some(object_c),
+        0x48,
+        &[
+            boolean("bRecipesRequireIngredients", RECIPES_OFF, 0xff),
+            boolean("bAutoCompleteBuildings", AUTO_COMPLETE_OFF, 0xff),
+            float("EnemyDamageMultiplier", ENEMY_DAMAGE_OFF),
+        ],
+    );
+    // Subclasse de Blueprint, como no jogo: os campos vêm da classe pai.
+    let normal_settings_c = s.add_class(
+        maine,
+        "BP_NormalModeSettings_C",
+        Some(settings_c),
+        0x48,
+        &[],
+    );
+    s.link_struct(game_state_c, "SurvivalModeManagerComponent", mode_manager_c);
+    s.link_struct(mode_manager_c, "GameModeSettings", settings_c);
 
     // O controller e o pawn compartilham o `Outer` (o nível persistente), como no jogo.
     let level = s.add_object(level_c, "PersistentLevel", maine);
@@ -305,6 +353,18 @@ pub fn build(arena: u64, len: usize) -> (SynthImage, UeAddrs) {
     s.set(world, GAME_STATE_OFF, &game_state.to_le_bytes());
     s.set(game_state, PARTY_OFF, &party.to_le_bytes());
     s.set(party, SCIENCE_OFF, &SCIENCE_START.to_le_bytes());
+    let mode_manager = s.add_object(mode_manager_c, "ModeManager", game_state);
+    let settings = s.add_object(normal_settings_c, "NormalModeSettings", world);
+    let cdo_settings = s.add_object(normal_settings_c, "Default__BP_NormalModeSettings_C", maine);
+    s.set(game_state, MODE_MANAGER_OFF, &mode_manager.to_le_bytes());
+    s.set(mode_manager, SETTINGS_OFF, &settings.to_le_bytes());
+    let uobject = UeLayout::observed().uobject;
+    s.set(cdo_settings, uobject.flags, &uobject.cdo_flag.to_le_bytes());
+    for obj in [settings, cdo_settings] {
+        s.set(obj, RECIPES_OFF, &[1]);
+        s.set(obj, AUTO_COMPLETE_OFF, &[0]);
+        s.set(obj, ENEMY_DAMAGE_OFF, &ENEMY_DAMAGE_START.to_le_bytes());
+    }
     let controller = s.add_object(survival_controller_c, "Controller_0", level);
     let pawn = s.add_object(player_character_c, "Player_0", level);
     let creature = s.add_object(character_c, "Creature_0", maine);
@@ -328,7 +388,7 @@ pub fn build(arena: u64, len: usize) -> (SynthImage, UeAddrs) {
         s.set(owner, FALL_BYTE, &[FALL_MASK]);
         s.set(stamina, CUR_STAMINA, &100f32.to_le_bytes());
         s.set(stamina, MAX_STAMINA, &100f32.to_le_bytes());
-        for off in [0x30, 0x38, 0x40].into_iter().chain(SETTINGS_OFF) {
+        for off in [0x30, 0x38, 0x40].into_iter().chain(TRAIT_SETTINGS_OFF) {
             s.set(survival, off, &100f32.to_le_bytes());
         }
         s.set(temperature, CUR_TEMP, &NEUTRAL_TEMP.to_le_bytes());
@@ -369,6 +429,9 @@ pub fn build(arena: u64, len: usize) -> (SynthImage, UeAddrs) {
         world,
         game_state,
         party,
+        mode_manager,
+        settings,
+        cdo_settings,
     };
     (image, addrs)
 }
@@ -462,7 +525,48 @@ fn set_rule(fields: &[&str], kind: FieldKind, target: Option<f64>) -> FieldRule 
         fields: fields.iter().map(|f| f.to_string()).collect(),
         kind,
         target,
+        bools: None,
     }
+}
+
+/// Os dois cheats do mundo da spec 007, com os ids e as grades do `generic.toml`.
+fn world_defs() -> Vec<FieldDef> {
+    let settings = (
+        "SurvivalModeManagerComponent.GameModeSettings",
+        format!("{MAINE}.SurvivalGameModeSettings"),
+        FieldRoot::GameState,
+    );
+    let world = |id: &str, category, rule, value| {
+        progression(
+            id,
+            category,
+            (settings.0, &settings.1, settings.2),
+            rule,
+            value,
+        )
+    };
+    vec![
+        world(
+            "construir-sem-ingredientes",
+            Category::Itens,
+            FieldRule::Set {
+                fields: vec![
+                    "bRecipesRequireIngredients".into(),
+                    "bAutoCompleteBuildings".into(),
+                ],
+                kind: FieldKind::Bool,
+                target: None,
+                bools: Some(vec![false, true]),
+            },
+            None,
+        ),
+        world(
+            "dano-recebido",
+            Category::Sobrevivencia,
+            set_rule(&["EnemyDamageMultiplier"], FieldKind::Float, None),
+            Some(grid(ValueType::F32, (0.0, 1.0, 0.05), 0.25, Some("x"))),
+        ),
+    ]
 }
 
 /// Os seis cheats da spec 006, 6.7, com os nomes do jogo e as grades do `generic.toml`.
@@ -539,7 +643,7 @@ fn progression_defs() -> Vec<FieldDef> {
 }
 
 /// `[ue]` e `[[field]]` da cena: o `[ue.player]`, os oito cheats da spec 5 (6.5) e os seis da
-/// spec 6 (6.7), com os nomes do jogo, e o layout observado. As globais não têm `rva` (a cena entrega os endereços direto).
+/// spec 6 (6.7) e os dois da spec 7, com os nomes do jogo, e o layout observado. As globais não têm `rva` (a cena entrega os endereços direto).
 pub fn synth_signatures() -> (UeSigs, Vec<FieldDef>) {
     let global = || GlobalDef {
         pattern: GlobalPattern {
@@ -633,5 +737,71 @@ pub fn synth_signatures() -> (UeSigs, Vec<FieldDef>) {
         ),
     ];
     defs.extend(progression_defs());
+    defs.extend(world_defs());
     (sigs, defs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gt_core::mem::ReadMem;
+
+    fn ptr(mem: &impl ReadMem, addr: u64) -> u64 {
+        let mut b = [0u8; 8];
+        mem.read_exact(addr, &mut b).unwrap();
+        u64::from_le_bytes(b)
+    }
+
+    fn bytes<const N: usize>(mem: &impl ReadMem, addr: u64) -> [u8; N] {
+        let mut b = [0u8; N];
+        mem.read_exact(addr, &mut b).unwrap();
+        b
+    }
+
+    #[test]
+    fn scene_has_mode_settings() {
+        let (image, a) = build(0x1000_0000, ARENA_LEN);
+        let mem = image.into_mem();
+        let layout = UeLayout::observed();
+
+        assert_eq!(
+            ptr(&mem, a.game_state + u64::from(MODE_MANAGER_OFF)),
+            a.mode_manager
+        );
+        assert_eq!(
+            ptr(&mem, a.mode_manager + u64::from(SETTINGS_OFF)),
+            a.settings
+        );
+        assert_eq!(bytes::<1>(&mem, a.settings + u64::from(RECIPES_OFF)), [1]);
+        assert_eq!(
+            bytes::<1>(&mem, a.settings + u64::from(AUTO_COMPLETE_OFF)),
+            [0]
+        );
+        assert_eq!(
+            bytes::<4>(&mem, a.settings + u64::from(ENEMY_DAMAGE_OFF)),
+            ENEMY_DAMAGE_START.to_le_bytes()
+        );
+
+        let flags =
+            |obj: u64| u32::from_le_bytes(bytes(&mem, obj + u64::from(layout.uobject.flags)));
+        assert_ne!(flags(a.cdo_settings) & layout.uobject.cdo_flag, 0);
+        assert_eq!(flags(a.settings) & layout.uobject.cdo_flag, 0);
+        assert_ne!(a.settings, a.cdo_settings);
+    }
+
+    #[test]
+    fn synth_signatures_include_world_cheats() {
+        let (_, defs) = synth_signatures();
+        let ids: Vec<&str> = defs.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(
+            &ids[ids.len() - 2..],
+            ["construir-sem-ingredientes", "dano-recebido"]
+        );
+        let build_def = &defs[defs.len() - 2];
+        assert_eq!(build_def.root, FieldRoot::GameState);
+        assert!(matches!(
+            &build_def.rule,
+            FieldRule::Set { kind: FieldKind::Bool, bools: Some(b), .. } if b == &[false, true]
+        ));
+    }
 }

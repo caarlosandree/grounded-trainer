@@ -134,6 +134,9 @@ impl TestTarget {
                 world: parse_hex(&u["world"]),
                 game_state: parse_hex(&u["game_state"]),
                 party: parse_hex(&u["party"]),
+                mode_manager: parse_hex(&u["mode_manager"]),
+                settings: parse_hex(&u["settings"]),
+                cdo_settings: parse_hex(&u["cdo_settings"]),
             }),
             child,
         }
