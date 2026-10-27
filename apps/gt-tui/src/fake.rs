@@ -125,6 +125,7 @@ pub(crate) fn field(id: &str, avail: Avail) -> CheatInfo {
         avail,
         field: true,
         action: false,
+        label: None,
     }
 }
 
@@ -138,6 +139,7 @@ pub(crate) fn cheat(id: &str, avail: Avail) -> CheatInfo {
         avail,
         field: false,
         action: false,
+        label: None,
     }
 }
 
@@ -787,8 +789,9 @@ impl Session<()> for FakeSession {
             .action_outcomes
             .pop_front()
             .unwrap_or(ActionOutcome::Done {
-                before: 0,
-                after: i32::try_from(k).unwrap_or(i32::MAX),
+                before: 0.0,
+                after: k as f64,
+                note: None,
             });
         if out == ActionOutcome::NeedsController {
             s.action_wants = true;

@@ -109,6 +109,8 @@ pub struct CheatRow {
     pub field: bool,
     /// Ação de uma execução (`rule = "add"`, spec 006 6.6): nunca está ligada nem desejada.
     pub action: bool,
+    /// Texto da quantidade na linha de uma ação, no lugar da formatação da grade (spec 008, 6.8.2).
+    pub label: Option<String>,
     /// Com o cheat ligado, por que ele não escreveu neste ciclo.
     pub note: Option<Note>,
 }
@@ -314,6 +316,7 @@ mod tests {
             desired: false,
             field: false,
             action: false,
+            label: None,
             note: None,
         }
     }

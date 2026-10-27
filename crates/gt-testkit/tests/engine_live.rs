@@ -19,6 +19,7 @@ use gt_core::recovery::recover;
 use gt_core::suspend::{
     Fault, HookPoint, PauseConfig, is_stopped_now, open_checked, pause, sample_pcs, wait_until,
 };
+use gt_core::value::ValueType;
 use gt_testkit::{TargetOpts, TestTarget};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
@@ -1907,6 +1908,117 @@ fn write_data_guard_mismatch_skips() {
         .read_exact(obj.word, &mut back)
         .unwrap();
     assert_eq!(f32::from_le_bytes(back), 7.0);
+}
+
+/// Valor `f64` no endereço.
+fn f64_at(t: &TestTarget, addr: u64) -> f64 {
+    let mut b = [0u8; 8];
+    MemReader::new(t.pid).read_exact(addr, &mut b).unwrap();
+    f64::from_le_bytes(b)
+}
+
+#[test]
+fn write_data_at_least_accepts_exact_and_above() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    let want = 7200.0f64;
+    // Releitura exata: igual ao pedido, que é o mínimo.
+    let read = engine
+        .write_data_at_least(
+            obj.word,
+            &want.to_le_bytes(),
+            &obj.guard,
+            want,
+            ValueType::F64,
+        )
+        .unwrap();
+    assert_eq!(read, want);
+    assert_eq!(f64_at(&t, obj.word), want);
+    // O jogo soma ao relógio entre a escrita e a releitura: acima do mínimo ainda vale.
+    engine.inject_data_fault_for_test(Some(DataFault::ThirdValue(
+        (want + 12.5).to_le_bytes().to_vec(),
+    )));
+    let read = engine
+        .write_data_at_least(
+            obj.word,
+            &want.to_le_bytes(),
+            &obj.guard,
+            want,
+            ValueType::F64,
+        )
+        .unwrap();
+    assert_eq!(read, want + 12.5);
+    // Sem diário: é uma escrita de dados sem desfazer.
+    assert_eq!(env.store.peek().unwrap(), Loaded::Missing);
+}
+
+#[test]
+fn write_data_at_least_below_is_bytes_mismatch() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    let want = 7200.0f64;
+    // O jogo sobrescreveu com um valor menor que o mínimo.
+    engine.inject_data_fault_for_test(Some(DataFault::ThirdValue(
+        (want - 3600.0).to_le_bytes().to_vec(),
+    )));
+    let err = engine
+        .write_data_at_least(
+            obj.word,
+            &want.to_le_bytes(),
+            &obj.guard,
+            want,
+            ValueType::F64,
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::BytesMismatch { .. }), "{err:?}");
+    // Um NaN também não é "maior ou igual".
+    engine.inject_data_fault_for_test(Some(DataFault::ThirdValue(f64::NAN.to_le_bytes().to_vec())));
+    let err = engine
+        .write_data_at_least(
+            obj.word,
+            &want.to_le_bytes(),
+            &obj.guard,
+            want,
+            ValueType::F64,
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::BytesMismatch { .. }), "{err:?}");
+}
+
+#[test]
+fn write_data_at_least_keeps_data_rules() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    // Fora da política de dados.
+    let err = engine
+        .write_data_at_least(t.exec_page, &[0; 8], &[], 0.0, ValueType::F64)
+        .unwrap_err();
+    assert!(matches!(err, Error::DataOutsidePolicy { .. }), "{err:?}");
+    // Guarda diferente: nada é escrito.
+    poke(&t, obj.word, &5f64.to_le_bytes());
+    poke(&t, t.big_region + 3, &[0x00]);
+    let err = engine
+        .write_data_at_least(
+            obj.word,
+            &9f64.to_le_bytes(),
+            &obj.guard,
+            9.0,
+            ValueType::F64,
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::GuardMismatch { .. }), "{err:?}");
+    assert_eq!(f64_at(&t, obj.word), 5.0);
+    // O tamanho dos bytes é o do tipo.
+    let err = engine
+        .write_data_at_least(obj.word, &9f32.to_le_bytes(), &[], 9.0, ValueType::F64)
+        .unwrap_err();
+    assert!(matches!(err, Error::BadPatch { .. }), "{err:?}");
 }
 
 #[test]

@@ -65,8 +65,9 @@
 //! identidade do objeto (bytes de guarda relidos imediatamente antes). [`Engine::write_data`]
 //! não vai ao diário (barras: não há original a restaurar). [`Engine::set_bits`] limpa bits
 //! e grava a entrada no diário **antes** de escrever; [`Engine::set_word`] faz o mesmo com um
-//! valor inteiro (spec 006, 6.4). [`Engine::restore_field`], o `undo_all`, o `Drop` e a
-//! recuperação devolvem os bits da máscara (ou o valor inteiro) ao original ([`decide_data`]).
+//! valor inteiro (spec 006, 6.4). [`Engine::write_data_at_least`] é a escrita de dados cuja
+//! releitura aceita "maior ou igual" (um campo que o jogo continua mexendo; spec 008, 6.8.2).
+//! [`Engine::restore_field`], o `undo_all`, o `Drop` e a recuperação devolvem os bits da máscara (ou o valor inteiro) ao original ([`decide_data`]).
 //! Uma entrada viva por par (`id`, endereço) ([`data_key`]).
 
 use std::ops::Range;
@@ -88,6 +89,7 @@ use crate::procinfo::{Identity, ThreadPos, check_alive, identity};
 use crate::suspend::{
     Fault, HookPoint, PauseConfig, PauseGuard, Thread, is_stopped_now, pause, resume_points,
 };
+use crate::value::ValueType;
 use crate::{Error, Result};
 
 /// Política de escrita calculada a partir do `maps` atual (relido antes de cada lote).
@@ -577,6 +579,23 @@ impl Engine {
         self.finish(result)
     }
 
+    /// Como [`Engine::write_data`], mas a releitura aceita "maior ou igual" (spec 008, 6.8.2): o valor
+    /// relido, decodificado como `ty`, tem de ser `>= min`. Serve a um campo que o próprio jogo continua
+    /// mexendo (o relógio soma a cada quadro), onde a releitura nunca é exata. Devolve o valor relido;
+    /// um valor `< min` (ou ilegível como `ty`) é [`Error::BytesMismatch`]. `bytes` tem o tamanho de `ty`.
+    pub fn write_data_at_least(
+        &mut self,
+        addr: u64,
+        bytes: &[u8],
+        guard: &[GuardBytes],
+        min: f64,
+        ty: ValueType,
+    ) -> Result<f64> {
+        self.retry_resume()?;
+        let result = self.write_data_at_least_inner(addr, bytes, guard, min, ty);
+        self.finish(result)
+    }
+
     /// Limpa os bits `mask` do byte em `addr` e registra o original no diário antes de
     /// escrever. Com a entrada (`id`, `addr`) já viva, é a manutenção: se algum bit da máscara
     /// voltou a ligar, limpa de novo (o original continua o do primeiro registro). Bits já
@@ -1004,6 +1023,64 @@ impl Engine {
             });
         }
         self.write_data_verified("dados", addr, bytes)
+    }
+
+    fn write_data_at_least_inner(
+        &mut self,
+        addr: u64,
+        bytes: &[u8],
+        guard: &[GuardBytes],
+        min: f64,
+        ty: ValueType,
+    ) -> Result<f64> {
+        if bytes.len() != ty.size() {
+            return Err(Error::BadPatch {
+                id: "dados".to_owned(),
+                reason: format!(
+                    "escrita de {} bytes para um valor de {} bytes",
+                    bytes.len(),
+                    ty.size()
+                ),
+            });
+        }
+        self.check_data_write(addr, bytes.len(), guard)?;
+        // O jogo escreve entre a nossa escrita e a releitura (só para testes).
+        let written = match self.data_fault.clone() {
+            Some(DataFault::ThirdValue(third)) => {
+                self.data_fault = None;
+                third
+            }
+            _ => bytes.to_vec(),
+        };
+        let result = self.write_data_at_least_verified(addr, &written, min, ty);
+        if result.is_err() {
+            self.data_maps = None;
+        }
+        result
+    }
+
+    /// Escreve `bytes`, relê e aceita se o valor relido é `>= min`.
+    fn write_data_at_least_verified(
+        &self,
+        addr: u64,
+        bytes: &[u8],
+        min: f64,
+        ty: ValueType,
+    ) -> Result<f64> {
+        self.writer.write(addr, bytes).map_err(|e| match e {
+            Error::PermissionDenied { .. } | Error::Unmapped { .. } => Error::WriteRefused { addr },
+            e => e,
+        })?;
+        let mut back = vec![0u8; ty.size()];
+        self.writer.read_exact(addr, &mut back)?;
+        match decode_le(ty, &back) {
+            Some(v) if v >= min => Ok(v),
+            _ => Err(Error::BytesMismatch {
+                id: "dados".to_owned(),
+                expected: format!(">= {min}"),
+                found: hex(&back),
+            }),
+        }
     }
 
     /// Entrada viva do par (`id`, `addr`).
@@ -2320,6 +2397,16 @@ fn hex(bytes: &[u8]) -> String {
         .map(|b| format!("{b:02X}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Os bytes (little-endian) como número do tipo `ty`; `None` se o tamanho não é o do tipo.
+fn decode_le(ty: ValueType, bytes: &[u8]) -> Option<f64> {
+    Some(match ty {
+        ValueType::I32 => f64::from(i32::from_le_bytes(bytes.try_into().ok()?)),
+        ValueType::U32 => f64::from(u32::from_le_bytes(bytes.try_into().ok()?)),
+        ValueType::F32 => f64::from(f32::from_le_bytes(bytes.try_into().ok()?)),
+        ValueType::F64 => f64::from_le_bytes(bytes.try_into().ok()?),
+    })
 }
 
 #[cfg(test)]

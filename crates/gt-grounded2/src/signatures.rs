@@ -202,6 +202,8 @@ pub enum FieldKind {
     Int,
     /// `BoolProperty` de byte inteiro (1 byte, `0` ou `1`; spec 007, 6.4).
     Bool,
+    /// `DoubleProperty` (8 bytes). Só no `add` (spec 008, 6.8.2); o `set` não o aceita.
+    Double,
 }
 
 impl FieldKind {
@@ -210,6 +212,7 @@ impl FieldKind {
         match self {
             FieldKind::Bool => 1,
             FieldKind::Int | FieldKind::Float => 4,
+            FieldKind::Double => 8,
         }
     }
 }
@@ -247,8 +250,13 @@ pub enum FieldRule {
         target: Option<f64>,
         bools: Option<Vec<bool>>,
     },
-    /// Soma a quantidade da grade a um campo `int`, sem diário nem desfazer (spec 006, 6.6).
-    Add { field: String, result_max: i64 },
+    /// Soma a quantidade da grade a um campo `int` (ou `double`, se a grade é `f64`), sem diário nem
+    /// desfazer (spec 006, 6.6, e 008, 6.8.2). Com `at_least` a releitura aceita "maior ou igual".
+    Add {
+        field: String,
+        result_max: i64,
+        at_least: bool,
+    },
 }
 
 /// Cheat de valor (`[[field]]`), já validado pela regra de carga.
@@ -268,6 +276,12 @@ pub struct FieldDef {
     pub rule: FieldRule,
     /// Grade do valor ajustável (`[field.value]`), sem `slot`.
     pub value: Option<ValueGrid>,
+    /// Classe dona do primeiro salto da raiz `game_state` (`Pacote.Nome`, subclasse da
+    /// `game_state_class`): o campo do primeiro salto mora nela e o `GameState` vivo tem de ser dela
+    /// (ou de uma filha) (spec 008, 6.8). `None`: a `game_state_class` do `[ue.player]`.
+    pub owner_class: Option<String>,
+    /// Texto da quantidade na linha da TUI, no lugar da formatação da grade (`[field.value] label`).
+    pub label: Option<String>,
 }
 
 /// Corpo da cave de um `[[hook]]` (spec 008, 6.7 e 12). O código de cada corpo mora em Rust; o TOML só nomeia.
@@ -519,6 +533,10 @@ struct GenericField {
     value: Option<ValueBlock>,
     result_max: Option<toml::Value>,
     bools: Option<Vec<bool>>,
+    /// Classe dona do primeiro salto da raiz `game_state` (spec 008, 6.8).
+    owner_class: Option<String>,
+    /// Releitura "maior ou igual" no `add` (spec 008, 6.8.2).
+    at_least: Option<bool>,
 }
 
 /// Bloco `[[hook]]` (spec 008, 12). Sem `expected`: a instrução é decodificada na ocorrência.
@@ -571,8 +589,10 @@ struct ValueBlock {
     default: Option<toml::Value>,
     unit: Option<toml::Value>,
     decimals: Option<toml::Value>,
-    /// Lista de pontos no lugar de `min`/`max`/`step` (spec 008, 6.9); por ora só nos `[[hook]]`.
+    /// Lista de pontos no lugar de `min`/`max`/`step` (spec 008, 6.9); nos `[[hook]]` e nos `[[field]]`.
     points: Option<toml::Value>,
+    /// Texto da quantidade na linha da TUI; só no `[field.value]`.
+    label: Option<toml::Value>,
 }
 
 #[derive(Deserialize)]
@@ -654,7 +674,7 @@ fn parse_hex(file: &str, field: &str, text: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Número do bloco `value`: inteiro TOML sempre vale; decimal só para `f32`.
+/// Número do bloco `value`: inteiro TOML sempre vale; decimal só para `f32` e `f64`.
 fn value_number(file: &str, field: &str, v: Option<&toml::Value>, ty: ValueType) -> Result<f64> {
     let Some(v) = v else {
         return Err(sig_err(file, field, "campo obrigatório ausente"));
@@ -662,7 +682,7 @@ fn value_number(file: &str, field: &str, v: Option<&toml::Value>, ty: ValueType)
     match v {
         // Inteiros fora da faixa exata do `f64` acabam recusados pelas conferências de faixa.
         toml::Value::Integer(i) => Ok(*i as f64),
-        toml::Value::Float(f) if ty == ValueType::F32 => Ok(*f),
+        toml::Value::Float(f) if matches!(ty, ValueType::F32 | ValueType::F64) => Ok(*f),
         toml::Value::Float(f) => Err(sig_err(
             file,
             field,
@@ -686,7 +706,7 @@ fn decimals_for(step: f64) -> u8 {
         .unwrap_or(6)
 }
 
-/// `type` do bloco de valor (`i32`, `u32` ou `f32`).
+/// `type` do bloco de valor (`i32`, `u32`, `f32` ou `f64`; o `f64` só vale no `add` de `double`).
 fn value_type(file: &str, block: &ValueBlock) -> Result<ValueType> {
     match block.ty.as_ref() {
         None => Err(sig_err(file, "value.type", "campo obrigatório ausente")),
@@ -694,10 +714,11 @@ fn value_type(file: &str, block: &ValueBlock) -> Result<ValueType> {
             "i32" => Ok(ValueType::I32),
             "u32" => Ok(ValueType::U32),
             "f32" => Ok(ValueType::F32),
+            "f64" => Ok(ValueType::F64),
             other => Err(sig_err(
                 file,
                 "value.type",
-                format!("`{other}` não é i32, u32 nem f32"),
+                format!("`{other}` não é i32, u32, f32 nem f64"),
             )),
         },
         Some(_) => Err(sig_err(file, "value.type", "esperava um texto")),
@@ -710,7 +731,7 @@ fn build_grid(file: &str, block: &ValueBlock, ty: ValueType) -> Result<ValueGrid
         return Err(sig_err(
             file,
             "value.points",
-            "a lista de pontos só vale no valor de um [[hook]]",
+            "a lista de pontos só vale no valor de um [[hook]] ou [[field]]",
         ));
     }
     let min = value_number(file, "value.min", block.min.as_ref(), ty)?;
@@ -872,6 +893,13 @@ fn build_points_grid(file: &str, id: &str, block: &ValueBlock) -> Result<ValueGr
 
 /// Converte o bloco `value` no `ValueSpec` e confere as regras de carga do valor (6.3).
 fn build_value(file: &str, block: &ValueBlock, replacement: &[u8]) -> Result<ValueSpec> {
+    if block.label.is_some() {
+        return Err(sig_err(
+            file,
+            "value.label",
+            "o label só vale no [field.value]",
+        ));
+    }
     let ty = value_type(file, block)?;
     let slot = match block.slot.as_ref() {
         None => return Err(sig_err(file, "value.slot", "campo obrigatório ausente")),
@@ -1063,7 +1091,17 @@ fn build_hook(file: &str, raw: GenericHook) -> Result<HookDef> {
         }
         (None, CaveBody::Analyzer) => None,
         (None, _) => return Err(err("value", "campo obrigatório ausente")),
-        (Some(block), _) => Some(build_points_grid(file, id, block)?),
+        (Some(block), _) => {
+            reject_label(file, id, block)?;
+            let grid = build_points_grid(file, id, block)?;
+            if grid.ty == ValueType::F64 {
+                return Err(err(
+                    "value.type",
+                    "f64 só vale no add de double de um [[field]]",
+                ));
+            }
+            Some(grid)
+        }
     };
     let object_class = match (raw.object_class, body) {
         (Some(_), CaveBody::Brain) => {
@@ -1515,7 +1553,36 @@ fn build_field_grid(
             format!("`{id}`: o tipo do valor precisa casar com o kind do campo"),
         ));
     }
+    if block.points.is_some() {
+        return build_points_grid(file, id, block);
+    }
     build_grid(file, block, ty)
+}
+
+/// `label` do bloco de valor de um `[[field]]`: texto não vazio.
+fn field_label(file: &str, id: &str, block: &ValueBlock) -> Result<Option<String>> {
+    match block.label.as_ref() {
+        None => Ok(None),
+        Some(toml::Value::String(t)) if !t.trim().is_empty() => Ok(Some(t.clone())),
+        Some(toml::Value::String(_)) => Err(sig_err(file, "value.label", format!("`{id}`: vazio"))),
+        Some(_) => Err(sig_err(
+            file,
+            "value.label",
+            format!("`{id}`: esperava um texto"),
+        )),
+    }
+}
+
+/// O `label` só vale no `[field.value]`: o `[hook.value]` o recusa.
+fn reject_label(file: &str, id: &str, block: &ValueBlock) -> Result<()> {
+    if block.label.is_some() {
+        return Err(sig_err(
+            file,
+            "value.label",
+            format!("`{id}`: o label só vale no [field.value]"),
+        ));
+    }
+    Ok(())
 }
 
 /// Número do `[[field]]` para `set` (`target`, `min`, `max`): inteiro de 32 bits para `int`, finito
@@ -1557,6 +1624,8 @@ fn field_number64(
         }
         // O `bool` não tem número: `build_field` recusa `target`, `min` e `max` antes de chegar aqui.
         FieldKind::Bool => return Err(err("kind = \"bool\" não tem número".into())),
+        // O `double` só existe no `add`, que não usa `target`, `min` nem `max`.
+        FieldKind::Double => return Err(err("kind = \"double\" só vale no add".into())),
     }
     Ok(n)
 }
@@ -1723,6 +1792,9 @@ fn build_field(file: &str, raw: GenericField) -> Result<FieldDef> {
                 Some("float") => FieldKind::Float,
                 Some("int") => FieldKind::Int,
                 Some("bool") => FieldKind::Bool,
+                Some("double") => {
+                    return Err(err("kind", "double só vale com rule = \"add\""));
+                }
                 Some(other) => {
                     return Err(err(
                         "kind",
@@ -1773,6 +1845,7 @@ fn build_field(file: &str, raw: GenericField) -> Result<FieldDef> {
                     let expected = match kind {
                         FieldKind::Int => ValueType::I32,
                         FieldKind::Float | FieldKind::Bool => ValueType::F32,
+                        FieldKind::Double => ValueType::F64,
                     };
                     value = Some(build_field_grid(file, id, block, expected)?);
                     None
@@ -1827,17 +1900,22 @@ fn build_field(file: &str, raw: GenericField) -> Result<FieldDef> {
                 Some(f) if f.trim().is_empty() => return Err(err("field", "vazio")),
                 Some(f) => f.to_string(),
             };
-            match raw.kind.as_deref() {
+            // O tipo da grade (`i32` ou `f64`) é o que leva o `kind` adiante.
+            let expected = match raw.kind.as_deref() {
                 None => return Err(err("kind", "campo obrigatório ausente")),
-                Some("int") => {}
+                Some("int") => ValueType::I32,
+                Some("double") => ValueType::F64,
                 Some(other) => {
-                    return Err(err("kind", &format!("`{other}` não é int (ação)")));
+                    return Err(err(
+                        "kind",
+                        &format!("`{other}` não é int nem double (ação)"),
+                    ));
                 }
-            }
+            };
             let Some(block) = raw.value.as_ref() else {
                 return Err(err("value", "campo obrigatório ausente"));
             };
-            let grid = build_field_grid(file, id, block, ValueType::I32)?;
+            let grid = build_field_grid(file, id, block, expected)?;
             if grid.min <= 0.0 {
                 return Err(sig_err(
                     file,
@@ -1860,7 +1938,11 @@ fn build_field(file: &str, raw: GenericField) -> Result<FieldDef> {
                 ));
             }
             value = Some(grid);
-            FieldRule::Add { field, result_max }
+            FieldRule::Add {
+                field,
+                result_max,
+                at_least: raw.at_least.unwrap_or(false),
+            }
         }
         Some(other) => {
             return Err(err(
@@ -1870,6 +1952,19 @@ fn build_field(file: &str, raw: GenericField) -> Result<FieldDef> {
         }
     };
 
+    if raw.at_least.is_some() && !matches!(rule, FieldRule::Add { .. }) {
+        return Err(err("at_least", "só vale com rule = \"add\""));
+    }
+    if let Some(owner) = &raw.owner_class {
+        if root != FieldRoot::GameState {
+            return Err(err("owner_class", "só vale com root = \"game_state\""));
+        }
+        check_class_path(file, "owner_class", owner)?;
+    }
+    let label = match raw.value.as_ref() {
+        Some(block) => field_label(file, id, block)?,
+        None => None,
+    };
     if root == FieldRoot::GameState {
         if !matches!(rule, FieldRule::Add { .. } | FieldRule::Set { .. }) {
             return Err(err(
@@ -1894,6 +1989,8 @@ fn build_field(file: &str, raw: GenericField) -> Result<FieldDef> {
         root,
         rule,
         value,
+        owner_class: raw.owner_class,
+        label,
     })
 }
 
@@ -2443,8 +2540,9 @@ offset = 3
                 "pet-stamina-infinita",
             ]
         );
-        // Os dois cheats do mundo (spec 007) vêm depois, conferidos em `real_generic_has_world_cheats`.
-        assert_eq!(ids.len(), 19);
+        // Os dois cheats do mundo (spec 007) e o `pular-hora` (spec 008) vêm depois, conferidos em
+        // `real_generic_has_world_cheats` e `real_generic_has_pular_hora`.
+        assert_eq!(ids.len(), 20);
         let category = |id: &str| {
             if id.starts_with("pet-") {
                 Category::Pet
@@ -3274,6 +3372,8 @@ kind = "bool"
                 object: "StaminaComponent".into(),
                 object_class: "/Script/Maine.StaminaComponent".into(),
                 root: FieldRoot::Pawn,
+                owner_class: None,
+                label: None,
                 value: None,
                 rule: FieldRule::Lock {
                     field: "CurrentStamina".into(),
@@ -3980,7 +4080,8 @@ bools = [false, true]
             def.rule,
             FieldRule::Add {
                 field: "ScienceFound".into(),
-                result_max: 100_000
+                result_max: 100_000,
+                at_least: false,
             }
         );
         let grid = def.value.unwrap();
@@ -4066,6 +4167,164 @@ bools = [false, true]
         for (what, text, field) in cases {
             assert_eq!(bad(text), field, "caso: {what}");
         }
+    }
+
+    /// O `pular-hora` da spec 008, 6.8.2, no mesmo formato do `generic.toml`.
+    const ADD_DOUBLE: &str = r#"
+[[field]]
+id = "pular-hora"
+name = "Pular 1 hora"
+category = "progressao"
+description = "Avança o relógio"
+object = "CalendarComponent"
+object_class = "/Script/Maine.CalendarComponent"
+root = "game_state"
+owner_class = "/Script/Maine.SurvivalGameState"
+rule = "add"
+field = "CurrentTime"
+kind = "double"
+at_least = true
+result_max = 1000000000
+
+[field.value]
+type = "f64"
+points = [3600.0]
+default = 3600.0
+label = "+1h"
+"#;
+
+    #[test]
+    fn add_double_loads_with_points_label_and_owner() {
+        let def = only_field_in(&with_ue(ADD_DOUBLE, true));
+        assert_eq!(
+            def.rule,
+            FieldRule::Add {
+                field: "CurrentTime".into(),
+                result_max: 1_000_000_000,
+                at_least: true,
+            }
+        );
+        assert_eq!(
+            def.owner_class.as_deref(),
+            Some("/Script/Maine.SurvivalGameState")
+        );
+        assert_eq!(def.label.as_deref(), Some("+1h"));
+        let grid = def.value.unwrap();
+        assert_eq!(grid.ty, ValueType::F64);
+        assert_eq!(grid.points.as_deref(), Some(&[3600.0][..]));
+        // Um ponto só: sem passos, e o valor é o próprio ponto.
+        assert_eq!((grid.steps(), grid.value(0)), (0, 3600.0));
+        // Sem `at_least`, `owner_class` nem `label`, o resto continua valendo.
+        let plain = ADD_DOUBLE
+            .replace("at_least = true\n", "")
+            .replace("owner_class = \"/Script/Maine.SurvivalGameState\"\n", "")
+            .replace("label = \"+1h\"\n", "");
+        let def = only_field_in(&with_ue(&plain, true));
+        assert_eq!(def.owner_class, None);
+        assert_eq!(def.label, None);
+        assert!(matches!(
+            def.rule,
+            FieldRule::Add {
+                at_least: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn add_double_rules() {
+        let bad = |text: String| field_err(&with_ue(&text, true));
+        let cases: Vec<(&str, String, &str)> = vec![
+            (
+                "value i32 com kind double",
+                ADD_DOUBLE.replace("type = \"f64\"", "type = \"i32\""),
+                "value.type",
+            ),
+            (
+                "value f64 com kind int",
+                ADD_DOUBLE.replace("kind = \"double\"", "kind = \"int\""),
+                "value.type",
+            ),
+            (
+                "kind float continua recusado",
+                ADD_DOUBLE.replace("kind = \"double\"", "kind = \"float\""),
+                "kind",
+            ),
+            (
+                "ponto não positivo",
+                ADD_DOUBLE
+                    .replace("points = [3600.0]", "points = [0.0]")
+                    .replace("default = 3600.0", "default = 0.0"),
+                "value.min",
+            ),
+            (
+                "default fora dos pontos",
+                ADD_DOUBLE.replace("default = 3600.0", "default = 7200.0"),
+                "value.default",
+            ),
+            (
+                "result_max abaixo do ponto",
+                ADD_DOUBLE.replace("result_max = 1000000000", "result_max = 3600"),
+                "result_max",
+            ),
+            (
+                "points junto de min",
+                ADD_DOUBLE.replace("points = [3600.0]", "points = [3600.0]\nmin = 1"),
+                "value.min",
+            ),
+            (
+                "label vazio",
+                ADD_DOUBLE.replace("label = \"+1h\"", "label = \" \""),
+                "value.label",
+            ),
+            (
+                "label não é texto",
+                ADD_DOUBLE.replace("label = \"+1h\"", "label = 1"),
+                "value.label",
+            ),
+            (
+                "owner_class malformada",
+                ADD_DOUBLE.replace("/Script/Maine.SurvivalGameState", "SurvivalGameState"),
+                "owner_class",
+            ),
+            (
+                "owner_class fora do game_state",
+                ADD_DOUBLE.replace("root = \"game_state\"\n", ""),
+                "owner_class",
+            ),
+        ];
+        for (what, text, field) in cases {
+            assert_eq!(bad(text), field, "caso: {what}");
+        }
+        // `at_least` só vale no `add`.
+        let set = SET_VALUE.replace("kind = \"int\"\n", "kind = \"int\"\nat_least = true\n");
+        assert_eq!(field_err(&set), "at_least");
+        // O `set` não aceita `double`.
+        let set_double = SET_VALUE.replace("kind = \"int\"", "kind = \"double\"");
+        assert_eq!(field_err(&set_double), "kind");
+    }
+
+    #[test]
+    fn f64_and_label_only_in_field_values() {
+        // O `f64` e o `label` não valem no `[hook.value]` nem no `slot` de um patch.
+        let hook = |value: &str| {
+            format!(
+                "{GENERIC}{UE_PATTERNS}{UE_LAYOUT}{UE_PLAYER_GAME_STATE}\n[[hook]]\nid = \"h\"\nname = \"H\"\n\
+                 category = \"progressao\"\ndescription = \"d\"\npattern = \"48 8b 05 ?? ?? ?? ??\"\n\
+                 offset = 0\nbody = \"brain\"\n[hook.value]\n{value}"
+            )
+        };
+        let err = |text: String| match parse(&[("generic.toml", &text)]) {
+            Err(e) => e.to_string(),
+            Ok(_) => "carregou".to_string(),
+        };
+        let ok = "type = \"i32\"\npoints = [2, 3]\ndefault = 2\n";
+        let e = err(hook(ok));
+        assert_eq!(e, "carregou");
+        let e = err(hook(&format!("{ok}label = \"x\"\n")));
+        assert!(e.contains("value.label"), "{e}");
+        let e = err(hook("type = \"f64\"\npoints = [2.0, 3.0]\ndefault = 2.0\n"));
+        assert!(e.contains("value.type"), "{e}");
     }
 
     /// Como `only_field`, para um texto que já traz o `[ue]`.
@@ -4302,6 +4561,7 @@ bools = [false, true]
                 FieldRule::Add {
                     field: class("ScienceFound"),
                     result_max: 100_000,
+                    at_least: false,
                 },
             ),
             (
@@ -4379,7 +4639,7 @@ bools = [false, true]
     fn real_generic_has_world_cheats() {
         let sigs = Signatures::embedded().unwrap();
         let fields = sigs.fields();
-        assert_eq!(fields.len(), 19);
+        assert_eq!(fields.len(), 20);
         let object = "SurvivalModeManagerComponent.GameModeSettings";
         let class = "/Script/Maine.SurvivalGameModeSettings";
 
@@ -4428,6 +4688,36 @@ bools = [false, true]
         assert!((grid.value(grid.default_k) - 0.25).abs() < 1e-9);
         assert_eq!(grid.unit.as_deref(), Some("x"));
         assert_eq!(grid.decimals, 2);
+    }
+
+    #[test]
+    fn real_generic_has_pular_hora() {
+        let sigs = Signatures::embedded().unwrap();
+        let def = &sigs.fields()[19];
+        assert_eq!(def.id, "pular-hora");
+        assert_eq!(def.category, Category::Progressao);
+        assert_eq!(def.root, FieldRoot::GameState);
+        assert_eq!(
+            (def.object.as_str(), def.object_class.as_str()),
+            ("CalendarComponent", "/Script/Maine.CalendarComponent")
+        );
+        assert_eq!(
+            def.owner_class.as_deref(),
+            Some("/Script/Maine.SurvivalGameState")
+        );
+        assert_eq!(
+            def.rule,
+            FieldRule::Add {
+                field: "CurrentTime".into(),
+                result_max: 1_000_000_000,
+                at_least: true,
+            }
+        );
+        assert_eq!(def.label.as_deref(), Some("+1h"));
+        let grid = def.value.as_ref().unwrap();
+        assert_eq!(grid.ty, ValueType::F64);
+        assert_eq!(grid.points.as_deref(), Some(&[3600.0][..]));
+        assert_eq!((grid.steps(), grid.value(grid.default_k)), (0, 3600.0));
     }
 
     // ---- [[hook]] (spec 008, 6.2 e 12) ----

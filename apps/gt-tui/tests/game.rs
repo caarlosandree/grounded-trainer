@@ -77,7 +77,7 @@ use std::time::{Duration, Instant};
 use gt_core::journal::Loaded;
 use gt_tui::backend::{JobKind, ReflectionJob};
 
-const FIELDS: [&str; 19] = [
+const FIELDS: [&str; 20] = [
     "vida-infinita",
     "stamina-infinita",
     "comida-infinita",
@@ -97,6 +97,7 @@ const FIELDS: [&str; 19] = [
     "gravidade",
     "construir-sem-ingredientes",
     "dano-recebido",
+    "pular-hora",
 ];
 
 /// Roda um trabalho da tarefa de reflexão nesta thread e junta o resultado na sessão.

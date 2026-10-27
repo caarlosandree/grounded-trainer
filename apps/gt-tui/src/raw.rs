@@ -191,6 +191,7 @@ fn raw_search(
             avail: avail_of(def, pid)?,
             field: false,
             action: false,
+            label: None,
         });
     }
     if let Some(ue) = &ue {

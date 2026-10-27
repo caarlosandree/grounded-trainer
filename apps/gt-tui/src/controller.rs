@@ -147,6 +147,7 @@ fn row_of(c: CheatInfo) -> CheatRow {
         desired: false,
         field: c.field,
         action: c.action,
+        label: c.label,
         note: None,
     }
 }
@@ -1102,11 +1103,12 @@ impl<B: Backend> Controller<B> {
 
 // ---- teclas, operações e religação ----
 
-/// Formata o inteiro `v` do jogo como a grade formata os valores (unidade incluída).
-fn fmt_int(grid: &gt_core::value::ValueGrid, v: i32) -> String {
+/// Formata o número `v` do jogo (um `int` ou um `double`) como a grade formata os valores (unidade
+/// incluída).
+fn fmt_num(grid: &gt_core::value::ValueGrid, v: f64) -> String {
     let point = gt_core::value::ValueGrid {
-        min: f64::from(v),
-        max: f64::from(v),
+        min: v,
+        max: v,
         step: 1.0,
         default_k: 0,
         // Sem a lista, `format(0)` mostraria `points[0]` em vez de `v`.
@@ -1414,14 +1416,19 @@ impl<B: Backend> Controller<B> {
             return false;
         };
         let spec = row.value.clone();
-        let show = |v: i32| {
+        let show = |v: f64| {
             spec.as_ref()
-                .map_or_else(|| v.to_string(), |g| fmt_int(g, v))
+                .map_or_else(|| format!("{v:.0}"), |g| fmt_num(g, v))
         };
         match outcome {
-            ActionOutcome::Done { before, after } => {
+            ActionOutcome::Done {
+                before,
+                after,
+                note,
+            } => {
                 self.action_wrote(id, now);
-                self.event(format!("{name}: {} → {}", show(before), show(after)));
+                let note = note.map(|n| format!(" {n}")).unwrap_or_default();
+                self.event(format!("{name}: {} → {}{note}", show(before), show(after)));
                 true
             }
             ActionOutcome::Raced { read } => {
@@ -2112,7 +2119,7 @@ mod tests {
     }
 
     #[test]
-    fn fmt_int_ignores_points_of_the_grid() {
+    fn fmt_num_ignores_points_of_the_grid() {
         let g = ValueGrid {
             ty: ValueType::I32,
             min: 2.0,
@@ -2123,7 +2130,16 @@ mod tests {
             decimals: 0,
             points: Some(vec![2.0, 3.0, 5.0, 10.0]),
         };
-        assert_eq!(fmt_int(&g, 7), "7x");
+        assert_eq!(fmt_num(&g, 7.0), "7x");
+        // Um `double` sem casas decimais mostra o valor inteiro, sem unidade se a grade não tem.
+        let clock = ValueGrid {
+            ty: ValueType::F64,
+            unit: None,
+            decimals: 0,
+            points: Some(vec![3600.0]),
+            ..g
+        };
+        assert_eq!(fmt_num(&clock, 123_456.5), "123456");
     }
 
     fn grid() -> ValueGrid {
@@ -4828,7 +4844,11 @@ mod tests {
     }
 
     fn done(before: i32, after: i32) -> ActionOutcome {
-        ActionOutcome::Done { before, after }
+        ActionOutcome::Done {
+            before: f64::from(before),
+            after: f64::from(after),
+            note: None,
+        }
     }
 
     fn press(h: &mut H, ms: u64) -> bool {
@@ -4846,7 +4866,7 @@ mod tests {
         assert!(!h.row("ciencia").on);
         assert!(h.c.desired().is_empty());
         // Uma corrida na releitura também escreveu: conta e abre a janela.
-        h.ctl.push_action(ActionOutcome::Raced { read: 123 });
+        h.ctl.push_action(ActionOutcome::Raced { read: 123.0 });
         assert!(press(&mut h, 1_200));
         assert_eq!(
             event_count(
@@ -4857,6 +4877,86 @@ mod tests {
         );
         assert!(!press(&mut h, 1_300));
         assert_eq!(h.ctl.actions(), 2);
+    }
+
+    /// A ação `hora` (`double`, uma hora por vez): grade de um ponto só, com `label`.
+    fn clock_action() -> H {
+        let mut c = field("hora", available());
+        c.name = "Pular 1 hora".to_string();
+        c.action = true;
+        c.label = Some("+1h".to_string());
+        c.value = Some(ValueGrid {
+            ty: ValueType::F64,
+            min: 3600.0,
+            max: 3600.0,
+            step: 0.0,
+            default_k: 0,
+            unit: None,
+            decimals: 0,
+            points: Some(vec![3600.0]),
+        });
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![c]);
+        h.ctl.set_field_avail(&[("hora", available())]);
+        h.connect(0);
+        h
+    }
+
+    #[test]
+    fn clock_action_logs_numbers_and_the_note() {
+        let mut h = clock_action();
+        // A linha mostra o `label` e a ação pede `k = 0` (o único ponto).
+        assert_eq!(h.row("hora").label.as_deref(), Some("+1h"));
+        h.ctl.push_action(ActionOutcome::Done {
+            before: 1000.25,
+            after: 4600.25,
+            note: None,
+        });
+        assert!(h.toggle("hora", 100));
+        assert_eq!(event_count(&h, "Pular 1 hora: 1000 → 4600"), 1);
+        assert!(!h.row("hora").on);
+        // Uma releitura bem acima do esperado vale, com o aviso no registro.
+        h.ctl.push_action(ActionOutcome::Done {
+            before: 5000.0,
+            after: 9100.0,
+            note: Some("(o relógio andou mais que o esperado)".to_string()),
+        });
+        assert!(h.toggle("hora", 1_300));
+        assert_eq!(
+            event_count(
+                &h,
+                "Pular 1 hora: 5000 → 9100 (o relógio andou mais que o esperado)"
+            ),
+            1
+        );
+        assert_eq!(h.ctl.actions(), 2);
+    }
+
+    #[test]
+    fn clock_action_not_taken_asks_to_press_again() {
+        let mut h = clock_action();
+        h.ctl.push_action(ActionOutcome::RefusedAfterRead(
+            "não pegou, aperte de novo".to_string(),
+        ));
+        // Leu o jogo (operação), mas não escreveu de forma que valha: sem janela e sem repetir sozinho.
+        assert!(h.toggle("hora", 100));
+        assert_eq!(
+            event_count(&h, "Pular 1 hora: não pegou, aperte de novo"),
+            1
+        );
+        assert_eq!(h.ctl.actions(), 1);
+        // O dono aperta de novo logo em seguida: executa, a recusa não abriu a janela de 1 s.
+        h.ctl.push_action(ActionOutcome::Done {
+            before: 0.0,
+            after: 3600.0,
+            note: None,
+        });
+        assert!(h.toggle("hora", 150));
+        assert_eq!(h.ctl.actions(), 2);
+        assert_eq!(event_count(&h, "Pular 1 hora: 0 → 3600"), 1);
+        // As setas não fazem nada numa grade de um ponto só.
+        assert!(!h.key(Action::Inc, 5_000));
+        assert_eq!(h.row("hora").k, 0);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use gt_core::journal::GuardBytes;
 use gt_core::mem::ReadMem;
-use gt_core::value::ValueGrid;
+use gt_core::value::{ValueGrid, ValueType};
 use gt_ue::read::{read_u8, read_u32, read_u64, read_vec};
 use gt_ue::{Field, ObjectArray, ReflectionIndex, ScanBudget, UeError, UeLayout, is_object_family};
 use serde::Serialize;
@@ -25,6 +25,8 @@ const PAWN_NULL_RESEARCH: Duration = Duration::from_secs(30);
 const PAWN_OBJECT: &str = "pawn";
 /// Motivo de um campo com tipo, tamanho ou máscara inesperados.
 const INCOHERENT: &str = "reflexão incoerente";
+/// Nome do salto que falha quando o `GameState` vivo não é da classe dona do cheat (spec 008, 6.8).
+const OWNER_HOP: &str = "GameState";
 /// Campos do controller mostrados pelo `gt ue player`.
 const REPORT_POINTERS: [&str; 3] = ["Pawn", "Character", "AcknowledgedPawn"];
 
@@ -57,8 +59,13 @@ pub enum ResolvedRule {
         /// Valor de cada campo, só no `kind = "bool"` (spec 007, 6.4).
         bools: Option<Vec<bool>>,
     },
-    /// Soma a um campo `int`, sem diário (spec 006, 6.6).
-    Add { field: Field, result_max: i64 },
+    /// Soma a um campo `int` ou `double` (o tamanho do campo diz qual), sem diário (spec 006, 6.6, e
+    /// 008, 6.8.2). Com `at_least` a releitura aceita "maior ou igual".
+    Add {
+        field: Field,
+        result_max: i64,
+        at_least: bool,
+    },
 }
 
 /// Um salto do caminho até o objeto de um cheat: o campo de objeto e a classe esperada do
@@ -80,6 +87,9 @@ pub struct ResolvedField {
     pub object_path: Vec<ObjectHop>,
     /// Classe esperada do objeto final, conferida com `is_a` a cada leitura.
     pub object_class: u64,
+    /// Classe dona do primeiro salto (raiz `game_state`, spec 008, 6.8): o `GameState` vivo tem de ser
+    /// dela ou de uma filha, conferido a cada leitura antes de ler o campo do primeiro salto.
+    pub owner_class: Option<u64>,
     pub rule: ResolvedRule,
 }
 
@@ -186,13 +196,14 @@ impl FieldCatalog {
             .map(|def| {
                 let base = match (&path, def.root) {
                     (Err(reason), _) => Err(reason.clone()),
-                    (Ok(_), FieldRoot::Pawn) => pawn_class.clone(),
+                    (Ok(_), FieldRoot::Pawn) => pawn_class.clone().map(|class| (class, None)),
                     (Ok(_), FieldRoot::GameState) => game_state
                         .as_ref()
-                        .map(|g| g.game_state_class)
-                        .map_err(Clone::clone),
+                        .map_err(Clone::clone)
+                        .and_then(|g| resolve_owner(index, mem, g.game_state_class, def)),
                 };
-                let resolved = base.and_then(|class| resolve_field(index, mem, class, def));
+                let resolved =
+                    base.and_then(|(class, owner)| resolve_field(index, mem, class, owner, def));
                 if let Err(reason) = &resolved {
                     tracing::debug!(id = %def.id, "cheat de valor indisponível: {reason}");
                 }
@@ -394,6 +405,32 @@ fn int_field<M: ReadMem + ?Sized>(
     }
 }
 
+/// Campo `double` (`DoubleProperty`) de 8 bytes.
+fn double_field<M: ReadMem + ?Sized>(
+    index: &ReflectionIndex,
+    mem: &M,
+    class: u64,
+    name: &str,
+) -> Result<Field, String> {
+    let field = index.find_field_path(mem, class, name).map_err(|e| {
+        tracing::debug!("campo {name}: {e}");
+        match e {
+            UeError::NotFound(_) => format!("campo {name} não encontrado"),
+            _ => INCOHERENT.to_string(),
+        }
+    })?;
+    if field.kind == "DoubleProperty" && field.size == 8 {
+        Ok(field)
+    } else {
+        tracing::debug!(
+            "campo {name} é {} de {} bytes, esperado double",
+            field.kind,
+            field.size
+        );
+        Err(INCOHERENT.to_string())
+    }
+}
+
 /// Campo `bool` de byte inteiro (`bool` nativo do C++): `BoolProperty` de 1 byte, máscara
 /// `0xff` e o byte da máscara igual ao `offset` (spec 007, 6.4). Bits de verdade ficam para o
 /// [`bool_field`] do `clear_bits`.
@@ -515,12 +552,39 @@ fn resolve_research<M: ReadMem + ?Sized>(
     })
 }
 
-/// Resolve um `[[field]]`; `base_class` é a classe de onde parte o caminho do objeto (a do pawn
-/// ou a do `GameState`, conforme a raiz).
+/// A classe de onde parte o caminho de um `[[field]]` de raiz `game_state` e a classe dona dele:
+/// com `owner_class`, a dona (que tem de ser a `game_state_class` ou uma filha dela) e `Some`;
+/// sem, a `game_state_class` e `None` (spec 008, 6.8).
+fn resolve_owner<M: ReadMem + ?Sized>(
+    index: &ReflectionIndex,
+    mem: &M,
+    game_state_class: u64,
+    def: &FieldDef,
+) -> Result<(u64, Option<u64>), String> {
+    let Some(path) = &def.owner_class else {
+        return Ok((game_state_class, None));
+    };
+    let owner = find_class(index, path)?;
+    match index.is_a(mem, owner, game_state_class) {
+        Ok(true) => Ok((owner, Some(owner))),
+        Ok(false) => {
+            tracing::debug!(id = %def.id, "classe dona {path} não é filha do game_state");
+            Err(INCOHERENT.to_string())
+        }
+        Err(e) => {
+            tracing::debug!(id = %def.id, "classe dona {path}: {e}");
+            Err(INCOHERENT.to_string())
+        }
+    }
+}
+
+/// Resolve um `[[field]]`; `base_class` é a classe de onde parte o caminho do objeto (a do pawn,
+/// a do `GameState` ou a classe dona, conforme a raiz).
 fn resolve_field<M: ReadMem + ?Sized>(
     index: &ReflectionIndex,
     mem: &M,
     base_class: u64,
+    owner_class: Option<u64>,
     def: &FieldDef,
 ) -> Result<ResolvedField, String> {
     let object_class = find_class(index, &def.object_class)?;
@@ -586,21 +650,33 @@ fn resolve_field<M: ReadMem + ?Sized>(
                     FieldKind::Float => float_field(index, mem, object_class, name),
                     FieldKind::Int => int_field(index, mem, object_class, name),
                     FieldKind::Bool => byte_bool_field(index, mem, object_class, name),
+                    FieldKind::Double => double_field(index, mem, object_class, name),
                 })
                 .collect::<Result<_, _>>()?,
             kind: *kind,
             target: *target,
             bools: bools.clone(),
         },
-        FieldRule::Add { field, result_max } => ResolvedRule::Add {
-            field: int_field(index, mem, object_class, field)?,
+        FieldRule::Add {
+            field,
+            result_max,
+            at_least,
+        } => ResolvedRule::Add {
+            // A grade `f64` é a de um `double`; o resto é `int` (a carga garante o par).
+            field: if def.value.as_ref().is_some_and(|g| g.ty == ValueType::F64) {
+                double_field(index, mem, object_class, field)?
+            } else {
+                int_field(index, mem, object_class, field)?
+            },
             result_max: *result_max,
+            at_least: *at_least,
         },
     };
     Ok(ResolvedField {
         root: def.root,
         object_path,
         object_class,
+        owner_class,
         rule,
     })
 }
@@ -824,9 +900,26 @@ impl<M: ReadMem + ?Sized> Reader<'_, M> {
         Ok(())
     }
 
+    /// Confere a classe dona do primeiro salto (spec 008, 6.8): o objeto raiz (o `GameState`) é da
+    /// `owner_class` do cheat ou de uma filha. Sem `owner_class`, nada a conferir.
+    fn check_owner(&self, root: u64, r: &ResolvedField) -> Result<(), Absent> {
+        let Some(owner) = r.owner_class else {
+            return Ok(());
+        };
+        if self
+            .catalog
+            .object_is_a(self.index, self.mem, root, owner)?
+        {
+            Ok(())
+        } else {
+            Err(Absent::ComponentWrongClass(OWNER_HOP.to_string()))
+        }
+    }
+
     /// Objeto de um cheat: o pawn ou o fim do caminho de campos de objeto, com a classe de cada
     /// salto conferida.
     fn object(&mut self, pawn: u64, r: &ResolvedField) -> Result<u64, Absent> {
+        self.check_owner(pawn, r)?;
         let mut obj = pawn;
         if r.object_path.is_empty() {
             let ok = self
@@ -1315,11 +1408,15 @@ pub fn value_is_sane(kind: FieldKind, bytes: &[u8]) -> bool {
             Err(_) => return false,
         },
         FieldKind::Bool => return matches!(bytes, [0] | [1]),
+        FieldKind::Double => match <[u8; 8]>::try_from(bytes) {
+            Ok(raw) => f64::from_le_bytes(raw),
+            Err(_) => return false,
+        },
     };
     v.is_finite() && (-SANE_LIMIT..=SANE_LIMIT).contains(&v)
 }
 
-/// Os bytes (little-endian) de `v` como `kind`: 4 para `float`/`int` e 1 para `bool`. O `int` é
+/// Os bytes (little-endian) de `v` como `kind`: 4 para `float`/`int`, 8 para `double` e 1 para `bool`. O `int` é
 /// arredondado ao inteiro mais próximo; o `bool` é `0x01` para `v != 0` e `0x00` senão.
 pub fn encode_value(kind: FieldKind, v: f64) -> Vec<u8> {
     match kind {
@@ -1327,6 +1424,7 @@ pub fn encode_value(kind: FieldKind, v: f64) -> Vec<u8> {
         FieldKind::Int => (v.round() as i32).to_le_bytes().to_vec(),
         FieldKind::Float => (v as f32).to_le_bytes().to_vec(),
         FieldKind::Bool => vec![u8::from(v != 0.0)],
+        FieldKind::Double => v.to_le_bytes().to_vec(),
     }
 }
 
@@ -1385,18 +1483,29 @@ pub enum AddRefusal {
     WouldExceed,
 }
 
-/// O valor a escrever ao somar `amount` a `current` (a soma é em 64 bits; spec 006, 6.6).
-pub fn plan_add(current: i32, amount: i32, result_max: i64) -> Result<i32, AddRefusal> {
-    let current = i64::from(current);
-    if current < 0 || current > result_max {
+/// O valor a escrever ao somar `amount` a `current` (spec 006, 6.6, e 008, 6.8.2). `kind` é `Int` (a
+/// soma é em 64 bits e tem de caber em `i32`) ou `Double` (a soma é em `f64`); `current` não finito
+/// conta como fora da faixa. Um valor atual `< 0` ou `> result_max` é recusado, e uma soma `> result_max`
+/// também.
+pub fn plan_add(
+    kind: FieldKind,
+    current: f64,
+    amount: f64,
+    result_max: i64,
+) -> Result<f64, AddRefusal> {
+    let max = result_max as f64;
+    if !current.is_finite() || current < 0.0 || current > max {
         return Err(AddRefusal::OutOfRange);
     }
-    let sum = current + i64::from(amount);
-    if sum > result_max {
+    let sum = current + amount;
+    if !sum.is_finite() || sum > max {
         return Err(AddRefusal::WouldExceed);
     }
-    // Um teto acima de `i32::MAX` não cabe no campo.
-    i32::try_from(sum).map_err(|_| AddRefusal::WouldExceed)
+    // Um teto acima de `i32::MAX` não cabe no campo `int`.
+    if kind != FieldKind::Double && sum > f64::from(i32::MAX) {
+        return Err(AddRefusal::WouldExceed);
+    }
+    Ok(sum)
 }
 
 /// Um bit de um cheat, no relatório.
@@ -1430,7 +1539,7 @@ pub enum FieldReportValue {
     /// Valor atual do campo de uma ação (`add`), lido sob demanda pelo caminho do `GameState`.
     Add {
         addr: u64,
-        current: i32,
+        current: f64,
     },
 }
 
@@ -1707,6 +1816,10 @@ fn report_path<M: ReadMem + ?Sized>(
             return report;
         }
     };
+    if let Err(absent) = r.check_owner(obj, resolved) {
+        report.error = Some(gone(OWNER_HOP)(absent).to_string());
+        return report;
+    }
     let check_cdo = !matches!(resolved.rule, ResolvedRule::Add { .. });
     let last = resolved.object_path.len().saturating_sub(1);
     for (i, hop) in resolved.object_path.iter().enumerate() {
@@ -1794,6 +1907,15 @@ fn report_entry<M: ReadMem + ?Sized>(
     }
 }
 
+/// O tipo do campo de uma ação (`add`): `Double` para 8 bytes, `Int` para o resto (spec 008, 6.8.2).
+pub fn add_kind(field: &Field) -> FieldKind {
+    if field.size == 8 {
+        FieldKind::Double
+    } else {
+        FieldKind::Int
+    }
+}
+
 /// Valor atual do campo de uma ação (`add`) no objeto `obj`; a falha vira o `error` do caminho.
 fn report_add<M: ReadMem + ?Sized>(
     mem: &M,
@@ -1811,15 +1933,17 @@ fn report_add<M: ReadMem + ?Sized>(
         objects: Vec::new(),
     };
     let addr = obj + u64::from(field.offset);
+    let kind = add_kind(field);
     let read = r
         .check_fits(obj, &field.name, field.offset, field.size)
         .map_err(|absent| gone(&field.name)(absent).to_string())
-        .and_then(|()| read_u32(mem, addr).map_err(|_| format!("{} ilegível", field.name)));
+        .and_then(|()| {
+            read_vec(mem, addr, kind.size() as usize)
+                .map(|bytes| decode_value(kind, &bytes))
+                .map_err(|_| format!("{} ilegível", field.name))
+        });
     match read {
-        Ok(raw) => FieldReportValue::Add {
-            addr,
-            current: i32::from_le_bytes(raw.to_le_bytes()),
-        },
+        Ok(current) => FieldReportValue::Add { addr, current },
         Err(reason) => {
             path.error = Some(reason.clone());
             FieldReportValue::Unavailable { reason }
@@ -1920,6 +2044,7 @@ pub(crate) fn format_value(grid: Option<&ValueGrid>, kind: FieldKind, v: f64) ->
             FieldKind::Int => format!("{v:.0}"),
             FieldKind::Float => format!("{v}"),
             FieldKind::Bool => (v != 0.0).to_string(),
+            FieldKind::Double => format!("{v:.0}"),
         },
     }
 }
@@ -1930,6 +2055,7 @@ pub(crate) fn decode_value(kind: FieldKind, bytes: &[u8]) -> f64 {
         FieldKind::Bool => f64::from(u8::from(bytes.first().is_some_and(|&b| b != 0))),
         FieldKind::Int => f64::from(i32::from_le_bytes(bytes.try_into().unwrap_or_default())),
         FieldKind::Float => f64::from(f32::from_le_bytes(bytes.try_into().unwrap_or_default())),
+        FieldKind::Double => f64::from_le_bytes(bytes.try_into().unwrap_or_default()),
     }
 }
 

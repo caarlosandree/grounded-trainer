@@ -89,6 +89,7 @@ pub fn field_infos(defs: &[FieldDef], avail: &Avail) -> Vec<CheatInfo> {
             avail: avail.clone(),
             field: true,
             action: matches!(d.rule, FieldRule::Add { .. }),
+            label: d.label.clone(),
         })
         .collect()
 }
@@ -225,7 +226,7 @@ impl ValueCheats {
         let amount = match self.def(id) {
             Some(d) if matches!(d.rule, FieldRule::Add { .. }) => {
                 match d.value.as_ref().map(|g| g.value(k)) {
-                    Some(v) if v.is_finite() && v >= 0.0 && v <= f64::from(i32::MAX) => v as i32,
+                    Some(v) if v.is_finite() && v >= 0.0 => v,
                     _ => return ActionOutcome::Refused("quantidade inválida".to_string()),
                 }
             }
@@ -703,6 +704,12 @@ mod tests {
         assert!(find("somar-ciencia").action && find("somar-ciencia").value.is_some());
         assert!(!find("carga").action && find("carga").value.is_some());
         assert!(!find("vida-infinita").action && find("vida-infinita").value.is_none());
+        // O `pular-hora` é uma ação de grade com um ponto só e carrega o `label` do TOML.
+        let hour = find("pular-hora");
+        assert!(hour.action);
+        assert_eq!(hour.label.as_deref(), Some("+1h"));
+        assert_eq!(hour.value.as_ref().map(|g| g.steps()), Some(0));
+        assert_eq!(find("somar-ciencia").label, None);
     }
 
     fn controller_outcome(data: ControllerData) -> ReflectionOutcome {

@@ -946,7 +946,7 @@ fn raw_absent_then_found_resumes() {
 // ---- valor nos cheats de valor e a ação (spec 006, 6.5 e 6.6; plano 006 tarefa 9) ----
 
 use gt_grounded2::fields::ActionOutcome;
-use gt_testkit::ue::{CAPACITY_OFF, SCIENCE_OFF};
+use gt_testkit::ue::{CAPACITY_OFF, CLOCK_START, CURRENT_TIME_OFF, SCIENCE_OFF};
 use gt_tui::backend::JobKind;
 
 /// Sessão crua contra o alvo com a reflexão sintética, com o índice montado.
@@ -1096,11 +1096,40 @@ fn action_needs_controller_marks_search() {
     assert_eq!(
         u.s.field_action("somar-ciencia", 9),
         ActionOutcome::Done {
-            before: start,
-            after: start + 1000
+            before: f64::from(start),
+            after: f64::from(start + 1000),
+            note: None,
         }
     );
     assert_eq!(read_i32(u.target.pid, science), start + 1000);
+}
+
+#[test]
+fn clock_action_adds_one_hour_with_a_single_point_grid() {
+    let mut u = ue_session(true);
+    run_job(&mut u.s, JobKind::Controller);
+    let clock = u.ue.calendar + u64::from(CURRENT_TIME_OFF);
+    let start = f64::from_le_bytes(read(u.target.pid, clock, 8).try_into().unwrap());
+    assert_eq!(start, CLOCK_START);
+    // A grade tem um ponto só (`k = 0`); um `k` além dele cai no mesmo ponto.
+    for k in [0, 7] {
+        let before = f64::from_le_bytes(read(u.target.pid, clock, 8).try_into().unwrap());
+        assert_eq!(
+            u.s.field_action("pular-hora", k),
+            ActionOutcome::Done {
+                before,
+                after: before + 3600.0,
+                note: None,
+            }
+        );
+    }
+    let end = f64::from_le_bytes(read(u.target.pid, clock, 8).try_into().unwrap());
+    assert_eq!(end, start + 7200.0);
+    // A ação não liga nem desliga.
+    assert!(matches!(
+        u.s.field_on("pular-hora", 0),
+        OpOutcome::Refused(_)
+    ));
 }
 
 /// Passa os ciclos de manutenção em `base + secs` e devolve o último relatório.

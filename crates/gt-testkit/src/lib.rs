@@ -183,6 +183,7 @@ impl TestTarget {
                 mode_manager: parse_hex(&u["mode_manager"]),
                 settings: parse_hex(&u["settings"]),
                 cdo_settings: parse_hex(&u["cdo_settings"]),
+                calendar: parse_hex(&u["calendar"]),
             }),
             module,
             module_dir,

@@ -115,6 +115,7 @@ fn cheats_of(
             avail: avail_of(&e.state),
             field: false,
             action: false,
+            label: None,
         })
         .collect();
     if ue.is_some() {
@@ -703,7 +704,7 @@ mod tests {
         let cheats = cheats_of(&entries, &fields(), Some(&ue), &Ok(()));
         let ids: Vec<&str> = cheats.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(&ids[..3], ["p1", "p2", "vida-infinita"]);
-        assert_eq!(cheats.len(), 2 + 19);
+        assert_eq!(cheats.len(), 2 + 20);
         assert!(
             cheats[2..]
                 .iter()

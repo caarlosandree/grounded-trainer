@@ -75,6 +75,8 @@ pub struct CheatInfo {
     pub field: bool,
     /// Ação de uma execução (`rule = "add"`, spec 006 6.6), não um cheat que liga e desliga.
     pub action: bool,
+    /// Texto da quantidade na linha de uma ação, no lugar da formatação da grade (spec 008, 6.8.2).
+    pub label: Option<String>,
 }
 
 /// Resultado de abrir o alvo e buscar o catálogo; `P` é o que cada implementação leva

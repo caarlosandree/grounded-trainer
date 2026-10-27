@@ -461,6 +461,32 @@ default = 0.25
 unit = "x"
 decimals = 2
 
+# Ação: soma 1 hora ao relógio do jogo (spec 008, 6.8.2). `CurrentTime` é um `double` do `CalendarComponent`, que
+# mora no `SurvivalGameState` (subclasse do `InGameGameState`): `owner_class` diz a classe dona do primeiro salto
+# e o trainer confere que o `GameState` vivo é dela antes de ler o campo. O jogo soma ao relógio a cada quadro,
+# então a releitura nunca é exata: `at_least` aceita "maior ou igual". Uma grade de um ponto só (sem ←→); o `label`
+# é o texto da quantidade na linha. Sem diário e sem desfazer (a hora vai para o save).
+[[field]]
+id = "pular-hora"
+name = "Pular 1 hora"
+category = "progressao"
+description = "Avança o relógio do jogo em 1 hora; vai para o save e não tem desfazer"
+object = "CalendarComponent"
+object_class = "/Script/Maine.CalendarComponent"
+root = "game_state"
+owner_class = "/Script/Maine.SurvivalGameState"
+rule = "add"
+field = "CurrentTime"
+kind = "double"
+at_least = true
+result_max = 1000000000
+
+[field.value]
+type = "f64"
+points = [3600.0]
+default = 3600.0
+label = "+1h"
+
 # Fase 6 (spec 008): desvios com cave. Cada [[hook]] troca UMA instrução de 5+ bytes, decodificada na
 # ocorrência do padrão em `offset` (sem `expected`: o padrão único já fixa os bytes que importam e o motor
 # relê a instrução na pausa). `body` nomeia o corpo da cave, escrito em Rust. O valor (`[hook.value]`) é uma

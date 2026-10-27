@@ -77,6 +77,13 @@ pub const ENEMY_DAMAGE_OFF: u32 = 0x3c;
 /// Dano inimigo inicial das configurações da cena.
 pub const ENEMY_DAMAGE_START: f32 = 1.0;
 
+/// Relógio do jogo (spec 008, 6.8): `SurvivalGameState.CalendarComponent` (subclasse do `InGameGameState`)
+/// e `CalendarComponent.CurrentTime` (`double`).
+pub const CALENDAR_OFF: u32 = 0x70;
+pub const CURRENT_TIME_OFF: u32 = 0x38;
+/// Relógio inicial da cena, em segundos.
+pub const CLOCK_START: f64 = 5000.25;
+
 /// Valores iniciais dos campos novos (o personagem sem nenhum cheat).
 pub const CAPACITY_START: i32 = 10;
 pub const SCIENCE_START: i32 = 500;
@@ -119,6 +126,8 @@ pub struct UeAddrs {
     pub settings: u64,
     /// Outra instância da subclasse, com o bit de CDO, fora do caminho.
     pub cdo_settings: u64,
+    /// `CalendarComponent` do `GameState` (um `SurvivalGameState`).
+    pub calendar: u64,
 }
 
 fn field(name: &'static str, kind: &'static str, offset: u32, size: u32) -> SynthField {
@@ -137,6 +146,10 @@ fn float(name: &'static str, offset: u32) -> SynthField {
 
 fn int(name: &'static str, offset: u32) -> SynthField {
     field(name, "IntProperty", offset, 4)
+}
+
+fn double(name: &'static str, offset: u32) -> SynthField {
+    field(name, "DoubleProperty", offset, 8)
 }
 
 fn object(name: &'static str, offset: u32) -> SynthField {
@@ -308,6 +321,29 @@ pub fn build(arena: u64, len: usize) -> (SynthImage, UeAddrs) {
             object("SurvivalModeManagerComponent", MODE_MANAGER_OFF),
         ],
     );
+    // O `GameState` vivo é um `SurvivalGameState`: o relógio mora na subclasse, não no `InGameGameState`.
+    // `OtherGameState` é uma filha irmã com o mesmo campo, para a conferência da classe dona.
+    let survival_game_state_c = s.add_class(
+        maine,
+        "SurvivalGameState",
+        Some(game_state_c),
+        0x80,
+        &[object("CalendarComponent", CALENDAR_OFF)],
+    );
+    s.add_class(
+        maine,
+        "OtherGameState",
+        Some(game_state_c),
+        0x80,
+        &[object("CalendarComponent", CALENDAR_OFF)],
+    );
+    let calendar_c = s.add_class(
+        maine,
+        "CalendarComponent",
+        Some(object_c),
+        0x48,
+        &[double("CurrentTime", CURRENT_TIME_OFF)],
+    );
     let party_c = s.add_class(
         maine,
         "PartyComponent",
@@ -347,8 +383,11 @@ pub fn build(arena: u64, len: usize) -> (SynthImage, UeAddrs) {
     // O controller e o pawn compartilham o `Outer` (o nível persistente), como no jogo.
     let level = s.add_object(level_c, "PersistentLevel", maine);
     let world = s.add_object(world_c, "World_0", maine);
-    let game_state = s.add_object(game_state_c, "GameState_0", level);
+    let game_state = s.add_object(survival_game_state_c, "GameState_0", level);
     let party = s.add_object(party_c, "Party", game_state);
+    let calendar = s.add_object(calendar_c, "Calendar", game_state);
+    s.set(game_state, CALENDAR_OFF, &calendar.to_le_bytes());
+    s.set(calendar, CURRENT_TIME_OFF, &CLOCK_START.to_le_bytes());
     s.set(level, WORLD_OFF, &world.to_le_bytes());
     s.set(world, GAME_STATE_OFF, &game_state.to_le_bytes());
     s.set(game_state, PARTY_OFF, &party.to_le_bytes());
@@ -432,6 +471,7 @@ pub fn build(arena: u64, len: usize) -> (SynthImage, UeAddrs) {
         mode_manager,
         settings,
         cdo_settings,
+        calendar,
     };
     (image, addrs)
 }
@@ -452,6 +492,8 @@ fn lock(
         object: object.into(),
         object_class: format!("{MAINE}.{object}"),
         root: FieldRoot::Pawn,
+        owner_class: None,
+        label: None,
         value: None,
         rule: FieldRule::Lock {
             field: field.into(),
@@ -472,6 +514,8 @@ fn clear_bits(id: &str, object: &str, class: &str, fields: &[&str]) -> FieldDef 
         object: object.into(),
         object_class: format!("{MAINE}.{class}"),
         root: FieldRoot::Pawn,
+        owner_class: None,
+        label: None,
         value: None,
         rule: FieldRule::ClearBits {
             fields: fields.iter().map(|f| f.to_string()).collect(),
@@ -495,6 +539,8 @@ fn progression(
         object: object.into(),
         object_class: class.into(),
         root,
+        owner_class: None,
+        label: None,
         value,
         rule,
     }
@@ -570,6 +616,36 @@ fn world_defs() -> Vec<FieldDef> {
     ]
 }
 
+/// O `pular-hora` da spec 008, 6.8.2, com o id, a classe dona e a grade do `generic.toml`.
+fn clock_defs() -> Vec<FieldDef> {
+    vec![FieldDef {
+        id: "pular-hora".into(),
+        name: "Pular 1 hora".into(),
+        category: Category::Progressao,
+        description: String::new(),
+        object: "CalendarComponent".into(),
+        object_class: format!("{MAINE}.CalendarComponent"),
+        root: FieldRoot::GameState,
+        owner_class: Some(format!("{MAINE}.SurvivalGameState")),
+        label: Some("+1h".into()),
+        value: Some(ValueGrid {
+            ty: ValueType::F64,
+            min: 3600.0,
+            max: 3600.0,
+            step: 0.0,
+            default_k: 0,
+            unit: None,
+            decimals: 0,
+            points: Some(vec![3600.0]),
+        }),
+        rule: FieldRule::Add {
+            field: "CurrentTime".into(),
+            result_max: 1_000_000_000,
+            at_least: true,
+        },
+    }]
+}
+
 /// Os seis cheats da spec 006, 6.7, com os nomes do jogo e as grades do `generic.toml`.
 fn progression_defs() -> Vec<FieldDef> {
     let maine = |class: &str| format!("{MAINE}.{class}");
@@ -609,6 +685,7 @@ fn progression_defs() -> Vec<FieldDef> {
             FieldRule::Add {
                 field: "ScienceFound".into(),
                 result_max: 100_000,
+                at_least: false,
             },
             Some(grid(ValueType::I32, (100.0, 10_000.0, 100.0), 1000.0, None)),
         ),
@@ -740,6 +817,7 @@ pub fn synth_signatures() -> (UeSigs, Vec<FieldDef>) {
         ),
     ];
     defs.extend(progression_defs());
+    defs.extend(clock_defs());
     defs.extend(world_defs());
     (sigs, defs)
 }

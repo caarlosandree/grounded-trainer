@@ -244,7 +244,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             write_local(*addr, bytes)?;
         }
         format!(
-            ",\"ue\":{{\"gobjects\":\"{:#x}\",\"names\":\"{:#x}\",\"controller\":\"{:#x}\",\"pawn\":\"{:#x}\",\"creature\":\"{:#x}\",\"pawn_field_addr\":\"{:#x}\",\"health\":\"{:#x}\",\"alt_pawn\":\"{:#x}\",\"hauling\":\"{:#x}\",\"movement\":\"{:#x}\",\"creature_hauling\":\"{:#x}\",\"creature_movement\":\"{:#x}\",\"level\":\"{:#x}\",\"world\":\"{:#x}\",\"game_state\":\"{:#x}\",\"party\":\"{:#x}\",\"mode_manager\":\"{:#x}\",\"settings\":\"{:#x}\",\"cdo_settings\":\"{:#x}\"}}",
+            ",\"ue\":{{\"gobjects\":\"{:#x}\",\"names\":\"{:#x}\",\"controller\":\"{:#x}\",\"pawn\":\"{:#x}\",\"creature\":\"{:#x}\",\"pawn_field_addr\":\"{:#x}\",\"health\":\"{:#x}\",\"alt_pawn\":\"{:#x}\",\"hauling\":\"{:#x}\",\"movement\":\"{:#x}\",\"creature_hauling\":\"{:#x}\",\"creature_movement\":\"{:#x}\",\"level\":\"{:#x}\",\"world\":\"{:#x}\",\"game_state\":\"{:#x}\",\"party\":\"{:#x}\",\"mode_manager\":\"{:#x}\",\"settings\":\"{:#x}\",\"cdo_settings\":\"{:#x}\",\"calendar\":\"{:#x}\"}}",
             a.gobjects,
             a.names,
             a.controller,
@@ -263,7 +263,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             a.party,
             a.mode_manager,
             a.settings,
-            a.cdo_settings
+            a.cdo_settings,
+            a.calendar
         )
     } else {
         String::new()
