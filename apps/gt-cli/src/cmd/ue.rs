@@ -300,7 +300,7 @@ fn write_report(out: &mut dyn Write, report: &PlayerReport) -> std::io::Result<(
             FieldReportValue::Set { fields } => {
                 let list: Vec<String> = fields
                     .iter()
-                    .map(|v| format!("{}={} ({:#x})", v.name, v.value, v.addr))
+                    .map(|v| format!("{}={} ({:#x}, cru {:#x})", v.name, v.value, v.addr, v.raw))
                     .collect();
                 writeln!(out, "  {:<20} {}", f.id, list.join("  "))?;
             }
@@ -309,15 +309,22 @@ fn write_report(out: &mut dyn Write, report: &PlayerReport) -> std::io::Result<(
             }
         }
     }
-    if let Some(gs) = &report.game_state {
+    if let Some(error) = &report.pawn_error {
+        writeln!(out, "pawn: indisponível ({error})")?;
+    }
+    for gs in &report.game_state {
         writeln!(
             out,
-            "GameState: Level {}  World {}  GameState {}  objeto da ação {}",
+            "GameState {}: Level {}  World {}  GameState {}  objeto {}",
+            gs.path,
             ptr(gs.level),
             ptr(gs.world),
             ptr(gs.game_state),
             ptr(gs.object)
         )?;
+        for hop in &gs.hops {
+            writeln!(out, "  {} = {:#x} ({})", hop.name, hop.addr, hop.class)?;
+        }
         if let Some(error) = &gs.error {
             writeln!(out, "  caminho interrompido: {error}")?;
         }
@@ -388,5 +395,87 @@ fn run_player(
     match last {
         Some(absent) if watch.is_none() => bail!("personagem indisponível: {absent}"),
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gt_grounded2::player::{FieldReport, GameStateReport, HopReport, SetFieldReport};
+
+    use super::*;
+
+    fn report() -> PlayerReport {
+        PlayerReport {
+            controller: 0x10,
+            pawn: Some(0),
+            character: None,
+            acknowledged_pawn: None,
+            fields: vec![FieldReport {
+                id: "construir-sem-ingredientes".into(),
+                value: FieldReportValue::Set {
+                    fields: vec![SetFieldReport {
+                        name: "bRecipesRequireIngredients".into(),
+                        addr: 0x5030,
+                        raw: 1,
+                        value: "true".into(),
+                    }],
+                },
+            }],
+            pawn_error: Some("Pawn nulo".into()),
+            game_state: vec![
+                GameStateReport {
+                    level: Some(0x1),
+                    world: Some(0x2),
+                    game_state: Some(0x3),
+                    path: "SurvivalModeManagerComponent.GameModeSettings".into(),
+                    hops: vec![
+                        HopReport {
+                            name: "SurvivalModeManagerComponent".into(),
+                            addr: 0x4000,
+                            class: "SurvivalModeManagerComponent".into(),
+                        },
+                        HopReport {
+                            name: "GameModeSettings".into(),
+                            addr: 0x5000,
+                            class: "BP_NormalModeSettings_C".into(),
+                        },
+                    ],
+                    object: Some(0x5000),
+                    error: None,
+                },
+                GameStateReport {
+                    path: "PartyComponent".into(),
+                    level: Some(0x1),
+                    world: Some(0x2),
+                    game_state: Some(0x3),
+                    error: Some("PartyComponent ausente ou de classe inesperada".into()),
+                    ..GameStateReport::default()
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn write_report_shows_world_path_bool_and_pawn_error() {
+        let mut out = Vec::new();
+        write_report(&mut out, &report()).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("pawn: indisponível (Pawn nulo)"), "{text}");
+        assert!(
+            text.contains("GameState SurvivalModeManagerComponent.GameModeSettings:"),
+            "{text}"
+        );
+        assert!(
+            text.contains("GameModeSettings = 0x5000 (BP_NormalModeSettings_C)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("bRecipesRequireIngredients=true (0x5030, cru 0x1)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("caminho interrompido: PartyComponent ausente"),
+            "{text}"
+        );
     }
 }

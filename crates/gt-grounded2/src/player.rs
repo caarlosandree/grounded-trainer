@@ -1410,14 +1410,29 @@ pub struct SetFieldReport {
     pub value: String,
 }
 
-/// Caminho controller → `Level` → `World` → `GameState` → objeto da ação, até onde foi lido. Um
-/// salto que falha deixa os seguintes em `None` e o motivo em `error`.
+/// Um salto do caminho do `GameState` até o objeto de um cheat, como a instância foi lida.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HopReport {
+    /// Nome do campo de objeto do salto.
+    pub name: String,
+    pub addr: u64,
+    /// Nome da classe da instância (a subclasse, quando houver), pela reflexão.
+    pub class: String,
+}
+
+/// Caminho controller → `Level` → `World` → `GameState` → objeto de um cheat, até onde foi lido.
+/// Um salto que falha deixa os seguintes em `None` e o motivo em `error`. Há uma entrada por
+/// caminho de objeto distinto entre os cheats de raiz `game_state` (spec 007, 6.7).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 pub struct GameStateReport {
     pub level: Option<u64>,
     pub world: Option<u64>,
     pub game_state: Option<u64>,
-    /// Objeto da ação (o `PartyComponent`, no jogo).
+    /// Campos de objeto do caminho, a partir do `GameState`, separados por ponto.
+    pub path: String,
+    /// Saltos do caminho que deram certo, na ordem.
+    pub hops: Vec<HopReport>,
+    /// Objeto final do caminho (o `PartyComponent`, as configurações do modo), se foi lido.
     pub object: Option<u64>,
     pub error: Option<String>,
 }
@@ -1438,11 +1453,16 @@ pub struct PlayerReport {
     pub character: Option<u64>,
     pub acknowledged_pawn: Option<u64>,
     pub fields: Vec<FieldReport>,
-    /// Caminho do `GameState`, quando há cheat de ação nessa raiz.
-    pub game_state: Option<GameStateReport>,
+    /// Por que o personagem não foi lido (`Pawn` nulo, montaria, ...); os cheats do pawn ficam
+    /// indisponíveis e o `game_state` continua valendo.
+    pub pawn_error: Option<String>,
+    /// Um caminho por objeto distinto entre os cheats de raiz `game_state`, na ordem do catálogo.
+    pub game_state: Vec<GameStateReport>,
 }
 
-/// Lê o personagem e monta o relatório do `gt ue player`.
+/// Lê o personagem e monta o relatório do `gt ue player`. Só um controller ausente ou inválido
+/// devolve `Err`; um pawn que falha vira `pawn_error` e a parte do `GameState` continua (spec 007,
+/// 6.7).
 pub fn player_report<M: ReadMem + ?Sized>(
     mem: &M,
     index: &ReflectionIndex,
@@ -1450,7 +1470,15 @@ pub fn player_report<M: ReadMem + ?Sized>(
     objects: &ObjectArray,
     controller: u64,
 ) -> Result<PlayerReport, Absent> {
-    let snapshot = read_player(mem, index, catalog, objects, controller)?;
+    let snapshot = match read_player(mem, index, catalog, objects, controller) {
+        Ok(snapshot) => Ok(snapshot),
+        Err(
+            absent @ (Absent::NoController
+            | Absent::ControllerAmbiguous
+            | Absent::ControllerInvalid),
+        ) => return Err(absent),
+        Err(absent) => Err(absent),
+    };
     let class = index.class_of(mem, controller).map_err(unreadable)?;
     let [pawn, character, acknowledged_pawn] = REPORT_POINTERS.map(|name| {
         index
@@ -1459,23 +1487,25 @@ pub fn player_report<M: ReadMem + ?Sized>(
             .filter(|f| is_object_family(&f.kind))
             .and_then(|f| read_u64(mem, controller + u64::from(f.offset)).ok())
     });
-    let mut game_state = None;
+
+    // Os `set` do mundo, lidos uma vez; só se houver algum resolvido.
+    let has_world_set = catalog.entries.iter().any(|e| world_set(e).is_some());
+    let world = has_world_set.then(|| read_world(mem, index, catalog, objects, controller));
+    let mut game_state = world_paths(mem, index, catalog, controller);
+
     let fields = catalog
         .entries
         .iter()
         .map(|entry| {
-            let value = match action_in_game_state(entry) {
-                Some(field) => {
-                    let mut hops = GameStateReport::default();
-                    let value = report_action(
-                        mem, index, catalog, objects, controller, entry, field, &mut hops,
-                    );
-                    // Um só caminho no relatório: o do primeiro cheat de ação.
-                    game_state.get_or_insert(hops);
-                    value
-                }
-                None => report_value(&snapshot, entry),
-            };
+            let value = report_entry(
+                mem,
+                index,
+                catalog,
+                entry,
+                snapshot.as_ref(),
+                world.as_ref(),
+                &mut game_state,
+            );
             FieldReport {
                 id: entry.id.clone(),
                 value,
@@ -1488,55 +1518,220 @@ pub fn player_report<M: ReadMem + ?Sized>(
         character,
         acknowledged_pawn,
         fields,
+        pawn_error: snapshot.err().map(|absent| absent.to_string()),
         game_state,
     })
 }
 
-/// O campo de uma ação (`add`) de raiz `game_state` resolvida, se `entry` for uma.
-fn action_in_game_state(entry: &CatalogEntry) -> Option<&Field> {
+/// O cheat de raiz `game_state` resolvido de `entry`, qualquer que seja a regra.
+fn game_state_resolved(entry: &CatalogEntry) -> Option<&ResolvedField> {
     match &entry.resolved {
-        Ok(ResolvedField {
-            root: FieldRoot::GameState,
-            rule: ResolvedRule::Add { field, .. },
-            ..
-        }) => Some(field),
+        Ok(resolved) if resolved.root == FieldRoot::GameState => Some(resolved),
         _ => None,
     }
 }
 
-/// Lê o valor atual de uma ação pelo caminho do `GameState`; a falha mostra o salto que faltou.
-#[allow(clippy::too_many_arguments)]
-fn report_action<M: ReadMem + ?Sized>(
+/// O `set` de raiz `game_state` resolvido de `entry` (o que `read_world` lê).
+fn world_set(entry: &CatalogEntry) -> Option<&ResolvedField> {
+    game_state_resolved(entry).filter(|r| matches!(r.rule, ResolvedRule::Set { .. }))
+}
+
+/// Campos de objeto do caminho de `resolved`, separados por ponto.
+fn path_key(resolved: &ResolvedField) -> String {
+    let names: Vec<&str> = resolved
+        .object_path
+        .iter()
+        .map(|h| h.field.name.as_str())
+        .collect();
+    names.join(".")
+}
+
+/// Uma entrada por caminho de objeto distinto entre os cheats de raiz `game_state`, na ordem do
+/// catálogo, cada uma com os saltos lidos até onde o caminho vai.
+fn world_paths<M: ReadMem + ?Sized>(
     mem: &M,
     index: &ReflectionIndex,
     catalog: &FieldCatalog,
-    objects: &ObjectArray,
     controller: u64,
-    entry: &CatalogEntry,
-    field: &Field,
-    hops: &mut GameStateReport,
-) -> FieldReportValue {
-    let fail = |reason: String, hops: &mut GameStateReport| {
-        hops.error = Some(reason.clone());
-        FieldReportValue::Unavailable { reason }
+) -> Vec<GameStateReport> {
+    let mut out: Vec<GameStateReport> = Vec::new();
+    for resolved in catalog.entries.iter().filter_map(game_state_resolved) {
+        let key = path_key(resolved);
+        if out.iter().all(|g| g.path != key) {
+            out.push(report_path(mem, index, catalog, controller, resolved, key));
+        }
+    }
+    out
+}
+
+/// Nome da classe da instância `obj`, pela reflexão (`?` se não der para ler).
+fn class_name<M: ReadMem + ?Sized>(index: &ReflectionIndex, mem: &M, obj: u64) -> String {
+    index
+        .class_of(mem, obj)
+        .and_then(|class| index.object_name(mem, class))
+        .unwrap_or_else(|_| "?".to_string())
+}
+
+/// Anda do controller (já validado) até o objeto de `resolved`, anotando cada salto que deu certo.
+/// O objeto final de um `set` que é um CDO não conta (nunca se escreve nele).
+fn report_path<M: ReadMem + ?Sized>(
+    mem: &M,
+    index: &ReflectionIndex,
+    catalog: &FieldCatalog,
+    controller: u64,
+    resolved: &ResolvedField,
+    path: String,
+) -> GameStateReport {
+    let mut report = GameStateReport {
+        path,
+        ..GameStateReport::default()
     };
-    match walk_game_state(mem, index, catalog, objects, controller, &entry.id, hops) {
-        Ok((_, addr, _)) => match read_u32(mem, addr) {
-            Ok(raw) => FieldReportValue::Add {
-                addr,
-                current: i32::from_le_bytes(raw.to_le_bytes()),
-            },
-            Err(_) => fail(format!("{} ilegível", field.name), hops),
-        },
-        Err(absent) => fail(absent.to_string(), hops),
+    let Ok(gs) = &catalog.game_state else {
+        report.error = Some(GameStateAbsent::Missing("GameState".to_string()).to_string());
+        return report;
+    };
+    let mut r = Reader {
+        mem,
+        index,
+        catalog,
+        props: HashMap::new(),
+        objects: Vec::new(),
+    };
+    let mut obj = match walk_to_game_state(&mut r, controller, gs, &mut report) {
+        Ok(state) => state,
+        Err(absent) => {
+            report.error = Some(absent.to_string());
+            return report;
+        }
+    };
+    let check_cdo = !matches!(resolved.rule, ResolvedRule::Add { .. });
+    let last = resolved.object_path.len().saturating_sub(1);
+    for (i, hop) in resolved.object_path.iter().enumerate() {
+        let name = hop.field.name.as_str();
+        let next = r.pointer(obj, &hop.field).and_then(|ptr| {
+            if ptr != 0 && catalog.object_is_a(index, mem, ptr, hop.class)? {
+                Ok(ptr)
+            } else {
+                Err(Absent::ComponentWrongClass(name.to_string()))
+            }
+        });
+        let cdo = |ptr: u64| i == last && check_cdo && r.is_cdo(ptr).unwrap_or(false);
+        match next {
+            Ok(ptr) if !cdo(ptr) => {
+                report.hops.push(HopReport {
+                    name: name.to_string(),
+                    addr: ptr,
+                    class: class_name(index, mem, ptr),
+                });
+                obj = ptr;
+            }
+            Ok(_) => {
+                report.error = Some(GameStateAbsent::Missing(name.to_string()).to_string());
+                return report;
+            }
+            Err(absent) => {
+                report.error = Some(gone(name)(absent).to_string());
+                return report;
+            }
+        }
+    }
+    report.object = Some(obj);
+    report
+}
+
+/// O estado de um cheat no relatório: pawn pelo snapshot (ou o erro dele), `game_state` pelo
+/// caminho e por `read_world`.
+fn report_entry<M: ReadMem + ?Sized>(
+    mem: &M,
+    index: &ReflectionIndex,
+    catalog: &FieldCatalog,
+    entry: &CatalogEntry,
+    snapshot: Result<&PlayerSnapshot, &Absent>,
+    world: Option<&Result<WorldSnapshot, GameStateAbsent>>,
+    paths: &mut [GameStateReport],
+) -> FieldReportValue {
+    let resolved = match &entry.resolved {
+        Ok(r) => r,
+        Err(reason) => {
+            return FieldReportValue::Unavailable {
+                reason: reason.clone(),
+            };
+        }
+    };
+    let unavailable = |reason: String| FieldReportValue::Unavailable { reason };
+    if resolved.root != FieldRoot::GameState {
+        return match snapshot {
+            Ok(snap) => report_value(
+                entry,
+                &snap.values,
+                snap.missing.get(&entry.id).map(ToString::to_string),
+            ),
+            Err(absent) => unavailable(absent.to_string()),
+        };
+    }
+    let key = path_key(resolved);
+    let Some(path) = paths.iter_mut().find(|g| g.path == key) else {
+        return unavailable(INCOHERENT.to_string());
+    };
+    // O motivo do caminho vale para o cheat: os dois mostram o mesmo salto.
+    if let Some(error) = &path.error {
+        return unavailable(error.clone());
+    }
+    match (&resolved.rule, path.object, world) {
+        (ResolvedRule::Add { field, .. }, Some(obj), _) => {
+            report_add(mem, index, catalog, obj, field, path)
+        }
+        (ResolvedRule::Set { .. }, _, Some(Ok(snap))) => report_value(
+            entry,
+            &snap.values,
+            snap.missing.get(&entry.id).map(ToString::to_string),
+        ),
+        (ResolvedRule::Set { .. }, _, Some(Err(absent))) => unavailable(absent.to_string()),
+        _ => unavailable(INCOHERENT.to_string()),
     }
 }
 
-fn report_value(snapshot: &PlayerSnapshot, entry: &CatalogEntry) -> FieldReportValue {
-    if let Some(absent) = snapshot.missing.get(&entry.id) {
-        return FieldReportValue::Unavailable {
-            reason: absent.to_string(),
-        };
+/// Valor atual do campo de uma ação (`add`) no objeto `obj`; a falha vira o `error` do caminho.
+fn report_add<M: ReadMem + ?Sized>(
+    mem: &M,
+    index: &ReflectionIndex,
+    catalog: &FieldCatalog,
+    obj: u64,
+    field: &Field,
+    path: &mut GameStateReport,
+) -> FieldReportValue {
+    let mut r = Reader {
+        mem,
+        index,
+        catalog,
+        props: HashMap::new(),
+        objects: Vec::new(),
+    };
+    let addr = obj + u64::from(field.offset);
+    let read = r
+        .check_fits(obj, &field.name, field.offset, field.size)
+        .map_err(|absent| gone(&field.name)(absent).to_string())
+        .and_then(|()| read_u32(mem, addr).map_err(|_| format!("{} ilegível", field.name)));
+    match read {
+        Ok(raw) => FieldReportValue::Add {
+            addr,
+            current: i32::from_le_bytes(raw.to_le_bytes()),
+        },
+        Err(reason) => {
+            path.error = Some(reason.clone());
+            FieldReportValue::Unavailable { reason }
+        }
+    }
+}
+
+/// Estado de um cheat lido por `values` (ou o motivo em `missing`).
+fn report_value(
+    entry: &CatalogEntry,
+    values: &HashMap<String, FieldValues>,
+    missing: Option<String>,
+) -> FieldReportValue {
+    if let Some(reason) = missing {
+        return FieldReportValue::Unavailable { reason };
     }
     let resolved = match &entry.resolved {
         Ok(r) => r,
@@ -1546,7 +1741,7 @@ fn report_value(snapshot: &PlayerSnapshot, entry: &CatalogEntry) -> FieldReportV
             };
         }
     };
-    match (&resolved.rule, snapshot.values.get(&entry.id)) {
+    match (&resolved.rule, values.get(&entry.id)) {
         (
             _,
             Some(&FieldValues::Lock {

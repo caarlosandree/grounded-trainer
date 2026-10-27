@@ -2001,24 +2001,33 @@ fn report_includes_set_and_add() {
     );
 }
 
+/// Entrada do relatório do `GameState` para o `PartyComponent` (a ação de somar ciência).
+fn party_entry(w: &World) -> GameStateReport {
+    GameStateReport {
+        level: Some(w.level),
+        world: Some(w.world),
+        game_state: Some(w.game_state),
+        path: "PartyComponent".into(),
+        hops: vec![HopReport {
+            name: "PartyComponent".into(),
+            addr: w.party,
+            class: "PartyComponent".into(),
+        }],
+        object: Some(w.party),
+        error: None,
+    }
+}
+
 #[test]
 fn report_game_state_path() {
     let w = world(&[]);
     let catalog = full_catalog(&w, &cfg_gs());
     let report = report_with(&w, &catalog);
-    assert_eq!(
-        report.game_state,
-        Some(GameStateReport {
-            level: Some(w.level),
-            world: Some(w.world),
-            game_state: Some(w.game_state),
-            object: Some(w.party),
-            error: None,
-        })
-    );
+    assert_eq!(report.game_state, vec![party_entry(&w)]);
+    assert_eq!(report.pawn_error, None);
     // Sem cheat de `game_state` no catálogo, não há caminho a mostrar.
     let plain = FieldCatalog::resolve(&w.index, &w.mem, &cfg_gs(), &defs());
-    assert_eq!(report_with(&w, &plain).game_state, None);
+    assert_eq!(report_with(&w, &plain).game_state, vec![]);
 }
 
 #[test]
@@ -2030,13 +2039,15 @@ fn report_game_state_missing_hop() {
     // Os saltos que deram certo continuam aparecendo; o que falhou vem como motivo.
     assert_eq!(
         report.game_state,
-        Some(GameStateReport {
+        vec![GameStateReport {
             level: Some(w.level),
             world: Some(w.world),
             game_state: None,
+            path: "PartyComponent".into(),
+            hops: vec![],
             object: None,
             error: Some("GameState ausente ou de classe inesperada".into()),
-        })
+        }]
     );
     match report_field(&report, "somar-ciencia") {
         FieldReportValue::Unavailable { reason } => {
@@ -2271,4 +2282,273 @@ fn index_missing_class_only_hits_world_cheats() {
         );
     }
     assert_eq!(catalog.avail("vida-infinita"), Ok(()));
+}
+
+// ---- relatório do caminho do mundo (spec 007, 6.7) ----
+
+/// Os cheats do personagem, o do `PartyComponent` e os dois do mundo; `dano-recebido` com a grade
+/// do `generic.toml` (`x`, duas casas).
+fn report_catalog(w: &World) -> FieldCatalog {
+    let mut all = defs();
+    all.extend(new_defs());
+    all.extend(world_defs().into_iter().map(|mut d| {
+        if d.id == "dano-recebido" {
+            d.value = Some(ValueGrid {
+                ty: gt_core::value::ValueType::F32,
+                min: 0.0,
+                max: 1.0,
+                step: 0.05,
+                default_k: 5,
+                unit: Some("x".into()),
+                decimals: 2,
+            });
+        }
+        d
+    }));
+    FieldCatalog::resolve(&w.index, &w.mem, &cfg_gs(), &all)
+}
+
+fn settings_entry(w: &World) -> GameStateReport {
+    GameStateReport {
+        level: Some(w.level),
+        world: Some(w.world),
+        game_state: Some(w.game_state),
+        path: "SurvivalModeManagerComponent.GameModeSettings".into(),
+        hops: vec![
+            HopReport {
+                name: "SurvivalModeManagerComponent".into(),
+                addr: w.mode_manager,
+                class: "SurvivalModeManagerComponent".into(),
+            },
+            HopReport {
+                name: "GameModeSettings".into(),
+                addr: w.settings,
+                // A cena local não tem a subclasse `BP_NormalModeSettings_C` do jogo: a instância
+                // é da própria classe das configurações.
+                class: "SurvivalGameModeSettings".into(),
+            },
+        ],
+        object: Some(w.settings),
+        error: None,
+    }
+}
+
+#[test]
+fn report_world_path_and_bools() {
+    let w = world(&[]);
+    let catalog = report_catalog(&w);
+    w.mem.write(w.settings + u64::from(RECIPES_OFF), &[1]);
+    w.mem.write(w.settings + u64::from(AUTO_COMPLETE_OFF), &[0]);
+    w.write_f32(w.settings + u64::from(ENEMY_DAMAGE_OFF), 1.0);
+    let report = report_with(&w, &catalog);
+
+    assert_eq!(report.pawn_error, None);
+    // Uma entrada por caminho distinto, na ordem dos cheats: ciência e configurações.
+    assert_eq!(report.game_state, vec![party_entry(&w), settings_entry(&w)]);
+
+    assert_eq!(
+        report_field(&report, "construir-sem-ingredientes"),
+        &FieldReportValue::Set {
+            fields: vec![
+                SetFieldReport {
+                    name: "bRecipesRequireIngredients".into(),
+                    addr: w.settings + u64::from(RECIPES_OFF),
+                    raw: 1,
+                    value: "true".into(),
+                },
+                SetFieldReport {
+                    name: "bAutoCompleteBuildings".into(),
+                    addr: w.settings + u64::from(AUTO_COMPLETE_OFF),
+                    raw: 0,
+                    value: "false".into(),
+                },
+            ]
+        }
+    );
+    assert_eq!(
+        report_field(&report, "dano-recebido"),
+        &FieldReportValue::Set {
+            fields: vec![SetFieldReport {
+                name: "EnemyDamageMultiplier".into(),
+                addr: w.settings + u64::from(ENEMY_DAMAGE_OFF),
+                raw: 1.0f32.to_bits(),
+                value: "1.00x".into(),
+            }]
+        }
+    );
+    // A ação e o pawn seguem como antes.
+    assert!(matches!(
+        report_field(&report, "somar-ciencia"),
+        FieldReportValue::Add { .. }
+    ));
+    assert!(matches!(
+        report_field(&report, "vida-infinita"),
+        FieldReportValue::Lock { .. }
+    ));
+}
+
+#[test]
+fn report_world_survives_pawn_null() {
+    let w = world(&[]);
+    let catalog = report_catalog(&w);
+    w.mem.write(w.settings + u64::from(RECIPES_OFF), &[1]);
+    w.write_u64(w.controller + u64::from(PAWN_OFF), 0);
+    let report = report_with(&w, &catalog);
+
+    assert_eq!(report.pawn_error.as_deref(), Some("Pawn nulo"));
+    assert_eq!(report.pawn, Some(0));
+    // Os cheats do pawn ficam indisponíveis com o motivo; os do mundo e a ação, não.
+    for id in ["vida-infinita", "nao-morrer", "carga", "velocidade"] {
+        assert_eq!(
+            report_field(&report, id),
+            &FieldReportValue::Unavailable {
+                reason: "Pawn nulo".into()
+            },
+            "{id}"
+        );
+    }
+    for id in ["construir-sem-ingredientes", "dano-recebido"] {
+        assert!(
+            matches!(report_field(&report, id), FieldReportValue::Set { .. }),
+            "{id}"
+        );
+    }
+    let FieldReportValue::Set { fields } = report_field(&report, "construir-sem-ingredientes")
+    else {
+        panic!("não é set");
+    };
+    assert_eq!(fields[0].value, "true");
+    assert!(matches!(
+        report_field(&report, "somar-ciencia"),
+        FieldReportValue::Add { .. }
+    ));
+    assert_eq!(report.game_state, vec![party_entry(&w), settings_entry(&w)]);
+}
+
+#[test]
+fn report_world_pawn_wrong_class_keeps_world() {
+    let w = world(&[]);
+    let catalog = report_catalog(&w);
+    w.write_u64(w.controller + u64::from(PAWN_OFF), w.creature);
+    let report = report_with(&w, &catalog);
+    assert_eq!(
+        report.pawn_error.as_deref(),
+        Some("o Pawn não é o personagem do jogador")
+    );
+    assert_eq!(report.game_state.len(), 2);
+    assert!(
+        report
+            .game_state
+            .iter()
+            .all(|g| g.error.is_none() && g.object.is_some())
+    );
+}
+
+#[test]
+fn report_world_hop_error() {
+    let w = world(&[]);
+    let catalog = report_catalog(&w);
+    w.write_u64(w.game_state + u64::from(MODE_MANAGER_OFF), 0);
+    let report = report_with(&w, &catalog);
+
+    let reason = "SurvivalModeManagerComponent ausente ou de classe inesperada";
+    assert_eq!(
+        report.game_state,
+        vec![
+            party_entry(&w),
+            GameStateReport {
+                object: None,
+                hops: vec![],
+                error: Some(reason.into()),
+                ..settings_entry(&w)
+            }
+        ]
+    );
+    for id in ["construir-sem-ingredientes", "dano-recebido"] {
+        assert_eq!(
+            report_field(&report, id),
+            &FieldReportValue::Unavailable {
+                reason: reason.into()
+            },
+            "{id}"
+        );
+    }
+    // O pawn e a ação não dependem disso.
+    assert_eq!(report.pawn_error, None);
+    assert!(matches!(
+        report_field(&report, "somar-ciencia"),
+        FieldReportValue::Add { .. }
+    ));
+}
+
+#[test]
+fn report_world_second_hop_error_keeps_first() {
+    let w = world(&[]);
+    let catalog = report_catalog(&w);
+    w.write_u64(w.mode_manager + u64::from(SETTINGS_OFF), 0);
+    let report = report_with(&w, &catalog);
+    let entry = &report.game_state[1];
+    assert_eq!(
+        entry.hops,
+        vec![HopReport {
+            name: "SurvivalModeManagerComponent".into(),
+            addr: w.mode_manager,
+            class: "SurvivalModeManagerComponent".into(),
+        }]
+    );
+    assert_eq!(entry.object, None);
+    assert_eq!(
+        entry.error.as_deref(),
+        Some("GameModeSettings ausente ou de classe inesperada")
+    );
+}
+
+#[test]
+fn report_world_cdo_is_not_an_object() {
+    let w = world(&[]);
+    let catalog = report_catalog(&w);
+    w.write_u64(w.mode_manager + u64::from(SETTINGS_OFF), w.cdo_settings);
+    let report = report_with(&w, &catalog);
+    let entry = &report.game_state[1];
+    assert_eq!(entry.object, None);
+    assert_eq!(entry.hops.len(), 1);
+    assert_eq!(
+        entry.error.as_deref(),
+        Some("GameModeSettings ausente ou de classe inesperada")
+    );
+    assert!(matches!(
+        report_field(&report, "dano-recebido"),
+        FieldReportValue::Unavailable { .. }
+    ));
+}
+
+#[test]
+fn report_controller_invalid_is_err() {
+    let w = world(&[]);
+    let catalog = report_catalog(&w);
+    let at = w.controller + u64::from(w.layout.uobject.index);
+    let good = gt_ue::read::read_u32(&w.mem, at).unwrap();
+    w.mem.write(at, &(good + 1).to_le_bytes());
+    assert_eq!(
+        player_report(&w.mem, &w.index, &catalog, &w.objects, w.controller).map(|_| ()),
+        Err(Absent::ControllerInvalid)
+    );
+}
+
+#[test]
+fn watch_player_reports_world_with_pawn_null() {
+    let mut w = world(&[]);
+    w.catalog = report_catalog(&w);
+    w.write_u64(w.controller + u64::from(PAWN_OFF), 0);
+    let mem = Counting {
+        inner: &w.mem,
+        batches: AtomicUsize::new(0),
+    };
+    let seen = watch(&w, &mem, Some(w.controller), 2, |_| {});
+    assert_eq!(seen.len(), 2);
+    for r in seen {
+        let report = r.unwrap();
+        assert_eq!(report.pawn_error.as_deref(), Some("Pawn nulo"));
+        assert_eq!(report.game_state.len(), 2);
+    }
 }
