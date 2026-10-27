@@ -3,7 +3,7 @@
 Trainer **nativo de Linux** para o Grounded 2 (Steam/Proton), para uso pessoal em partidas solo/offline.
 
 Escopo de funcionalidades definido: **Sobrevivência, Itens, Progressão e Movimento**.
-Interface: **TUI no terminal**. Estratégia técnica: **externo primeiro, DLL injetada como fase opcional posterior**.
+Interface: **TUI no terminal**. Estratégia técnica: **só externo**, nada é injetado no jogo.
 
 Cada fase só começa quando a anterior cumpre seu critério de pronto. Cada funcionalidade passa por
 `spec → plano → código` (ver `AGENTS.md`).
@@ -147,22 +147,10 @@ A fase foi dividida em duas specs:
 
 ---
 
-## Fase 7 (opcional) — DLL interna
-
-**Objetivo:** recursos que um trainer externo não alcança.
-
-- DLL Windows em Rust, carregada pelo jogo via override de DLL do Proton.
-- Chamar funções do jogo diretamente (ex.: dar item X).
-- Comunicação com a TUI externa.
-- Possível overlay dentro do jogo.
-
-**Só começa** se as fases 1–6 estiverem estáveis e houver funcionalidades que realmente precisem disso.
-
----
-
 ## Fora de escopo
 
 - Multiplayer, qualquer interação com outros jogadores ou servidores.
 - Burlar anti-cheat.
 - Versão Game Pass/Windows.
+- DLL injetada no jogo (a antiga Fase 7 opcional, removida em 2026-10-27 por decisão do dono: desnecessária).
 - Distribuição pública ou reaproveitamento de código de terceiros (FLiNG, WeMod/Wand).

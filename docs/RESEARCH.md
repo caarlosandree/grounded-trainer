@@ -442,7 +442,7 @@ execução** (`scratch/fling/tools/ue_props.py`), não de SDK gerado.
 ### Catálogo: as 36 opções do menu
 
 Caminho proposto para o nosso trainer: **V** = escrita de valor no objeto (Fase 5, sem patch de código);
-**P** = patch simples (Fase 4); **C** = desvio com cave (Fase 6); **D** = DLL (Fase 7).
+**P** = patch simples (Fase 4); **C** = desvio com cave (Fase 6); **D** = DLL (antiga Fase 7, removida em 2026-10-27; fora de escopo).
 
 | Tecla | Opção | Como o FLiNG faz | Estado no build | Nosso caminho |
 |---|---|---|---|---|

@@ -2,7 +2,7 @@
 
 ## 1. Visão geral
 
-Trainer **externo**, binário nativo de Linux. Ele não roda dentro do Wine nem injeta nada no jogo (até a Fase 7 opcional). Funciona porque o jogo, mesmo rodando pelo Proton, é um processo Linux comum: o Wine carrega o `.exe` no mesmo endereço virtual que o Windows usaria.
+Trainer **externo**, binário nativo de Linux. Ele não roda dentro do Wine nem injeta nada no jogo. Funciona porque o jogo, mesmo rodando pelo Proton, é um processo Linux comum: o Wine carrega o `.exe` no mesmo endereço virtual que o Windows usaria.
 
 ```
 ┌─────────────── Linux (host) ────────────────┐
@@ -21,7 +21,6 @@ Trainer **externo**, binário nativo de Linux. Ele não roda dentro do Wine nem 
 |---|---|
 | Leitura/escrita de memória | Empate com Go |
 | Montar/desmontar x86-64 (code caves, fronteiras de instrução) | **Rust**: `iced-x86` monta *e* desmonta; em Go só há desmontador |
-| DLL Windows futura (Fase 7) | **Rust**: `cdylib` enxuta para `x86_64-pc-windows-gnu`; Go embutiria runtime e GC no processo do jogo |
 | Structs com layout C (SDK do Unreal) | **Rust**: `#[repr(C)]` |
 | Curva de aprendizado | Irrelevante: o código é escrito pela IA |
 
@@ -212,7 +211,7 @@ As instruções originais copiadas para a cave passam por relocação (endereço
 - Fedora 44, kernel 7.2, Wayland, GPU RTX 3060 Laptop.
 - Steam nativa (`~/.local/share/Steam`), Proton Experimental, Steam Linux Runtime 4.
 - Grounded 2: AppID `2661300`, executável em `steamapps/common/Grounded2/Augusta/Binaries/Win64/`.
-- Toolchain: `rustup` stable (Fase 0). Target `x86_64-pc-windows-gnu` + `mingw64-gcc` só na Fase 7.
+- Toolchain: `rustup` stable (Fase 0).
 
 ## 8. Registro de decisões
 
@@ -280,3 +279,4 @@ As instruções originais copiadas para a cave passam por relocação (endereço
 | 2026-10-27 | `set` com `bool` de byte inteiro por função nova (`byte_bool_field`), valor por campo, só liga/desliga, sem mudar o `gt-ue` nem o `bool_field` do `clear_bits`; caminho do `set` de 1 ou 4 bytes | IA, spec 007 6.4 |
 | 2026-10-27 | Procura do controller por pawn nulo (30 s) sem descartar o controller guardado; risco aceito de os cheats do `game_state` escreverem no mundo que saiu até a procura terminar | IA, spec 007 6.3 |
 | 2026-10-27 | Construção em ITENS e "Dano recebido" (grade 0 a 1, passo 0,05, padrão 0,25) em SOBREVIVÊNCIA; `gt ue player` mostra o `game_state` mesmo com o pawn falhando | IA, spec 007 |
+| 2026-10-27 | Fase 7 (DLL interna) removida | Desnecessária: o trainer fica só externo (decisão do dono) |

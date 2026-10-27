@@ -109,7 +109,6 @@ O projeto avança por fases; cada uma só começa quando a anterior cumpre seu c
 | 4 | Primeiros cheats por troca de bytes | ✅ |
 | 5 | Estruturas do Unreal Engine pela reflexão (vida, stamina, fome, sede…) | 🚧 em andamento |
 | 6 | Code caves: lógica nova montada com `iced-x86` | ⏳ |
-| 7 | (opcional) DLL interna carregada pelo Proton | ⏳ |
 
 Cheats que já funcionam no jogo (Fase 4):
 
