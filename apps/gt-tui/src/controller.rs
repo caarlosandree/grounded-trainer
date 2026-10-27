@@ -1107,6 +1107,10 @@ fn fmt_int(grid: &gt_core::value::ValueGrid, v: i32) -> String {
     let point = gt_core::value::ValueGrid {
         min: f64::from(v),
         max: f64::from(v),
+        step: 1.0,
+        default_k: 0,
+        // Sem a lista, `format(0)` mostraria `points[0]` em vez de `v`.
+        points: None,
         ..grid.clone()
     };
     point.format(0)
@@ -2105,6 +2109,21 @@ mod tests {
         fn events(&self) -> Vec<&str> {
             self.c.model.events.iter().map(String::as_str).collect()
         }
+    }
+
+    #[test]
+    fn fmt_int_ignores_points_of_the_grid() {
+        let g = ValueGrid {
+            ty: ValueType::I32,
+            min: 2.0,
+            max: 10.0,
+            step: 0.0,
+            default_k: 0,
+            unit: Some("x".into()),
+            decimals: 0,
+            points: Some(vec![2.0, 3.0, 5.0, 10.0]),
+        };
+        assert_eq!(fmt_int(&g, 7), "7x");
     }
 
     fn grid() -> ValueGrid {
