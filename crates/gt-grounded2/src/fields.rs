@@ -134,6 +134,8 @@ pub fn missing_note(kind: MissingKind) -> Note {
     match kind {
         MissingKind::Pet => Note::WaitingPet,
         MissingKind::Component => Note::Waiting,
+        // A marca própria (`aguardando o mundo`) chega com o ciclo do mundo; até lá, a do personagem.
+        MissingKind::World => Note::Waiting,
     }
 }
 

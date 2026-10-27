@@ -97,11 +97,16 @@ pub enum MissingKind {
     Pet,
     /// Um componente do personagem: `aguardando o personagem`.
     Component,
+    /// O objeto do mundo (raiz `game_state`): `aguardando o mundo` (spec 007, 6.3).
+    World,
 }
 
 /// Tipo do objeto que falta no cheat `resolved` (a nota em si mora em `fields.rs`).
 pub fn missing_kind(resolved: &ResolvedField) -> MissingKind {
-    if resolved.is_secondary() {
+    // Na raiz `game_state` um caminho de vários saltos nunca é o pet.
+    if resolved.root == FieldRoot::GameState {
+        MissingKind::World
+    } else if resolved.is_secondary() {
         MissingKind::Pet
     } else {
         MissingKind::Component
@@ -767,6 +772,13 @@ impl<M: ReadMem + ?Sized> Reader<'_, M> {
         read_vec(self.mem, obj + u64::from(field.offset), len as usize).map_err(unreadable)
     }
 
+    /// O objeto é um CDO (bit `cdo_flag` nas `ObjectFlags`)? Nunca se escreve num CDO (spec 007, 6.3).
+    fn is_cdo(&self, obj: u64) -> Result<bool, Absent> {
+        let u = &self.catalog.layout.uobject;
+        let flags = read_u32(self.mem, obj + u64::from(u.flags)).map_err(unreadable)?;
+        Ok(flags & u.cdo_flag != 0)
+    }
+
     /// Registra o objeto no caminho (com a guarda), uma vez.
     fn visit(&mut self, obj: u64) -> Result<(), Absent> {
         if self.objects.iter().all(|o| o.addr != obj) {
@@ -902,6 +914,58 @@ pub fn read_game_state<M: ReadMem + ?Sized>(
     )
 }
 
+/// Converte a falha de uma leitura no `GameState` em `Missing(salto)`: o nome do campo que não
+/// confere, ou `hop` quando a leitura em si falhou.
+fn gone(hop: &str) -> impl Fn(Absent) -> GameStateAbsent {
+    let hop = hop.to_string();
+    move |absent: Absent| match absent {
+        Absent::ComponentWrongClass(name) | Absent::FieldOutsideObject(name) => {
+            GameStateAbsent::Missing(name)
+        }
+        _ => GameStateAbsent::Missing(hop.clone()),
+    }
+}
+
+/// Anda do controller (já conferido) até o `GameState`: `Outer` → `Level.OwningWorld` →
+/// `World.GameState`, anotando em `hops` cada salto que deu certo. Usada pela ação sob demanda
+/// ([`walk_game_state`]) e pela leitura do mundo no ciclo ([`read_world`]).
+fn walk_to_game_state<M: ReadMem + ?Sized>(
+    r: &mut Reader<'_, M>,
+    controller: u64,
+    gs: &GameStatePath,
+    hops: &mut GameStateReport,
+) -> Result<u64, GameStateAbsent> {
+    let missing = |hop: &str| GameStateAbsent::Missing(hop.to_string());
+    // O `Outer` do controller é o nível; ele mora no cabeçalho do `UObject`, não na reflexão.
+    let outer = read_u64(
+        r.mem,
+        controller + u64::from(r.catalog.layout.uobject.outer),
+    )
+    .map_err(|_| missing("Outer"))?;
+    if outer == 0
+        || !r
+            .catalog
+            .object_is_a(r.index, r.mem, outer, gs.level_class)
+            .map_err(|_| missing("Outer"))?
+    {
+        return Err(missing("Outer"));
+    }
+    hops.level = Some(outer);
+    let mut next = |from: u64, hop: &Field, class: u64| -> Result<u64, GameStateAbsent> {
+        let ptr = r.pointer(from, hop).map_err(gone(&hop.name))?;
+        let ok = ptr != 0
+            && r.catalog
+                .object_is_a(r.index, r.mem, ptr, class)
+                .map_err(gone(&hop.name))?;
+        if ok { Ok(ptr) } else { Err(missing(&hop.name)) }
+    };
+    let world = next(outer, &gs.world_field, gs.world_class)?;
+    hops.world = Some(world);
+    let state = next(world, &gs.game_state_field, gs.game_state_class)?;
+    hops.game_state = Some(state);
+    Ok(state)
+}
+
 /// Como [`read_game_state`], anotando em `hops` o endereço de cada salto que deu certo (para o
 /// relatório mostrar até onde o caminho chegou quando um deles falha).
 fn walk_game_state<M: ReadMem + ?Sized>(
@@ -934,39 +998,7 @@ fn walk_game_state<M: ReadMem + ?Sized>(
         props: HashMap::new(),
         objects: Vec::new(),
     };
-    let gone = |hop: &str| {
-        let hop = hop.to_string();
-        move |absent: Absent| match absent {
-            Absent::ComponentWrongClass(name) | Absent::FieldOutsideObject(name) => {
-                GameStateAbsent::Missing(name)
-            }
-            _ => GameStateAbsent::Missing(hop.clone()),
-        }
-    };
-
-    // O `Outer` do controller é o nível; ele mora no cabeçalho do `UObject`, não na reflexão.
-    let outer = read_u64(mem, controller + u64::from(catalog.layout.uobject.outer))
-        .map_err(|_| missing("Outer"))?;
-    if outer == 0
-        || !catalog
-            .object_is_a(index, mem, outer, gs.level_class)
-            .map_err(|_| missing("Outer"))?
-    {
-        return Err(missing("Outer"));
-    }
-    hops.level = Some(outer);
-    let mut next = |from: u64, hop: &Field, class: u64| -> Result<u64, GameStateAbsent> {
-        let ptr = r.pointer(from, hop).map_err(gone(&hop.name))?;
-        let ok = ptr != 0
-            && r.catalog
-                .object_is_a(r.index, r.mem, ptr, class)
-                .map_err(gone(&hop.name))?;
-        if ok { Ok(ptr) } else { Err(missing(&hop.name)) }
-    };
-    let world = next(outer, &gs.world_field, gs.world_class)?;
-    hops.world = Some(world);
-    let state = next(world, &gs.game_state_field, gs.game_state_class)?;
-    hops.game_state = Some(state);
+    let state = walk_to_game_state(&mut r, controller, gs, hops)?;
     let obj = r.object(state, resolved).map_err(gone(id))?;
     hops.object = Some(obj);
     r.check_fits(obj, &field.name, field.offset, field.size)
@@ -978,6 +1010,92 @@ fn walk_game_state<M: ReadMem + ?Sized>(
         .map(|o| o.guard.clone())
         .unwrap_or_default();
     Ok((obj, obj + u64::from(field.offset), guard))
+}
+
+/// Os `set` da raiz `game_state` lidos num ciclo (spec 007, 6.3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorldSnapshot {
+    /// O `GameState` vivo, de onde saem os caminhos.
+    pub game_state: u64,
+    pub objects: Vec<ObjSnap>,
+    /// Por `id`, só dos cheats do mundo resolvidos e com o objeto no lugar.
+    pub values: HashMap<String, FieldValues>,
+    /// Cheats do mundo cujo objeto não está disponível neste ciclo, com o salto que falhou.
+    pub missing: HashMap<String, GameStateAbsent>,
+}
+
+/// Lê os `set` de raiz `game_state` pelo caminho controller → `Outer` → `World` → `GameState`,
+/// sem tocar no pawn (spec 007, 6.3). Controller inválido ou um salto até o `GameState` falhando
+/// derrubam a leitura; um salto do objeto de um cheat (nulo, classe errada, ilegível, fora do
+/// objeto ou um CDO) só deixa aquele `id` em `missing`.
+pub fn read_world<M: ReadMem + ?Sized>(
+    mem: &M,
+    index: &ReflectionIndex,
+    catalog: &FieldCatalog,
+    objects: &ObjectArray,
+    controller: u64,
+) -> Result<WorldSnapshot, GameStateAbsent> {
+    let Ok(path) = &catalog.path else {
+        return Err(GameStateAbsent::ControllerInvalid);
+    };
+    check_controller(mem, index, catalog, objects, controller, path)
+        .map_err(|_| GameStateAbsent::ControllerInvalid)?;
+    let Ok(gs) = &catalog.game_state else {
+        return Err(GameStateAbsent::Missing("GameState".to_string()));
+    };
+    let mut r = Reader {
+        mem,
+        index,
+        catalog,
+        props: HashMap::new(),
+        objects: Vec::new(),
+    };
+    let state = walk_to_game_state(&mut r, controller, gs, &mut GameStateReport::default())?;
+
+    let mut values = HashMap::new();
+    let mut missing = HashMap::new();
+    for entry in &catalog.entries {
+        let Ok(resolved) = &entry.resolved else {
+            continue;
+        };
+        if resolved.root != FieldRoot::GameState
+            || !matches!(resolved.rule, ResolvedRule::Set { .. })
+        {
+            continue;
+        }
+        // Falha de leitura sem nome de campo: o último salto do caminho (as configurações).
+        let last = resolved
+            .object_path
+            .last()
+            .map_or(entry.id.as_str(), |h| h.field.name.as_str());
+        let before = r.objects.len();
+        let read = r
+            .object(state, resolved)
+            .and_then(|obj| match r.is_cdo(obj)? {
+                true => {
+                    tracing::debug!(id = %entry.id, obj, "objeto do mundo é um CDO");
+                    Err(Absent::ComponentWrongClass(last.to_string()))
+                }
+                false => r.values(obj, &resolved.rule),
+            });
+        match read {
+            Ok(Some(v)) => {
+                values.insert(entry.id.clone(), v);
+            }
+            Ok(None) => {}
+            Err(absent) => {
+                // Um objeto rejeitado não fica entre os do ciclo.
+                r.objects.truncate(before);
+                missing.insert(entry.id.clone(), gone(last)(absent));
+            }
+        }
+    }
+    Ok(WorldSnapshot {
+        game_state: state,
+        objects: r.objects,
+        values,
+        missing,
+    })
 }
 
 /// Lê o personagem a partir do controller guardado, revalidando o caminho inteiro (spec 6.3,
