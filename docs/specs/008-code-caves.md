@@ -3,7 +3,7 @@
 | Campo | Valor |
 |---|---|
 | Fase | 6 (ver `docs/ROADMAP.md`) |
-| Estado | Rascunho, aguardando aprovação do dono |
+| Estado | Aprovada pelo dono em 2026-10-27 (Fase 6 em andamento) |
 | Data | 2026-10-27 |
 | Depende de | Spec 007 na `main` (raiz `game_state` com `set`), só para `congelar-hora` (6.8.1) |
 
@@ -86,7 +86,7 @@ Valem os das specs anteriores. Além deles:
 | Escritas de cave e de variável, política da folga, entradas novas do diário, limpeza com conferência do `pc` | `crates/gt-core/src/` (`engine.rs`, `journal.rs`, `recovery.rs`, `patch.rs`, `mem/`) e `apps/gt-patch` (`restore`) |
 | Grade por lista, `f64` na grade | `crates/gt-core/src/value.rs` |
 | Pontos dos desvios (`[[hook]]` ou equivalente) e corpos das caves (Rust) | `crates/gt-grounded2/signatures/generic.toml` e `crates/gt-grounded2/src/` |
-| Calendário, `add` de `double` com tolerância, salto com classe dona própria | `crates/gt-grounded2/src/` (`player.rs`, `fields.rs`, `signatures.rs`) e, no motor, uma escrita de dados com releitura **"maior ou igual"** (`crates/gt-core/src/engine.rs`; hoje a releitura exige igualdade exata). Os tipos da ação (`plan_add`, `ActionOutcome`, `Backend::field_action`, backend falso, formatação no `controller.rs`) passam de `i32` para um valor numérico de 4 ou 8 bytes, de ponta a ponta |
+| Calendário, `add` de `double` com `at_least`, salto com classe dona própria | `crates/gt-grounded2/src/` (`player.rs`, `fields.rs`, `signatures.rs`) e, no motor, uma escrita de dados com releitura **"maior ou igual"** (`crates/gt-core/src/engine.rs`; hoje a releitura exige igualdade exata). Os tipos da ação (`plan_add`, `ActionOutcome`, `Backend::field_action`, backend falso, formatação no `controller.rs`) passam de `i32` para um valor numérico de 4 ou 8 bytes, de ponta a ponta |
 | Linhas na TUI (desvio com valor, ação de armar, `[ação]` de pular hora, registro do Brain Power) | `apps/gt-tui/src/` |
 | `gt caves`, `gt diff`, `gt ue player` (só leitura; `gt diff` e `gt caves` passam a ler o diário sem a trava, conferindo a identidade boot/PID/início antes de usar) | `apps/gt-cli/` e `crates/gt-grounded2/src/player.rs` |
 | `gt-patch observe` (escreve; usa trava do diário e recuperação) | `apps/gt-patch/` |
@@ -137,8 +137,8 @@ ao RIP) e `jmp` de volta para a instrução seguinte.
   registra e mantém a entrada no diário para a próxima execução. Por último, zera as variáveis. Por isso **toda cave
   é segura com as variáveis zeradas**: valor 0 = não faz nada (passa direto para a instrução original).
 - **Recuperação** (próxima execução depois de SIGKILL, e `gt-patch restore`): mesma ordem. Desvio: regra da Fase 2
-  por byte (original ou nosso; byte de outro não é escrito). Cave: só devolve `CC` se **todos** os bytes forem os
-  nossos e não houver desvio nosso instalado apontando para ela, **e com a mesma pausa, conferência do `pc` e até 5
+  por byte (original ou nosso; byte de outro não é escrito). Cave: só devolve `CC` se **cada byte** for `CC` ou o
+  nosso (`CC` é o original) e não houver desvio nosso instalado apontando para ela, **e com a mesma pausa, conferência do `pc` e até 5
   tentativas da saída** (depois de um SIGKILL o desvio estava vivo, então pode haver thread dentro). Variáveis: 6.4.
 
 ### 6.4 Escritas de cave e de variável (tipos novos do motor)
@@ -386,7 +386,7 @@ Patches com `slot` e grades existentes não mudam. O `unit` continua sufixo (`5x
 | Achar folgas (função pura): sequências de `CC`, margem de 16, `tamanho ≥ cave + 16`, várias caves na mesma sequência sem sobreposição; folga da `.data` pelo `VirtualSize` e pelo `maps` | Não |
 | Montagem do desvio (função pura): `jmp rel32` + `NOP`; instrução original relocada (com e sem RIP relativo); recusa instrução < 5 bytes e distância > ±2 GB | Não |
 | Grade por lista: carga (crescente, `default`, inteiros, um ponto só), `←→`, `f64`; grades antigas iguais | Não |
-| Assinaturas: os quatro desvios e os dois cheats de hora carregam; erros de carga do formato novo; `add` com `double`, `tolerance` e um ponto | Não |
+| Assinaturas: os quatro desvios e os dois cheats de hora carregam; erros de carga do formato novo; `add` com `double`, `at_least` e um ponto | Não |
 | Módulo sintético: ligar um desvio numa função "soma" multiplica; trocar valor muda o resultado sem pausa; desligar devolve; sair limpa cave e variáveis (`.text` igual à cópia "em disco") | Não |
 | Módulo sintético com uma thread chamando a função em laço: 1000 ligar/desligar e a saída sem crash, resultado sempre o original ou o multiplicado | Não |
 | Limpeza com thread parada dentro da cave (thread de teste segura num laço dentro dela): a cave não é apagada; com a thread fora, é | Não |
@@ -442,7 +442,7 @@ Com o item 2, a **Fase 6 fecha**.
 - `docs/RESEARCH.md`: pesquisa de 2026-10-27, resultados da cave de observação (arrastar e coleta) e do teste.
 - `docs/ARCHITECTURE.md`: 5.5 (desvio de uma instrução, alocador, cave e variável como tipos de escrita, ordem de
   ligar/desligar/sair, limpeza com `pc`, cave de observação), 5.3 (formato do desvio, `points`, `add` de `double`,
-  `tolerance`, classe dona no salto), 5.4 (entradas novas do diário) e registro de decisões.
+  `at_least`, classe dona no salto), 5.4 (entradas novas do diário) e registro de decisões.
 - `AGENTS.md` 3: ressalva dos desvios (7).
 - `docs/specs/005-sobrevivencia-por-reflexao.md` e `006-progressao-e-movimento.md`: notas da exceção da `.data` e do
   `add` generalizado.

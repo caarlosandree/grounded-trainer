@@ -739,8 +739,7 @@ e a separação das fontes da coleta continuam em aberto.
 | Analisador `+57bd6d0` | desmontagem | O getter é uma **função folha**: sem entrada na `.pdata`, começa logo depois de `CC`. Cumpre a regra 2 do ponto aceito |
 
 - **O que não funcionou e por quê:** o `observe` recusou o thunk (`+5942240`) e o getter (`+57bd6d0`), porque a regra
-  da spec 008 6.7.3 então só aceitava começo de função **pela `.pdata`**, que exclui as funções folha. Um atalho para
-  pular a conferência por variável de ambiente foi tentado e bloqueado (não foi aplicado; nada foi escrito no jogo).
+  da spec 008 6.7.3 então só aceitava começo de função **pela `.pdata`**, que exclui as funções folha.
   Em vez disso a regra foi corrigida: o ponto é aceito se a desmontagem desde a entrada da função provar que `rsp` não
   mudou até ele (folha ou prefixo sem pilha; spec 6.7.3, plano Tarefa 9b), e o `observe` passou a aceitar os três
   pontos acima.
