@@ -277,6 +277,6 @@ As instruções originais copiadas para a cave passam por relocação (endereço
 | 2026-10-27 | Construir sem ingredientes só com o que já foi desbloqueado, num cheat só (sem ingredientes e construção pronta na hora); defesa como `EnemyDamageMultiplier` (tentativa; se não funcionar, volta à Fase 6) | Dono, spec 007 |
 | 2026-10-27 | Caminho de valor pelas configurações do modo de jogo (`GameModeSettings`), aceitando o risco de save | Dono, spec 007 |
 | 2026-10-27 | `set` liberado na raiz `game_state`, com leitura a cada ciclo e isolamento por raiz; chave de unicidade do `set` = (`root`, `object`, nome) | IA, spec 007 6.2 e 6.3 |
-| 2026-10-27 | `set` com `bool` de byte inteiro por função nova (`byte_bool_field`), valor por campo, só liga/desliga, sem mudar o `gt-ue` nem o `bool_field` do `clear_bits`; caminho do `set` de 1 ou 4 bytes | IA, spec 007 6.2 |
+| 2026-10-27 | `set` com `bool` de byte inteiro por função nova (`byte_bool_field`), valor por campo, só liga/desliga, sem mudar o `gt-ue` nem o `bool_field` do `clear_bits`; caminho do `set` de 1 ou 4 bytes | IA, spec 007 6.4 |
 | 2026-10-27 | Procura do controller por pawn nulo (30 s) sem descartar o controller guardado; risco aceito de os cheats do `game_state` escreverem no mundo que saiu até a procura terminar | IA, spec 007 6.3 |
 | 2026-10-27 | Construção em ITENS e "Dano recebido" (grade 0 a 1, passo 0,05, padrão 0,25) em SOBREVIVÊNCIA; `gt ue player` mostra o `game_state` mesmo com o pawn falhando | IA, spec 007 |

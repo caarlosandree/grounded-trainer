@@ -10,6 +10,7 @@ use gt_core::journal::{JournalStore, Loaded};
 use gt_core::mem::{MemReader, MemWriter};
 use gt_core::procinfo::identity;
 use gt_core::value::{ValueGrid, ValueSpec, ValueType};
+use gt_grounded2::fields::Note;
 use gt_grounded2::signatures::Category;
 use gt_testkit::{TargetOpts, TestTarget};
 use gt_tui::backend::{Backend, Find, OpOutcome, Recovered, Session};
@@ -1126,8 +1127,6 @@ fn note_of(report: &gt_grounded2::fields::TickReport, id: &str) -> Option<Note> 
         .find(|(i, _)| i.as_str() == id)
         .map(|(_, n)| *n)
 }
-
-use gt_grounded2::fields::Note;
 
 #[test]
 fn raw_pawn_null_over_30s_keeps_controller() {
