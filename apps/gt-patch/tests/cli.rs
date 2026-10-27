@@ -90,6 +90,7 @@ fn restore_discards_dead_process_journal() {
                 original: vec![0x48, 0x8B, 0xF9],
                 replacement: vec![0x48, 0x89, 0xCF],
                 next: None,
+                kind: gt_core::patch::PatchKind::Code,
             }],
             data: Vec::new(),
         })

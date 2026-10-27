@@ -531,6 +531,7 @@ mod tests {
             addr: 0x1000,
             expected: expected.clone(),
             replacement: bytes,
+            kind: crate::patch::PatchKind::Code,
         };
         let base = validate(patch(replacement.to_vec())).unwrap();
         assert_eq!(s.grid.steps(), 20);

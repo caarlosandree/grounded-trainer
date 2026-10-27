@@ -107,6 +107,7 @@ mod tests {
             original: vec![0x90],
             replacement: vec![0xcc],
             next: None,
+            kind: gt_core::patch::PatchKind::Code,
         }
     }
 

@@ -6,7 +6,12 @@
 //! funciona com o jogo fechado. A recuperação é genérica (não conhece o jogo) e só
 //! escreve onde cada byte é o original ou o nosso; por isso a política de escrita é
 //! só "a entrada cabe inteira em memória executável do `maps` atual e tem no máximo
-//! [`MAX_PATCH_LEN`] bytes". Entrada fora disso é de outro: não é tocada e sai do diário.
+//! [`MAX_PATCH_LEN`] bytes" ([`MAX_CAVE_LEN`] para uma cave). Entrada fora disso é de outro:
+//! não é tocada e sai do diário.
+//!
+//! A ordem é a do motor (spec 008, 6.3): primeiro os desvios (`Code`), depois as caves, estas
+//! com a pausa mais paciente e só se nenhum desvio ficou sem resolver (ver
+//! [`Engine::restore_entries`]).
 //!
 //! As entradas de dados (bits, spec 005 6.6; valor inteiro, spec 006 6.8) não passam por essa
 //! política: cada uma é decidida por [`crate::journal::decide_data`], com a guarda do objeto
@@ -23,7 +28,7 @@ use crate::journal::{
     DiscardReason, Journal, JournalEntry, JournalLock, JournalStore, Loaded, Recovery, decide,
 };
 use crate::maps::{MapRegion, read_maps};
-use crate::patch::{MAX_PATCH_LEN, WritePolicy};
+use crate::patch::{MAX_CAVE_LEN, MAX_PATCH_LEN, PatchKind, WritePolicy};
 use crate::procinfo::{Identity, ProcStat, boot_id, read_stat};
 use crate::suspend::{PauseConfig, open_checked};
 use crate::{Error, Result};
@@ -147,7 +152,7 @@ pub fn recover(
         .entries
         .iter()
         .cloned()
-        .partition(|e| e.original.len() <= MAX_PATCH_LEN && exec.allows(&e.range()));
+        .partition(|e| e.original.len() <= max_entry_len(e.kind) && exec.allows(&e.range()));
     for e in outside {
         tracing::warn!(
             id = %e.id,
@@ -199,6 +204,7 @@ pub fn recover(
             report.dropped = r.dropped;
             report.foreign.extend(r.foreign);
             report.kept = r.outside_policy;
+            report.kept.extend(r.deferred);
         }
         Err(Error::ProcessGone { .. }) => {
             report.discarded = Some(DiscardReason::ProcessGone);
@@ -231,6 +237,14 @@ pub fn recover(
         );
     }
     Ok(report)
+}
+
+/// Maior entrada que a recuperação aceita tocar, por tipo.
+fn max_entry_len(kind: PatchKind) -> usize {
+    match kind {
+        PatchKind::Code => MAX_PATCH_LEN,
+        PatchKind::Cave => MAX_CAVE_LEN,
+    }
 }
 
 /// Estado atual do processo do diário; `None` se ele não existe mais.
@@ -296,6 +310,12 @@ mod tests {
         assert!(p.allows(&(0x1ffe..0x2002)));
         assert!(!p.allows(&(0x2ffe..0x3002)));
         assert!(!p.allows(&(0x3000..0x3003)));
+    }
+
+    #[test]
+    fn entry_length_limit_depends_on_kind() {
+        assert_eq!(max_entry_len(PatchKind::Code), 64);
+        assert_eq!(max_entry_len(PatchKind::Cave), 4096);
     }
 
     #[test]

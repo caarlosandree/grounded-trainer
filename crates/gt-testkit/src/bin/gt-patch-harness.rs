@@ -414,6 +414,7 @@ fn run(
         addr,
         expected,
         replacement,
+        kind: gt_core::patch::PatchKind::Code,
     })?;
     let policy: PolicyFn = Box::new(move |_maps| WritePolicy::new(vec![allow.clone()]));
     let opts = EngineOptions {

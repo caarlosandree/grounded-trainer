@@ -6,11 +6,38 @@
 use std::ops::Range;
 
 use iced_x86::{Decoder, DecoderOptions, Mnemonic};
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-/// Tamanho máximo de um patch, em bytes.
+/// Tamanho máximo de um patch de código (desvio), em bytes.
 pub const MAX_PATCH_LEN: usize = 64;
+
+/// Tamanho máximo de uma cave, em bytes (spec 008, 6.4).
+pub const MAX_CAVE_LEN: usize = 4096;
+
+/// Byte de preenchimento (`int3`) sobre o qual uma cave é escrita.
+pub const CAVE_FILL: u8 = 0xCC;
+
+/// Tipo de um patch: o que a regra de perigo e a validação esperam dele.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PatchKind {
+    /// Instruções inteiras do jogo trocadas por outras (1 a [`MAX_PATCH_LEN`] bytes); só os
+    /// pontos de retomada no meio do trecho que perdem fronteira de instrução são perigosos.
+    #[default]
+    Code,
+    /// Código nosso escrito sobre preenchimento `0xCC` (1 a [`MAX_CAVE_LEN`] bytes): qualquer
+    /// `pc` dentro do trecho (inclusive o início) e qualquer posição desconhecida são perigosos.
+    Cave,
+}
+
+impl PatchKind {
+    /// `true` para [`PatchKind::Code`] (usado para não gravar o `kind` padrão no diário).
+    pub fn is_code(&self) -> bool {
+        *self == PatchKind::Code
+    }
+}
 
 /// Um patch: troca `expected` por `replacement` a partir de `addr`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -23,6 +50,8 @@ pub struct PatchSpec {
     pub expected: Vec<u8>,
     /// Bytes escritos ao aplicar (mesmo tamanho de `expected`).
     pub replacement: Vec<u8>,
+    /// Tipo do patch (desvio ou cave).
+    pub kind: PatchKind,
 }
 
 impl PatchSpec {
@@ -124,9 +153,18 @@ pub fn validate(spec: PatchSpec) -> Result<Validated> {
         )));
     }
     let len = spec.expected.len();
-    if len == 0 || len > MAX_PATCH_LEN {
+    let max_len = match spec.kind {
+        PatchKind::Code => MAX_PATCH_LEN,
+        PatchKind::Cave => MAX_CAVE_LEN,
+    };
+    if len == 0 || len > max_len {
         return Err(bad(format!(
-            "tamanho {len} fora do limite de 1 a {MAX_PATCH_LEN} bytes"
+            "tamanho {len} fora do limite de 1 a {max_len} bytes"
+        )));
+    }
+    if spec.kind == PatchKind::Cave && spec.expected.iter().any(|b| *b != CAVE_FILL) {
+        return Err(bad(format!(
+            "os bytes esperados de uma cave devem ser todos {CAVE_FILL:#04X}"
         )));
     }
     if spec.addr.checked_add(len as u64).is_none() {
@@ -138,6 +176,16 @@ pub fn validate(spec: PatchSpec) -> Result<Validated> {
 
     let expected = decode_side(&spec.id, "esperados", &spec.expected, spec.addr)?;
     let replacement = decode_side(&spec.id, "novos", &spec.replacement, spec.addr)?;
+
+    // Numa cave os bytes esperados são só preenchimento e nada aponta para ela quando é
+    // escrita ou desfeita: não há retorno de `call` a conferir nem fronteira a comparar.
+    if spec.kind == PatchKind::Cave {
+        return Ok(Validated {
+            spec,
+            expected_starts: expected.starts,
+            replacement_starts: replacement.starts,
+        });
+    }
 
     for (side, other_side, ret_points, other_starts) in [
         (
@@ -169,9 +217,18 @@ pub fn validate(spec: PatchSpec) -> Result<Validated> {
 
 /// Diz se um ponto de retomada de thread é perigoso para o patch no sentido dado.
 ///
-/// `point` é um `pc` (ou `pc - 2` em syscall); `None` é posição ilegível, perigosa só se o
-/// sentido tem fronteira perdida. O início do trecho nunca é perigoso.
+/// `point` é um `pc` (ou `pc - 2` em syscall); `None` é posição ilegível (ou thread rodando).
+///
+/// [`PatchKind::Code`]: `None` é perigoso só se o sentido tem fronteira perdida, e o início do
+/// trecho nunca é perigoso. [`PatchKind::Cave`]: qualquer ponto de `range.start` a
+/// `range.end - 1` (inclusive o início) e `None` são sempre perigosos, nos dois sentidos.
 pub fn is_dangerous(v: &Validated, dir: Direction, point: Option<u64>) -> bool {
+    if v.spec.kind == PatchKind::Cave {
+        return match point {
+            None => true,
+            Some(p) => v.spec.range().contains(&p),
+        };
+    }
     let (written_starts, lost) = match dir {
         Direction::Apply => (&v.replacement_starts, v.lost_on_apply()),
         Direction::Undo => (&v.expected_starts, v.lost_on_undo()),
@@ -234,6 +291,19 @@ mod tests {
             addr: ADDR,
             expected: expected.to_vec(),
             replacement: replacement.to_vec(),
+            kind: PatchKind::Code,
+        }
+    }
+
+    fn cave_spec(len: usize, replacement: &[u8]) -> PatchSpec {
+        let mut replacement = replacement.to_vec();
+        replacement.resize(len, 0x90);
+        PatchSpec {
+            id: "cave".into(),
+            addr: ADDR,
+            expected: vec![CAVE_FILL; len],
+            replacement,
+            kind: PatchKind::Cave,
         }
     }
 
@@ -340,6 +410,79 @@ mod tests {
         let same = validate(spec(&[0x48, 0x8B, 0xF9], &[0x48, 0x89, 0xCF])).unwrap();
         assert!(!is_dangerous(&same, Direction::Apply, None));
         assert!(!is_dangerous(&same, Direction::Undo, None));
+    }
+
+    #[test]
+    fn cave_validate_requires_cc() {
+        // mov rax, 1; ret (+ nops até 8 bytes)
+        let code = [0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, 0xC3];
+        assert!(validate(cave_spec(8, &code)).is_ok());
+        let mut s = cave_spec(8, &code);
+        s.expected[3] = 0x90;
+        assert!(bad_reason(validate(s)).contains("0xCC"));
+        // O mesmo conteúdo como `Code` passa pela regra de 64 bytes (não exige CC).
+        let mut as_code = cave_spec(8, &code);
+        as_code.kind = PatchKind::Code;
+        assert!(validate(as_code).is_ok());
+        // Cave com instrução cortada nos bytes novos não é decodificável inteira.
+        let mut cut = cave_spec(8, &[0x48, 0xC7, 0xC0, 0x01]);
+        cut.replacement = vec![0x48, 0xC7, 0xC0, 0x01, 0, 0, 0, 0x48];
+        assert!(matches!(validate(cut), Err(Error::BadPatch { .. })));
+    }
+
+    #[test]
+    fn cave_validate_max_len() {
+        assert!(validate(cave_spec(MAX_CAVE_LEN, &[0xC3])).is_ok());
+        assert!(matches!(
+            validate(cave_spec(MAX_CAVE_LEN + 1, &[0xC3])),
+            Err(Error::BadPatch { .. })
+        ));
+        assert!(validate(cave_spec(MAX_PATCH_LEN + 1, &[0xC3])).is_ok());
+        assert!(matches!(
+            validate(PatchSpec {
+                expected: Vec::new(),
+                replacement: Vec::new(),
+                ..cave_spec(1, &[0xC3])
+            }),
+            Err(Error::BadPatch { .. })
+        ));
+    }
+
+    #[test]
+    fn cave_any_pc_inside_is_dangerous() {
+        let v = validate(cave_spec(16, &[0xC3])).unwrap();
+        for dir in [Direction::Apply, Direction::Undo] {
+            let d = |p| is_dangerous(&v, dir, p);
+            assert!(d(Some(ADDR)), "o início conta");
+            assert!(d(Some(ADDR + 7)), "o meio conta");
+            assert!(d(Some(ADDR + 15)), "o último byte conta");
+            assert!(!d(Some(ADDR + 16)));
+            assert!(!d(Some(ADDR - 1)));
+            assert!(d(None), "posição desconhecida conta");
+        }
+    }
+
+    #[test]
+    fn code_rules_unchanged() {
+        // Desvio de 5 bytes: jmp rel32 no lugar de uma instrução de 5 bytes; sem fronteira
+        // perdida, o início e `None` não são perigosos.
+        let v = validate(spec(&[0xB8, 1, 0, 0, 0], &[0xE9, 0x10, 0x00, 0x00, 0x00])).unwrap();
+        assert_eq!(v.spec.kind, PatchKind::Code);
+        assert!(!is_dangerous(&v, Direction::Apply, Some(ADDR)));
+        assert!(!is_dangerous(&v, Direction::Apply, None));
+        assert!(!is_dangerous(&v, Direction::Undo, None));
+        // Instrução de 5 bytes + nop de 3: o meio é perigoso só se perde fronteira.
+        let lost = validate(spec(&[0x90, 0x90, 0x90], &[0x0F, 0x1F, 0x00])).unwrap();
+        assert!(is_dangerous(&lost, Direction::Apply, Some(ADDR + 1)));
+        assert!(!is_dangerous(&lost, Direction::Apply, Some(ADDR)));
+        assert!(is_dangerous(&lost, Direction::Apply, None));
+        assert!(!is_dangerous(&lost, Direction::Undo, None));
+        // O limite de 64 bytes continua valendo para `Code`.
+        let long = vec![0x90; MAX_PATCH_LEN + 1];
+        assert!(matches!(
+            validate(spec(&long, &long)),
+            Err(Error::BadPatch { .. })
+        ));
     }
 
     #[test]

@@ -35,6 +35,17 @@
 //! - **Jogo fechou**: `Err(ProcessGone)`; o motor já descartou ativos, pendentes e o
 //!   diário sem escrever. Sem rodar operação, [`Engine::discard_gone`] faz o mesmo.
 //!
+//! # Desvio e cave (spec 008, 6.3)
+//!
+//! Um patch é de um de dois tipos ([`PatchKind`]): `Code` (o desvio, de instruções inteiras) ou
+//! `Cave` (código nosso sobre preenchimento `0xCC`). Para a cave, qualquer `pc` dentro do
+//! trecho e qualquer thread de posição desconhecida são perigo. [`Engine::undo_all`] e a
+//! recuperação ([`Engine::restore_entries`]) trabalham em **duas fases**: primeiro todos os
+//! `Code`, depois as `Cave`, estas com [`CAVE_PAUSE_ATTEMPTS`] tentativas e
+//! [`CAVE_PAUSE_WAIT`] entre elas. Uma `Cave` só é desfeita se nenhum `Code` ficou sem
+//! resolver (senão o desvio ainda aponta para ela): ela fica no registro como pendente e no
+//! diário. A cave que não pôde ser desfeita (`ThreadsInPatch`) também vira pendente.
+//!
 //! # Escrita em dados (spec 005, 6.6)
 //!
 //! Um segundo tipo de escrita, **sem pausa**: campos de dados do jogo, numa região permitida
@@ -58,7 +69,7 @@ use crate::journal::{
 use crate::maps::{MapRegion, read_maps};
 use crate::mem::{MemWriter, Pidfd};
 use crate::patch::{
-    Direction, PatchSpec, Validated, WritePolicy, is_dangerous, overlaps, validate,
+    Direction, PatchKind, PatchSpec, Validated, WritePolicy, is_dangerous, overlaps, validate,
 };
 use crate::procinfo::{Identity, ThreadPos, check_alive, identity};
 use crate::suspend::{
@@ -75,6 +86,12 @@ pub type DataPolicyFn = Box<dyn FnMut(&[MapRegion]) -> WritePolicy>;
 
 /// Maior escrita em dados aceita, em bytes.
 const MAX_DATA_WRITE: usize = 8;
+
+/// Tentativas da pausa ao desfazer caves (spec 008, 6.3).
+pub const CAVE_PAUSE_ATTEMPTS: u32 = 5;
+
+/// Espera entre as tentativas da pausa ao desfazer caves (spec 008, 6.3).
+pub const CAVE_PAUSE_WAIT: Duration = Duration::from_millis(100);
 
 /// Parâmetros do motor.
 #[derive(Debug, Clone)]
@@ -111,6 +128,9 @@ pub struct RestoreReport {
     pub foreign: Vec<String>,
     /// Entradas fora da política de escrita: não tocadas e mantidas no diário.
     pub outside_policy: Vec<String>,
+    /// Caves não tentadas porque ainda restava um desvio sem resolver (o desvio aponta para
+    /// elas): não tocadas e mantidas no diário.
+    pub deferred: Vec<String>,
 }
 
 /// Quais fronteiras perdidas valem na regra de perigo de uma escrita.
@@ -406,11 +426,11 @@ impl Engine {
 
     /// Desfaz todos os patches ativos e restaura os bits de todas as entradas de dados (os
     /// restaurados e os já originais vão em `restored`; os descartados, em `foreign`). As
-    /// duas partes são tentadas mesmo que a primeira falhe; o primeiro erro volta.
+    /// duas partes são tentadas mesmo que a primeira falhe; o primeiro erro volta. Os patches
+    /// saem em duas fases: os desvios (`Code`) e depois as caves (spec 008, 6.3).
     pub fn undo_all(&mut self) -> Result<BatchReport> {
         self.retry_resume()?;
-        let result = self.undo_inner(|_| true);
-        let patches = self.finish(result);
+        let patches = self.undo_all_patches();
         if matches!(patches, Err(Error::ProcessGone { .. })) {
             return patches;
         }
@@ -426,6 +446,63 @@ impl Engine {
         report.restored.extend(data.dropped);
         report.foreign.extend(data.foreign);
         Ok(report)
+    }
+
+    /// Os patches do `undo_all`, em duas fases (spec 008, 6.3): todos os `Code` e, só se
+    /// nenhum ficou sem resolver, as `Cave`. A cave que não pôde ser desfeita vira pendente
+    /// (e o erro, como `ThreadsInPatch`, volta).
+    fn undo_all_patches(&mut self) -> Result<BatchReport> {
+        let result = self.undo_inner(|v| v.spec.kind == PatchKind::Code);
+        let mut report = self.finish(result)?;
+        if !self.active.iter().any(|v| v.spec.kind == PatchKind::Cave) {
+            return Ok(report);
+        }
+        if !caves_may_resolve(&self.journal_entries()) {
+            tracing::warn!("há desvio sem desfazer; as caves ficam como estão");
+            return Ok(report);
+        }
+        let result =
+            self.with_cave_pause(|engine| engine.undo_inner(|v| v.spec.kind == PatchKind::Cave));
+        match self.finish(result) {
+            Ok(caves) => {
+                report.restored.extend(caves.restored);
+                report.foreign.extend(caves.foreign);
+                report.pause = report.pause.max(caves.pause);
+                report.danger_retries += caves.danger_retries;
+                report.timeout_retries += caves.timeout_retries;
+                Ok(report)
+            }
+            Err(e @ Error::ProcessGone { .. }) => Err(e),
+            Err(e) => {
+                // O desvio já saiu, então a cave é inalcançável: fica no diário, como
+                // pendente, para a próxima execução (ou o `Drop`) tentar de novo.
+                let (caves, rest): (Vec<Validated>, Vec<Validated>) =
+                    std::mem::take(&mut self.active)
+                        .into_iter()
+                        .partition(|v| v.spec.kind == PatchKind::Cave);
+                self.active = rest;
+                for v in &caves {
+                    let entry = entry_of(v);
+                    if !self.pending.contains(&entry) {
+                        tracing::warn!(id = %v.spec.id, erro = %e, "cave não desfeita; mantida no diário");
+                        self.pending.push(entry);
+                    }
+                }
+                self.save_logged(self.stuck);
+                Err(e)
+            }
+        }
+    }
+
+    /// Roda `f` com a pausa das caves ([`CAVE_PAUSE_ATTEMPTS`] tentativas, [`CAVE_PAUSE_WAIT`]
+    /// entre elas) e devolve a configuração de antes.
+    fn with_cave_pause<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let saved = (self.pause_cfg.max_attempts, self.pause_cfg.retry_wait);
+        self.pause_cfg.max_attempts = CAVE_PAUSE_ATTEMPTS;
+        self.pause_cfg.retry_wait = CAVE_PAUSE_WAIT;
+        let out = f(self);
+        (self.pause_cfg.max_attempts, self.pause_cfg.retry_wait) = saved;
+        out
     }
 
     /// Define a política das escritas em dados (e esquece a calculada antes).
@@ -1199,6 +1276,12 @@ impl Engine {
             .position(|v| v.spec.id == id)
             .ok_or_else(|| Error::NotActive { id: id.to_owned() })?;
         let old = self.active[index].clone();
+        if old.spec.kind == PatchKind::Cave {
+            return Err(Error::BadPatch {
+                id: id.to_owned(),
+                reason: "uma cave não troca de valor".to_owned(),
+            });
+        }
         check_alive(&self.identity)?;
         let policy = self.current_policy()?;
         if !policy.allows(&old.spec.range()) {
@@ -1212,6 +1295,7 @@ impl Engine {
             addr: old.spec.addr,
             expected: old.spec.expected.clone(),
             replacement: new.clone(),
+            kind: old.spec.kind,
         })?;
         if fresh.replacement_starts != old.replacement_starts {
             return Err(Error::BoundariesChanged { id: id.to_owned() });
@@ -1353,7 +1437,7 @@ impl Engine {
         let policy = self.current_policy()?;
         let mut report = RestoreReport::default();
         let mut resolved: Vec<JournalEntry> = Vec::new();
-        let mut ops = Vec::new();
+        let (mut code_ops, mut cave_ops) = (Vec::new(), Vec::new());
         for e in entries {
             if !policy.allows(&e.range()) {
                 // Não conta como resolvida: os bytes podem ser nossos, então a entrada
@@ -1371,13 +1455,21 @@ impl Engine {
                 addr: e.addr,
                 expected: e.original.clone(),
                 replacement: e.replacement.clone(),
+                kind: e.kind,
             };
             match validate(spec) {
-                Ok(v) => ops.push(Op {
-                    v,
-                    danger: Danger::Both,
-                    kind: Kind::Restore(e),
-                }),
+                Ok(v) => {
+                    let kind = v.spec.kind;
+                    let op = Op {
+                        v,
+                        danger: Danger::Both,
+                        kind: Kind::Restore(e),
+                    };
+                    match kind {
+                        PatchKind::Code => code_ops.push(op),
+                        PatchKind::Cave => cave_ops.push(op),
+                    }
+                }
                 Err(err) => {
                     tracing::warn!(id = %e.id, erro = %err, "entrada inválida; não tocada");
                     report.foreign.push(e.id.clone());
@@ -1385,28 +1477,63 @@ impl Engine {
                 }
             }
         }
-        let (to_write, skipped) = self.presort(ops)?;
-        let mut outcomes: Vec<(Op, Option<Skip>)> =
-            skipped.into_iter().map(|(op, s)| (op, Some(s))).collect();
-        if !to_write.is_empty() {
-            let pass = self.run_pass(&to_write)?;
-            outcomes.extend(to_write.into_iter().zip(pass.outcomes));
-        }
-        for (op, outcome) in outcomes {
-            let Kind::Restore(e) = op.kind else { continue };
-            match outcome {
-                None => report.restored.push(e.id.clone()),
-                Some(Skip::Dropped) => report.dropped.push(e.id.clone()),
-                Some(Skip::Foreign) => {
-                    tracing::warn!(id = %e.id, "bytes de outro na entrada do diário; não tocada");
-                    report.foreign.push(e.id.clone());
+        // Fase 1: os desvios. Fase 2: as caves, só se nenhum desvio ficou sem resolver
+        // (senão ele ainda aponta para elas) e com a pausa mais paciente (spec 008, 6.3).
+        self.restore_phase(code_ops, &mut report, &mut resolved)?;
+        if !cave_ops.is_empty() {
+            if caves_may_resolve(&self.journal_entries()) {
+                self.with_cave_pause(|engine| {
+                    engine.restore_phase(cave_ops, &mut report, &mut resolved)
+                })?;
+            } else {
+                for op in cave_ops {
+                    tracing::warn!(
+                        id = %op.v.spec.id,
+                        "há desvio sem resolver; cave não tocada e mantida no diário"
+                    );
+                    report.deferred.push(op.v.spec.id.clone());
                 }
             }
-            resolved.push(e);
         }
         self.forget(&resolved);
         self.save_final();
         Ok(report)
+    }
+
+    /// Uma fase da restauração: decide cada entrada, escreve as que precisam e fecha o
+    /// diário (as resolvidas saem do registro). Falha por perigo ou prazo devolve o erro e
+    /// mantém tudo o que esta fase tocava.
+    fn restore_phase(
+        &mut self,
+        ops: Vec<Op>,
+        report: &mut RestoreReport,
+        resolved: &mut Vec<JournalEntry>,
+    ) -> Result<()> {
+        if !ops.is_empty() {
+            let (to_write, skipped) = self.presort(ops)?;
+            let mut outcomes: Vec<(Op, Option<Skip>)> =
+                skipped.into_iter().map(|(op, s)| (op, Some(s))).collect();
+            if !to_write.is_empty() {
+                let pass = self.run_pass(&to_write)?;
+                outcomes.extend(to_write.into_iter().zip(pass.outcomes));
+            }
+            for (op, outcome) in outcomes {
+                let Kind::Restore(e) = op.kind else { continue };
+                match outcome {
+                    None => report.restored.push(e.id.clone()),
+                    Some(Skip::Dropped) => report.dropped.push(e.id.clone()),
+                    Some(Skip::Foreign) => {
+                        tracing::warn!(id = %e.id, "bytes de outro na entrada do diário; não tocada");
+                        report.foreign.push(e.id.clone());
+                    }
+                }
+                resolved.push(e);
+            }
+        }
+        // O que esta fase resolveu sai do registro já, para a conferência da fase seguinte.
+        self.forget(resolved);
+        self.save_final();
+        Ok(())
     }
 
     /// Intenção no diário, passagem pausada e tratamento da falha (desfazer e restaurar).
@@ -1852,10 +1979,22 @@ fn entry_of(v: &Validated) -> JournalEntry {
         original: v.spec.expected.clone(),
         replacement: v.spec.replacement.clone(),
         next: None,
+        kind: v.spec.kind,
     }
 }
 
+/// Decisão pura da segunda fase: `unresolved` são as entradas ainda no registro (ativas e
+/// pendentes). As caves só podem ser desfeitas se nenhum desvio (`Code`) continua sem
+/// resolver, porque um desvio vivo aponta para a cave.
+fn caves_may_resolve(unresolved: &[JournalEntry]) -> bool {
+    unresolved.iter().all(|e| e.kind != PatchKind::Code)
+}
+
 fn has_lost(v: &Validated, danger: Danger) -> bool {
+    // Numa cave toda posição vale: as threads são sempre lidas.
+    if v.spec.kind == PatchKind::Cave && !matches!(danger, Danger::None) {
+        return true;
+    }
     match danger {
         Danger::One(Direction::Apply) => !v.lost_on_apply().is_empty(),
         Danger::One(Direction::Undo) => !v.lost_on_undo().is_empty(),
@@ -1904,6 +2043,7 @@ mod tests {
             addr: 0x1000,
             expected: expected.to_vec(),
             replacement: replacement.to_vec(),
+            kind: PatchKind::Code,
         })
         .unwrap()
     }
@@ -1914,6 +2054,60 @@ mod tests {
 
     fn io_error() -> Error {
         Error::Io(std::io::Error::other("sigcont"))
+    }
+
+    fn entry(id: &str, kind: PatchKind) -> JournalEntry {
+        JournalEntry {
+            id: id.into(),
+            addr: 0x1000,
+            original: vec![0x90],
+            replacement: vec![0xCC],
+            next: None,
+            kind,
+        }
+    }
+
+    #[test]
+    fn recovery_keeps_cave_while_code_unresolved() {
+        // Um desvio que continua sem resolver (fora da política, por exemplo) segura a cave.
+        let code = entry("desvio", PatchKind::Code);
+        let cave = entry("cave", PatchKind::Cave);
+        assert!(!caves_may_resolve(&[code.clone(), cave.clone()]));
+        assert!(!caves_may_resolve(std::slice::from_ref(&code)));
+        // Com o desvio resolvido (saiu do registro, inclusive o de bytes de outro), a cave segue.
+        assert!(caves_may_resolve(std::slice::from_ref(&cave)));
+        assert!(caves_may_resolve(&[]));
+        assert!(caves_may_resolve(&[cave.clone(), cave]));
+    }
+
+    #[test]
+    fn cave_threads_are_always_dangerous_in_both_directions() {
+        let cave = validate(PatchSpec {
+            id: "c".into(),
+            addr: 0x1000,
+            expected: vec![0xCC; 8],
+            replacement: vec![0x90; 8],
+            kind: PatchKind::Cave,
+        })
+        .unwrap();
+        for danger in [
+            Danger::One(Direction::Apply),
+            Danger::One(Direction::Undo),
+            Danger::Both,
+        ] {
+            assert!(has_lost(&cave, danger));
+            let stopped = |pc| thread(Some(ThreadPos::Stopped { pc, syscall: None }));
+            assert!(thread_dangerous(&cave, danger, &stopped(0x1000)));
+            assert!(thread_dangerous(&cave, danger, &stopped(0x1007)));
+            assert!(!thread_dangerous(&cave, danger, &stopped(0x1008)));
+            assert!(thread_dangerous(&cave, danger, &thread(None)));
+            assert!(thread_dangerous(
+                &cave,
+                danger,
+                &thread(Some(ThreadPos::Running))
+            ));
+        }
+        assert_eq!(entry_of(&cave).kind, PatchKind::Cave);
     }
 
     #[test]

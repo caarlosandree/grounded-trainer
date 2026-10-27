@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::patch::PatchKind;
 use crate::procinfo::{ProcStat, is_dead, is_stopped};
 use crate::{Error, Result};
 
@@ -154,6 +155,10 @@ pub struct JournalEntry {
     /// Bytes novos, só durante uma troca de valor (spec 003 6.7); `None` fora dela.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "hex_opt")]
     pub next: Option<Vec<u8>>,
+    /// Tipo do patch (spec 008). Diários antigos não têm o campo e leem como `Code`; `Code`
+    /// não é gravado.
+    #[serde(default, skip_serializing_if = "PatchKind::is_code")]
+    pub kind: PatchKind,
 }
 
 impl JournalEntry {
@@ -631,6 +636,7 @@ mod tests {
             original: original.to_vec(),
             replacement: replacement.to_vec(),
             next: None,
+            kind: PatchKind::Code,
         }
     }
 
@@ -781,6 +787,24 @@ mod tests {
         assert!(text.contains("\"0x140123456\""), "{text}");
         let back: Journal = serde_json::from_str(&text).unwrap();
         assert_eq!(back, j);
+    }
+
+    #[test]
+    fn journal_entry_without_kind_reads_as_code() {
+        let old = r#"{"id":"x","addr":"0x10","original":"488bf9","replacement":"909090"}"#;
+        let e: JournalEntry = serde_json::from_str(old).unwrap();
+        assert_eq!(e.kind, PatchKind::Code);
+        // `Code` continua sem o campo no arquivo; `Cave` grava `kind`.
+        let text = serde_json::to_string(&e).unwrap();
+        assert!(!text.contains("kind"), "{text}");
+        let cave = JournalEntry {
+            kind: PatchKind::Cave,
+            ..e
+        };
+        let text = serde_json::to_string(&cave).unwrap();
+        assert!(text.contains(r#""kind":"cave""#), "{text}");
+        let back: JournalEntry = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, cave);
     }
 
     #[test]

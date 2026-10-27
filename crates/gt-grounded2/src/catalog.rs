@@ -515,6 +515,7 @@ rva = 0x1000
                 original: ORIGINAL.to_vec(),
                 replacement: NEW.to_vec(),
                 next: None,
+                kind: gt_core::patch::PatchKind::Code,
             }],
             data: Vec::new(),
         }

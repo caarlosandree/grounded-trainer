@@ -208,6 +208,7 @@ fn patch(id: &str, addr: u64, expected: &[u8], replacement: &[u8]) -> Validated 
         addr,
         expected: expected.to_vec(),
         replacement: replacement.to_vec(),
+        kind: gt_core::patch::PatchKind::Code,
     })
     .unwrap()
 }
@@ -302,6 +303,7 @@ fn apply_and_undo_on_exec_page() {
                     original: NOP3.to_vec(),
                     replacement: NOP2_NOP.to_vec(),
                     next: None,
+                    kind: gt_core::patch::PatchKind::Code,
                 }]
             );
         }
@@ -313,6 +315,101 @@ fn apply_and_undo_on_exec_page() {
     assert!(engine.active().is_empty());
     assert!(missing(&env));
     assert!(wait_all_running(t.pid), "{:?}", states(t.pid));
+}
+
+/// Cave de 16 bytes sobre o preenchimento `0xCC` da página executável do alvo.
+fn cave(id: &str, addr: u64) -> Validated {
+    let mut code = vec![0x48, 0xFF, 0xC0, 0xC3]; // inc rax; ret
+    code.resize(16, 0x90);
+    validate(PatchSpec {
+        id: id.into(),
+        addr,
+        expected: vec![0xCC; 16],
+        replacement: code,
+        kind: gt_core::patch::PatchKind::Cave,
+    })
+    .unwrap()
+}
+
+#[test]
+fn undo_all_undoes_code_then_cave() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let cave_addr = t.exec_page + 0x100;
+    let mut engine = open_engine(
+        t.pid,
+        &env,
+        vec![exec2_range(&t), page_range(&t, t.exec_page)],
+        None,
+    );
+    let batch = vec![patch("p", t.exec2, &NOP3, &NOP2_NOP), cave("c", cave_addr)];
+    engine.apply(batch).unwrap();
+    assert_eq!(bytes_at(t.pid, cave_addr, 4), [0x48, 0xFF, 0xC0, 0xC3]);
+    match env.store.peek().unwrap() {
+        Loaded::Ok(j) => {
+            let kinds: Vec<_> = j.entries.iter().map(|e| (e.id.as_str(), e.kind)).collect();
+            assert!(
+                kinds.contains(&("c", gt_core::patch::PatchKind::Cave)),
+                "{kinds:?}"
+            );
+        }
+        other => panic!("diário inesperado: {other:?}"),
+    }
+    let report = engine.undo_all().unwrap();
+    let mut restored = report.restored.clone();
+    restored.sort();
+    assert_eq!(restored, vec!["c".to_string(), "p".to_string()]);
+    assert_eq!(bytes_at(t.pid, t.exec2, 3), NOP3);
+    assert_eq!(bytes_at(t.pid, cave_addr, 16), vec![0xCC; 16]);
+    assert!(engine.active().is_empty());
+    assert!(engine.pending_ids().is_empty());
+    assert!(missing(&env));
+    assert!(wait_all_running(t.pid), "{:?}", states(t.pid));
+}
+
+#[test]
+fn restore_keeps_cave_while_code_unresolved() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let cave_addr = t.exec_page + 0x100;
+    // A política só cobre a página da cave: o desvio (em `exec2`) fica sem resolver.
+    let mut engine = open_engine(t.pid, &env, vec![page_range(&t, t.exec_page)], None);
+    engine.apply(vec![cave("c", cave_addr)]).unwrap();
+    let code = JournalEntry {
+        id: "p".into(),
+        addr: t.exec2,
+        original: NOP3.to_vec(),
+        replacement: NOP2_NOP.to_vec(),
+        next: None,
+        kind: gt_core::patch::PatchKind::Code,
+    };
+    let cave_entry = JournalEntry {
+        id: "c".into(),
+        addr: cave_addr,
+        original: vec![0xCC; 16],
+        replacement: bytes_at(t.pid, cave_addr, 16),
+        next: None,
+        kind: gt_core::patch::PatchKind::Cave,
+    };
+    let report = engine
+        .restore_entries(vec![code, cave_entry.clone()])
+        .unwrap();
+    assert_eq!(report.outside_policy, vec!["p".to_string()]);
+    assert_eq!(report.deferred, vec!["c".to_string()]);
+    assert!(report.restored.is_empty(), "{report:?}");
+    // A cave continua escrita e as duas entradas continuam no diário.
+    assert_eq!(bytes_at(t.pid, cave_addr, 4), [0x48, 0xFF, 0xC0, 0xC3]);
+    match env.store.peek().unwrap() {
+        Loaded::Ok(j) => {
+            let ids: Vec<_> = j.entries.iter().map(|e| e.id.as_str()).collect();
+            assert!(ids.contains(&"p") && ids.contains(&"c"), "{ids:?}");
+        }
+        other => panic!("diário inesperado: {other:?}"),
+    }
+    // O desvio continua pendente no registro: a cave segue adiada.
+    let report = engine.restore_entries(vec![cave_entry]).unwrap();
+    assert_eq!(report.deferred, vec!["c".to_string()], "{report:?}");
+    assert_eq!(bytes_at(t.pid, cave_addr, 4), [0x48, 0xFF, 0xC0, 0xC3]);
 }
 
 #[test]
@@ -771,6 +868,7 @@ fn restore_entries_handles_mixed_bytes() {
         original: vec![0x90; 4],
         replacement: new.to_vec(),
         next: None,
+        kind: gt_core::patch::PatchKind::Code,
     };
     let report = engine.restore_entries(vec![entry]).unwrap();
     assert_eq!(report.restored, vec!["meio".to_string()]);
@@ -1267,6 +1365,7 @@ fn set_replacement_changes_executed_value() {
             original: VALUE_11.to_vec(),
             replacement: VALUE_33.to_vec(),
             next: None,
+            kind: gt_core::patch::PatchKind::Code,
         }]
     );
 
@@ -1466,6 +1565,7 @@ fn set_replacement_dirty_leaves_pending_with_next() {
             original: VALUE_11.to_vec(),
             replacement: VALUE_22.to_vec(),
             next: Some(VALUE_33.to_vec()),
+            kind: gt_core::patch::PatchKind::Code,
         }]
     );
 

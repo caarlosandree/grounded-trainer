@@ -12,7 +12,7 @@ use gt_core::engine::{BatchReport, Engine};
 use gt_core::journal::{JournalLock, JournalStore};
 use gt_core::mem::Pidfd;
 use gt_core::modules::Module;
-use gt_core::patch::{PatchSpec, Validated, validate};
+use gt_core::patch::{PatchKind, PatchSpec, Validated, validate};
 use gt_core::pe::PeHeaders;
 use gt_core::process::ptrace_scope;
 use gt_core::procinfo::{Identity, check_alive, identity};
@@ -388,6 +388,7 @@ impl Session<GamePayload> for GameSession {
                 addr,
                 expected: entry.def.expected.clone(),
                 replacement: Self::bytes_at(&entry.def, *k),
+                kind: PatchKind::Code,
             };
             match validate(spec) {
                 Ok(v) => batch.push(v),

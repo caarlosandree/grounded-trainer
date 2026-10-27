@@ -12,7 +12,7 @@ use std::io::{self, Write};
 use anyhow::Context;
 use gt_core::engine::Engine;
 use gt_core::journal::{DiscardReason, JournalLock, JournalStore};
-use gt_core::patch::{PatchSpec, Validated, validate};
+use gt_core::patch::{PatchKind, PatchSpec, Validated, validate};
 use gt_core::recovery::{RecoveryReport, recover};
 use gt_core::session::Shutdown;
 use gt_core::suspend::PauseConfig;
@@ -165,6 +165,7 @@ pub fn select_patches(scan: &CatalogScan, ids: &[String]) -> anyhow::Result<Vec<
                 addr,
                 expected: def.expected,
                 replacement: def.replacement,
+                kind: PatchKind::Code,
             })?;
             Ok(Selected { patch, unverified })
         })

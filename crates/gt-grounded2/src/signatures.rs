@@ -2460,6 +2460,7 @@ offset = 3
                 addr: rva,
                 expected: hex(expected),
                 replacement: hex(replacement),
+                kind: gt_core::patch::PatchKind::Code,
             })
             .unwrap_or_else(|e| panic!("{id}: {e}"));
             assert!(v.lost_on_apply().is_empty(), "{id}");
