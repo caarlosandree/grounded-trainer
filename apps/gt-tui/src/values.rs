@@ -539,6 +539,14 @@ mod tests {
     use gt_testkit::synth_signatures;
     use gt_ue::synth::SparseMem;
 
+    /// Definições da cena sem o `construir-sem-ingredientes`: o `kind = "bool"` só resolve na
+    /// Tarefa 3 do plano 007 (depois dela, este filtro sai).
+    fn synth_defs() -> Vec<FieldDef> {
+        let (_, mut defs) = synth_signatures();
+        defs.retain(|d| d.id != "construir-sem-ingredientes");
+        defs
+    }
+
     /// Índice e catálogo da cena sintética do alvo de teste, resolvido com `defs`.
     fn index_data(defs: &[FieldDef]) -> IndexData {
         let (image, _) = gt_testkit::ue::build(0x1000_0000, gt_testkit::ue::ARENA_LEN);
@@ -567,7 +575,8 @@ mod tests {
     }
 
     fn cheats() -> ValueCheats {
-        let (sigs, defs) = synth_signatures();
+        let (sigs, _) = synth_signatures();
+        let defs = synth_defs();
         let globals = Ok(Globals {
             sigs,
             gobjects: 1,
@@ -588,7 +597,7 @@ mod tests {
     fn checking_until_index_then_available_unverified() {
         let mut v = cheats();
         assert!(v.avail().iter().all(|(_, a)| *a == Avail::Checking));
-        let (_, defs) = synth_signatures();
+        let defs = synth_defs();
         let news = v.merge(outcome(index_data(&defs)));
         assert!(news.index_ok && !news.retry);
         // Globais sem `rva` conferido: disponível com `?`.
@@ -602,7 +611,7 @@ mod tests {
     #[test]
     fn good_index_not_replaced_by_worse() {
         let mut v = cheats();
-        let (_, defs) = synth_signatures();
+        let defs = synth_defs();
         v.merge(outcome(index_data(&defs)));
         assert_eq!(available_count(&v), defs.len());
         // Um índice pior (um campo que falta) e uma falha não trocam o bom.
@@ -621,7 +630,7 @@ mod tests {
     #[test]
     fn better_index_keeps_desired_values() {
         let mut v = cheats();
-        let (_, defs) = synth_signatures();
+        let defs = synth_defs();
         // Primeiro um índice parcial (um `Lock` quebrado); `carga` resolve.
         let mut partial = defs.clone();
         let broken = partial
@@ -663,7 +672,7 @@ mod tests {
                 .all(|(_, a)| *a == Avail::Unavailable(REFLECTION_INCONCLUSIVE.to_string()))
         );
         // Índice parcial: os que faltam mostram o motivo, e a tarefa tenta de novo.
-        let (_, mut defs) = synth_signatures();
+        let mut defs = synth_defs();
         if let FieldRule::Lock { field, .. } = &mut defs[1].rule {
             *field = "CurrentFoo".into();
         }
@@ -678,7 +687,7 @@ mod tests {
 
     #[test]
     fn field_infos_carry_value_and_action() {
-        let (_, defs) = synth_signatures();
+        let defs = synth_defs();
         let infos = field_infos(&defs, &Avail::Checking);
         let find = |id: &str| infos.iter().find(|i| i.id == id).unwrap();
         assert!(find("somar-ciencia").action && find("somar-ciencia").value.is_some());
