@@ -12,7 +12,7 @@ use gt_core::engine::Engine;
 use gt_core::mem::MemReader;
 use gt_grounded2::fields::{ActionOutcome, FieldRuntime, PlayerState, TickReport};
 use gt_grounded2::player::{
-    Absent, ControllerFind, FieldCatalog, controller_needs_search, find_controller,
+    Absent, ControllerFind, FieldCatalog, controller_needs_search, find_controller, read_player,
 };
 use gt_grounded2::signatures::{FieldDef, FieldRule, UeSigs};
 use gt_grounded2::ue::{DISK_UNREADABLE, GlobalState, UeScan};
@@ -90,8 +90,22 @@ pub fn field_infos(defs: &[FieldDef], avail: &Avail) -> Vec<CheatInfo> {
             field: true,
             action: matches!(d.rule, FieldRule::Add { .. }),
             label: d.label.clone(),
+            hook: false,
+            pawn: false,
         })
         .collect()
+}
+
+/// O que a reflexão da sessão já diz aos desvios (spec 008, 6.11): eles esperam o índice como os
+/// cheats de valor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReflectionGate {
+    /// Não há como ler a reflexão (motivo).
+    Unavailable(String),
+    /// O índice ainda não chegou (`verificando…`).
+    Checking,
+    /// Índice bom; `verified` é falso para as globais sem o `rva` conferido.
+    Ready { verified: bool },
 }
 
 /// Índice e catálogo de uma conexão, e a execução dos cheats.
@@ -177,6 +191,47 @@ impl ValueCheats {
             action_search: false,
             controller_news: None,
         }
+    }
+
+    /// A reflexão da sessão vista pelos desvios.
+    pub fn gate(&self) -> ReflectionGate {
+        match (&self.globals, &self.reflection) {
+            (Err(reason), _) => ReflectionGate::Unavailable(reason.clone()),
+            (Ok(g), Some(_)) => ReflectionGate::Ready {
+                verified: g.verified,
+            },
+            (Ok(_), None) => match &self.index_failure {
+                Some(reason) => ReflectionGate::Unavailable(reason.clone()),
+                None => ReflectionGate::Checking,
+            },
+        }
+    }
+
+    /// O índice da reflexão e as globais, se já há um índice bom.
+    pub fn reflection_parts(&self) -> Option<(Arc<ReflectionIndex>, &Globals)> {
+        let globals = self.globals.as_ref().ok()?;
+        let r = self.reflection.as_ref()?;
+        Some((r.index.clone(), globals))
+    }
+
+    /// O leitor de memória do processo.
+    pub fn reader(&self) -> MemReader {
+        self.reader
+    }
+
+    /// O pawn do personagem, lido agora a partir do controller guardado. Só leitura: não toca no
+    /// estado dos cheats de valor nem escreve nada. `None` sem índice, sem controller ou com o
+    /// personagem ausente.
+    pub fn read_pawn(&self) -> Option<u64> {
+        let (index, globals) = self.reflection_parts()?;
+        let r = self.reflection.as_ref()?;
+        let controller = self.controller?;
+        let objects = ObjectArray::read(&self.reader, &globals.sigs.layout, globals.gobjects)
+            .map_err(|e| tracing::debug!("tabela de objetos ilegível: {e}"))
+            .ok()?;
+        read_player(&self.reader, &index, &r.catalog, &objects, controller)
+            .ok()
+            .map(|snapshot| snapshot.pawn)
     }
 
     /// A definição do cheat de valor `id`.

@@ -192,6 +192,8 @@ fn raw_search(
             field: false,
             action: false,
             label: None,
+            hook: false,
+            pawn: false,
         });
     }
     if let Some(ue) = &ue {

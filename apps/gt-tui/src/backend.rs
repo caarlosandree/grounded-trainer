@@ -16,6 +16,7 @@ use gt_core::procinfo::Identity;
 use gt_core::recovery::RecoveryReport;
 use gt_core::value::ValueGrid;
 use gt_grounded2::fields::{ActionOutcome, PlayerState, TickReport};
+use gt_grounded2::hooks::HookEvent;
 use gt_grounded2::player::Absent;
 use gt_grounded2::signatures::Category;
 
@@ -77,6 +78,10 @@ pub struct CheatInfo {
     pub action: bool,
     /// Texto da quantidade na linha de uma ação, no lugar da formatação da grade (spec 008, 6.8.2).
     pub label: Option<String>,
+    /// Desvio com cave (`[[hook]]`, spec 008), não patch nem cheat de valor.
+    pub hook: bool,
+    /// O desvio precisa do personagem (inventário da coleta, spec 008, 6.7.4).
+    pub pawn: bool,
 }
 
 /// Resultado de abrir o alvo e buscar o catálogo; `P` é o que cada implementação leva
@@ -266,6 +271,24 @@ pub struct ReflectionNews {
     pub player_changed: Option<PlayerState>,
 }
 
+/// Resultado de apertar a tecla do arrastar (spec 008, 6.7.2): armar ou desarmar. `N` é a
+/// quantidade armada.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArmReport {
+    /// Estava desarmado: armado com `N`.
+    Armed(i32),
+    /// Estava armado: desarmado sem o jogo ter aplicado.
+    Disarmed(i32),
+    /// Estava armado, mas o jogo aplicou antes do desarme.
+    Applied(i32),
+    /// Recusado sem deixar nada escrito (motivo).
+    Refused(String),
+    /// Falhou deixando restos no jogo (causa); só a restauração resolve.
+    Residue(String),
+    /// O jogo fechou.
+    Gone,
+}
+
 /// Relatório de um ciclo sem manutenção (sem cheats de valor, sem motor ou com o motor parado).
 pub fn idle_tick() -> TickReport {
     TickReport {
@@ -373,6 +396,46 @@ pub trait Session<P> {
     /// Manutenção de ~10 Hz dos cheats de valor ligados (`on`).
     fn field_tick(&mut self, _on: &[String], _now: Instant) -> TickReport {
         idle_tick()
+    }
+
+    // ---- desvios com cave (spec 008); o padrão é "sem desvios" ----
+
+    /// Disponibilidade de cada desvio: `Checking` até o índice da reflexão, e depois o que a
+    /// conferência da sessão achou (o motivo vem sem o `indisponível (…)` em volta).
+    fn hook_avail(&self) -> Vec<(String, Avail)> {
+        Vec::new()
+    }
+
+    /// Liga o desvio `id` com o ponto `k` da grade do valor (ignorado sem valor).
+    fn hook_enable(&mut self, id: &str, _k: u64) -> OpOutcome {
+        OpOutcome::Refused(format!("{id} não é um desvio"))
+    }
+
+    /// Desliga o desvio `id`: só o desvio volta; a cave fica até sair (spec 008, 6.3).
+    fn hook_disable(&mut self, id: &str) -> OpOutcome {
+        OpOutcome::Refused(format!("{id} não é um desvio"))
+    }
+
+    /// Troca o valor de um desvio ligado: uma escrita na variável, sem pausa (spec 008, 6.5).
+    fn hook_set_value(&mut self, id: &str, _k: u64) -> OpOutcome {
+        OpOutcome::Refused(format!("{id} não é um desvio"))
+    }
+
+    /// Arma o arrastar com o ponto `k` da grade, ou o desarma se já estiver armado.
+    fn hook_arm(&mut self, _k: u64) -> ArmReport {
+        ArmReport::Refused("o arrastar não está disponível".to_string())
+    }
+
+    /// O personagem (pawn) lido agora, só leitura: de onde a coleta acha o inventário. `None` se
+    /// o personagem não está achado.
+    fn read_pawn(&mut self) -> Option<u64> {
+        None
+    }
+
+    /// Manutenção de ~10 Hz dos desvios: o registro do Brain Power, o arrastar armado e o
+    /// inventário. `pawn` é o personagem do ciclo (`None` se não há).
+    fn hook_tick(&mut self, _pawn: Option<u64>, _now: Instant) -> Vec<HookEvent> {
+        Vec::new()
     }
 }
 

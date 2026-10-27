@@ -13,10 +13,11 @@ use std::time::{Duration, Instant};
 
 use gt_core::procinfo::Identity;
 use gt_grounded2::fields::{ActionOutcome, Note as FieldNote, PlayerState};
+use gt_grounded2::hooks::HookEvent;
 use gt_grounded2::ue::UE_ID;
 
 use crate::backend::{
-    Backend, CheatInfo, Find, JobKind, OpOutcome, Recovered, ReflectionOutcome, Search,
+    ArmReport, Backend, CheatInfo, Find, JobKind, OpOutcome, Recovered, ReflectionOutcome, Search,
     SearchError, Session,
 };
 use crate::keys::Action;
@@ -60,6 +61,9 @@ const ACTION_PLAYER_MISSING: &str = "personagem não encontrado";
 /// Recusas da ação que dependem da procura do controller.
 const SEARCHING_PLAYER: &str = "procurando o personagem";
 const WAIT_SEARCH: &str = "aguarde a procura";
+/// Nome do arrastar nas linhas do registro (spec 008, 6.7.2).
+const DRAG_LABEL: &str = "Quantidade ao arrastar";
+
 /// Janela depois de uma execução da ação que escreveu, e intervalo mínimo entre duas linhas
 /// de registro com o mesmo motivo (spec 006, 6.6).
 const ACTION_WINDOW: Duration = Duration::from_secs(1);
@@ -148,6 +152,8 @@ fn row_of(c: CheatInfo) -> CheatRow {
         field: c.field,
         action: c.action,
         label: c.label,
+        hook: c.hook,
+        pawn: c.pawn,
         note: None,
     }
 }
@@ -213,6 +219,9 @@ pub struct Controller<B: Backend> {
     action_last: HashMap<String, Instant>,
     /// Quando cada motivo de recusa da ação foi ao registro pela última vez (por ação).
     refusal_last: HashMap<(String, String), Instant>,
+    /// O pawn que a manutenção dos cheats de valor leu neste ciclo (`None`: ela não rodou), para a
+    /// manutenção dos desvios não ler o personagem de novo.
+    cycle_pawn: Option<Option<u64>>,
 }
 
 impl<B: Backend> Controller<B> {
@@ -249,6 +258,7 @@ impl<B: Backend> Controller<B> {
             player_found: None,
             action_last: HashMap::new(),
             refusal_last: HashMap::new(),
+            cycle_pawn: None,
         }
     }
 
@@ -281,6 +291,7 @@ impl<B: Backend> Controller<B> {
             called = self.run_pending_swap(now, draw);
         }
         self.maintain_fields(now);
+        self.maintain_hooks(now);
         called
     }
 
@@ -706,8 +717,8 @@ impl<B: Backend> Controller<B> {
         }
         for c in cheats {
             match self.model.cheats.iter_mut().find(|r| r.id == c.id) {
-                // Os cheats de valor seguem a sessão (globais e índice), logo abaixo.
-                Some(row) if row.field => {}
+                // Os cheats de valor e os desvios seguem a sessão (globais e índice), logo abaixo.
+                Some(row) if row.field || row.hook => {}
                 Some(row) => {
                     if keeps_state(&row.avail, &c.avail) {
                         continue;
@@ -806,6 +817,7 @@ impl<B: Backend> Controller<B> {
         self.player_found = None;
         self.action_last.clear();
         self.refusal_last.clear();
+        self.cycle_pawn = None;
         self.model.player = PlayerLine::Idle;
         self.model.busy = None;
         self.model.banners.stuck = None;
@@ -881,7 +893,7 @@ impl<B: Backend> Controller<B> {
             .map(|r| r.id.clone())
             .collect();
         // As globais do Unreal entram na nova busca enquanto não há índice bom (spec 005, 6.7).
-        if !self.index_ok && self.model.cheats.iter().any(|r| r.field) {
+        if !self.index_ok && self.model.cheats.iter().any(|r| r.field || r.hook) {
             ids.push(UE_ID.to_string());
         }
         let expected = self.identity.clone();
@@ -906,13 +918,30 @@ impl<B: Backend> Controller<B> {
             .any(|r| r.field && (r.on || self.desired.contains_key(&r.id)))
     }
 
-    /// Acerta a disponibilidade das linhas de valor com a da sessão.
+    /// Há desvio ligado ou desejado que precisa do personagem (a coleta, spec 008, 6.7.4).
+    fn hook_pawn_wanted(&self) -> bool {
+        self.model
+            .cheats
+            .iter()
+            .any(|r| r.hook && r.pawn && (r.on || self.desired.contains_key(&r.id)))
+    }
+
+    /// Acerta a disponibilidade das linhas de valor e dos desvios com a da sessão.
     fn sync_field_avail(&mut self) {
-        let Some(avail) = self.session.as_ref().map(|s| s.field_avail()) else {
+        let Some((fields, hooks)) = self
+            .session
+            .as_ref()
+            .map(|s| (s.field_avail(), s.hook_avail()))
+        else {
             return;
         };
-        for (id, a) in avail {
+        for (id, a) in fields {
             if let Some(row) = self.model.cheats.iter_mut().find(|r| r.field && r.id == id) {
+                row.avail = a;
+            }
+        }
+        for (id, a) in hooks {
+            if let Some(row) = self.model.cheats.iter_mut().find(|r| r.hook && r.id == id) {
                 row.avail = a;
             }
         }
@@ -967,7 +996,7 @@ impl<B: Backend> Controller<B> {
     /// Dispara o próximo trabalho, um de cada vez: o índice enquanto ele não está bom e dentro
     /// do prazo; a procura do controller só com cheat de valor desejado (ou ligado).
     fn maybe_spawn_job(&mut self, now: Instant) {
-        if self.job.is_some() || !self.model.cheats.iter().any(|r| r.field) {
+        if self.job.is_some() || !self.model.cheats.iter().any(|r| r.field || r.hook) {
             return;
         }
         let index_due = !self.index_ok
@@ -978,7 +1007,7 @@ impl<B: Backend> Controller<B> {
             .as_ref()
             .is_some_and(|s| s.action_wants_controller());
         let controller_due = self.index_ok
-            && (self.fields_wanted() || action_wants)
+            && (self.fields_wanted() || action_wants || self.hook_pawn_wanted())
             && self.next_controller.is_none_or(|t| now >= t)
             && self
                 .session
@@ -1070,6 +1099,7 @@ impl<B: Backend> Controller<B> {
         let Some(report) = self.session_call(|s| s.field_tick(&on, now)) else {
             return;
         };
+        self.cycle_pawn = Some(report.pawn);
         for row in self.model.cheats.iter_mut().filter(|r| r.field) {
             row.note = if row.on {
                 report.notes.get(&row.id).copied()
@@ -1097,6 +1127,83 @@ impl<B: Backend> Controller<B> {
             if e != PLAYER_FOUND && e != PLAYER_LOST {
                 self.event(e);
             }
+        }
+    }
+}
+
+impl<B: Backend> Controller<B> {
+    /// Manutenção de ~10 Hz dos desvios (spec 008, 6.11): o registro do Brain Power, o arrastar
+    /// armado e o inventário da coleta. Como a dos cheats de valor, não é operação e fica
+    /// suspensa com o diário não resolvido, sem motor ou com o jogo possivelmente parado.
+    fn maintain_hooks(&mut self, now: Instant) {
+        let field_pawn = self.cycle_pawn.take();
+        let active = self
+            .model
+            .cheats
+            .iter()
+            .any(|r| r.hook && (r.on || r.applied_k.is_some()));
+        if !active {
+            return;
+        }
+        let engine = matches!(self.model.conn, Conn::Connected { engine: true, .. });
+        let stuck = self.session.as_ref().is_some_and(|s| s.is_stuck());
+        if !engine || stuck || !self.diary_resolved() {
+            return;
+        }
+        // O personagem só é lido com um desvio ligado que dependa dele; se a manutenção dos
+        // cheats de valor já o leu neste ciclo, vale esse.
+        let needs_pawn = self.model.cheats.iter().any(|r| r.hook && r.pawn && r.on);
+        let pawn = match (needs_pawn, field_pawn) {
+            (false, _) => None,
+            (true, Some(pawn)) => pawn,
+            (true, None) => self.session_call(|s| s.read_pawn()).flatten(),
+        };
+        let Some(events) = self.session_call(|s| s.hook_tick(pawn, now)) else {
+            return;
+        };
+        for e in events {
+            self.hook_event(e);
+        }
+    }
+
+    /// Põe um acontecimento da manutenção dos desvios no registro, com os textos da spec 008
+    /// (6.6.1 e 6.7.2).
+    fn hook_event(&mut self, e: HookEvent) {
+        match e {
+            HookEvent::BrainGain {
+                gain,
+                applied,
+                l1,
+                skipped,
+            } => {
+                let mut text = format!("Brain Power: +{gain} → +{applied}");
+                if l1 > 0 {
+                    text.push_str(&format!(" (próximo nível em {l1})"));
+                }
+                if skipped > 0 {
+                    text.push_str(&format!(" (+{skipped} ganhos não mostrados)"));
+                }
+                self.event(text);
+            }
+            HookEvent::DragApplied(n) => {
+                self.clear_armed();
+                self.event(format!("{DRAG_LABEL}: aplicada ({n})"));
+            }
+            HookEvent::DragExpired => {
+                self.clear_armed();
+                self.event(format!("{DRAG_LABEL}: expirou"));
+            }
+            HookEvent::DragDisarmed => {
+                self.clear_armed();
+                self.event(format!("{DRAG_LABEL}: desarmado"));
+            }
+        }
+    }
+
+    /// O arrastar deixou de estar armado: a linha para de mostrar `armado`.
+    fn clear_armed(&mut self) {
+        for row in self.model.cheats.iter_mut().filter(|r| r.hook && r.action) {
+            row.applied_k = None;
         }
     }
 }
@@ -1410,6 +1517,9 @@ impl<B: Backend> Controller<B> {
             self.throttled_event(id, why, text, now);
             return false;
         }
+        if row.hook {
+            return self.run_arm(row, now);
+        }
         let k = Self::shown_k(row);
         let target = id.to_string();
         let Some(outcome) = self.session_call(|s| s.field_action(&target, k)) else {
@@ -1469,6 +1579,58 @@ impl<B: Backend> Controller<B> {
         }
     }
 
+    /// Arma o arrastar com o valor mostrado, ou o desarma se já está armado (spec 008, 6.7.2). A
+    /// janela de 1 s e as recusas dos passos anteriores são as das ações. Devolve `true` se chamou
+    /// a sessão numa operação.
+    fn run_arm(&mut self, row: &CheatRow, now: Instant) -> bool {
+        let (id, name) = (row.id.as_str(), row.name.as_str());
+        let k = Self::shown_k(row);
+        let Some(report) = self.session_call(|s| s.hook_arm(k)) else {
+            return false;
+        };
+        match report {
+            ArmReport::Armed(n) => {
+                self.action_wrote(id, now);
+                self.set_armed(id, Some(k));
+                self.event(format!("{DRAG_LABEL}: armado ({n})"));
+                true
+            }
+            ArmReport::Disarmed(_) => {
+                self.action_wrote(id, now);
+                self.set_armed(id, None);
+                self.event(format!("{DRAG_LABEL}: desarmado"));
+                true
+            }
+            ArmReport::Applied(n) => {
+                self.action_wrote(id, now);
+                self.set_armed(id, None);
+                self.event(format!("{DRAG_LABEL}: aplicada ({n})"));
+                true
+            }
+            ArmReport::Refused(reason) => {
+                self.throttled_event(id, &reason, format!("{name}: {reason}"), now);
+                false
+            }
+            ArmReport::Residue(cause) => {
+                self.note_op(id);
+                self.mark_residue(&[id.to_string()]);
+                self.event(format!("{name}: falhou deixando restos no jogo ({cause})"));
+                true
+            }
+            ArmReport::Gone => {
+                self.on_game_closed(now);
+                true
+            }
+        }
+    }
+
+    /// Guarda (ou tira) o ponto da grade com que o arrastar está armado.
+    fn set_armed(&mut self, id: &str, k: Option<u64>) {
+        if let Some(row) = self.model.cheats.iter_mut().find(|r| r.id == id) {
+            row.applied_k = k;
+        }
+    }
+
     /// Uma execução que escreveu: abre a janela e conta como operação.
     fn action_wrote(&mut self, id: &str, now: Instant) {
         self.action_last.insert(id.to_string(), now);
@@ -1508,10 +1670,12 @@ impl<B: Backend> Controller<B> {
         self.note_op(&row.id);
         let busy = format!("ligando {}…", row.name);
         let id = row.id.clone();
-        let field = row.field;
+        let (field, hook) = (row.field, row.hook);
         let Some(outcome) = self.run_op(busy, draw, |s| {
             if field {
                 s.field_on(&id, k)
+            } else if hook {
+                s.hook_enable(&id, k)
             } else {
                 s.apply(&[(id.clone(), k)])
             }
@@ -1547,9 +1711,15 @@ impl<B: Backend> Controller<B> {
         self.note_op(&row.id);
         let busy = format!("desligando {}…", row.name);
         let id = row.id.clone();
-        let field = row.field;
+        let (field, hook) = (row.field, row.hook);
         let Some(outcome) = self.run_op(busy, draw, |s| {
-            if field { s.field_off(&id) } else { s.undo(&id) }
+            if field {
+                s.field_off(&id)
+            } else if hook {
+                s.hook_disable(&id)
+            } else {
+                s.undo(&id)
+            }
         }) else {
             return false;
         };
@@ -1666,7 +1836,14 @@ impl<B: Backend> Controller<B> {
         self.note_op(id);
         let busy = format!("trocando o valor de {}…", row.name);
         let target = id.to_string();
-        let Some(outcome) = self.run_op(busy, draw, |s| s.set_value(&target, k)) else {
+        let hook = row.hook;
+        let Some(outcome) = self.run_op(busy, draw, |s| {
+            if hook {
+                s.hook_set_value(&target, k)
+            } else {
+                s.set_value(&target, k)
+            }
+        }) else {
             return false;
         };
         match outcome {
@@ -1841,7 +2018,8 @@ impl<B: Backend> Controller<B> {
             .cloned()
             .collect();
         let mut batch: Vec<(String, u64)> = Vec::new();
-        let mut fields: Vec<(String, u64)> = Vec::new();
+        // Os de valor e os desvios, um a um (`true`: desvio).
+        let mut singles: Vec<(String, u64, bool)> = Vec::new();
         for row in rows {
             let Some(wanted) = self.desired.get(&row.id).cloned() else {
                 continue;
@@ -1868,18 +2046,24 @@ impl<B: Backend> Controller<B> {
                         Note::NotReapplied,
                         format!("{}: não foi religado ({why})", row.name),
                     ),
-                    None if row.field => fields.push((row.id.clone(), Self::shown_k(&row))),
+                    None if row.field || row.hook => {
+                        singles.push((row.id.clone(), Self::shown_k(&row), row.hook));
+                    }
                     None => batch.push((row.id.clone(), Self::shown_k(&row))),
                 },
             }
         }
-        // Os cheats de valor, um a um (não pausam o jogo).
+        // Os cheats de valor (não pausam o jogo) e os desvios, um a um.
         let mut called = false;
-        for (id, k) in fields {
+        for (id, k, hook) in singles {
             self.note_op(&id);
-            let Some(outcome) =
-                self.run_op("religando…".to_string(), draw, |s| s.field_on(&id, k))
-            else {
+            let Some(outcome) = self.run_op("religando…".to_string(), draw, |s| {
+                if hook {
+                    s.hook_enable(&id, k)
+                } else {
+                    s.field_on(&id, k)
+                }
+            }) else {
                 return called;
             };
             called = true;
@@ -5273,5 +5457,565 @@ mod tests {
             1
         );
         assert_eq!(h.ctl.actions(), 0);
+    }
+
+    // ---- desvios com cave (spec 008, 6.11) ----
+
+    /// Grade de pontos de um desvio.
+    fn points(values: &[f64], default_k: u64, unit: Option<&str>) -> ValueGrid {
+        ValueGrid {
+            ty: ValueType::I32,
+            min: values[0],
+            max: values[values.len() - 1],
+            step: 0.0,
+            default_k,
+            unit: unit.map(str::to_string),
+            decimals: 0,
+            points: Some(values.to_vec()),
+        }
+    }
+
+    fn hook_info(id: &str, name: &str, value: ValueGrid) -> CheatInfo {
+        let mut c = cheat(id, Avail::Checking);
+        c.name = name.to_string();
+        c.category = gt_grounded2::signatures::Category::Progressao;
+        c.hook = true;
+        c.value = Some(value);
+        c
+    }
+
+    const BRAIN: &str = "brain-power";
+    const DRAG: &str = "quantidade-arrastar";
+    const COLLECT: &str = "coleta-multiplicada";
+
+    fn brain_info() -> CheatInfo {
+        hook_info(
+            BRAIN,
+            "Brain Power rápido",
+            points(&[2.0, 3.0, 5.0, 10.0], 0, Some("x")),
+        )
+    }
+
+    fn drag_info() -> CheatInfo {
+        let mut c = hook_info(
+            DRAG,
+            "Quantidade ao arrastar",
+            points(&[10.0, 50.0, 100.0, 250.0, 500.0, 999.0], 2, None),
+        );
+        c.action = true;
+        c
+    }
+
+    fn collect_info() -> CheatInfo {
+        let mut c = hook_info(
+            COLLECT,
+            "Coleta multiplicada",
+            points(&[2.0, 3.0, 5.0, 10.0], 0, Some("x")),
+        );
+        c.pawn = true;
+        c
+    }
+
+    /// Conectado em 0 com o Brain Power e o arrastar, disponíveis pela sessão.
+    fn with_hooks() -> H {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![brain_info(), drag_info()]);
+        h.ctl
+            .set_hook_avail(&[(BRAIN, available()), (DRAG, available())]);
+        h.connect(0);
+        h
+    }
+
+    fn hook_calls(h: &H, f: impl Fn(&Call) -> bool) -> usize {
+        h.ctl.count(f)
+    }
+
+    fn enables(h: &H, id: &str) -> usize {
+        hook_calls(
+            h,
+            |c| matches!(c, Call::HookEnable { id: i, .. } if i == id),
+        )
+    }
+
+    #[test]
+    fn hook_row_toggle_and_value() {
+        let mut h = with_hooks();
+        assert!(h.toggle(BRAIN, 100));
+        assert!(h.ctl.calls().contains(&Call::HookEnable {
+            id: BRAIN.to_string(),
+            k: 0,
+            busy: Some("ligando Brain Power rápido…".to_string()),
+        }));
+        assert!(h.row(BRAIN).on && h.row(BRAIN).applied_k == Some(0));
+        assert!(h.c.desired().contains_key(BRAIN));
+        assert_eq!(event_count(&h, "Brain Power rápido ligado (pausa 1 ms)"), 1);
+        // Os patches e os cheats de valor não são chamados para um desvio.
+        assert_eq!(hook_calls(&h, |c| matches!(c, Call::Apply { .. })), 0);
+        assert_eq!(hook_calls(&h, |c| matches!(c, Call::FieldOn { .. })), 0);
+
+        // `→` troca o valor pela lista de pontos, com uma escrita de variável (sem pausa).
+        assert!(h.key(Action::Inc, 1_000));
+        assert!(h.ctl.calls().contains(&Call::HookSetValue {
+            id: BRAIN.to_string(),
+            k: 1,
+            busy: Some("trocando o valor de Brain Power rápido…".to_string()),
+        }));
+        assert_eq!(hook_calls(&h, |c| matches!(c, Call::SetValue { .. })), 0);
+        assert_eq!(h.row(BRAIN).applied_k, Some(1));
+        assert_eq!(event_count(&h, "Brain Power rápido: 2x → 3x"), 1);
+        assert_eq!(h.c.desired().get(BRAIN).map(|d| d.k), Some(1));
+
+        // Desligar tira o desvio e o desejado.
+        assert!(h.toggle(BRAIN, 2_000));
+        assert!(h.ctl.calls().contains(&Call::HookDisable {
+            id: BRAIN.to_string(),
+            busy: Some("desligando Brain Power rápido…".to_string()),
+        }));
+        assert!(!h.row(BRAIN).on);
+        assert!(h.c.desired().is_empty());
+        assert_eq!(
+            event_count(&h, "Brain Power rápido desligado (pausa 1 ms)"),
+            1
+        );
+    }
+
+    #[test]
+    fn hook_row_verifying_until_reflection() {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![brain_info()]);
+        h.ctl.set_hook_avail(&[(BRAIN, Avail::Checking)]);
+        h.ctl.set_jobs(&[JobKind::Index]);
+        h.connect(0);
+        assert_eq!(h.row(BRAIN).avail, Avail::Checking);
+        // Antes do índice a tecla só avisa; nada é escrito.
+        assert!(!h.toggle(BRAIN, 100));
+        assert_eq!(
+            event_count(
+                &h,
+                "Brain Power rápido: verificando a reflexão do jogo; tente de novo em instantes"
+            ),
+            1
+        );
+        assert_eq!(enables(&h, BRAIN), 0);
+        // O índice chega: a sessão confere e o desvio fica disponível.
+        h.ctl.set_hook_avail(&[(BRAIN, available())]);
+        h.tick(200);
+        assert!(h.wait_job(200));
+        assert_eq!(h.row(BRAIN).avail, available());
+        assert!(h.toggle(BRAIN, 300));
+        assert_eq!(enables(&h, BRAIN), 1);
+    }
+
+    #[test]
+    fn hook_row_unavailable_reason_and_refusal() {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![brain_info()]);
+        h.ctl
+            .set_hook_avail(&[(BRAIN, unavailable("bytes diferentes"))]);
+        h.connect(0);
+        assert!(!h.toggle(BRAIN, 100));
+        assert_eq!(
+            event_count(&h, "Brain Power rápido: indisponível (bytes diferentes)"),
+            1
+        );
+        assert_eq!(enables(&h, BRAIN), 0);
+
+        // Recusa limpa do motor: continua desligado e sem desejado.
+        let mut h = with_hooks();
+        h.ctl
+            .push_outcome(OpOutcome::Refused("bytes diferentes".to_string()));
+        assert!(h.toggle(BRAIN, 100));
+        assert_eq!(event_count(&h, "Brain Power rápido: bytes diferentes"), 1);
+        assert!(!h.row(BRAIN).on && h.c.desired().is_empty());
+    }
+
+    #[test]
+    fn hook_enable_failure_with_residue_marks_the_row() {
+        let mut h = with_hooks();
+        h.ctl.push_residue("falhou", &[BRAIN]);
+        assert!(h.toggle(BRAIN, 100));
+        assert!(h.row(BRAIN).residue && !h.row(BRAIN).on);
+        assert!(h.c.model.banners.residue.is_some());
+        assert!(h.c.desired().is_empty());
+    }
+
+    #[test]
+    fn hook_rearmed_after_reconnect() {
+        let mut h = with_hooks();
+        assert!(h.toggle(BRAIN, 100));
+        assert!(h.key(Action::Inc, 1_000));
+        assert_eq!(enables(&h, BRAIN), 1);
+        h.reopen(2_000, 4_100);
+        assert!(!h.row(BRAIN).on);
+        assert!(h.c.desired().contains_key(BRAIN));
+        // A religação roda no `tick` seguinte, com o valor mostrado, um desvio por vez.
+        assert!(h.tick(4_200));
+        assert_eq!(enables(&h, BRAIN), 2);
+        assert!(h.ctl.calls().iter().any(|c| matches!(
+            c,
+            Call::HookEnable { id, k: 1, busy: Some(b) }
+                if id == BRAIN && b == "religando…"
+        )));
+        assert!(h.row(BRAIN).on);
+        assert_eq!(event_count(&h, "Brain Power rápido religado"), 1);
+    }
+
+    #[test]
+    fn hook_reapply_waits_for_the_reflection() {
+        let mut h = with_hooks();
+        assert!(h.toggle(BRAIN, 100));
+        // Depois de reconectar a sessão nova ainda confere o índice (`verificando…`).
+        h.ctl.set_hook_avail(&[(BRAIN, Avail::Checking)]);
+        h.reopen(1_000, 3_100);
+        assert!(!h.tick(3_200));
+        assert_eq!(enables(&h, BRAIN), 1);
+        assert!(!h.row(BRAIN).on);
+    }
+
+    fn press_drag(h: &mut H, ms: u64) -> bool {
+        h.toggle(DRAG, ms)
+    }
+
+    #[test]
+    fn drag_arm_disarm_expire_texts() {
+        let mut h = with_hooks();
+        // Arma com o valor mostrado (100): vira `armado`, sem ficar ligado nem desejado.
+        assert!(press_drag(&mut h, 100));
+        assert!(h.ctl.calls().contains(&Call::HookArm { k: 2 }));
+        assert_eq!(event_count(&h, "Quantidade ao arrastar: armado (2)"), 1);
+        assert_eq!(h.row(DRAG).applied_k, Some(2));
+        assert!(!h.row(DRAG).on && h.c.desired().is_empty());
+        assert_eq!(h.c.model.counts(), (1, 1), "uma ação não conta no topo");
+
+        // As setas mudam só o número mostrado.
+        assert!(!h.key(Action::Inc, 500));
+        assert_eq!(h.row(DRAG).k, 3);
+        assert_eq!(h.row(DRAG).applied_k, Some(2));
+        assert_eq!(
+            hook_calls(&h, |c| matches!(c, Call::HookSetValue { .. })),
+            0
+        );
+
+        // Apertar de novo (fora da janela de 1 s) desarma.
+        assert!(press_drag(&mut h, 1_200));
+        assert_eq!(event_count(&h, "Quantidade ao arrastar: desarmado"), 1);
+        assert_eq!(h.row(DRAG).applied_k, None);
+
+        // O jogo aplica: o acompanhamento de 100 ms registra `aplicada (N)`.
+        assert!(press_drag(&mut h, 2_500));
+        assert_eq!(h.row(DRAG).applied_k, Some(3));
+        h.ctl.push_hook_events(vec![HookEvent::DragApplied(250)]);
+        h.tick(2_600);
+        assert_eq!(event_count(&h, "Quantidade ao arrastar: aplicada (250)"), 1);
+        assert_eq!(h.row(DRAG).applied_k, None);
+
+        // Expira depois de 60 s armado.
+        assert!(press_drag(&mut h, 4_000));
+        h.ctl.push_hook_events(vec![HookEvent::DragExpired]);
+        h.tick(4_100);
+        assert_eq!(event_count(&h, "Quantidade ao arrastar: expirou"), 1);
+        assert_eq!(h.row(DRAG).applied_k, None);
+
+        // O jogo aplicou antes do desarme.
+        assert!(press_drag(&mut h, 6_000));
+        h.ctl.push_arm(ArmReport::Applied(250));
+        assert!(press_drag(&mut h, 7_100));
+        assert_eq!(event_count(&h, "Quantidade ao arrastar: aplicada (250)"), 2);
+        assert_eq!(h.row(DRAG).applied_k, None);
+
+        // A variável zerada por fora acaba com o arme.
+        assert!(press_drag(&mut h, 9_000));
+        h.ctl.push_hook_events(vec![HookEvent::DragDisarmed]);
+        h.tick(9_100);
+        assert_eq!(event_count(&h, "Quantidade ao arrastar: desarmado"), 2);
+        assert_eq!(h.row(DRAG).applied_k, None);
+        assert_eq!(enables(&h, DRAG), 0, "o arme instala o desvio, não o ligar");
+    }
+
+    #[test]
+    fn action_window_1s() {
+        let mut h = with_hooks();
+        assert!(press_drag(&mut h, 100));
+        // A janela de 1 s vale também para o arme: o segundo aperto é descartado.
+        assert!(!press_drag(&mut h, 500));
+        assert!(!press_drag(&mut h, 1_000));
+        assert_eq!(h.ctl.arms(), 1);
+        assert_eq!(event_count(&h, "Quantidade ao arrastar: aguarde"), 1);
+        assert!(press_drag(&mut h, 1_150));
+        assert_eq!(h.ctl.arms(), 2);
+        assert_eq!(h.row(DRAG).applied_k, None);
+    }
+
+    #[test]
+    fn drag_arm_refused_when_stuck() {
+        let mut h = with_hooks();
+        h.ctl.set_stuck(true);
+        assert!(!press_drag(&mut h, 100));
+        assert!(!press_drag(&mut h, 200));
+        assert_eq!(
+            event_count(
+                &h,
+                "Quantidade ao arrastar: não foi possível ligar (o jogo pode ter ficado parado; aperte r)"
+            ),
+            1
+        );
+        assert_eq!(h.ctl.arms(), 0);
+        assert_eq!(h.row(DRAG).applied_k, None);
+        assert!(!h.c.op_counts.contains_key(DRAG));
+
+        // Sem motor (disco ilegível): a mesma mensagem do ligar.
+        let mut h = H::new();
+        let mut spec = SearchSpec::new(vec![drag_info()]);
+        spec.disk = Err("disco ilegível".to_string());
+        h.ctl.set_default_search(spec);
+        h.ctl.set_hook_avail(&[(DRAG, available())]);
+        h.connect(0);
+        assert!(!press_drag(&mut h, 100));
+        assert_eq!(
+            event_count(
+                &h,
+                "Quantidade ao arrastar: não foi possível ligar (o motor não está aberto)"
+            ),
+            1
+        );
+        assert_eq!(h.ctl.arms(), 0);
+    }
+
+    #[test]
+    fn drag_arm_checking_and_unavailable_states() {
+        // Verificando a reflexão: só avisa, sem chamar a sessão.
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![drag_info()]);
+        h.ctl.set_hook_avail(&[(DRAG, Avail::Checking)]);
+        h.connect(0);
+        assert!(!press_drag(&mut h, 100));
+        assert_eq!(
+            event_count(
+                &h,
+                "Quantidade ao arrastar: verificando a reflexão do jogo; tente de novo em instantes"
+            ),
+            1
+        );
+        assert_eq!(h.ctl.arms(), 0);
+
+        // Indisponível: o motivo da conferência, com o `indisponível (…)` da tela.
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![drag_info()]);
+        h.ctl
+            .set_hook_avail(&[(DRAG, unavailable("sem espaço para a cave"))]);
+        h.connect(0);
+        assert!(!press_drag(&mut h, 100));
+        assert_eq!(
+            event_count(
+                &h,
+                "Quantidade ao arrastar: indisponível (sem espaço para a cave)"
+            ),
+            1
+        );
+        assert_eq!(h.ctl.arms(), 0);
+    }
+
+    #[test]
+    fn drag_arm_refusal_from_the_session_is_not_an_operation() {
+        let mut h = with_hooks();
+        h.ctl
+            .push_arm(ArmReport::Refused("sem espaço para a cave".to_string()));
+        assert!(!press_drag(&mut h, 100));
+        assert_eq!(
+            event_count(&h, "Quantidade ao arrastar: sem espaço para a cave"),
+            1
+        );
+        assert_eq!(h.row(DRAG).applied_k, None);
+        // A recusa não abriu a janela de 1 s.
+        assert!(press_drag(&mut h, 150));
+    }
+
+    #[test]
+    fn drag_not_rearmed_on_reconnect() {
+        let mut h = with_hooks();
+        // O Brain Power é religado; o arrastar armado não.
+        assert!(h.toggle(BRAIN, 100));
+        assert!(press_drag(&mut h, 1_500));
+        assert_eq!(h.row(DRAG).applied_k, Some(2));
+        h.reopen(2_000, 4_100);
+        assert_eq!(h.row(DRAG).applied_k, None);
+        assert!(!h.c.desired().contains_key(DRAG));
+        h.tick(4_200);
+        h.tick(6_000);
+        h.tick(30_000);
+        assert_eq!(h.ctl.arms(), 1, "nenhum arme novo só por reconectar");
+        assert_eq!(
+            enables(&h, DRAG),
+            0,
+            "nenhum desvio reinstalado só por reconectar"
+        );
+        assert_eq!(enables(&h, BRAIN), 2);
+        assert_eq!(h.row(DRAG).applied_k, None);
+        // A linha mostra desarmada: só um novo aperto arma.
+        assert!(press_drag(&mut h, 31_000));
+        assert_eq!(h.ctl.arms(), 2);
+        assert_eq!(h.row(DRAG).applied_k, Some(2));
+    }
+
+    #[test]
+    fn brain_log_line_and_skipped() {
+        let mut h = with_hooks();
+        assert!(h.toggle(BRAIN, 100));
+        h.ctl.push_hook_events(vec![HookEvent::BrainGain {
+            gain: 40,
+            applied: 200,
+            l1: 1500,
+            skipped: 0,
+        }]);
+        h.tick(200);
+        assert_eq!(
+            event_count(&h, "Brain Power: +40 → +200 (próximo nível em 1500)"),
+            1
+        );
+        assert_eq!(event_count(&h, "ganhos não mostrados"), 0);
+        // Vários ganhos em menos de 100 ms: o último e a conta dos que não foram mostrados.
+        h.ctl.push_hook_events(vec![HookEvent::BrainGain {
+            gain: 10,
+            applied: 50,
+            l1: 1500,
+            skipped: 3,
+        }]);
+        h.tick(300);
+        assert_eq!(
+            event_count(
+                &h,
+                "Brain Power: +10 → +50 (próximo nível em 1500) (+3 ganhos não mostrados)"
+            ),
+            1
+        );
+        // Sem próximo nível (`L1` zero): sem o trecho do nível.
+        h.ctl.push_hook_events(vec![HookEvent::BrainGain {
+            gain: 5,
+            applied: 10,
+            l1: 0,
+            skipped: 0,
+        }]);
+        h.tick(400);
+        assert_eq!(event_count(&h, "Brain Power: +5 → +10"), 1);
+        assert_eq!(event_count(&h, "Brain Power: +5 → +10 ("), 0);
+    }
+
+    #[test]
+    fn pular_hora_not_taken_text() {
+        let mut h = clock_action();
+        h.ctl.push_action(ActionOutcome::RefusedAfterRead(
+            "não pegou, aperte de novo".to_string(),
+        ));
+        assert!(h.toggle("hora", 100));
+        assert_eq!(
+            h.c.model.events.back().map(String::as_str),
+            Some("12:00 Pular 1 hora: não pegou, aperte de novo")
+        );
+        assert_eq!(h.row("hora").label.as_deref(), Some("+1h"));
+        h.ctl.push_action(ActionOutcome::Done {
+            before: 5000.0,
+            after: 9100.0,
+            note: Some("(o relógio andou mais que o esperado)".to_string()),
+        });
+        assert!(h.toggle("hora", 200));
+        assert_eq!(
+            h.c.model.events.back().map(String::as_str),
+            Some("12:00 Pular 1 hora: 5000 → 9100 (o relógio andou mais que o esperado)")
+        );
+    }
+
+    #[test]
+    fn hook_tick_only_with_a_hook_on_or_armed() {
+        let mut h = with_hooks();
+        h.tick(100);
+        assert_eq!(h.ctl.hook_ticks(), 0);
+        assert!(h.toggle(BRAIN, 200));
+        h.tick(300);
+        assert_eq!(h.ctl.hook_ticks(), 1);
+        // Sem o personagem: o Brain Power não precisa dele.
+        assert!(h.ctl.calls().contains(&Call::HookTick { pawn: None }));
+        assert_eq!(hook_calls(&h, |c| matches!(c, Call::ReadPawn)), 0);
+        // A manutenção dos desvios não é operação.
+        assert!(!h.tick(400));
+        // Com o jogo possivelmente parado ela fica suspensa.
+        h.ctl.set_stuck(true);
+        let before = h.ctl.hook_ticks();
+        h.tick(500);
+        assert_eq!(h.ctl.hook_ticks(), before);
+    }
+
+    /// Conectado em 0 com a coleta (precisa do pawn), disponível pela sessão.
+    fn with_collect() -> H {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![collect_info()]);
+        h.ctl.set_hook_avail(&[(COLLECT, available())]);
+        h.connect(0);
+        h
+    }
+
+    #[test]
+    fn hook_tick_gets_the_pawn_without_a_value_cheat() {
+        let mut h = with_collect();
+        h.ctl.set_pawn(Some(0x10));
+        // Desligada, ninguém lê o personagem.
+        h.tick(100);
+        assert_eq!(hook_calls(&h, |c| matches!(c, Call::ReadPawn)), 0);
+        assert!(h.toggle(COLLECT, 200));
+        h.tick(300);
+        assert!(h.ctl.calls().contains(&Call::ReadPawn));
+        assert!(h.ctl.calls().contains(&Call::HookTick { pawn: Some(0x10) }));
+        assert_eq!(h.ctl.field_ticks(), 0);
+        // O personagem some (morreu, trocou de mundo): o ciclo seguinte leva `None`.
+        h.ctl.set_pawn(None);
+        h.tick(400);
+        assert!(h.ctl.calls().contains(&Call::HookTick { pawn: None }));
+    }
+
+    #[test]
+    fn hook_tick_reuses_the_pawn_of_the_value_maintenance() {
+        let mut h = H::new();
+        h.ctl
+            .set_catalog(vec![field("f", Avail::Checking), collect_info()]);
+        h.ctl.set_field_avail(&[("f", available())]);
+        h.ctl.set_hook_avail(&[(COLLECT, available())]);
+        h.connect(0);
+        assert!(h.toggle("f", 100));
+        assert!(h.toggle(COLLECT, 200));
+        let mut r = report(PlayerState::Found, &[]);
+        r.pawn = Some(0x20);
+        h.ctl.push_tick(r);
+        h.ctl.set_pawn(Some(0x99));
+        h.tick(300);
+        // Lido uma vez no ciclo: o dos cheats de valor vale e não há segunda leitura.
+        assert!(h.ctl.calls().contains(&Call::HookTick { pawn: Some(0x20) }));
+        assert_eq!(hook_calls(&h, |c| matches!(c, Call::ReadPawn)), 0);
+    }
+
+    #[test]
+    fn pawn_hook_triggers_the_controller_search() {
+        let mut h = with_collect();
+        h.ctl.set_jobs(&[JobKind::Index, JobKind::Controller]);
+        h.ctl.set_needs_controller(true);
+        h.tick(0);
+        assert!(h.wait_job(0));
+        // Sem o desvio ligado ou desejado, ninguém procura o controller.
+        h.tick(50);
+        assert!(h.c.job.is_none());
+        assert!(h.toggle(COLLECT, 100));
+        h.tick(200);
+        assert!(matches!(&h.c.job, Some(j) if j.kind == JobKind::Controller));
+        assert!(h.wait_job(200));
+        assert_eq!(h.ctl.job_runs(JobKind::Controller), 1);
+    }
+
+    #[test]
+    fn hook_rows_do_not_use_the_field_paths() {
+        // Um desvio não entra na manutenção dos cheats de valor.
+        let mut h = with_hooks();
+        assert!(h.toggle(BRAIN, 100));
+        h.tick(200);
+        h.tick(300);
+        assert_eq!(h.ctl.field_ticks(), 0);
+        assert_eq!(h.c.model.player, PlayerLine::Idle);
     }
 }

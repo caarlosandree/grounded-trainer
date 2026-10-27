@@ -13,11 +13,12 @@ use std::time::{Duration, Instant};
 
 use gt_core::procinfo::Identity;
 use gt_grounded2::fields::{ActionOutcome, TickReport};
+use gt_grounded2::hooks::HookEvent;
 use gt_grounded2::signatures::Category;
 
 use crate::backend::{
-    Backend, CheatInfo, Find, JobKind, OpOutcome, Recovered, ReflectionJob, ReflectionNews,
-    ReflectionOutcome, Search, SearchError, SearchFn, Session, TuiError, idle_tick,
+    ArmReport, Backend, CheatInfo, Find, JobKind, OpOutcome, Recovered, ReflectionJob,
+    ReflectionNews, ReflectionOutcome, Search, SearchError, SearchFn, Session, TuiError, idle_tick,
 };
 use crate::model::{Avail, Model};
 
@@ -91,6 +92,27 @@ pub(crate) enum Call {
     FieldTick {
         on: Vec<String>,
     },
+    HookEnable {
+        id: String,
+        k: u64,
+        busy: Option<String>,
+    },
+    HookDisable {
+        id: String,
+        busy: Option<String>,
+    },
+    HookSetValue {
+        id: String,
+        k: u64,
+        busy: Option<String>,
+    },
+    HookArm {
+        k: u64,
+    },
+    ReadPawn,
+    HookTick {
+        pawn: Option<u64>,
+    },
 }
 
 /// O que uma busca devolve (a parte que o teste programa).
@@ -126,6 +148,8 @@ pub(crate) fn field(id: &str, avail: Avail) -> CheatInfo {
         field: true,
         action: false,
         label: None,
+        hook: false,
+        pawn: false,
     }
 }
 
@@ -140,6 +164,8 @@ pub(crate) fn cheat(id: &str, avail: Avail) -> CheatInfo {
         field: false,
         action: false,
         label: None,
+        hook: false,
+        pawn: false,
     }
 }
 
@@ -201,6 +227,16 @@ pub(crate) struct FakeState {
     pub controller_news: Option<bool>,
     /// Relatórios dos próximos ciclos (vazia: ciclo sem manutenção).
     pub tick_reports: VecDeque<TickReport>,
+    /// Disponibilidade dos desvios segundo a sessão.
+    pub hook_avail: Vec<(String, Avail)>,
+    /// Resultados programados dos próximos armes do arrastar (vazia: arma com `k`, ou desarma).
+    pub arm_reports: VecDeque<ArmReport>,
+    /// O arrastar está armado (com esta quantidade) na sessão falsa.
+    pub armed: Option<i32>,
+    /// Acontecimentos dos próximos ciclos de manutenção dos desvios.
+    pub hook_events: VecDeque<Vec<HookEvent>>,
+    /// O personagem que a sessão falsa lê.
+    pub pawn: Option<u64>,
 }
 
 fn lock(state: &Mutex<FakeState>) -> MutexGuard<'_, FakeState> {
@@ -425,6 +461,35 @@ impl FakeCtl {
         self.state().tick_reports.push_back(report);
     }
 
+    pub fn set_hook_avail(&self, avail: &[(&str, Avail)]) {
+        self.state().hook_avail = avail
+            .iter()
+            .map(|(id, a)| (id.to_string(), a.clone()))
+            .collect();
+    }
+
+    /// Programa o resultado do próximo arme do arrastar.
+    pub fn push_arm(&self, report: ArmReport) {
+        self.state().arm_reports.push_back(report);
+    }
+
+    /// Programa o que a manutenção dos desvios do próximo ciclo devolve.
+    pub fn push_hook_events(&self, events: Vec<HookEvent>) {
+        self.state().hook_events.push_back(events);
+    }
+
+    pub fn set_pawn(&self, pawn: Option<u64>) {
+        self.state().pawn = pawn;
+    }
+
+    pub fn arms(&self) -> usize {
+        self.count(|c| matches!(c, Call::HookArm { .. }))
+    }
+
+    pub fn hook_ticks(&self) -> usize {
+        self.count(|c| matches!(c, Call::HookTick { .. }))
+    }
+
     pub fn job_runs(&self, kind: JobKind) -> usize {
         self.count(|c| matches!(c, Call::JobRun { kind: k, .. } if *k == kind))
     }
@@ -476,6 +541,11 @@ impl FakeBackend {
             action_wants: false,
             controller_news: None,
             tick_reports: VecDeque::new(),
+            hook_avail: Vec::new(),
+            arm_reports: VecDeque::new(),
+            armed: None,
+            hook_events: VecDeque::new(),
+            pawn: None,
         };
         FakeBackend {
             ctl: FakeCtl(Arc::new(Mutex::new(state))),
@@ -583,6 +653,8 @@ impl Backend for FakeBackend {
             return Err(TuiError::Other(e.clone()));
         }
         s.sessions += 1;
+        // Uma sessão nova (processo novo) começa com o arrastar desarmado.
+        s.armed = None;
         Ok(FakeSession {
             ctl: self.ctl.clone(),
             engine: engine && search.disk.is_ok(),
@@ -823,6 +895,70 @@ impl Session<()> for FakeSession {
         let mut s = self.ctl.state();
         s.calls.push(Call::FieldTick { on: on.to_vec() });
         s.tick_reports.pop_front().unwrap_or_else(idle_tick)
+    }
+
+    fn hook_avail(&self) -> Vec<(String, Avail)> {
+        self.ctl.state().hook_avail.clone()
+    }
+
+    fn hook_enable(&mut self, id: &str, k: u64) -> OpOutcome {
+        self.op(|busy| Call::HookEnable {
+            id: id.to_string(),
+            k,
+            busy,
+        })
+    }
+
+    fn hook_disable(&mut self, id: &str) -> OpOutcome {
+        self.op(|busy| Call::HookDisable {
+            id: id.to_string(),
+            busy,
+        })
+    }
+
+    fn hook_set_value(&mut self, id: &str, k: u64) -> OpOutcome {
+        self.op(|busy| Call::HookSetValue {
+            id: id.to_string(),
+            k,
+            busy,
+        })
+    }
+
+    fn hook_arm(&mut self, k: u64) -> ArmReport {
+        let mut s = self.ctl.state();
+        s.calls.push(Call::HookArm { k });
+        let report = s.arm_reports.pop_front().unwrap_or(match s.armed {
+            Some(n) => ArmReport::Disarmed(n),
+            None => ArmReport::Armed(i32::try_from(k).unwrap_or(i32::MAX)),
+        });
+        s.armed = match &report {
+            ArmReport::Armed(n) => Some(*n),
+            ArmReport::Refused(_) | ArmReport::Residue(_) => s.armed,
+            _ => None,
+        };
+        report
+    }
+
+    fn read_pawn(&mut self) -> Option<u64> {
+        let mut s = self.ctl.state();
+        s.calls.push(Call::ReadPawn);
+        s.pawn
+    }
+
+    fn hook_tick(&mut self, pawn: Option<u64>, _now: Instant) -> Vec<HookEvent> {
+        let mut s = self.ctl.state();
+        s.calls.push(Call::HookTick { pawn });
+        let events = s.hook_events.pop_front().unwrap_or_default();
+        // Como a sessão real: aplicar, expirar ou zerar por fora acaba com o arme.
+        if events.iter().any(|e| {
+            matches!(
+                e,
+                HookEvent::DragApplied(_) | HookEvent::DragExpired | HookEvent::DragDisarmed
+            )
+        }) {
+            s.armed = None;
+        }
+        events
     }
 }
 

@@ -13,33 +13,42 @@ use gt_core::journal::{JournalLock, JournalStore};
 use gt_core::mem::Pidfd;
 use gt_core::modules::Module;
 use gt_core::patch::{PatchKind, PatchSpec, Validated, validate};
-use gt_core::pe::PeHeaders;
+use gt_core::pe::{DiskImage, PeHeaders};
 use gt_core::process::ptrace_scope;
 use gt_core::procinfo::{Identity, check_alive, identity};
 use gt_core::recovery::recover;
 use gt_core::suspend::{PauseConfig, open_checked};
-use gt_grounded2::catalog::{CatalogScan, Entry, scan, scan_subset};
+use gt_grounded2::catalog::{CatalogScan, Entry, HookEntry, HookState, scan, scan_subset};
 use gt_grounded2::fields::{ActionOutcome, TickReport};
+use gt_grounded2::hooks::HookEvent;
 use gt_grounded2::patching;
 use gt_grounded2::resolve::{Target, find_pid, permission_hint};
-use gt_grounded2::signatures::{FieldDef, PatchDef, Signatures};
+use gt_grounded2::signatures::{CaveBody, FieldDef, PatchDef, Signatures};
 use gt_grounded2::state::PatchState;
 use gt_grounded2::ue::UeScan;
 
 use crate::backend::{
-    Backend, CheatInfo, Find, JobKind, OpOutcome, Recovered, ReflectionJob, ReflectionNews,
-    ReflectionOutcome, Search, SearchError, SearchFn, Session, TuiError, outcome_of,
-    recovery_outcome, restore_outcome,
+    ArmReport, Backend, CheatInfo, Find, JobKind, OpOutcome, Recovered, ReflectionJob,
+    ReflectionNews, ReflectionOutcome, Search, SearchError, SearchFn, Session, TuiError,
+    outcome_of, recovery_outcome, restore_outcome,
 };
+use crate::hooks::HookCheats;
 use crate::model::Avail;
 use crate::values::{ValueCheats, field_infos, globals_of, search_avail};
 
 /// Nome do programa nas dicas de permissão.
 const PROGRAM: &str = "gt-tui";
 
-/// Dados que a busca leva de volta para a sessão: o alvo aberto, o catálogo e as definições dos
-/// cheats de valor.
-pub type GamePayload = (Target, CatalogScan, Vec<FieldDef>);
+/// Motivo mostrado quando a imagem do módulo no disco não pôde ser aberta para os desvios.
+const DISK_UNREADABLE: &str = "disco ilegível";
+
+/// A imagem do módulo no disco, que os desvios usam para conferir os bytes e achar as sequências
+/// de `CC` (spec 008, 6.4), ou o motivo de não haver. Só a busca de conexão a abre.
+pub type HookDisk = Result<Arc<DiskImage>, String>;
+
+/// Dados que a busca leva de volta para a sessão: o alvo aberto, o catálogo, as definições dos
+/// cheats de valor e a imagem do disco dos desvios (`None` nas novas buscas).
+pub type GamePayload = (Target, CatalogScan, Vec<FieldDef>, Option<HookDisk>);
 
 /// Disponibilidade mostrada para o estado de um patch: só `Verified` e `Unverified` podem ser
 /// ligados; todos os outros (inclusive `Active` e `Pending`, que a busca sem diário não
@@ -96,12 +105,51 @@ fn core_search_error(e: gt_core::Error) -> SearchError {
     search_error(gt_grounded2::Error::Core(e))
 }
 
-/// Os cheats que a busca viu: os patches na ordem do catálogo e, depois, os cheats de valor
-/// (a tela os mostra depois dos patches da mesma categoria). Os de valor só entram quando a
-/// busca trouxe o `[ue]` (busca completa ou com `@ue`).
+/// Abre a imagem do módulo no disco para os desvios. Sem ela os desvios ficam indisponíveis.
+fn load_hook_disk(target: &Target) -> HookDisk {
+    let opened = target
+        .module(gt_grounded2::GAME_EXE)
+        .and_then(|(module, mem)| target.open_disk(module, &mem));
+    match opened {
+        Ok(image) => Ok(Arc::new(image)),
+        Err(e) => {
+            tracing::warn!(erro = %e, "imagem do módulo no disco ilegível para os desvios");
+            Err(DISK_UNREADABLE.to_string())
+        }
+    }
+}
+
+/// As linhas dos desvios (`[[hook]]`) para a busca: o motivo da varredura, ou, achados, o estado
+/// das globais da reflexão (`verificando…` até o índice, spec 008, 6.11).
+fn hook_infos(hooks: &[HookEntry], gate: &Avail) -> Vec<CheatInfo> {
+    hooks
+        .iter()
+        .map(|h| CheatInfo {
+            id: h.def.id.clone(),
+            name: h.def.name.clone(),
+            category: h.def.category,
+            value: h.def.value.clone(),
+            avail: match &h.state {
+                HookState::Found { .. } => gate.clone(),
+                HookState::Unavailable(reason) => Avail::Unavailable(reason.clone()),
+            },
+            field: false,
+            action: h.def.action,
+            label: None,
+            hook: true,
+            pawn: h.def.body == CaveBody::Collect,
+        })
+        .collect()
+}
+
+/// Os cheats que a busca viu: os patches na ordem do catálogo, depois os cheats de valor e os
+/// desvios (a tela os mostra depois dos patches da mesma categoria). Os de valor só entram quando
+/// a busca trouxe o `[ue]` (busca completa ou com `@ue`); os desvios entram sempre, para uma nova
+/// busca poder achar o que faltava.
 fn cheats_of(
     entries: &[Entry],
     fields: &[FieldDef],
+    hooks: &[HookEntry],
     ue: Option<&UeScan>,
     disk: &Result<(), String>,
 ) -> Vec<CheatInfo> {
@@ -116,12 +164,18 @@ fn cheats_of(
             field: false,
             action: false,
             label: None,
+            hook: false,
+            pawn: false,
         })
         .collect();
+    let gate = match ue {
+        Some(_) => search_avail(&globals_of(ue, disk)),
+        None => Avail::Checking,
+    };
     if ue.is_some() {
-        let avail = search_avail(&globals_of(ue, disk));
-        out.extend(field_infos(fields, &avail));
+        out.extend(field_infos(fields, &gate));
     }
+    out.extend(hook_infos(hooks, &gate));
     out
 }
 
@@ -166,16 +220,26 @@ fn game_search(
     );
     let disk = disk_status(catalog.disk.is_some(), &catalog.entries);
     let fields = sigs.fields().to_vec();
+    let cheats = cheats_of(
+        &catalog.entries,
+        &fields,
+        &catalog.hooks,
+        catalog.ue.as_ref(),
+        &disk,
+    );
+    // Só a busca de conexão abre a imagem do disco (≈187 MB) para os desvios.
+    let hook_disk = (ids.is_none() && catalog.disk.is_some() && !catalog.hooks.is_empty())
+        .then(|| load_hook_disk(&target));
     Ok(Search {
         pid,
         identity: target.identity.clone(),
         version_key: catalog.version_key.clone(),
         has_version_file: catalog.has_version_file,
-        cheats: cheats_of(&catalog.entries, &fields, catalog.ue.as_ref(), &disk),
+        cheats,
         disk,
         ids,
         took,
-        payload: (target, catalog, fields),
+        payload: (target, catalog, fields, hook_disk),
     })
 }
 
@@ -227,11 +291,17 @@ impl Backend for GameBackend {
         if id != search.identity {
             return Err(TuiError::Other("o processo terminou".to_string()));
         }
-        let (target, catalog, fields) = search.payload;
+        let (target, catalog, fields, hook_disk) = search.payload;
         let values = ValueCheats::new(
             target.reader,
             fields,
             globals_of(catalog.ue.as_ref(), &search.disk),
+        );
+        let hooks = HookCheats::new(
+            catalog.module.clone(),
+            target.maps.clone(),
+            hook_disk.unwrap_or_else(|| Err(DISK_UNREADABLE.to_string())),
+            catalog.hooks,
         );
         let mut session = GameSession {
             engine: None,
@@ -244,6 +314,7 @@ impl Backend for GameBackend {
             headers: catalog.disk,
             entries: catalog.entries,
             values,
+            hooks,
             lock: self.lock.clone(),
         };
         if engine && session.disk.is_ok() {
@@ -270,6 +341,8 @@ pub struct GameSession {
     entries: Vec<Entry>,
     /// Cheats de valor (spec 005).
     values: ValueCheats,
+    /// Desvios com cave (spec 008).
+    hooks: HookCheats,
     lock: Arc<JournalLock>,
 }
 
@@ -284,6 +357,17 @@ impl GameSession {
             Some(v) => v.bytes(&def.replacement, k),
             None => def.replacement.clone(),
         }
+    }
+
+    /// Confere os desvios com o índice da reflexão, se já há um.
+    fn resolve_hooks(&mut self) {
+        let Some((index, globals)) = self.values.reflection_parts() else {
+            return;
+        };
+        let globals = globals.clone();
+        let reader = self.values.reader();
+        self.hooks
+            .resolve(&reader, self.engine.as_ref(), &index, &globals);
     }
 
     /// Roda uma operação do motor e a classifica; sem motor, recusa.
@@ -333,11 +417,13 @@ impl Session<GamePayload> for GameSession {
             return false;
         }
         self.disk = s.disk;
-        let (target, catalog, _) = s.payload;
+        let (target, catalog, _, _) = s.payload;
         if catalog.ue.is_some() {
             self.values
                 .update_globals(globals_of(catalog.ue.as_ref(), &self.disk));
         }
+        self.hooks.merge_scan(catalog.hooks, s.ids.as_deref());
+        self.resolve_hooks();
         self.target = target;
         self.module = catalog.module;
         self.headers = catalog.disk;
@@ -454,10 +540,18 @@ impl Session<GamePayload> for GameSession {
     }
 
     fn pending_ids(&self) -> Vec<String> {
-        self.engine
-            .as_ref()
-            .map(Engine::pending_ids)
-            .unwrap_or_default()
+        let Some(engine) = self.engine.as_ref() else {
+            return Vec::new();
+        };
+        // As entradas de um desvio no motor (`<id>-cave`, `<id>-hook`) valem como o `id` dele.
+        let mut out: Vec<String> = Vec::new();
+        for id in engine.pending_ids() {
+            let id = self.hooks.row_of_engine_id(&id).unwrap_or(id);
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        out
     }
 
     fn discard_gone(&mut self) {
@@ -490,7 +584,12 @@ impl Session<GamePayload> for GameSession {
     }
 
     fn merge_reflection(&mut self, out: ReflectionOutcome) -> ReflectionNews {
-        self.values.merge(out)
+        let kind = out.kind;
+        let news = self.values.merge(out);
+        if kind == JobKind::Index && news.index_ok {
+            self.resolve_hooks();
+        }
+        news
     }
 
     fn field_avail(&self) -> Vec<(String, Avail)> {
@@ -523,6 +622,49 @@ impl Session<GamePayload> for GameSession {
 
     fn field_tick(&mut self, on: &[String], now: Instant) -> TickReport {
         self.values.tick(self.engine.as_mut(), on, now)
+    }
+
+    fn hook_avail(&self) -> Vec<(String, Avail)> {
+        self.hooks.avail(&self.values.gate())
+    }
+
+    fn hook_enable(&mut self, id: &str, k: u64) -> OpOutcome {
+        let Some(engine) = self.engine.as_mut() else {
+            return OpOutcome::Refused("sem motor".to_string());
+        };
+        self.hooks.enable(engine, id, k)
+    }
+
+    fn hook_disable(&mut self, id: &str) -> OpOutcome {
+        let Some(engine) = self.engine.as_mut() else {
+            return OpOutcome::Refused("sem motor".to_string());
+        };
+        self.hooks.disable(engine, id)
+    }
+
+    fn hook_set_value(&mut self, id: &str, k: u64) -> OpOutcome {
+        let Some(engine) = self.engine.as_mut() else {
+            return OpOutcome::Refused("sem motor".to_string());
+        };
+        self.hooks.set_value(engine, id, k)
+    }
+
+    fn hook_arm(&mut self, k: u64) -> ArmReport {
+        let Some(engine) = self.engine.as_mut() else {
+            return ArmReport::Refused("sem motor".to_string());
+        };
+        self.hooks.arm(engine, k)
+    }
+
+    fn read_pawn(&mut self) -> Option<u64> {
+        self.values.read_pawn()
+    }
+
+    fn hook_tick(&mut self, pawn: Option<u64>, now: Instant) -> Vec<HookEvent> {
+        let Some(engine) = self.engine.as_mut() else {
+            return Vec::new();
+        };
+        self.hooks.tick(&self.target.reader, engine, pawn, now)
     }
 }
 
@@ -666,7 +808,7 @@ mod tests {
             entry("a", "A", PatchState::Verified { addr: 1 }),
             entry("b", "B", PatchState::NotFound),
         ];
-        let cheats = cheats_of(&entries, &[], None, &Ok(()));
+        let cheats = cheats_of(&entries, &[], &[], None, &Ok(()));
         assert_eq!(cheats.len(), 2);
         assert_eq!(cheats[0].id, "a");
         assert_eq!(cheats[0].avail, Avail::Available { verified: true });
@@ -701,7 +843,7 @@ mod tests {
     fn field_cheats_after_patches_in_category() {
         let ue = ue_scan(GlobalState::Verified(1), GlobalState::Verified(2), Ok(()));
         let entries = vec![sobrevivencia("p1"), entry("p2", "P2", PatchState::NotFound)];
-        let cheats = cheats_of(&entries, &fields(), Some(&ue), &Ok(()));
+        let cheats = cheats_of(&entries, &fields(), &[], Some(&ue), &Ok(()));
         let ids: Vec<&str> = cheats.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(&ids[..3], ["p1", "p2", "vida-infinita"]);
         assert_eq!(cheats.len(), 2 + 21);
@@ -712,7 +854,76 @@ mod tests {
         );
         assert!(cheats[..2].iter().all(|c| !c.field));
         // Uma busca sem o `[ue]` (nova busca só de patches) não traz os cheats de valor.
-        assert_eq!(cheats_of(&entries, &fields(), None, &Ok(())).len(), 2);
+        assert_eq!(cheats_of(&entries, &fields(), &[], None, &Ok(())).len(), 2);
+    }
+
+    fn hook_entries() -> Vec<HookEntry> {
+        Signatures::embedded()
+            .unwrap()
+            .hooks()
+            .iter()
+            .enumerate()
+            .map(|(i, def)| HookEntry {
+                def: def.clone(),
+                state: match i {
+                    0 => HookState::Found {
+                        addr: 0x1000,
+                        captures: vec![0; 8],
+                    },
+                    _ => HookState::Unavailable("ambíguo".to_string()),
+                },
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hooks_follow_the_scan_and_wait_for_the_reflection() {
+        let ue = ue_scan(GlobalState::Verified(1), GlobalState::Verified(2), Ok(()));
+        let hooks = hook_entries();
+        let cheats = cheats_of(&[], &[], &hooks, Some(&ue), &Ok(()));
+        assert_eq!(cheats.len(), hooks.len());
+        assert!(cheats.iter().all(|c| c.hook && !c.field));
+        // Achado: `verificando…` até o índice; não achado: o motivo da varredura.
+        assert_eq!(cheats[0].avail, Avail::Checking);
+        assert_eq!(cheats[1].avail, Avail::Unavailable("ambíguo".to_string()));
+        // Os desvios entram também na nova busca sem o `[ue]`, para o `não encontrado` se resolver.
+        let again = cheats_of(&[], &fields(), &hooks, None, &Ok(()));
+        assert_eq!(again.len(), hooks.len());
+        // Globais indisponíveis: o motivo vale para os achados.
+        let ue = ue_scan(
+            GlobalState::Unavailable("não encontrado"),
+            GlobalState::Verified(2),
+            Err("x".into()),
+        );
+        let cheats = cheats_of(&[], &[], &hooks, Some(&ue), &Ok(()));
+        assert_eq!(
+            cheats[0].avail,
+            Avail::Unavailable("não encontrado".to_string())
+        );
+    }
+
+    #[test]
+    fn hook_infos_carry_action_value_and_pawn() {
+        let mut hooks = hook_entries();
+        for h in &mut hooks {
+            h.state = HookState::Found {
+                addr: 1,
+                captures: Vec::new(),
+            };
+        }
+        // A coleta ainda não está nas assinaturas: o `pawn` vem do corpo da cave.
+        let mut collect = hooks[0].clone();
+        collect.def.id = "coleta-multiplicada".to_string();
+        collect.def.body = CaveBody::Collect;
+        hooks.push(collect);
+        let infos = hook_infos(&hooks, &Avail::Checking);
+        let find = |id: &str| infos.iter().find(|i| i.id == id).unwrap();
+        assert!(find("quantidade-arrastar").action);
+        assert!(!find("brain-power").action && find("brain-power").value.is_some());
+        assert!(find("brain-power").value.as_ref().unwrap().steps() > 0);
+        assert!(find("coleta-multiplicada").pawn);
+        assert!(infos.iter().filter(|i| i.pawn).count() == 1);
+        assert!(infos.iter().all(|i| i.hook));
     }
 
     #[test]
@@ -735,7 +946,7 @@ mod tests {
             ),
         ] {
             let ue = ue_scan(gobjects, names, Err("globais indisponíveis".into()));
-            let cheats = cheats_of(&[], &fields(), Some(&ue), &Ok(()));
+            let cheats = cheats_of(&[], &fields(), &[], Some(&ue), &Ok(()));
             assert!(
                 cheats
                     .iter()
@@ -752,7 +963,7 @@ mod tests {
             GlobalState::Unverified(2),
             Err("nome 0 não é None".into()),
         );
-        let cheats = cheats_of(&[], &fields(), Some(&ue), &Ok(()));
+        let cheats = cheats_of(&[], &fields(), &[], Some(&ue), &Ok(()));
         assert!(
             cheats
                 .iter()
@@ -763,7 +974,7 @@ mod tests {
     #[test]
     fn disk_unreadable_makes_fields_unavailable() {
         let ue = ue_scan(GlobalState::Verified(1), GlobalState::Verified(2), Ok(()));
-        let cheats = cheats_of(&[], &fields(), Some(&ue), &Err("causa".into()));
+        let cheats = cheats_of(&[], &fields(), &[], Some(&ue), &Err("causa".into()));
         assert!(
             cheats
                 .iter()
