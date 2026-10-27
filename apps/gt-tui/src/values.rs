@@ -116,6 +116,27 @@ type IndexData = Result<(ReflectionIndex, FieldCatalog), String>;
 /// Resultado do trabalho `Controller`.
 type ControllerData = Result<ControllerFind, String>;
 
+/// O controller guardado depois de uma procura, e o estado novo do personagem (`None`: nada
+/// mudou). Achar um controller o põe no lugar do guardado; ausente, ambíguo ou falha com um
+/// guardado o mantém, para os cheats do `game_state` não esperarem durante a procura (spec 007,
+/// 6.3). Sem guardado, o resultado vira o estado ausente de sempre.
+fn next_controller(
+    kept: Option<u64>,
+    found: &ControllerData,
+) -> (Option<u64>, Option<PlayerState>) {
+    match (found, kept) {
+        (Ok(ControllerFind::Found(c)), _) => (Some(*c), Some(PlayerState::Found)),
+        (_, Some(k)) => (Some(k), None),
+        (Ok(ControllerFind::Absent), None) => {
+            (None, Some(PlayerState::Absent(Absent::NoController)))
+        }
+        (Ok(ControllerFind::Ambiguous), None) => {
+            (None, Some(PlayerState::Absent(Absent::ControllerAmbiguous)))
+        }
+        (Err(_), None) => (None, Some(PlayerState::Absent(Absent::Unreadable))),
+    }
+}
+
 fn index_reason(e: &UeError) -> String {
     match e {
         UeError::Deadline => REFLECTION_INCONCLUSIVE.to_string(),
@@ -363,32 +384,26 @@ impl ValueCheats {
                     return news;
                 };
                 news.index_ok = self.reflection.is_some();
-                let state = match *data {
+                match &*data {
                     Ok(ControllerFind::Found(c)) => {
                         tracing::info!(took = ?out.took, controller = format_args!("{c:#x}"), "controller achado");
-                        self.controller = Some(c);
                         self.pawn_null_since = None;
-                        PlayerState::Found
                     }
-                    Ok(ControllerFind::Absent) => {
-                        self.controller = None;
-                        PlayerState::Absent(Absent::NoController)
-                    }
-                    Ok(ControllerFind::Ambiguous) => {
-                        self.controller = None;
-                        PlayerState::Absent(Absent::ControllerAmbiguous)
-                    }
-                    Err(e) => {
-                        tracing::warn!("procura do controller: {e}");
-                        self.controller = None;
-                        PlayerState::Absent(Absent::Unreadable)
-                    }
-                };
-                if std::mem::take(&mut self.action_search) {
-                    self.controller_news = Some(state == PlayerState::Found);
+                    Err(e) => tracing::warn!("procura do controller: {e}"),
+                    _ => {}
                 }
-                news.retry = state != PlayerState::Found;
-                news.player_changed = Some(state);
+                let (controller, state) = next_controller(self.controller, &data);
+                self.controller = controller;
+                if std::mem::take(&mut self.action_search) {
+                    // Sem estado novo, o controller guardado segue em uso: há personagem.
+                    self.controller_news =
+                        Some(state.as_ref().is_none_or(|s| *s == PlayerState::Found));
+                }
+                // Guardado mantido: nada muda, nem evento nem nova procura imediata.
+                if let Some(state) = state {
+                    news.retry = state != PlayerState::Found;
+                    news.player_changed = Some(state);
+                }
             }
         }
         news
@@ -500,13 +515,9 @@ impl ValueCheats {
         );
         match report.player {
             PlayerState::Absent(Absent::ControllerInvalid) => self.controller = None,
-            PlayerState::Absent(Absent::PawnNull) => {
-                self.pawn_null_since = report.pawn_null_since;
-                if controller_needs_search(true, self.pawn_null_since, now) {
-                    // Controller antigo depois de carregar outro save: procura de novo.
-                    self.controller = None;
-                }
-            }
+            // O controller guardado segue em uso enquanto a procura (pedida por
+            // `needs_controller` depois de 30 s) não achar outro (spec 007, 6.3).
+            PlayerState::Absent(Absent::PawnNull) => self.pawn_null_since = report.pawn_null_since,
             _ => self.pawn_null_since = None,
         }
         report
@@ -690,6 +701,102 @@ mod tests {
         assert!(find("somar-ciencia").action && find("somar-ciencia").value.is_some());
         assert!(!find("carga").action && find("carga").value.is_some());
         assert!(!find("vida-infinita").action && find("vida-infinita").value.is_none());
+    }
+
+    fn controller_outcome(data: ControllerData) -> ReflectionOutcome {
+        ReflectionOutcome {
+            kind: JobKind::Controller,
+            took: Duration::from_millis(5),
+            data: Box::new(data),
+        }
+    }
+
+    #[test]
+    fn next_controller_keeps_on_absent_ambiguous_err() {
+        let kept = Some(0x10);
+        for data in [
+            Ok(ControllerFind::Absent),
+            Ok(ControllerFind::Ambiguous),
+            Err("falhou".to_string()),
+        ] {
+            assert_eq!(next_controller(kept, &data), (Some(0x10), None), "{data:?}");
+        }
+    }
+
+    #[test]
+    fn next_controller_swaps_on_found() {
+        assert_eq!(
+            next_controller(Some(0x10), &Ok(ControllerFind::Found(0x20))),
+            (Some(0x20), Some(PlayerState::Found))
+        );
+        assert_eq!(
+            next_controller(None, &Ok(ControllerFind::Found(0x20))),
+            (Some(0x20), Some(PlayerState::Found))
+        );
+    }
+
+    #[test]
+    fn next_controller_without_kept_as_today() {
+        assert_eq!(
+            next_controller(None, &Ok(ControllerFind::Absent)),
+            (None, Some(PlayerState::Absent(Absent::NoController)))
+        );
+        assert_eq!(
+            next_controller(None, &Ok(ControllerFind::Ambiguous)),
+            (None, Some(PlayerState::Absent(Absent::ControllerAmbiguous)))
+        );
+        assert_eq!(
+            next_controller(None, &Err("falhou".to_string())),
+            (None, Some(PlayerState::Absent(Absent::Unreadable)))
+        );
+    }
+
+    #[test]
+    fn merge_controller_keeps_stored_without_news() {
+        let mut v = cheats();
+        v.controller = Some(0x10);
+        for data in [
+            Ok(ControllerFind::Absent),
+            Ok(ControllerFind::Ambiguous),
+            Err("falhou".to_string()),
+        ] {
+            let news = v.merge(controller_outcome(data));
+            assert_eq!(v.controller, Some(0x10));
+            assert_eq!(news.player_changed, None);
+            assert!(!news.retry);
+        }
+        let news = v.merge(controller_outcome(Ok(ControllerFind::Found(0x20))));
+        assert_eq!(v.controller, Some(0x20));
+        assert_eq!(news.player_changed, Some(PlayerState::Found));
+        assert!(!news.retry);
+    }
+
+    #[test]
+    fn merge_controller_without_stored_as_today() {
+        let mut v = cheats();
+        let news = v.merge(controller_outcome(Ok(ControllerFind::Ambiguous)));
+        assert_eq!(v.controller, None);
+        assert_eq!(
+            news.player_changed,
+            Some(PlayerState::Absent(Absent::ControllerAmbiguous))
+        );
+        assert!(news.retry);
+    }
+
+    #[test]
+    fn action_search_with_stored_controller_reports_character() {
+        let mut v = cheats();
+        v.controller = Some(0x10);
+        v.action_search = true;
+        v.merge(controller_outcome(Ok(ControllerFind::Ambiguous)));
+        assert!(!v.action_wants_controller());
+        // O guardado segue em uso: há personagem para a ação.
+        assert_eq!(v.take_controller_news(), Some(true));
+        // Sem guardado, a procura que falha segue dizendo que não há.
+        v.controller = None;
+        v.action_search = true;
+        v.merge(controller_outcome(Ok(ControllerFind::Absent)));
+        assert_eq!(v.take_controller_news(), Some(false));
     }
 
     #[test]

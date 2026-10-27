@@ -877,6 +877,21 @@ mod tests {
     }
 
     #[test]
+    fn on_with_waiting_world_note() {
+        let mut m = Model::new(false);
+        m.conn = connected();
+        let mut r = row("Dano recebido", Category::Sobrevivencia, ok());
+        r.field = true;
+        r.on = true;
+        r.note = Some(Note::WaitingWorld);
+        m.cheats = vec![r];
+        let lines = screen(&m);
+        let line = line_with(&lines, "Dano recebido");
+        assert!(line.contains("[ON ] aguardando o mundo"), "{line}");
+        assert!(!line.contains("personagem"), "{line}");
+    }
+
+    #[test]
     fn on_with_invalid_target_note() {
         let mut m = Model::new(false);
         m.conn = connected();

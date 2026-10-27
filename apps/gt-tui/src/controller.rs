@@ -4500,6 +4500,46 @@ mod tests {
     }
 
     #[test]
+    fn world_note_only_on_world_rows() {
+        let mut h = H::new();
+        h.ctl.set_catalog(vec![
+            cheat("p", available()),
+            field("a", Avail::Checking),
+            field("b", Avail::Checking),
+            field("c", Avail::Checking),
+        ]);
+        h.ctl
+            .set_field_avail(&[("a", available()), ("b", available()), ("c", available())]);
+        h.connect(0);
+        assert!(h.toggle("a", 100));
+        assert!(h.toggle("b", 150));
+        assert!(h.toggle("c", 200));
+        // Personagem achado, mas o mundo some em duas linhas: a marca só vai a elas.
+        h.ctl.push_tick(report(
+            PlayerState::Found,
+            &[
+                ("a", FieldNote::WaitingWorld),
+                ("b", FieldNote::WaitingWorld),
+            ],
+        ));
+        h.tick(300);
+        assert_eq!(h.row("a").note, Some(FieldNote::WaitingWorld));
+        assert_eq!(h.row("b").note, Some(FieldNote::WaitingWorld));
+        assert_eq!(h.row("c").note, None);
+        assert_eq!(h.c.model.player, PlayerLine::Found);
+        // Corrida de um ciclo: personagem achado e o mundo com o controller inválido.
+        let mut r = report(PlayerState::Found, &[("a", FieldNote::WaitingWorld)]);
+        r.world = Some(gt_grounded2::fields::WorldState::Absent(
+            gt_grounded2::player::GameStateAbsent::ControllerInvalid,
+        ));
+        h.ctl.push_tick(r);
+        h.tick(400);
+        assert_eq!(h.row("a").note, Some(FieldNote::WaitingWorld));
+        assert_eq!(h.row("b").note, None);
+        assert_eq!(h.c.model.player, PlayerLine::Found);
+    }
+
+    #[test]
     fn field_off_absent_player_succeeds() {
         let mut h = with_field();
         assert!(h.toggle("f", 100));
