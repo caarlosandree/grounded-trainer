@@ -671,6 +671,7 @@ pub fn synth_signatures() -> (UeSigs, Vec<FieldDef>) {
                 game_state_field: "GameState".into(),
                 game_state_class: format!("{MAINE}.InGameGameState"),
             }),
+            research: None,
         },
     };
     let bar = (0.0, 10_000.0);

@@ -6,6 +6,7 @@ use anyhow::{anyhow, bail};
 use gt_core::Error;
 use gt_core::asm::{Insn, disassemble_around};
 use gt_core::guard;
+use gt_core::journal::Journal;
 use gt_core::mem::LossyRead;
 use gt_core::modules::require_trusted;
 use gt_core::pe::Section;
@@ -15,6 +16,7 @@ use super::Global;
 use super::compare::{
     AsmLine, BranchOutput, Chunk, asm_lines, branch_output, compare_section, hex, hex_spaced,
 };
+use super::ours;
 use crate::context::Target;
 use crate::output::emit;
 
@@ -46,7 +48,9 @@ pub struct Options<'a> {
 /// rótulo `módulo+offset`, o tamanho real em `len`, os bytes originais (disco) e atuais
 /// (memória) em hexadecimal, limitados a 256 bytes (`hex_truncated`), a desmontagem dos dois
 /// lados e, se o início do trecho atual é um desvio, o destino. `unreadable` marca trechos que
-/// tocam páginas ilegíveis da memória (`current_hex` vazio quando é só lacuna).
+/// tocam páginas ilegíveis da memória (`current_hex` vazio quando é só lacuna). `ours` lista os
+/// `id` das entradas do diário (do mesmo processo) que explicam todas as diferenças do trecho
+/// (spec 008, 6.10); `null` se o trecho tem alguma diferença que não é nossa.
 #[derive(Serialize)]
 struct DiffOutput {
     section: String,
@@ -67,6 +71,7 @@ struct ChunkOutput {
     original_asm: Vec<AsmLine>,
     current_asm: Vec<AsmLine>,
     branch: Option<BranchOutput>,
+    ours: Option<Vec<String>>,
 }
 
 /// O que o modo legível mostra a mais que o JSON (instruções completas e o texto do desvio).
@@ -78,8 +83,26 @@ struct TextExtra {
 
 pub fn run(global: &Global, opts: &Options<'_>) -> anyhow::Result<()> {
     let target = Target::open(global.pid)?;
+    // O diário vem sem a trava (só leitura) e só vale se for do mesmo processo.
+    let diary = ours::read_default(&target.identity);
+    let (output, extras) = build(&target, &global.module, opts, diary.journal())?;
+    emit(
+        global.json,
+        |out| write_text(out, &output, &extras),
+        &output,
+    )
+}
+
+/// Compara as seções de `module_name` com o disco e marca como nossas as diferenças que o `journal`
+/// (do mesmo processo) explica.
+fn build(
+    target: &Target,
+    module_name: &str,
+    opts: &Options<'_>,
+    journal: Option<&Journal>,
+) -> anyhow::Result<(DiffOutput, Vec<TextExtra>)> {
     // O módulo vem antes de tudo: num alvo que não é PE, o erro é "não é uma imagem PE".
-    let (module, headers) = target.module(&global.module)?;
+    let (module, headers) = target.module(module_name)?;
     require_trusted(module)?;
 
     let sections = select_sections(&headers.sections, opts.section)?;
@@ -111,7 +134,7 @@ pub fn run(global: &Global, opts: &Options<'_>) -> anyhow::Result<()> {
             }
         })?;
         for chunk in &chunks {
-            let (json, extra) = render(&target, chunk, start, disk_bytes, start + size)?;
+            let (json, extra) = render(target, chunk, start, disk_bytes, start + size, journal)?;
             chunk_outputs.push(json);
             extras.push(extra);
         }
@@ -130,11 +153,7 @@ pub fn run(global: &Global, opts: &Options<'_>) -> anyhow::Result<()> {
         total: chunk_outputs.len(),
         chunks: chunk_outputs,
     };
-    emit(
-        global.json,
-        |out| write_text(out, &output, &extras),
-        &output,
-    )
+    Ok((output, extras))
 }
 
 /// Seções a comparar: a pedida ou as executáveis.
@@ -166,6 +185,7 @@ fn render(
     section_start: u64,
     section_disk: &[u8],
     section_end: u64,
+    journal: Option<&Journal>,
 ) -> anyhow::Result<(ChunkOutput, TextExtra)> {
     let span_end = chunk.end().min(chunk.addr + MAX_ASM_SPAN);
     let pure_hole = chunk.unreadable && chunk.current.is_empty();
@@ -202,6 +222,7 @@ fn render(
         original_asm: asm_lines(&original_insns),
         current_asm: asm_lines(&current_insns),
         branch,
+        ours: journal.and_then(|journal| explained_by(journal, chunk)),
     };
     Ok((
         json,
@@ -264,6 +285,9 @@ fn write_text(
                 ""
             }
         )?;
+        if let Some(ids) = &chunk.ours {
+            writeln!(out, "  nosso ({})", ids.join(", "))?;
+        }
         let more = if chunk.hex_truncated { " ..." } else { "" };
         writeln!(out, "  original: {}{more}", spaced(&chunk.original_hex))?;
         if chunk.unreadable && chunk.current_hex.is_empty() {
@@ -281,9 +305,51 @@ fn write_text(
     if output.total == 0 {
         writeln!(out, "nenhuma alteração")?;
     } else {
-        writeln!(out, "Total: {} trecho(s)", output.total)?;
+        let ours = output.chunks.iter().filter(|c| c.ours.is_some()).count();
+        if ours == 0 {
+            writeln!(out, "Total: {} trecho(s)", output.total)?;
+        } else {
+            writeln!(
+                out,
+                "Total: {} trecho(s), {ours} nosso(s) (pelo diário)",
+                output.total
+            )?;
+        }
     }
     Ok(())
+}
+
+/// Os `id` das entradas do `journal` que explicam **todas** as diferenças do trecho: cada byte
+/// que difere do disco está dentro de uma entrada e é um dos bytes que ela escreveu (os
+/// `replacement`, ou os `next` de uma troca de valor em curso). `None` se o trecho é ilegível, não
+/// tem diferença ou tem alguma que não é nossa (outro trainer mexeu no mesmo lugar).
+fn explained_by(journal: &Journal, chunk: &Chunk) -> Option<Vec<String>> {
+    if chunk.unreadable || chunk.current.len() != chunk.original.len() {
+        return None;
+    }
+    let mut ids: Vec<String> = Vec::new();
+    let mut any = false;
+    for (i, (orig, now)) in chunk.original.iter().zip(&chunk.current).enumerate() {
+        if orig == now {
+            continue;
+        }
+        any = true;
+        let addr = chunk.addr + i as u64;
+        let entry = journal.entries.iter().find(|e| {
+            let Some(at) = addr
+                .checked_sub(e.addr)
+                .and_then(|d| usize::try_from(d).ok())
+            else {
+                return false;
+            };
+            let writes = |bytes: &[u8]| bytes.get(at) == Some(now);
+            writes(&e.replacement) || e.next.as_deref().is_some_and(writes)
+        })?;
+        if !ids.contains(&entry.id) {
+            ids.push(entry.id.clone());
+        }
+    }
+    any.then_some(ids)
 }
 
 fn write_insns(out: &mut dyn Write, title: &str, insns: &[Insn]) -> std::io::Result<()> {
@@ -314,9 +380,136 @@ fn spaced(compact: &str) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use gt_core::journal::{JournalEntry, JournalStore, Loaded};
+    use gt_core::mem::MemWriter;
+    use gt_grounded2::caves::Register;
+    use gt_testkit::rig::{MODULE_NAME, SynthRig};
+
     use super::*;
+
+    /// O diário do `rig` como o `gt diff` o lê: sem a trava, com a identidade conferida.
+    fn diary(rig: &SynthRig) -> ours::Diary {
+        ours::read(&rig.store, &rig.target.identity)
+    }
+
+    fn only_text(rig: &SynthRig) -> (DiffOutput, Vec<TextExtra>) {
+        let diary = diary(rig);
+        build(
+            &rig.target,
+            MODULE_NAME,
+            &Options {
+                section: Some(".text"),
+            },
+            diary.journal(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn diff_marks_ours() {
+        let rig = SynthRig::new();
+        let mut engine = rig.engine();
+        let mut alloc = rig.cave_allocator();
+        let hook = rig.install_observe(&mut engine, &mut alloc, "obs", "sum", Register::RCX);
+        // Outro trainer troca um byte no meio de `getter`: fora do diário.
+        let foreign = rig.t.symbol("getter") + 9;
+        let mut before = [0u8; 1];
+        rig.target.reader.read_exact(foreign, &mut before).unwrap();
+        MemWriter::open(rig.t.pid)
+            .unwrap()
+            .write(foreign, &[before[0] ^ 0xFF])
+            .unwrap();
+
+        let (output, extras) = only_text(&rig);
+        let at = |addr: u64| {
+            output
+                .chunks
+                .iter()
+                .find(|c| c.address == format!("{addr:#x}"))
+                .unwrap_or_else(|| panic!("sem trecho em {addr:#x}"))
+        };
+        // O desvio (5 bytes) e a cave (do `CC` ao código) saem como nossos, com o `id` do diário.
+        assert_eq!(at(hook.hook_at).ours, Some(vec![hook.hook_id.clone()]));
+        assert_eq!(at(hook.cave_at).ours, Some(vec![hook.cave_id.clone()]));
+        assert_eq!(at(hook.hook_at).len, hook.hook_len);
+        // A alteração de outro trainer não é marcada.
+        assert_eq!(at(foreign).ours, None);
+        assert_eq!(output.total, 3);
+
+        let mut text = Vec::new();
+        write_text(&mut text, &output, &extras).unwrap();
+        let text = String::from_utf8(text).unwrap();
+        assert!(
+            text.contains(&format!("nosso ({})", hook.hook_id)),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("nosso ({})", hook.cave_id)),
+            "{text}"
+        );
+        assert_eq!(text.matches("nosso (").count(), 2, "{text}");
+        assert!(text.contains("2 nosso(s) (pelo diário)"), "{text}");
+
+        // Outro trainer escreve por cima do nosso desvio: o trecho deixa de ser explicado.
+        MemWriter::open(rig.t.pid)
+            .unwrap()
+            .write(hook.hook_at + 1, &[0x12])
+            .unwrap();
+        let (output, _) = only_text(&rig);
+        let changed = output
+            .chunks
+            .iter()
+            .find(|c| c.address == format!("{:#x}", hook.hook_at))
+            .unwrap();
+        assert_eq!(changed.ours, None);
+        // Devolvemos o byte antes de sair, para o motor desfazer sem recusar.
+        let our_byte = hook_bytes_of(&rig, &hook);
+        MemWriter::open(rig.t.pid)
+            .unwrap()
+            .write(hook.hook_at, &our_byte)
+            .unwrap();
+
+        // Sem diário (ou de outro processo), nada é marcado.
+        let (output, _) = build(
+            &rig.target,
+            MODULE_NAME,
+            &Options {
+                section: Some(".text"),
+            },
+            None,
+        )
+        .unwrap();
+        assert!(output.chunks.iter().all(|c| c.ours.is_none()));
+        let mut other = match rig.store.peek().unwrap() {
+            Loaded::Ok(journal) => journal,
+            other => panic!("{other:?}"),
+        };
+        other.pid += 1;
+        let elsewhere = tempfile::tempdir().unwrap();
+        let store = JournalStore::new(elsewhere.path().join("state"));
+        store.save(&other).unwrap();
+        assert_eq!(
+            ours::read(&store, &rig.target.identity),
+            ours::Diary::OtherProcess
+        );
+        drop(engine);
+    }
+
+    /// Os bytes do desvio que o motor escreveu (do diário).
+    fn hook_bytes_of(rig: &SynthRig, hook: &gt_testkit::rig::InstalledHook) -> Vec<u8> {
+        match rig.store.peek().unwrap() {
+            Loaded::Ok(journal) => journal
+                .entries
+                .iter()
+                .find(|e: &&JournalEntry| e.id == hook.hook_id)
+                .unwrap()
+                .replacement
+                .clone(),
+            other => panic!("{other:?}"),
+        }
+    }
 
     fn render_text(output: &DiffOutput, extras: &[TextExtra]) -> String {
         let mut buf = Vec::new();
@@ -353,6 +546,7 @@ mod tests {
                 original_asm: Vec::new(),
                 current_asm: Vec::new(),
                 branch: None,
+                ours: None,
             }],
             total: 1,
         };

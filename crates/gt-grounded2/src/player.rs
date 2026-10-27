@@ -16,7 +16,7 @@ use gt_ue::{Field, ObjectArray, ReflectionIndex, ScanBudget, UeError, UeLayout, 
 use serde::Serialize;
 
 use crate::signatures::{
-    FieldDef, FieldKind, FieldRoot, FieldRule, LockMode, LockTarget, PlayerCfg,
+    FieldDef, FieldKind, FieldRoot, FieldRule, LockMode, LockTarget, PlayerCfg, ResearchCfg,
 };
 
 /// Com o `Pawn` nulo há mais que isto, o controller guardado é procurado de novo (spec 6.3).
@@ -131,6 +131,15 @@ struct GameStatePath {
     game_state_class: u64,
 }
 
+/// Campo do `GameState` que leva ao `PartyComponent` e o campo dos pontos de pesquisa nele
+/// (spec 008, 6.10).
+#[derive(Debug, Clone)]
+struct ResearchPath {
+    party_field: Field,
+    party_class: u64,
+    points: Field,
+}
+
 #[derive(Debug, Clone)]
 struct CatalogEntry {
     id: String,
@@ -149,6 +158,8 @@ pub struct FieldCatalog {
     pawn_class: Result<u64, String>,
     /// Caminho do `GameState`; a falta dele afeta só os cheats com essa raiz.
     game_state: Result<GameStatePath, String>,
+    /// `PartyComponent.ResearchPoints` (só leitura); `None` se o `[ue.player]` não o configura.
+    research: Option<Result<ResearchPath, String>>,
     entries: Vec<CatalogEntry>,
     /// `(classe, ancestral) → is_a`. As classes não mudam com o jogo rodando.
     is_a_cache: Mutex<HashMap<(u64, u64), bool>>,
@@ -166,6 +177,10 @@ impl FieldCatalog {
         let path = resolve_path(index, mem, cfg);
         let pawn_class = find_class(index, &cfg.pawn_class);
         let game_state = resolve_game_state(index, mem, cfg);
+        let research = cfg
+            .research
+            .as_ref()
+            .map(|rc| resolve_research(index, mem, rc, &game_state));
         let entries = defs
             .iter()
             .map(|def| {
@@ -194,6 +209,7 @@ impl FieldCatalog {
             path,
             pawn_class,
             game_state,
+            research,
             entries,
             is_a_cache: Mutex::new(HashMap::new()),
         }
@@ -476,6 +492,26 @@ fn resolve_game_state<M: ReadMem + ?Sized>(
         world_class,
         game_state_field,
         game_state_class,
+    })
+}
+
+/// Resolve o campo `ResearchPoints` do `PartyComponent` (spec 008, 6.10): o campo do `GameState` que
+/// aponta para o componente, a classe dele e o campo `int` dos pontos. O que faltar vira o motivo
+/// da linha do `gt ue player`.
+fn resolve_research<M: ReadMem + ?Sized>(
+    index: &ReflectionIndex,
+    mem: &M,
+    cfg: &ResearchCfg,
+    game_state: &Result<GameStatePath, String>,
+) -> Result<ResearchPath, String> {
+    let gs = game_state.as_ref().map_err(Clone::clone)?;
+    let party_field = object_field(index, mem, gs.game_state_class, &cfg.party_field)?;
+    let party_class = find_class(index, &cfg.party_class)?;
+    let points = int_field(index, mem, party_class, &cfg.points_field)?;
+    Ok(ResearchPath {
+        party_field,
+        party_class,
+        points,
     })
 }
 
@@ -1458,6 +1494,19 @@ pub struct PlayerReport {
     pub pawn_error: Option<String>,
     /// Um caminho por objeto distinto entre os cheats de raiz `game_state`, na ordem do catálogo.
     pub game_state: Vec<GameStateReport>,
+    /// `PartyComponent.ResearchPoints` pelo caminho do `GameState` (spec 008, 6.10); `None` se o
+    /// `[ue.player]` não o configura.
+    pub research_points: Option<ResearchPointsReport>,
+}
+
+/// A linha `ResearchPoints` do `gt ue player`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ResearchPointsReport {
+    /// Valor lido, com o endereço do campo.
+    Value { addr: u64, current: i32 },
+    /// Não deu para ler: o motivo, em pt-BR.
+    Unavailable { reason: String },
 }
 
 /// Lê o personagem e monta o relatório do `gt ue player`. Só um controller ausente ou inválido
@@ -1492,6 +1541,10 @@ pub fn player_report<M: ReadMem + ?Sized>(
     let has_world_set = catalog.entries.iter().any(|e| world_set(e).is_some());
     let world = has_world_set.then(|| read_world(mem, index, catalog, objects, controller));
     let mut game_state = world_paths(mem, index, catalog, controller);
+    let research_points = catalog
+        .research
+        .as_ref()
+        .map(|research| report_research(mem, index, catalog, controller, research));
 
     let fields = catalog
         .entries
@@ -1520,7 +1573,57 @@ pub fn player_report<M: ReadMem + ?Sized>(
         fields,
         pawn_error: snapshot.err().map(|absent| absent.to_string()),
         game_state,
+        research_points,
     })
+}
+
+/// Lê `PartyComponent.ResearchPoints` pelo caminho do `GameState` (controller já validado). Só lê.
+fn report_research<M: ReadMem + ?Sized>(
+    mem: &M,
+    index: &ReflectionIndex,
+    catalog: &FieldCatalog,
+    controller: u64,
+    research: &Result<ResearchPath, String>,
+) -> ResearchPointsReport {
+    let unavailable = |reason: String| ResearchPointsReport::Unavailable { reason };
+    let (Ok(research), Ok(gs)) = (research, &catalog.game_state) else {
+        let reason = match (research, &catalog.game_state) {
+            (Err(reason), _) | (_, Err(reason)) => reason.clone(),
+            _ => INCOHERENT.to_string(),
+        };
+        return unavailable(reason);
+    };
+    let mut r = Reader {
+        mem,
+        index,
+        catalog,
+        props: HashMap::new(),
+        objects: Vec::new(),
+    };
+    let read = (|| -> Result<(u64, i32), GameStateAbsent> {
+        let state = walk_to_game_state(&mut r, controller, gs, &mut GameStateReport::default())?;
+        let name = research.party_field.name.as_str();
+        let party = r
+            .pointer(state, &research.party_field)
+            .map_err(gone(name))?;
+        let is_party = party != 0
+            && catalog
+                .object_is_a(index, mem, party, research.party_class)
+                .map_err(gone(name))?;
+        if !is_party {
+            return Err(GameStateAbsent::Missing(name.to_string()));
+        }
+        let field = &research.points;
+        r.check_fits(party, &field.name, field.offset, field.size)
+            .map_err(gone(&field.name))?;
+        let addr = party + u64::from(field.offset);
+        let raw = read_u32(mem, addr).map_err(|_| GameStateAbsent::Missing(field.name.clone()))?;
+        Ok((addr, i32::from_le_bytes(raw.to_le_bytes())))
+    })();
+    match read {
+        Ok((addr, current)) => ResearchPointsReport::Value { addr, current },
+        Err(absent) => unavailable(absent.to_string()),
+    }
 }
 
 /// O cheat de raiz `game_state` resolvido de `entry`, qualquer que seja a regra.

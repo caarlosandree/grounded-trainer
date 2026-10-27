@@ -70,11 +70,17 @@ enum Command {
         #[arg(short = 'n', long = "count", value_name = "N", default_value = cmd::disasm::default_count())]
         count: String,
     },
-    /// Compara o código na memória com o executável em disco (acha patches de outros trainers).
+    /// Compara o código na memória com o executável em disco (acha patches de outros trainers; marca os nossos pelo diário).
     Diff {
         /// Só esta seção (ex.: `.rdata`); o padrão são as seções executáveis.
         #[arg(long, value_name = "NOME")]
         section: Option<String>,
+    },
+    /// Lista as sequências de CC (onde as caves moram), a folga das variáveis e o que é nosso pelo diário.
+    Caves {
+        /// Tamanho mínimo, em bytes, das sequências de CC listadas.
+        #[arg(long, value_name = "BYTES", default_value = "64", value_parser = clap::value_parser!(usize))]
+        min: usize,
     },
     /// Lê os pontos do `symbols.ini` do FLiNG e mostra o estado de cada um.
     Fling {
@@ -185,6 +191,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 section: section.as_deref(),
             },
         ),
+        Command::Caves { min } => cmd::caves::run(&global, &cmd::caves::Options { min_len: min }),
         Command::Fling { steam_library, ini } => cmd::fling::run(
             &global,
             &cmd::fling::Options {

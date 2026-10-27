@@ -645,6 +645,7 @@ dependencies = [
  "gt-core",
  "gt-grounded2",
  "gt-testkit",
+ "gt-ue",
  "serde_json",
  "tempfile",
  "tracing",

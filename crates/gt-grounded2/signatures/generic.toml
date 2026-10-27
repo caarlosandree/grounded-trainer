@@ -139,6 +139,11 @@ world_field = "OwningWorld"
 world_class = "/Script/Engine.World"
 game_state_field = "GameState"
 game_state_class = "/Script/Maine.InGameGameState"
+# ResearchPoints (spec 008, 6.10): o `PartyComponent` fica no GameState; o `gt ue player` mostra o campo e o
+# Brain Power confere o offset dele contra os `disp` do padrão. Os três vêm juntos e exigem o game_state.
+party_field = "PartyComponent"
+party_class = "/Script/Maine.PartyComponent"
+research_points_field = "ResearchPoints"
 
 # Fase 5 (spec 005, 6.5): cheats de valor, na ordem da spec. Campos e alvos por NOME da reflexão (P2–P8 em
 # RESEARCH.md, 2026-10-26). As faixas sãs têm folga para upgrades; alvo fora delas não é escrito.

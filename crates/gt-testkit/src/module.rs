@@ -1,6 +1,8 @@
 //! Módulo sintético do `gt-testtarget --module`: uma imagem PE mínima com a mesma forma do jogo.
 //!
-//! - o arquivo `gt-synthetic.exe` (cabeçalho PE, `.text` e `.data`) é o "disco" do `gt diff`;
+//! - o arquivo `gt-synthetic.exe` (cabeçalho PE, `.text` e `.data`) é o "disco" do `gt diff`; o
+//!   diretório de exceção (`.pdata`: uma `RUNTIME_FUNCTION` por função-alvo) mora na página do
+//!   cabeçalho ([`PDATA_RVA`]), sem seção própria, para a imagem manter o tamanho e a forma;
 //! - na memória, a cabeça vem do arquivo (`r--` no cabeçalho, `r-x` na `.text`, `rw-` no começo da
 //!   `.data`) e a cauda da `.data` é uma VMA **anônima** `rw-p` até o fim da página, com o
 //!   `VirtualSize` terminando no meio dela (folga de [`SLACK_LEN`] bytes, como no jogo);
@@ -42,6 +44,22 @@ pub const SLACK_LEN: u32 = 0x130;
 pub const DATA_VSIZE: u32 = DATA_HEAD_LEN + PAGE - SLACK_LEN;
 /// `SizeOfImage`.
 pub const IMAGE_SIZE: u32 = DATA_RVA + DATA_HEAD_LEN + PAGE;
+/// RVA do diretório de exceção (`.pdata`), dentro da página do cabeçalho (depois da tabela de seções).
+pub const PDATA_RVA: u32 = 0x800;
+/// Bytes de uma `RUNTIME_FUNCTION` (início, fim e dados de desenrolamento, três `u32`).
+pub const RUNTIME_FUNCTION_LEN: u32 = 12;
+/// Funções que entram na `.pdata`, em ordem de RVA: cada uma vai do símbolo ao próximo (a última,
+/// `spin`, tem 2 bytes). `mark_dirty` e `get_table` são os auxiliares de `level_gain`.
+pub const PDATA_FUNCTIONS: [&str; 8] = [
+    "sum",
+    "mark_dirty",
+    "get_table",
+    "level_gain",
+    "getter",
+    "drag",
+    "add_item",
+    "spin",
+];
 /// Marca de data do cabeçalho (fixa, para o arquivo ser reproduzível).
 const TIME_DATE_STAMP: u32 = 0x5A5A_5A5A;
 
@@ -159,13 +177,38 @@ pub fn build() -> Result<Image> {
 
     let text_len = text.len() as u32;
     let mut file = vec![0u8; (DATA_RVA + DATA_HEAD_LEN) as usize];
-    write_headers(&mut file, text_len);
+    let pdata = pdata_entries(&symbols)?;
+    write_headers(&mut file, text_len, &pdata);
     file[TEXT_RVA as usize..TEXT_RVA as usize + text.len()].copy_from_slice(&text);
     Ok(Image {
         file,
         symbols,
         text,
     })
+}
+
+/// `(início, fim)` em RVA de cada função de [`PDATA_FUNCTIONS`]: o fim é o começo da seguinte
+/// (inclui o `int3` de preenchimento) e, para a última, o começo mais o laço de 2 bytes.
+fn pdata_entries(symbols: &Symbols) -> Result<Vec<(u32, u32)>> {
+    let rva = |name: &str| {
+        symbols
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, r)| *r)
+            .ok_or_else(|| anyhow!("símbolo {name} ausente para a .pdata"))
+    };
+    let starts = PDATA_FUNCTIONS
+        .iter()
+        .map(|name| rva(name))
+        .collect::<Result<Vec<u32>>>()?;
+    if starts.windows(2).any(|w| w[0] >= w[1]) {
+        return Err(anyhow!("as funções da .pdata não estão em ordem de RVA"));
+    }
+    Ok(starts
+        .iter()
+        .enumerate()
+        .map(|(i, start)| (*start, starts.get(i + 1).map_or(start + 2, |next| *next)))
+        .collect())
 }
 
 fn put_u16(f: &mut [u8], at: usize, v: u16) {
@@ -177,8 +220,9 @@ fn put_u32(f: &mut [u8], at: usize, v: u32) {
 }
 
 /// Cabeçalhos PE32+ mínimos: DOS, `PE\0\0`, COFF, optional header (16 diretórios vazios) e as
-/// duas seções. Alinhamento de arquivo e de seção iguais à página.
-fn write_headers(f: &mut [u8], text_len: u32) {
+/// duas seções. Alinhamento de arquivo e de seção iguais à página. O diretório de exceção
+/// (índice 3) aponta para as `RUNTIME_FUNCTION` de `pdata`, gravadas em [`PDATA_RVA`].
+fn write_headers(f: &mut [u8], text_len: u32, pdata: &[(u32, u32)]) {
     const OPT_SIZE: usize = 112 + 16 * 8;
     f[0..2].copy_from_slice(b"MZ");
     put_u32(f, 0x3c, 0x40);
@@ -202,6 +246,19 @@ fn write_headers(f: &mut [u8], text_len: u32) {
     put_u32(f, o + 60, PAGE); // SizeOfHeaders
     put_u16(f, o + 68, 2); // Subsystem: GUI
     put_u32(f, o + 108, 16); // NumberOfRvaAndSizes
+    // Diretório de exceção: RVA e tamanho; as entradas ficam na página do cabeçalho.
+    put_u32(f, o + 112 + 3 * 8, PDATA_RVA);
+    put_u32(
+        f,
+        o + 112 + 3 * 8 + 4,
+        pdata.len() as u32 * RUNTIME_FUNCTION_LEN,
+    );
+    for (i, (start, end)) in pdata.iter().enumerate() {
+        let at = PDATA_RVA as usize + i * RUNTIME_FUNCTION_LEN as usize;
+        put_u32(f, at, *start);
+        put_u32(f, at + 4, *end);
+        put_u32(f, at + 8, 0); // UnwindData: ninguém desenrola a pilha do módulo sintético
+    }
     let sections = [
         SectionHeader {
             name: b".text",
@@ -425,6 +482,8 @@ fn assemble_text() -> Result<(Vec<u8>, Symbols)> {
     };
     let symbols = vec![
         ("sum", rva(&sum)?),
+        ("mark_dirty", rva(&mark_dirty)?),
+        ("get_table", rva(&get_table)?),
         ("level_gain", rva(&level_gain)?),
         ("level_pattern", rva(&level_pattern)?),
         ("level_point", rva(&level_point)?),
@@ -602,6 +661,35 @@ mod tests {
             let at = (image.rva(name).unwrap() - TEXT_RVA) as usize;
             assert_eq!(&text_of(&image)[at..at + first.len()], first, "{name}");
         }
+    }
+
+    #[test]
+    fn pdata_lists_the_target_functions() {
+        let image = build().unwrap();
+        let disk = gt_core::pe::DiskImage::from_file_bytes(&image.file).unwrap();
+        let functions = disk.functions().unwrap();
+        assert_eq!(functions.len(), PDATA_FUNCTIONS.len());
+        for name in PDATA_FUNCTIONS {
+            let start = image.rva(name).unwrap();
+            assert!(
+                functions.iter().any(|f| f.start == start),
+                "{name} deveria começar uma função da .pdata"
+            );
+        }
+        // Meio de função, a sequência de `CC` e o `level_point` (no meio de `level_gain`) não.
+        for name in ["level_point", "level_pattern", "cc300", "cc70"] {
+            let rva = image.rva(name).unwrap();
+            assert!(
+                !functions.iter().any(|f| f.start == rva),
+                "{name} não começa função"
+            );
+        }
+        // As faixas não se sobrepõem e cobrem a `.text` das funções até o laço `spin`.
+        assert!(functions.windows(2).all(|w| w[0].end <= w[1].start));
+        // A página do cabeçalho segue legível e as seções não mudaram.
+        let pe = gt_core::pe::PeHeaders::parse(&image.file).unwrap();
+        assert_eq!(pe.sections.len(), 2);
+        assert_eq!(pe.size_of_image, IMAGE_SIZE);
     }
 
     #[test]

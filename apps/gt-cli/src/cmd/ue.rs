@@ -11,7 +11,8 @@ use clap::{Args, Subcommand};
 use gt_core::addr::parse_addr;
 use gt_grounded2::catalog;
 use gt_grounded2::player::{
-    Absent, FieldCatalog, FieldReportValue, PlayerReport, WatchOpts, watch_player,
+    Absent, FieldCatalog, FieldReportValue, PlayerReport, ResearchPointsReport, WatchOpts,
+    watch_player,
 };
 use gt_grounded2::signatures::{Signatures, UeSigs};
 use gt_grounded2::ue::{GlobalState, UE_ID};
@@ -312,6 +313,18 @@ fn write_report(out: &mut dyn Write, report: &PlayerReport) -> std::io::Result<(
     if let Some(error) = &report.pawn_error {
         writeln!(out, "pawn: indisponível ({error})")?;
     }
+    match &report.research_points {
+        Some(ResearchPointsReport::Value { addr, current }) => {
+            writeln!(out, "PartyComponent.ResearchPoints: {current}  ({addr:#x})")?;
+        }
+        Some(ResearchPointsReport::Unavailable { reason }) => {
+            writeln!(
+                out,
+                "PartyComponent.ResearchPoints: indisponível ({reason})"
+            )?;
+        }
+        None => {}
+    }
     for gs in &report.game_state {
         writeln!(
             out,
@@ -400,7 +413,9 @@ fn run_player(
 
 #[cfg(test)]
 mod tests {
-    use gt_grounded2::player::{FieldReport, GameStateReport, HopReport, SetFieldReport};
+    use gt_grounded2::player::{
+        FieldReport, GameStateReport, HopReport, ResearchPointsReport, SetFieldReport,
+    };
 
     use super::*;
 
@@ -422,6 +437,10 @@ mod tests {
                 },
             }],
             pawn_error: Some("Pawn nulo".into()),
+            research_points: Some(ResearchPointsReport::Value {
+                addr: 0x6514,
+                current: 2150,
+            }),
             game_state: vec![
                 GameStateReport {
                     level: Some(0x1),
@@ -453,6 +472,36 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn ue_player_shows_research_points() {
+        let mut out = Vec::new();
+        write_report(&mut out, &report()).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("PartyComponent.ResearchPoints: 2150  (0x6514)"),
+            "{text}"
+        );
+        let mut broken = report();
+        broken.research_points = Some(ResearchPointsReport::Unavailable {
+            reason: "campo ResearchPoints não encontrado".into(),
+        });
+        let mut out = Vec::new();
+        write_report(&mut out, &broken).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(
+                "PartyComponent.ResearchPoints: indisponível (campo ResearchPoints não encontrado)"
+            ),
+            "{text}"
+        );
+        // Sem o bloco nas assinaturas, a linha some.
+        let mut none = report();
+        none.research_points = None;
+        let mut out = Vec::new();
+        write_report(&mut out, &none).unwrap();
+        assert!(!String::from_utf8(out).unwrap().contains("ResearchPoints"));
     }
 
     #[test]

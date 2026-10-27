@@ -129,6 +129,21 @@ pub struct PlayerCfg {
     pub alt_pawn_fields: Vec<String>,
     /// Caminho até o `GameState` (spec 006, 6.3); só existe se o `[ue.player]` traz os cinco campos.
     pub game_state: Option<GameStateCfg>,
+    /// Onde está `PartyComponent.ResearchPoints` (spec 008, 6.10); só existe se o `[ue.player]` traz
+    /// os três campos e o caminho do `GameState`.
+    pub research: Option<ResearchCfg>,
+}
+
+/// `PartyComponent.ResearchPoints`, a partir do `GameState` (spec 008, 6.10): só leitura, para o
+/// `gt ue player` e para conferir o offset que o Brain Power usa.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResearchCfg {
+    /// Campo do `GameState` que aponta para o `PartyComponent`.
+    pub party_field: String,
+    /// Classe esperada do `PartyComponent`, como `Pacote.Nome`.
+    pub party_class: String,
+    /// Campo `int` do `PartyComponent` com os pontos de pesquisa.
+    pub points_field: String,
 }
 
 /// Caminho controller → `Outer` → `Level.OwningWorld` → `World.GameState` (spec 006, 6.3).
@@ -386,6 +401,10 @@ struct PlayerBlock {
     world_class: Option<String>,
     game_state_field: Option<String>,
     game_state_class: Option<String>,
+    // Os três do `ResearchPoints` vêm juntos ou nenhum, e só com o `game_state` (`build_player`).
+    party_field: Option<String>,
+    party_class: Option<String>,
+    research_points_field: Option<String>,
 }
 
 // Espelhos de `UeLayout` para o serde (o `gt-ue` não depende dele). Sem `Default`: todo campo é
@@ -1293,12 +1312,52 @@ fn build_player(file: &str, block: PlayerBlock) -> Result<PlayerCfg> {
             ));
         }
     };
+    let research = match (
+        block.party_field,
+        block.party_class,
+        block.research_points_field,
+    ) {
+        (None, None, None) => None,
+        (Some(party_field), Some(party_class), Some(points_field)) => {
+            check_not_blank(file, "ue.player.party_field", &party_field)?;
+            check_class_path(file, "ue.player.party_class", &party_class)?;
+            check_not_blank(file, "ue.player.research_points_field", &points_field)?;
+            if game_state.is_none() {
+                return Err(sig_err(
+                    file,
+                    "ue.player.party_field",
+                    "o ResearchPoints parte do GameState: faltam os cinco campos do game_state",
+                ));
+            }
+            Some(ResearchCfg {
+                party_field,
+                party_class,
+                points_field,
+            })
+        }
+        (party_field, party_class, points_field) => {
+            let missing = [
+                ("party_field", party_field.is_none()),
+                ("party_class", party_class.is_none()),
+                ("research_points_field", points_field.is_none()),
+            ]
+            .into_iter()
+            .find_map(|(name, absent)| absent.then_some(name))
+            .unwrap_or("party_field");
+            return Err(sig_err(
+                file,
+                &format!("ue.player.{missing}"),
+                "os três campos do ResearchPoints vêm juntos: campo obrigatório ausente",
+            ));
+        }
+    };
     Ok(PlayerCfg {
         controller_class: block.controller_class,
         pawn_field: block.pawn_field,
         pawn_class: block.pawn_class,
         alt_pawn_fields: block.alt_pawn_fields,
         game_state,
+        research,
     })
 }
 
@@ -2976,6 +3035,7 @@ alt_pawn_fields = []
                 pawn_class: "/Script/Maine.SurvivalPlayerCharacter".into(),
                 alt_pawn_fields: vec![],
                 game_state: None,
+                research: None,
             }
         );
 
@@ -4101,6 +4161,45 @@ bools = [false, true]
         // Sem nenhum dos cinco, o `game_state` fica ausente.
         let sigs = parse(&[("generic.toml", &with_ue("", false))]).unwrap();
         assert_eq!(sigs.ue_for_version("x").unwrap().player.game_state, None);
+    }
+
+    #[test]
+    fn research_points_fields_come_together_and_need_game_state() {
+        const RESEARCH: &str = "party_field = \"PartyComponent\"\n\
+            party_class = \"/Script/Maine.PartyComponent\"\n\
+            research_points_field = \"ResearchPoints\"\n";
+        let build =
+            |player: &str, extra: &str| format!("{GENERIC}{UE_PATTERNS}{UE_LAYOUT}{player}{extra}");
+        // Os três com o `game_state`: carrega.
+        let sigs = parse(&[("generic.toml", &build(UE_PLAYER_GAME_STATE, RESEARCH))]).unwrap();
+        assert_eq!(
+            sigs.ue_for_version("x").unwrap().player.research,
+            Some(ResearchCfg {
+                party_field: "PartyComponent".into(),
+                party_class: "/Script/Maine.PartyComponent".into(),
+                points_field: "ResearchPoints".into(),
+            })
+        );
+        // Nenhum dos três: ausente.
+        let sigs = parse(&[("generic.toml", &build(UE_PLAYER_GAME_STATE, ""))]).unwrap();
+        assert_eq!(sigs.ue_for_version("x").unwrap().player.research, None);
+        // Faltando um: o nome do campo que falta.
+        let partial = RESEARCH.replace("party_class = \"/Script/Maine.PartyComponent\"\n", "");
+        assert_eq!(
+            field_err(&build(UE_PLAYER_GAME_STATE, &partial)),
+            "ue.player.party_class"
+        );
+        // Classe fora do formato Pacote.Nome.
+        let bad = RESEARCH.replace("/Script/Maine.PartyComponent", "PartyComponent");
+        assert_eq!(
+            field_err(&build(UE_PLAYER_GAME_STATE, &bad)),
+            "ue.player.party_class"
+        );
+        // Sem o caminho do `game_state`, não há de onde partir.
+        assert_eq!(
+            field_err(&build(UE_PLAYER, RESEARCH)),
+            "ue.player.party_field"
+        );
     }
 
     #[test]

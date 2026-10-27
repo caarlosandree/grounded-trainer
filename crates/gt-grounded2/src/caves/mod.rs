@@ -22,8 +22,9 @@ use std::collections::HashMap;
 
 use gt_core::cave;
 use gt_ue::UeLayout;
+use iced_x86::IcedError;
+pub use iced_x86::Register;
 use iced_x86::code_asm::{AsmRegister32, AsmRegister64, CodeAssembler, CodeLabel, qword_ptr};
-use iced_x86::{IcedError, Register};
 
 use crate::error::{Error, Result};
 use crate::signatures::CaveBody;
@@ -131,6 +132,39 @@ pub fn build(body: CaveBody, ctx: &CaveCtx) -> Result<Vec<u8>> {
     }
 }
 
+/// Registrador de 64 bits pelo nome (`rax`..`r15`, `rsp` incluído; sem `rip`), para
+/// `gt-patch observe`. Maiúsculas e espaços nas pontas são aceitos.
+pub fn parse_register(name: &str) -> Result<Register> {
+    const GPRS: [(&str, Register); 16] = [
+        ("rax", Register::RAX),
+        ("rcx", Register::RCX),
+        ("rdx", Register::RDX),
+        ("rbx", Register::RBX),
+        ("rsp", Register::RSP),
+        ("rbp", Register::RBP),
+        ("rsi", Register::RSI),
+        ("rdi", Register::RDI),
+        ("r8", Register::R8),
+        ("r9", Register::R9),
+        ("r10", Register::R10),
+        ("r11", Register::R11),
+        ("r12", Register::R12),
+        ("r13", Register::R13),
+        ("r14", Register::R14),
+        ("r15", Register::R15),
+    ];
+    let wanted = name.trim().to_ascii_lowercase();
+    GPRS.iter()
+        .find(|(n, _)| *n == wanted)
+        .map(|(_, r)| *r)
+        .ok_or_else(|| {
+            build_err(format!(
+                "`{}` não é um registrador de 64 bits (rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8..r15)",
+                name.trim()
+            ))
+        })
+}
+
 /// Monta a cave de observação (spec 008, 6.7.3) que guarda `[rsp]` e `reg` a cada passagem.
 ///
 /// `reg` é um registrador de 64 bits (inclusive `rsp`, gravado com o valor da entrada).
@@ -226,6 +260,31 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn parse_register_takes_the_64_bit_gprs_only() {
+        for (name, reg) in [
+            ("rax", Register::RAX),
+            ("RCX", Register::RCX),
+            (" rdx ", Register::RDX),
+            ("rbx", Register::RBX),
+            ("rsp", Register::RSP),
+            ("rbp", Register::RBP),
+            ("rsi", Register::RSI),
+            ("rdi", Register::RDI),
+            ("r8", Register::R8),
+            ("r15", Register::R15),
+        ] {
+            assert_eq!(parse_register(name).unwrap(), reg, "{name}");
+        }
+        for bad in ["", "eax", "cl", "xmm0", "rip", "r16", "rcx,rdx", "foo"] {
+            let err = parse_register(bad).unwrap_err();
+            assert!(
+                matches!(err, Error::CaveBuild { .. }) && err.to_string().contains("registrador"),
+                "{bad}: {err}"
+            );
+        }
+    }
 
     #[test]
     fn var_layout_matches_the_spec_table() {

@@ -8,7 +8,7 @@ use gt_ue::synth::{SparseMem, SynthField, SynthUe};
 use gt_ue::{Names, ObjectArray, ReflectionIndex, ScanBudget, UeLayout};
 
 use super::*;
-use crate::signatures::{Category, FieldKind, FieldRoot, GameStateCfg};
+use crate::signatures::{Category, FieldKind, FieldRoot, GameStateCfg, ResearchCfg};
 
 const ARENA: u64 = 0x1000_0000;
 const ARENA_LEN: usize = 64 << 20;
@@ -106,6 +106,8 @@ const WORLD_OFF: u32 = 0x40;
 const GAME_STATE_OFF: u32 = 0x48;
 const PARTY_OFF: u32 = 0x38;
 const SCIENCE_OFF: u32 = 0x30;
+/// `PartyComponent.ResearchPoints` (spec 008, 6.10).
+const RESEARCH_OFF: u32 = 0x34;
 /// `InGameGameState.SurvivalModeManagerComponent` e `SurvivalModeManagerComponent.GameModeSettings`.
 const MODE_MANAGER_OFF: u32 = 0x40;
 const SETTINGS_OFF: u32 = 0x30;
@@ -190,6 +192,7 @@ fn cfg() -> PlayerCfg {
         pawn_class: format!("{MAINE}.SurvivalPlayerCharacter"),
         alt_pawn_fields: vec!["CachedSurvivalPlayerCharacter".into()],
         game_state: None,
+        research: None,
     }
 }
 
@@ -202,6 +205,11 @@ fn cfg_gs() -> PlayerCfg {
             world_class: "/Script/Engine.World".into(),
             game_state_field: "GameState".into(),
             game_state_class: format!("{MAINE}.InGameGameState"),
+        }),
+        research: Some(ResearchCfg {
+            party_field: "PartyComponent".into(),
+            party_class: format!("{MAINE}.PartyComponent"),
+            points_field: "ResearchPoints".into(),
         }),
         ..cfg()
     }
@@ -462,7 +470,10 @@ fn world(omit: &[&str]) -> World {
         "PartyComponent",
         Some(object_c),
         0x40,
-        &keep(vec![int("ScienceFound", SCIENCE_OFF)]),
+        &keep(vec![
+            int("ScienceFound", SCIENCE_OFF),
+            int("ResearchPoints", RESEARCH_OFF),
+        ]),
     );
     let health_c = s.add_class(
         maine,
@@ -630,6 +641,8 @@ fn world(omit: &[&str]) -> World {
         .write(hauling + u64::from(CAPACITY_OFF), &20i32.to_le_bytes());
     w.mem
         .write(party + u64::from(SCIENCE_OFF), &7400i32.to_le_bytes());
+    w.mem
+        .write(party + u64::from(RESEARCH_OFF), &2150i32.to_le_bytes());
     w
 }
 
@@ -2028,6 +2041,84 @@ fn report_game_state_path() {
     // Sem cheat de `game_state` no catálogo, não há caminho a mostrar.
     let plain = FieldCatalog::resolve(&w.index, &w.mem, &cfg_gs(), &defs());
     assert_eq!(report_with(&w, &plain).game_state, vec![]);
+}
+
+#[test]
+fn ue_player_shows_research_points() {
+    let w = world(&[]);
+    let catalog = full_catalog(&w, &cfg_gs());
+    let report = report_with(&w, &catalog);
+    assert_eq!(
+        report.research_points,
+        Some(ResearchPointsReport::Value {
+            addr: w.party + u64::from(RESEARCH_OFF),
+            current: 2150,
+        })
+    );
+    // O valor acompanha a memória a cada leitura.
+    w.mem
+        .write(w.party + u64::from(RESEARCH_OFF), &(-5i32).to_le_bytes());
+    assert_eq!(
+        report_with(&w, &catalog).research_points,
+        Some(ResearchPointsReport::Value {
+            addr: w.party + u64::from(RESEARCH_OFF),
+            current: -5,
+        })
+    );
+    // Não depende de cheat nenhum no catálogo (só do caminho do `GameState`).
+    let plain = FieldCatalog::resolve(&w.index, &w.mem, &cfg_gs(), &defs());
+    assert!(matches!(
+        report_with(&w, &plain).research_points,
+        Some(ResearchPointsReport::Value { current: -5, .. })
+    ));
+    // Sem o bloco no `[ue.player]`, não há linha.
+    let none = FieldCatalog::resolve(&w.index, &w.mem, &cfg(), &defs());
+    assert_eq!(report_with(&w, &none).research_points, None);
+}
+
+#[test]
+fn research_points_unavailable_says_why() {
+    // Campo que falta na reflexão.
+    let w = world(&["ResearchPoints"]);
+    let catalog = full_catalog(&w, &cfg_gs());
+    assert_eq!(
+        report_with(&w, &catalog).research_points,
+        Some(ResearchPointsReport::Unavailable {
+            reason: "campo ResearchPoints não encontrado".into()
+        })
+    );
+    // Salto do caminho quebrado: o motivo é o do `GameState`.
+    let w = world(&[]);
+    let catalog = full_catalog(&w, &cfg_gs());
+    w.write_u64(w.world + u64::from(GAME_STATE_OFF), 0);
+    assert_eq!(
+        report_with(&w, &catalog).research_points,
+        Some(ResearchPointsReport::Unavailable {
+            reason: "GameState ausente ou de classe inesperada".into()
+        })
+    );
+    // `PartyComponent` nulo ou de outra classe.
+    w.write_u64(w.world + u64::from(GAME_STATE_OFF), w.game_state);
+    w.write_u64(w.game_state + u64::from(PARTY_OFF), w.hauling);
+    assert_eq!(
+        report_with(&w, &catalog).research_points,
+        Some(ResearchPointsReport::Unavailable {
+            reason: "PartyComponent ausente ou de classe inesperada".into()
+        })
+    );
+    // Classe do `PartyComponent` fora das assinaturas.
+    let w = world(&[]);
+    let mut bad = cfg_gs();
+    if let Some(r) = bad.research.as_mut() {
+        r.party_class = format!("{MAINE}.NaoExiste");
+    }
+    let catalog = full_catalog(&w, &bad);
+    assert_eq!(
+        report_with(&w, &catalog).research_points,
+        Some(ResearchPointsReport::Unavailable {
+            reason: "classe NaoExiste não encontrada".into()
+        })
+    );
 }
 
 #[test]

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 
 pub mod module;
+pub mod rig;
 pub mod ue;
 
 pub use ue::{UeAddrs, synth_signatures};
@@ -211,6 +212,25 @@ impl TestTarget {
         match self.module.as_ref().unwrap().symbols.get(name) {
             Some(addr) => *addr,
             None => panic!("símbolo {name} não existe no módulo sintético"),
+        }
+    }
+
+    /// O alvo como o `Target::open` o montaria para o jogo, mas com o diretório do módulo sintético
+    /// confiável: `maps`, `modules` e a identidade lidos agora. Entra em pânico sem `module`.
+    pub fn module_target(&self) -> gt_grounded2::resolve::Target {
+        let maps = gt_core::maps::read_maps(self.pid).unwrap();
+        let reader = gt_core::mem::MemReader::new(self.pid);
+        let policy = gt_core::modules::TrustPolicy::new(vec![self.module_dir().to_path_buf()]);
+        let root = PathBuf::from(format!("/proc/{}/root", self.pid));
+        let modules = gt_core::modules::discover(&maps, &reader, &policy, &root).unwrap();
+        gt_grounded2::resolve::Target {
+            pid: self.pid,
+            identity: gt_core::procinfo::identity(self.pid).unwrap(),
+            discarded: Vec::new(),
+            maps,
+            reader,
+            modules,
+            non_pe: std::collections::HashSet::new(),
         }
     }
 
