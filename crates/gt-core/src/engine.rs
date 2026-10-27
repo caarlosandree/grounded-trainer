@@ -75,7 +75,7 @@ use nix::sys::signal::Signal;
 
 use crate::journal::{
     DataAction, DataEntry, DataMode, EntryAction, GuardBytes, Journal, JournalEntry, JournalLock,
-    JournalStore, VarRegion, data_key, decide_data, decide_entry,
+    JournalStore, Loaded, VarRegion, data_key, decide_data, decide_entry,
 };
 use crate::maps::{MapRegion, read_maps};
 use crate::mem::{MemWriter, Pidfd};
@@ -402,7 +402,7 @@ impl Engine {
         if before != after {
             return Err(Error::ProcessGone { pid });
         }
-        Ok(Engine {
+        let mut engine = Engine {
             pid,
             identity: before,
             pidfd,
@@ -424,7 +424,18 @@ impl Engine {
             data_pending: Vec::new(),
             data_fault: None,
             vars: Vec::new(),
-        })
+        };
+        // Regiões de variáveis que um diário do mesmo processo ainda guarda (a recuperação as
+        // manteve): sem isto o primeiro diário deste motor as apagaria e a limpeza nunca mais
+        // aconteceria. Só regiões válidas; não grava nada.
+        if let Ok(Loaded::Ok(j)) = engine.store.peek()
+            && j.pid == engine.identity.pid
+            && j.start_time == engine.identity.start_time
+            && j.boot_id == engine.identity.boot_id
+        {
+            engine.adopt_vars(&j.vars);
+        }
+        Ok(engine)
     }
 
     /// Aplica um lote de patches (spec 6.2, passos 1–8). Tudo ou nada.
@@ -671,15 +682,32 @@ impl Engine {
         &self.vars
     }
 
-    /// Põe regiões vindas do diário (a recuperação) entre as reclamadas, **sem** ler nem
-    /// escrever: elas passam a constar do diário que o motor grava e [`Engine::clear_vars`] as
-    /// zera quando nenhum desvio nosso continua vivo.
-    pub fn adopt_vars(&mut self, regions: &[VarRegion]) {
+    /// Põe regiões vindas do diário entre as reclamadas, **sem** ler nem escrever nem gravar o
+    /// diário: elas passam a constar do diário que o motor grava e [`Engine::clear_vars`] as
+    /// zera quando nenhum desvio nosso continua vivo. O diário não é de confiança: cada região
+    /// passa pelo mesmo filtro do [`Engine::claim_vars`] (1 a [`MAX_VARS_LEN`] bytes, início
+    /// múltiplo de 8, sem sobrepor outra). Devolve as **recusadas** (com `warn`), que o motor
+    /// não guarda e portanto saem do diário na próxima gravação.
+    pub fn adopt_vars(&mut self, regions: &[VarRegion]) -> Vec<VarRegion> {
+        let mut rejected = Vec::new();
         for r in regions {
-            if !self.vars.contains(r) {
-                self.vars.push(*r);
+            if self.vars.contains(r) {
+                continue;
+            }
+            match self.check_var_region(r.addr, r.len) {
+                Ok(()) => self.vars.push(*r),
+                Err(reason) => {
+                    tracing::warn!(addr = r.addr, len = r.len, %reason, "região de variáveis do diário recusada");
+                    rejected.push(*r);
+                }
             }
         }
+        rejected
+    }
+
+    /// Regrava o diário com o estado em memória (a recuperação usa depois de recusar regiões).
+    pub fn save_journal_now(&self) {
+        self.save_final();
     }
 
     /// Zera todas as regiões de variáveis (spec 008, 6.4), **se** nenhum desvio (`Code`) nosso
@@ -1287,6 +1315,26 @@ impl Engine {
                 .any(|v| v.addr <= addr && end <= v.range().end)
     }
 
+    /// Forma de uma região de variáveis: 1 a [`MAX_VARS_LEN`] bytes, início múltiplo de 8, sem
+    /// estourar o espaço de endereços e sem sobrepor outra região já reclamada.
+    fn check_var_region(&self, addr: u64, len: u64) -> std::result::Result<(), String> {
+        let end = addr.checked_add(len);
+        if len == 0 || len > MAX_VARS_LEN || !addr.is_multiple_of(8) || end.is_none() {
+            return Err(format!(
+                "região de variáveis {addr:#x} com {len} bytes (1 a {MAX_VARS_LEN} bytes, alinhada a 8)"
+            ));
+        }
+        let end = end.unwrap_or(addr);
+        if self
+            .vars
+            .iter()
+            .any(|v| v.addr < end && addr < v.range().end)
+        {
+            return Err("a região se sobrepõe a outra já reclamada".to_owned());
+        }
+        Ok(())
+    }
+
     fn claim_vars_inner(&mut self, region: Range<u64>) -> Result<()> {
         let bad = |reason: String| Error::BadPatch {
             id: "variáveis".to_owned(),
@@ -1294,12 +1342,6 @@ impl Engine {
         };
         check_alive(&self.identity)?;
         let len = region.end.saturating_sub(region.start);
-        if len == 0 || len > MAX_VARS_LEN || !region.start.is_multiple_of(8) {
-            return Err(bad(format!(
-                "região de variáveis {:#x}..{:#x} (1 a {MAX_VARS_LEN} bytes, alinhada a 8)",
-                region.start, region.end
-            )));
-        }
         let wanted = VarRegion {
             addr: region.start,
             len,
@@ -1307,13 +1349,7 @@ impl Engine {
         if self.vars.contains(&wanted) {
             return Ok(());
         }
-        if self
-            .vars
-            .iter()
-            .any(|v| v.addr < region.end && region.start < v.range().end)
-        {
-            return Err(bad("a região se sobrepõe a outra já reclamada".to_owned()));
-        }
+        self.check_var_region(region.start, len).map_err(bad)?;
         let maps = read_maps(self.pid)?;
         if !rw_policy(&maps).allows(&region) {
             return Err(Error::VarsNotWritable { addr: region.start });

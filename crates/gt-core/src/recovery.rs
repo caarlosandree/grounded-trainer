@@ -205,7 +205,13 @@ pub fn recover(
     };
     // As regiões de variáveis entram no registro do motor antes de tudo: o diário que ele
     // regrava as mantém mesmo que uma falha abandone a recuperação no meio.
-    engine.adopt_vars(&journal.vars);
+    // Região do diário que não passa no filtro do motor (tamanho, alinhamento, sobreposição)
+    // não é tocada: sai do diário como entrada de outro.
+    let rejected = engine.adopt_vars(&journal.vars);
+    if !rejected.is_empty() {
+        report.foreign.push(VARS_ID.to_owned());
+        engine.save_journal_now();
+    }
     // O motor regrava o diário só com as entradas que ainda não resolveu (as de fora
     // de memória executável já saíram) e o apaga quando não sobra nenhuma. As de dados
     // entram como pendentes do motor e saem quando resolvidas.
@@ -243,7 +249,7 @@ pub fn recover(
     }
     // Por último (spec 008, 6.3): as variáveis, que só são zeradas se nenhum desvio nosso
     // continua sem resolver.
-    if !journal.vars.is_empty() {
+    if !engine.vars().is_empty() {
         match engine.clear_vars() {
             Ok(()) => {}
             Err(Error::ProcessGone { .. }) => {

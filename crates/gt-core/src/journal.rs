@@ -776,12 +776,19 @@ mod tests {
 
     #[test]
     fn old_journal_without_vars_reads() {
-        let j = journal(vec![entry(&[0x48], &[0x90])]);
-        let text = serde_json::to_string(&j).unwrap();
-        assert!(!text.contains("\"vars\""), "{text}");
-        // Diário antigo (sem a chave) carrega com `vars` vazio.
-        let back: Journal = serde_json::from_str(&text).unwrap();
-        assert!(back.vars.is_empty());
+        // Diário gravado antes da spec 008: sem a chave `vars` (nem `data`).
+        let text = r#"{
+            "boot_id": "boot-a", "pid": 4242, "start_time": 1000,
+            "version_key": "c935e799-0a1b2c", "paused_by_us": false,
+            "entries": [{"id": "god_mode", "addr": "0x140123456",
+                         "original": "48", "replacement": "90"}]
+        }"#;
+        let back: Journal = serde_json::from_str(text).unwrap();
+        assert!(back.vars.is_empty() && back.data.is_empty());
+        assert_eq!(back.entries.len(), 1);
+        // Gravar de novo não escreve a chave vazia.
+        assert!(!serde_json::to_string(&back).unwrap().contains("\"vars\""));
+        let j = back;
         // Com a região, a chave aparece, o endereço é hexadecimal e o diário volta igual.
         let with = Journal {
             vars: vec![VarRegion {

@@ -2623,3 +2623,192 @@ fn clear_vars_keeps_region_while_code_pending() {
     assert_eq!(engine.vars().len(), 1);
     assert_eq!(vars_in_journal(&env).len(), 1);
 }
+
+/// Diário do processo do alvo com estas regiões de variáveis e nenhuma entrada.
+fn save_vars_journal(env: &Env, t: &TestTarget, vars: Vec<gt_core::journal::VarRegion>) {
+    let id = identity(t.pid).unwrap();
+    env.store
+        .save(&gt_core::journal::Journal {
+            boot_id: id.boot_id,
+            pid: id.pid,
+            start_time: id.start_time,
+            version_key: "teste".into(),
+            paused_by_us: false,
+            entries: Vec::new(),
+            data: Vec::new(),
+            vars,
+        })
+        .unwrap();
+}
+
+#[test]
+fn recovery_refuses_malformed_vars_from_journal() {
+    use gt_core::journal::VarRegion;
+    let t = TestTarget::spawn();
+    let env = env();
+    let base = t.big_region + 0x800;
+    // Boa: 64 bytes. Grande demais (nem aloca). Desalinhada. Sobreposta à boa.
+    let good = VarRegion {
+        addr: base,
+        len: 64,
+    };
+    let huge = VarRegion {
+        addr: base + 0x1000,
+        len: 1 << 40,
+    };
+    let big = VarRegion {
+        addr: base + 0x2000,
+        len: 4104,
+    };
+    let unaligned = VarRegion {
+        addr: base + 0x4004,
+        len: 64,
+    };
+    let overlap = VarRegion {
+        addr: base + 32,
+        len: 64,
+    };
+    for addr in [
+        good.addr + 8,
+        huge.addr,
+        big.addr,
+        unaligned.addr,
+        overlap.addr + 40,
+    ] {
+        poke(&t, addr, &[0xAB; 8]);
+    }
+    save_vars_journal(&env, &t, vec![good, huge, big, unaligned, overlap]);
+    let report = recover(&env.store, &env.lock, &PauseConfig::default()).unwrap();
+    assert_eq!(report.foreign, vec!["variáveis".to_string()], "{report:?}");
+    assert!(report.kept.is_empty(), "{report:?}");
+    // A boa foi zerada; o resto não foi tocado (nada escrito fora do que passou no filtro).
+    assert_eq!(bytes_at(t.pid, good.addr, 64), vec![0u8; 64]);
+    // O byte da sobreposição que ficava depois da região boa (`+72`) não foi tocado.
+    assert_eq!(bytes_at(t.pid, overlap.addr + 40, 8), [0xAB; 8]);
+    for addr in [huge.addr, big.addr, unaligned.addr] {
+        assert_eq!(bytes_at(t.pid, addr, 8), [0xAB; 8], "{addr:#x}");
+    }
+    assert!(missing(&env));
+}
+
+#[test]
+fn recovery_with_only_malformed_vars_clears_the_journal() {
+    use gt_core::journal::VarRegion;
+    let t = TestTarget::spawn();
+    let env = env();
+    let addr = t.big_region + 0x804;
+    poke(&t, addr, &[0xAB; 8]);
+    save_vars_journal(&env, &t, vec![VarRegion { addr, len: 64 }]);
+    let report = recover(&env.store, &env.lock, &PauseConfig::default()).unwrap();
+    assert_eq!(report.foreign, vec!["variáveis".to_string()], "{report:?}");
+    assert_eq!(bytes_at(t.pid, addr, 8), [0xAB; 8]);
+    assert!(missing(&env));
+}
+
+#[test]
+fn open_adopts_vars_kept_by_recovery_with_code_pending() {
+    use gt_core::journal::VarRegion;
+    let t = TestTarget::spawn();
+    let env = env();
+    let region = vars_region(&t);
+    let second = t.big_region + 0x1000;
+    // Um desvio que a recuperação não consegue desfazer: a thread do `syscall_page` está
+    // parada com o `pc` no meio do trecho, e voltar o "original" (que aqui é o prefixo `66`
+    // sobre a `syscall`) perderia a fronteira dela. O diário é "invertido" de propósito: a
+    // memória já tem o `replacement`, então nada é poke antes (um poke deixaria a thread
+    // reiniciar a `syscall` sobre o código novo).
+    let addr = t.syscall_page + 20;
+    let original = [0x66, 0x66, 0x66, 0x66, 0x66, 0x90];
+    let replacement = [0x0F, 0x05, 0x90, 0x90, 0x90, 0x90];
+    poke(&t, region.start, &[7; 8]);
+    let id = identity(t.pid).unwrap();
+    env.store
+        .save(&gt_core::journal::Journal {
+            boot_id: id.boot_id,
+            pid: id.pid,
+            start_time: id.start_time,
+            version_key: "teste".into(),
+            paused_by_us: false,
+            entries: vec![JournalEntry {
+                id: "sys".into(),
+                addr,
+                original: original.to_vec(),
+                replacement: replacement.to_vec(),
+                next: None,
+                kind: gt_core::patch::PatchKind::Code,
+            }],
+            data: Vec::new(),
+            vars: vec![VarRegion {
+                addr: region.start,
+                len: 280,
+            }],
+        })
+        .unwrap();
+    let err = recover(&env.store, &env.lock, &PauseConfig::default()).unwrap_err();
+    assert!(matches!(err, Error::ThreadsInPatch { .. }), "{err:?}");
+    // Nada foi zerado e o diário mantém o desvio e a região.
+    assert_eq!(bytes_at(t.pid, region.start, 8), [7; 8]);
+    match env.store.peek().unwrap() {
+        Loaded::Ok(j) => {
+            assert_eq!(j.entries.len(), 1);
+            assert_eq!(j.vars.len(), 1);
+        }
+        other => panic!("diário inesperado: {other:?}"),
+    }
+    // Um motor novo (a sessão seguinte) adota a região do diário, e o diário que ele regrava
+    // ainda a tem.
+    let mut engine = open_engine(t.pid, &env, Vec::new(), None);
+    assert_eq!(
+        engine.vars(),
+        [VarRegion {
+            addr: region.start,
+            len: 280
+        }]
+    );
+    engine.claim_vars(second..second + 64).unwrap();
+    assert_eq!(vars_in_journal(&env).len(), 2);
+    // A limpeza posterior zera as duas.
+    engine.clear_vars().unwrap();
+    assert_eq!(bytes_at(t.pid, region.start, 8), [0; 8]);
+    assert!(engine.vars().is_empty());
+    assert!(missing(&env));
+}
+
+#[test]
+fn open_ignores_vars_of_another_process_and_malformed_ones() {
+    use gt_core::journal::{Journal, VarRegion};
+    let t = TestTarget::spawn();
+    let env = env();
+    let region = vars_region(&t);
+    let id = identity(t.pid).unwrap();
+    let journal = |start_time, vars| Journal {
+        boot_id: id.boot_id.clone(),
+        pid: id.pid,
+        start_time,
+        version_key: "teste".into(),
+        paused_by_us: false,
+        entries: Vec::new(),
+        data: Vec::new(),
+        vars,
+    };
+    let good = VarRegion {
+        addr: region.start,
+        len: 64,
+    };
+    // Outro processo (horário de início diferente): nada é adotado.
+    env.store
+        .save(&journal(id.start_time + 1, vec![good]))
+        .unwrap();
+    assert!(open_engine(t.pid, &env, Vec::new(), None).vars().is_empty());
+    // Mesmo processo, uma região malformada e uma boa: só a boa.
+    let bad = VarRegion {
+        addr: region.start + 0x400,
+        len: 1 << 40,
+    };
+    env.store
+        .save(&journal(id.start_time, vec![bad, good]))
+        .unwrap();
+    let engine = open_engine(t.pid, &env, Vec::new(), None);
+    assert_eq!(engine.vars(), [good]);
+    std::mem::forget(engine);
+}
