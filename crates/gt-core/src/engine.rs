@@ -52,9 +52,11 @@
 //! que [`Engine::claim_vars`] reclama (região `rw-` no `maps`, toda zerada, gravada no diário
 //! antes de qualquer escrita). [`Engine::write_var`] e [`Engine::read_var`] só tocam dentro
 //! dela. O diário guarda a região, não os valores. No fim do [`Engine::undo_all`], no `Drop` e
-//! na recuperação a região inteira volta a zeros ([`Engine::clear_vars`]), **se** nenhum
-//! desvio (`Code`) nosso está ativo ou pendente e o `maps` ainda mostra a região `rw-`;
-//! senão ela fica no diário. Toda cave é segura com as variáveis zeradas.
+//! na recuperação (e no [`Engine::restore_pending`] que resolve uma pendência) a região
+//! inteira volta a zeros ([`Engine::clear_vars`]), **se** nenhum desvio (`Code`) nem cave
+//! nossos estão ativos ou pendentes (uma cave que ficou com uma thread dentro ainda pode
+//! gravar) e o `maps` ainda mostra a região `rw-`; senão ela fica no diário. Toda cave é
+//! segura com as variáveis zeradas.
 //!
 //! # Escrita em dados (spec 005, 6.6)
 //!
@@ -456,7 +458,8 @@ impl Engine {
     /// restaurados e os já originais vão em `restored`; os descartados, em `foreign`). As
     /// partes são tentadas mesmo que a anterior falhe; o primeiro erro volta. Os patches
     /// saem em duas fases: os desvios (`Code`) e depois as caves (spec 008, 6.3). Por último
-    /// as variáveis voltam a zeros ([`Engine::clear_vars`]).
+    /// as variáveis voltam a zeros ([`Engine::clear_vars`]), a não ser que ainda reste um desvio
+    /// ou uma cave (pendentes): então elas ficam até o `restore_pending` (ou o `Drop`).
     pub fn undo_all(&mut self) -> Result<BatchReport> {
         self.retry_resume()?;
         let patches = self.undo_all_patches();
@@ -495,7 +498,11 @@ impl Engine {
             return Ok(report);
         }
         if !caves_may_resolve(&self.journal_entries()) {
-            tracing::warn!("há desvio sem desfazer; as caves ficam como estão");
+            // Um desvio pendente ainda aponta para as caves: não são tocadas, mas passam a
+            // pendentes (aparecem em `pending_ids` e o `restore_pending` as resolve depois do
+            // desvio, na ordem certa) em vez de ficarem ativas sem ninguém relatar.
+            tracing::warn!("há desvio sem desfazer; as caves ficam pendentes sem serem tocadas");
+            self.caves_to_pending("há desvio sem desfazer");
             return Ok(report);
         }
         let result =
@@ -513,22 +520,26 @@ impl Engine {
             Err(e) => {
                 // O desvio já saiu, então a cave é inalcançável: fica no diário, como
                 // pendente, para a próxima execução (ou o `Drop`) tentar de novo.
-                let (caves, rest): (Vec<Validated>, Vec<Validated>) =
-                    std::mem::take(&mut self.active)
-                        .into_iter()
-                        .partition(|v| v.spec.kind == PatchKind::Cave);
-                self.active = rest;
-                for v in &caves {
-                    let entry = entry_of(v);
-                    if !self.pending.contains(&entry) {
-                        tracing::warn!(id = %v.spec.id, erro = %e, "cave não desfeita; mantida no diário");
-                        self.pending.push(entry);
-                    }
-                }
-                self.save_logged(self.stuck);
+                self.caves_to_pending(&e.to_string());
                 Err(e)
             }
         }
+    }
+
+    /// Passa as caves ativas para pendentes (sem tocar na memória) e regrava o diário.
+    fn caves_to_pending(&mut self, why: &str) {
+        let (caves, rest): (Vec<Validated>, Vec<Validated>) = std::mem::take(&mut self.active)
+            .into_iter()
+            .partition(|v| v.spec.kind == PatchKind::Cave);
+        self.active = rest;
+        for v in &caves {
+            let entry = entry_of(v);
+            if !self.pending.contains(&entry) {
+                tracing::warn!(id = %v.spec.id, motivo = %why, "cave não desfeita; mantida no diário");
+                self.pending.push(entry);
+            }
+        }
+        self.save_logged(self.stuck);
     }
 
     /// Roda `f` com a pausa das caves ([`CAVE_PAUSE_ATTEMPTS`] tentativas, [`CAVE_PAUSE_WAIT`]
@@ -712,8 +723,9 @@ impl Engine {
         self.save_final();
     }
 
-    /// Zera todas as regiões de variáveis (spec 008, 6.4), **se** nenhum desvio (`Code`) nosso
-    /// está ativo ou pendente, a identidade do processo bate e o `maps` ainda mostra a região
+    /// Zera todas as regiões de variáveis (spec 008, 6.4), **se** nenhum desvio (`Code`) nem cave
+    /// nossos estão ativos ou pendentes (uma cave que ficou com uma thread dentro ainda pode
+    /// gravar nas variáveis), a identidade do processo bate e o `maps` ainda mostra a região
     /// `rw-`. Não confere os valores (ninguém mais usa a folga). Quando alguma condição falha, a
     /// região fica no registro e no diário e nada é escrito. Uma escrita que falha mantém a
     /// região e devolve o primeiro erro. Sem pausa.
@@ -754,6 +766,7 @@ impl Engine {
     /// não escreve nada (o SIGCONT que falhou ainda é tentado antes).
     pub fn restore_pending(&mut self) -> Result<RestoreReport> {
         let entries = self.pending.clone();
+        let had_pending = !entries.is_empty() || !self.data_pending.is_empty();
         let mut report = self.restore_entries(entries)?;
         let data = self.data_pending.clone();
         if !data.is_empty() {
@@ -761,6 +774,16 @@ impl Engine {
             report.restored.extend(r.restored);
             report.dropped.extend(r.dropped);
             report.foreign.extend(r.foreign);
+        }
+        // Resolvida a pendência (uma cave que ficou com uma thread dentro, por exemplo), as
+        // variáveis que ela segurava podem voltar a zeros. Só quando havia pendência: sem ela,
+        // as variáveis são de patches em uso.
+        if had_pending && !self.vars.is_empty() {
+            match self.clear_vars() {
+                Ok(()) => {}
+                Err(e @ Error::ProcessGone { .. }) => return Err(e),
+                Err(e) => tracing::warn!(erro = %e, "variáveis não zeradas agora"),
+            }
         }
         Ok(report)
     }
@@ -1390,12 +1413,10 @@ impl Engine {
         if self.vars.is_empty() {
             return Ok(());
         }
-        if self
-            .journal_entries()
-            .iter()
-            .any(|e| e.kind == PatchKind::Code)
-        {
-            tracing::warn!("há desvio ativo ou pendente; as variáveis ficam como estão");
+        // Um desvio vivo aponta para a cave; uma cave que ficou (thread dentro) ainda pode
+        // gravar nas variáveis. Em qualquer dos casos a folga continua como está.
+        if !self.journal_entries().is_empty() {
+            tracing::warn!("há desvio ou cave ativo ou pendente; as variáveis ficam como estão");
             return Ok(());
         }
         check_alive(&self.identity)?;

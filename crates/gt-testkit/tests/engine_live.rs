@@ -412,6 +412,140 @@ fn restore_keeps_cave_while_code_unresolved() {
     assert_eq!(bytes_at(t.pid, cave_addr, 4), [0x48, 0xFF, 0xC0, 0xC3]);
 }
 
+/// Alvo do gancho de ordem: o PID e os trechos (endereço e bytes originais) a conferir.
+static ORDER_PID: AtomicI32 = AtomicI32::new(0);
+static ORDER_PROBES: Mutex<Vec<(u64, Vec<u8>)>> = Mutex::new(Vec::new());
+/// Para cada trecho, se estava com os bytes originais dentro da pausa do gancho.
+static ORDER_SEEN: Mutex<Option<Vec<bool>>> = Mutex::new(None);
+
+fn order_hook(point: HookPoint) {
+    if point != HookPoint::InPause {
+        return;
+    }
+    let pid = ORDER_PID.load(Ordering::SeqCst);
+    let probes = ORDER_PROBES.lock().unwrap().clone();
+    let seen = probes
+        .iter()
+        .map(|(addr, original)| bytes_at(pid, *addr, original.len()) == *original)
+        .collect();
+    *ORDER_SEEN.lock().unwrap() = Some(seen);
+}
+
+#[test]
+fn undo_all_runs_every_code_before_any_cave() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let (c1, c2) = (t.exec_page + 0x100, t.exec_page + 0x200);
+    let (p1, p2) = (t.exec2, t.exec2 + 8);
+    // A pausa do gancho é a 3ª do motor: 1ª = aplicar o lote, 2ª = fase dos `Code`, 3ª = fase das
+    // `Cave`. Ali, todos os desvios já têm de ter saído e todas as caves ainda estar escritas,
+    // mesmo com o lote aplicado em ordem trocada (cave, desvio, cave, desvio).
+    ORDER_PID.store(t.pid, Ordering::SeqCst);
+    *ORDER_PROBES.lock().unwrap() = vec![
+        (c1, vec![0xCC; 16]),
+        (p1, NOP3.to_vec()),
+        (c2, vec![0xCC; 16]),
+        (p2, NOP3.to_vec()),
+    ];
+    *ORDER_SEEN.lock().unwrap() = None;
+    let mut engine = open_engine_with(
+        t.pid,
+        &env,
+        vec![exec2_range(&t), page_range(&t, t.exec_page)],
+        PauseConfig {
+            hook: Some(order_hook),
+            hook_on_pause: 3,
+            ..PauseConfig::default()
+        },
+    );
+    engine
+        .apply(vec![
+            cave("c1", c1),
+            patch("p1", p1, &NOP3, &NOP2_NOP),
+            cave("c2", c2),
+            patch("p2", p2, &NOP3, &NOP2_NOP),
+        ])
+        .unwrap();
+    engine.undo_all().unwrap();
+    let seen = ORDER_SEEN.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        Some(vec![false, true, false, true]),
+        "[c1, p1, c2, p2] originais na pausa das caves"
+    );
+    for addr in [p1, p2] {
+        assert_eq!(bytes_at(t.pid, addr, 3), NOP3);
+    }
+    for addr in [c1, c2] {
+        assert_eq!(bytes_at(t.pid, addr, 16), vec![0xCC; 16]);
+    }
+    assert!(missing(&env));
+}
+
+static PENDING_CODE_ALLOW: AtomicBool = AtomicBool::new(false);
+
+#[test]
+fn undo_all_with_pending_code_parks_caves() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let cave_addr = t.exec_page + 0x100;
+    let (exec2, cave_page) = (exec2_range(&t), page_range(&t, t.exec_page));
+    // Enquanto `PENDING_CODE_ALLOW` é falso a política só cobre a página da cave: o desvio fica
+    // sem resolver (fora da política) e continua no diário.
+    let policy: PolicyFn = Box::new(move |_maps| {
+        if PENDING_CODE_ALLOW.load(Ordering::SeqCst) {
+            WritePolicy::new(vec![exec2.clone(), cave_page.clone()])
+        } else {
+            WritePolicy::new(vec![cave_page.clone()])
+        }
+    });
+    let opts = EngineOptions {
+        version_key: "teste".into(),
+        pause: PauseConfig::default(),
+    };
+    let mut engine = Engine::open(t.pid, None, env.store.clone(), &env.lock, policy, opts).unwrap();
+    engine.apply(vec![cave("c", cave_addr)]).unwrap();
+    let code = JournalEntry {
+        id: "p".into(),
+        addr: t.exec2,
+        original: NOP3.to_vec(),
+        replacement: NOP2_NOP.to_vec(),
+        next: None,
+        kind: gt_core::patch::PatchKind::Code,
+    };
+    let report = engine.restore_entries(vec![code]).unwrap();
+    assert_eq!(report.outside_policy, vec!["p".to_string()], "{report:?}");
+    assert_eq!(engine.pending_ids(), vec!["p".to_string()]);
+
+    // O desvio pendente ainda apontaria para a cave: `undo_all` não a toca, mas ela deixa de
+    // ficar ativa sem ninguém saber e passa a pendente, ao lado do desvio.
+    let report = engine.undo_all().unwrap();
+    assert!(report.restored.is_empty(), "{report:?}");
+    assert_eq!(bytes_at(t.pid, cave_addr, 4), [0x48, 0xFF, 0xC0, 0xC3]);
+    assert!(engine.active().is_empty());
+    let mut pending = engine.pending_ids();
+    pending.sort();
+    assert_eq!(pending, vec!["c".to_string(), "p".to_string()]);
+    match env.store.peek().unwrap() {
+        Loaded::Ok(j) => {
+            let mut ids: Vec<_> = j.entries.iter().map(|e| e.id.as_str()).collect();
+            ids.sort();
+            assert_eq!(ids, vec!["c", "p"]);
+        }
+        other => panic!("diário inesperado: {other:?}"),
+    }
+
+    // Com o desvio dentro da política, `restore_pending` resolve os dois (o desvio já estava
+    // original; a cave sai depois dele).
+    PENDING_CODE_ALLOW.store(true, Ordering::SeqCst);
+    let report = engine.restore_pending().unwrap();
+    assert_eq!(report.dropped, vec!["p".to_string()], "{report:?}");
+    assert_eq!(report.restored, vec!["c".to_string()], "{report:?}");
+    assert_eq!(bytes_at(t.pid, cave_addr, 16), vec![0xCC; 16]);
+    assert!(engine.pending_ids().is_empty());
+    assert!(missing(&env));
+}
+
 #[test]
 fn mismatch_refuses_without_pausing() {
     let t = TestTarget::spawn();
@@ -2477,6 +2611,20 @@ fn vars_not_zeroed_while_code_active() {
     assert_eq!(bytes_at(t.pid, region.start, 4), [0; 4]);
     assert!(engine.vars().is_empty());
     assert!(missing(&env));
+}
+
+#[test]
+fn restore_pending_without_pending_keeps_vars() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let region = vars_region(&t);
+    let mut engine = open_engine(t.pid, &env, Vec::new(), None);
+    engine.claim_vars(region.clone()).unwrap();
+    engine.write_var(region.start, &5i32.to_le_bytes()).unwrap();
+    // Sem nada pendente, as variáveis são de patches em uso: não são tocadas.
+    engine.restore_pending().unwrap();
+    assert_eq!(bytes_at(t.pid, region.start, 4), 5i32.to_le_bytes());
+    assert_eq!(engine.vars().len(), 1);
 }
 
 static DENY_POLICY_VARS: AtomicBool = AtomicBool::new(false);
