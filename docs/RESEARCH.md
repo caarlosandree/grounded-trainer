@@ -654,6 +654,24 @@ Build `c935e799-0b27c000`, backup do save feito pelo dono, FLiNG fechado. Plano 
   morte e menu, save com os ajustes ligados, reinício do jogo com a TUI aberta, saída e estabilidade do jogo e do save.
 - Nenhum cheat saiu da spec; a grade de velocidade (×0,5 a ×4) ficou como estava.
 
+## Sessão de 2026-10-26/27 (spec 007): configurações do modo de jogo
+
+Build `c935e799-0b27c000`, partida carregada (modo Normal), FLiNG fechado, backup do save feito pelo dono. Leitura por
+`gt ue class` e `scratch/p11/{instances,propflags}.py`; o teste de efeito foi um spike descartável (escrita direta
+dos três campos, originais guardados e devolvidos), sem o trainer.
+
+| O quê | Resultado |
+|---|---|
+| Caminho | `BP_SurvivalGameState_C` → `InGameGameState.SurvivalModeManagerComponent` (`+0x328`) → `SurvivalModeManagerComponent.GameModeSettings` (`+0x148`, o `[rax+0x148]` do FLiNG em `+593AF1C`) → `BP_NormalModeSettings_C` (outer `Augusta_Main`) |
+| Outras instâncias | Um `SurvivalModeManagerComponent` em cada CDO de `GameState` (`Default__InGameGameState`, `Default__SurvivalGameState`, `Default__BP_SurvivalGameState_C`, `Default__LobbyGameState`); só o do `GameState` vivo é o certo |
+| Campos | `bRecipesRequireIngredients` (`+0x3d`) e `bAutoCompleteBuildings` (`+0x3b`): `BoolProperty` de 1 byte, máscara `0xff`. `EnemyDamageMultiplier` (`+0x58`): `FloatProperty`. Na mesma classe: `bUnlockAllRecipes` (`+0x3a`), `PlayerDamageMultiplier` (`+0x54`), `TimeOfDaySpeedMultiplier` (`+0x80`) e outros |
+| Valores no modo Normal | `bRecipesRequireIngredients = 1`, `bAutoCompleteBuildings = 0`, `EnemyDamageMultiplier = 1,0`, `bUnlockAllRecipes = 0` |
+| Save (`PropertyFlags`) | Nenhum dos campos tem `CPF_SaveGame`; `GameModeSettings` (no componente) é `Transient`, como `CurrentGameMode` e `CustomSettings`. Indício de que o objeto é recriado a partir do modo ao carregar |
+| **Efeito na hora** (spike, `0`/`1`/`0,25`) | **Funciona, confirmado pelo dono**: construção desbloqueada colocada sem materiais fica pronta na hora; a bancada cria sem ingredientes; o dano recebido de inimigos cai; nada não desbloqueado aparece. O jogo lê os três campos na hora, sem recarregar o mundo |
+
+Ainda não testado (fica para o critério de pronto da spec 007): consertar, construção em andamento antes de ligar,
+efeito do `EnemyDamageMultiplier` no pet e nas construções, e se um save feito com os valores ligados os grava.
+
 ## Hipóteses descartadas
 
 - (2026-10-25) "Os patches em `+57BD6D0`/`+5BBFE8C` indicam que as opções de cargas e arrastar item estavam
