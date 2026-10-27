@@ -281,8 +281,8 @@ fn game_set_round_trip() {
     assert_eq!(store.peek().unwrap(), Loaded::Missing);
 }
 
-/// Valores de campo em bytes, um por campo do cheat.
-type Bytes = Vec<Vec<u8>>;
+/// Par (original do jogo, valor escrito pelo cheat) de um campo, em bytes.
+type Pair = (Vec<u8>, Vec<u8>);
 
 /// Cheats do mundo da spec 007 (`construir-sem-ingredientes` e `dano-recebido`): liga e desliga cada
 /// um com o jogo aberto, confere o valor escrito nas configurações do modo e, no fim, que os
@@ -319,18 +319,25 @@ fn world_cheats_toggle_and_restore() {
         MemReader::new(pid).read_exact(addr, &mut b).unwrap();
         b
     };
-    // Valor do jogo esperado de cada campo (da spec 007, 6.1) e o que o cheat escreve.
-    let one = 1.0f32.to_le_bytes().to_vec();
-    let quarter = 0.25f32.to_le_bytes().to_vec();
-    let cases: [(&str, Bytes, Bytes); 2] = [
+    // Pares (original do jogo, valor do cheat) esperados de cada cheat (spec 007, 6.1):
+    // bRecipesRequireIngredients (true -> false), bAutoCompleteBuildings (false -> true) e
+    // EnemyDamageMultiplier (1.0 -> 0.25). O diário não guarda o nome do campo, então a
+    // conferência é por multiconjunto de pares, ordenado: trocar ou repetir valores falha.
+    let cases: [(&str, Vec<Pair>); 2] = [
         (
             "construir-sem-ingredientes",
-            vec![vec![1], vec![0]],
-            vec![vec![0], vec![1]],
+            vec![(vec![0], vec![1]), (vec![1], vec![0])],
         ),
-        ("dano-recebido", vec![one], vec![quarter]),
+        (
+            "dano-recebido",
+            vec![(
+                1.0f32.to_le_bytes().to_vec(),
+                0.25f32.to_le_bytes().to_vec(),
+            )],
+        ),
     ];
-    for (id, originals, written) in cases {
+    for (id, mut expected) in cases {
+        expected.sort();
         let k = defaults
             .iter()
             .find(|(d, _)| d == id)
@@ -348,14 +355,17 @@ fn world_cheats_toggle_and_restore() {
             .filter(|e| e.id == id)
             .cloned()
             .collect();
-        assert_eq!(entries.len(), originals.len(), "{id}: entradas no diário");
+        let mut pairs: Vec<Pair> = entries
+            .iter()
+            .map(|e| (e.original.clone(), e.written.clone()))
+            .collect();
+        pairs.sort();
+        assert_eq!(pairs, expected, "{id}: pares (original, escrito) do diário");
         for e in &entries {
             eprintln!(
                 "{id}: {:#x} original {:02x?} escrito {:02x?}",
                 e.addr, e.original, e.written
             );
-            assert!(originals.contains(&e.original), "{id}: original do jogo");
-            assert!(written.contains(&e.written), "{id}: valor do cheat");
             assert_eq!(
                 read(e.addr, e.written.len()),
                 e.written,
