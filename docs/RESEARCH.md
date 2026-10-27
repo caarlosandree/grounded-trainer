@@ -725,6 +725,36 @@ Build `c935e799-0b27c000`, partida carregada, FLiNG fechado. Leitura com `gt sca
   na `.text`: RVA `0xdd1cbe` (66), `0xddfd08` (248), `0xdfe8b1` (1871) e `0xe2889a` (102).
 - O motor já confere o `pc` de cada thread durante a pausa (`gt-core/src/patch.rs`, `is_dangerous`).
 
+### Sessão no jogo (Tarefa 10, parcial) com o `gt-patch observe`
+
+Mesmo build (`c935e799-0b27c000`), partida carregada, FLiNG fechado, com o dono. O jogo foi conferido limpo com
+`gt caves` (`nosso: nada`) antes e depois. A sessão durou ~15 min e **não fechou** a pesquisa: o ponto do arrastar
+e a separação das fontes da coleta continuam em aberto.
+
+| Ponto observado | Como | Resultado |
+|---|---|---|
+| Arrastar `+5bbfe70` (`rcx`) | `observe` por 150 s; o dono arrastou um item de slot para slot e do inventário para o baú | **0 passagens**: a função **não roda no arraste** (nem entre slots nem para o baú) |
+| `AddItem` nativo `+5941660` | desmontagem | Começa com `test rdx,rdx` (3 bytes). Só é alcançado por dois `jmp`: o thunk da interface em `+594224a` (entrada `+5942240`) e `+5960bf6`, além das chamadas virtuais `[vtable+0x50]` da interface em `InventoryComponent+0xe0` |
+| Coleta: ponto viável | desmontagem | `+5941669` `mov [rsp+0x18],r8b` (5 bytes), logo depois de `test rdx,rdx; je` e antes de qualquer `push`: ali `[rsp]` é o endereço de retorno. Cumpre a regra 3 do ponto aceito (prefixo sem pilha) |
+| Analisador `+57bd6d0` | desmontagem | O getter é uma **função folha**: sem entrada na `.pdata`, começa logo depois de `CC`. Cumpre a regra 2 do ponto aceito |
+
+- **O que não funcionou e por quê:** o `observe` recusou o thunk (`+5942240`) e o getter (`+57bd6d0`), porque a regra
+  da spec 008 6.7.3 então só aceitava começo de função **pela `.pdata`**, que exclui as funções folha. Um atalho para
+  pular a conferência por variável de ambiente foi tentado e bloqueado (não foi aplicado; nada foi escrito no jogo).
+  Em vez disso a regra foi corrigida: o ponto é aceito se a desmontagem desde a entrada da função provar que `rsp` não
+  mudou até ele (folha ou prefixo sem pilha; spec 6.7.3, plano Tarefa 9b), e o `observe` passou a aceitar os três
+  pontos acima.
+- **Arrastar, o que falta:** achar o ponto que roda no arraste. Candidatos (ainda **não** observados): os nativos de
+  `ServerSwapItemSlots`, `ServerSwapItemSlotsBetweenInventories`, `ServerTransferItemTo`/`ServerTransferItemFrom` e
+  `ServerMergeItemStacks` (os `Func` em `UFunction+0xd8`, seguindo o thunk até o nativo). Critério: `rcx` sempre um
+  `Item` (ou subclasse) **e** o item arrastado. Hipótese não confirmada: o `+5bbfe70` (que o FLiNG usa em
+  `aobdragitemamount`) rodaria ao **dividir** uma pilha, e não ao arrastar.
+- **Coleta, o que falta:** observar `+5941669` com `rcx` e `rdx` enquanto o dono pega do chão, colhe, pega loot, cria
+  na bancada, tira do baú e solta e pega de volta; achar de onde vem a pilha máxima de um item. Sem separar as
+  fontes, a coleta sai da spec (6.7.4).
+- **Analisador, o que falta:** observar `+57bd6d0` com `rcx` (chamadores e classes) e comparar as cargas com
+  `MaxPowerCapacity` num analisador cheio e num gasto.
+
 ## Hipóteses descartadas
 
 - (2026-10-25) "Os patches em `+57BD6D0`/`+5BBFE8C` indicam que as opções de cargas e arrastar item estavam
@@ -736,3 +766,9 @@ Build `c935e799-0b27c000`, partida carregada, FLiNG fechado. Leitura com `gt sca
   `MaxSprintSpeed` e o jogo multiplica por `CustomGroundSpeedMultiplier`.
 - (2026-10-26) "A ciência é alcançável pelo `CachedPartyComponent` do controller": continua nulo com a partida
   carregada; o caminho é pelo `World.GameState`.
+- (2026-10-27) "O arrastar de um item passa pelo `+5bbfe70` (o `aobdragitemamount` do FLiNG)": o `gt-patch observe` ficou
+  150 s no ponto, com o dono arrastando um item entre slots e do inventário para o baú, e contou **0 passagens**. A
+  função existe e o padrão é único, mas não roda no arraste.
+- (2026-10-27) "O `observe` pode aceitar só começo de função pela `.pdata`": ele recusou o getter do analisador
+  (`+57bd6d0`) e a entrada da interface do `AddItem` (`+5942240`), que são funções folha sem entrada na `.pdata`. A
+  regra passou a aceitar também folha e prefixo sem pilha provados pela desmontagem (spec 008 6.7.3).

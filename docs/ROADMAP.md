@@ -133,14 +133,24 @@ A fase foi dividida em duas specs:
 
 ## Fase 6 — Code caves (lógica nova)
 
+**Status:** 🚧 em andamento (spec e plano `008-code-caves`). Já está na branch `spec-008-code-caves`: o motor de
+desvios (cave e variáveis como tipos de escrita do motor), a cave de observação (`gt-patch observe`), `gt caves`,
+os corpos das caves (Brain Power, analisador, arrastar), a grade por lista de pontos, `congelar-hora`, `pular-hora`
+e as linhas de desvio na TUI, tudo testado sem o jogo. **Faltam**: a pesquisa no jogo (o ponto do arrastar, a coleta
+e o analisador), a coleta multiplicada e o critério de pronto no jogo com o dono. A fase **não está fechada**.
+
 **Objetivo:** cheats que mudam *cálculos* do jogo, não só valores.
 
-- Encontrar espaço livre no executável para código novo.
-- Montar o código com `iced-x86` e desviar a execução para ele.
-- Cheats:
-  - Sobrevivência: god mode por desvio (se a versão por valor da Fase 5 não servir).
-  - Progressão: Brain Power rápido, congelar a hora do dia / velocidade do tempo.
-  - Itens: cargas infinitas do analisador, quantidade ao arrastar.
+- Encontrar espaço livre no executável para código novo (sequências de `CC` da `.text` e a folga da `.data`).
+- Montar o código com `iced-x86` e desviar a execução para ele, com as garantias do motor da Fase 2.
+- Cheats da spec 008:
+  - Progressão: **Brain Power rápido** (×2 a ×10, sem pular nível), **congelar a hora do dia** e **pular 1 hora**
+    (os dois de hora são por valor, sem desvio).
+  - Itens: **analisador infinito** (cargas), **quantidade ao arrastar** (uso único por tecla) e **coleta
+    multiplicada** (mundo, loot de criatura e criação, ×2 a ×10; baú e item solto pelo dono não; é uma tentativa,
+    depende da pesquisa).
+- **Fora da fase:** god mode por desvio (o "não morrer" da Fase 5 funciona; volta se o dono pedir), multiplicador de
+  defesa (saiu na spec 007) e velocidade do tempo ajustável (o dono escolheu congelar e pular hora).
 
 **Pronto quando:** o Brain Power rápido funciona no jogo.
 **Você faz:** testar os cheats no jogo.
