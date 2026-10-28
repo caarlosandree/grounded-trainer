@@ -18,8 +18,8 @@ O dono quer, na Fase 6 (conversa de 2026-10-27):
 4. **Quantidade ao arrastar**: o dono escolhe N e "arma"; o **próximo** item arrastado fica com N unidades (uso
    único por tecla).
 5. **Coleta multiplicada** (não existe no FLiNG): ao **coletar no mundo**, ao pegar **loot de criaturas** e no
-   **resultado de criação**, o item vem ×N (×2 a ×10). **Tirar do baú e pegar de volta um item que o dono soltou não
-   multiplicam.**
+   **resultado de criação**, o item vem ×N (×2 a ×10). **Tirar do baú não multiplica** (pegar de volta um item solto multiplica, decisão de
+   2026-10-28).
 
 O que é novo no motor é o **desvio com code cave**: código nosso dentro do jogo, que muda um cálculo em vez de trocar
 um valor. Brain Power, analisador, arrastar e coleta precisam disso. Os dois de hora não precisam: a pesquisa achou
@@ -75,7 +75,7 @@ Valem os das specs anteriores. Além deles:
   aponta para ela).
 - **Brain Power pular um nível** (decisão do dono, 6.6.1).
 - Quantidade ao arrastar mudar mais de um item por arme, ou mudar item sem o dono ter armado.
-- Coleta multiplicada multiplicar o que sai de baú, outra transferência ou um item que o dono soltou e pegou de volta.
+- Coleta multiplicada multiplicar o que sai de baú ou outra transferência.
 - Pular hora "devolver" tempo.
 
 ## 5. Onde cada coisa mora
@@ -308,19 +308,9 @@ Funções com unwind encadeado (`UNW_FLAG_CHAININFO`) não contam como começo d
 - Sem desfazer: o item extra fica no inventário depois de desligar.
 - **Saída**: se a pesquisa não conseguir separar as três fontes do baú, ou um caminho exigir desvio de duas
   instruções, o cheat sai da spec (as outras partes seguem) e volta para o dono com o que foi achado.
-- **Item solto pelo próprio dono e pego de volta não multiplica** (decisão do dono): só multiplica o que nasce no
-  mundo (recursos, loot) ou sai da criação. Se a pesquisa não conseguir separar esse caso de "pegar do chão", vale a
-  saída acima.
-
-### 6.8 Os cheats de hora (por valor, sem desvio)
-
-Os dois usam a raiz `game_state` (o `add` nela já existe desde a 006; o `set`, desde a 007). O salto até o calendário é um campo de **outra classe dona**
-(`/Script/Maine.SurvivalGameState.CalendarComponent`, subclasse de `InGameGameState`): o `[[field]]` declara a classe
-dona do campo e o trainer confere que o `GameState` vivo é dessa classe (ou subclasse) antes de seguir; o objeto
-seguinte é conferido como `/Script/Maine.CalendarComponent`. O formato no TOML fica com o plano.
-
-#### 6.8.1 PROGRESSÃO — `congelar-hora` ("Congelar hora do dia")
-
+- **Pegar do chão multiplica, inclusive item solto pelo próprio dono** (decisão do dono em 2026-10-28, depois da
+  pesquisa: o jogo usa o mesmo caminho para item solto e para loot caído, e o chamador não os separa). Antes a decisão
+  era não multiplicar item solto; ela foi trocada. Baú e transferências continuam fora.
 - `set` de `GameToRealTimeRatio` (`float`) para `0`, sem valor ajustável; ao desligar, volta o original (regra `set`
   da 006, manutenção de ~10 Hz da 007).
 - Risco: **dormir** com a hora congelada. Se o jogo mexer no campo ao dormir, a regra `set` aprende o valor como
@@ -426,7 +416,7 @@ Com backup do save feito pelo dono e o FLiNG fechado:
 4. **Arrastar**: armar com 250 e arrastar um item: a pilha fica com 250 e o registro diz `aplicada`; o próximo
    arrasto não muda nada. Armar e apertar de novo desarma. Anotar o efeito de 999 num item de pilha menor e depois de salvar e carregar.
 5. **Coleta**: com ×3, pegar do chão, colher, pegar loot de uma criatura e criar um item: cada um vem ×3. Tirar do
-   baú: vem ×1. Soltar um item e pegar de volta: vem ×1.
+   baú: vem ×1. Soltar um item e pegar de volta: vem ×3 (decisão do dono).
 6. **Congelar hora**: o relógio para; desligado, volta. Tentar dormir com a hora congelada e anotar.
 7. **Pular hora**: cada toque avança 1 hora, com e sem a hora congelada; segurar avança no máximo uma vez por
    segundo.
@@ -457,7 +447,7 @@ Com o item 2, a **Fase 6 fecha**.
 | Hora: congelar e pular 1 hora por tecla | Dono |
 | Arrastar: uso único por tecla, 10 a 999 | Dono |
 | Coleta: mundo, loot e criação, ×2 a ×10; baú não; dentro da 008 | Dono |
-| Item solto pelo dono e pego de volta não multiplica | Dono |
+| Item solto pelo dono e pego de volta multiplica (pegar do chão é um caminho só no jogo; trocado em 2026-10-28) | Dono |
 | God mode por desvio fora | IA |
 | Hora por valor (`CalendarComponent`), congelar por `GameToRealTimeRatio = 0` | IA (spike) |
 | Desvio de uma instrução de 5+ bytes; pontos próprios (Brain Power em `+5970ee7`, arrastar no começo da função) | IA |

@@ -769,6 +769,26 @@ Build `c935e799-0b27c000`, partida carregada, dono ausente. Só leitura, mais um
 
 Para a próxima sessão no jogo: observar `+5c3f5a0` (pegar do chão), `+5941669` (`AddItem`, todas as fontes), `+5960590` (juntar pilhas) e `+5619580`/`+59611b9` (transferir de) enquanto o dono arrasta, junta e transfere; o arraste slot→slot não passa pela troca de slots do inventário.
 
+### Sessão no jogo de 2026-10-28 (Tarefa 10): coleta e arrastar
+
+Build `c935e799-0b27c000`, partida carregada, dono jogando, FLiNG fechado. `gt-patch observe`; tudo devolvido no fim de
+cada observação (`gt caves`: nada nosso).
+
+| Observação | Ações do dono | Resultado |
+|---|---|---|
+| `AddItem` em `+5941669`, `rcx` | pegar do chão, colher, loot, soltar e pegar (sem bancada nem baú por perto) | 9 passagens, todas de dois chamadores de Blueprint: `+5615fa6` (5) e `+5616cf1` (3, o thunk `execAddItem`); `rcx` sempre `InventoryComponent` |
+| `+5615f30` (função nativa que cria o item e chama o `AddItem` pela interface; 10 chamadores diretos), `rcx` | soltar e pegar de volta; colher; matar uma criatura e pegar o item no chão | 6 passagens: `+58b8b35` (nativo, 2: soltar+pegar e o item da criatura pego no chão) e `+5618680` (retorno do thunk `execServerAddItem`, 4: colheita e o loot que entra direto) |
+| Juntar pilhas (`+5960590`, implementação do `InventoryComponent`), `r8` | arrastar para slot vazio; juntar duas pilhas do mesmo item; trocar dois itens diferentes | 1 passagem (o juntar), pelo thunk `execServerMergeItemStacks` (`+5618e9a`); `r8` = `Item`. Arrastar para slot vazio e trocar não passam por ali |
+
+- **Coleta:** pegar do chão é um caminho só (`+58b8b35` → `+5615f30`), seja item solto pelo dono ou loot caído; o
+  chamador não separa os dois. Colheita e loot direto vêm pelo `ServerAddItem` (Blueprint) → `+5615f30`. A
+  `+5615f30` é o ponto comum das três fontes vistas (começa com `mov [rsp+8],rbx`, 5 bytes, começo pela `.pdata`;
+  padrão único `48 89 5c 24 08 48 89 6c 24 10 48 89 74 24 18 57 48 83 ec 30 48 8b f2 41 0f b6 f8 48 8b 15 26 8c 14 05 48 8b d9 e8 46 ef e9 fb`).
+  Ainda não observados: criar na bancada e tirar do baú.
+- **Arrastar:** mover para slot vazio e trocar passam pelo RPC `ServerSwapItemSlots` do controller, cujas implementações
+  (controller `+5c37240` → stubs de envio `+5616a00`/`+5616a60`; inventário `+5960fc0`) não têm ponto desviável na
+  entrada. Juntar pilhas tem (`+5960590`).
+
 ## Hipóteses descartadas
 
 - (2026-10-25) "Os patches em `+57BD6D0`/`+5BBFE8C` indicam que as opções de cargas e arrastar item estavam
