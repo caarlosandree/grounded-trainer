@@ -20,8 +20,8 @@ use anyhow::{Context, Result, anyhow};
 use gt_core::mem::test_support::{ImageSegment, PROT_R, PROT_RW, PROT_RX, map_image, write_local};
 use gt_ue::UeLayout;
 use iced_x86::code_asm::{
-    CodeAssembler, dword_ptr, eax, edx, esi, ptr, qword_ptr, r11, r14, rax, rbp, rbx, rcx, rdx,
-    rsi, rsp, xmm1,
+    CodeAssembler, dword_ptr, eax, edx, esi, ptr, qword_ptr, r8d, r11, r14, rax, rbp, rbx, rcx,
+    rdi, rdx, rsi, rsp, xmm1,
 };
 use iced_x86::{Code, Instruction, MemoryOperand, Register};
 
@@ -53,7 +53,7 @@ pub const RUNTIME_FUNCTION_LEN: u32 = 12;
 pub const UNWIND_RVA: u32 = 0x900;
 /// Funções que entram na `.pdata`, em ordem de RVA: cada uma vai do símbolo ao próximo (a última,
 /// `spin`, tem 2 bytes). `mark_dirty` e `get_table` são os auxiliares de `level_gain`.
-pub const PDATA_FUNCTIONS: [&str; 8] = [
+pub const PDATA_FUNCTIONS: [&str; 13] = [
     "sum",
     "mark_dirty",
     "get_table",
@@ -61,6 +61,11 @@ pub const PDATA_FUNCTIONS: [&str; 8] = [
     "getter",
     "stack_plus",
     "add_item",
+    "add_item_impl",
+    "owner_of",
+    "net_of",
+    "iface_add",
+    "add_item_rbx",
     "spin",
 ];
 /// Marca de data do cabeçalho (fixa, para o arquivo ser reproduzível).
@@ -94,6 +99,18 @@ pub const INVENTORY_TOTAL: i32 = 0x40;
 pub const INVENTORY_COUNT: i32 = 0x44;
 /// `MaxPowerCapacity` (`i32`) do analisador.
 pub const ANALYZER_MAX_POWER: i32 = 0x980;
+/// Último sinalizador (`r8d`) recebido por `iface_add` (`i32`), no inventário.
+pub const INVENTORY_FLAG: i32 = 0x48;
+/// Ponteiro da vtable da interface do inventário (`lea rcx,[rbx+0xe0]` de `add_item_impl`, o
+/// byte fixo do padrão da coleta).
+pub const INVENTORY_IFACE: i32 = 0xE0;
+/// Entrada do `AddItem` na vtable da interface (`call [rax+0x50]`).
+pub const IFACE_ADD_ITEM: i32 = 0x50;
+/// Byte e máscara que `add_item_impl` testa no objeto de `net_of` (`test byte [rax+0xd4],0x80`):
+/// com o bit ligado ela vai direto pela interface, como o `ServerAddItem` nativo do jogo.
+pub const NET_FLAG_AT: i32 = 0xD4;
+/// Valor de `rbx` que `add_item_rbx` põe antes de chamar `add_item_impl` e devolve depois.
+pub const RBX_MAGIC: u64 = 0x5A5A_1234_C0DE_0001;
 
 // Posições dos objetos dentro da `.data` (deslocamentos a partir do RVA da `.data`).
 const OBJ_RESEARCH: u32 = 0x0000;
@@ -101,6 +118,8 @@ const OBJ_TABLE: u32 = 0x0600;
 const OBJ_ENTRIES: u32 = 0x0800;
 const OBJ_INVENTORY_A: u32 = 0x0C00;
 const OBJ_INVENTORY_B: u32 = 0x0D00;
+const OBJ_IFACE_VTABLE: u32 = 0x0E00;
+const OBJ_NET: u32 = 0x0F00;
 const OBJ_ANALYZER: u32 = 0x1000;
 const OBJ_ITEM_A: u32 = 0x1A00;
 const OBJ_ITEM_B: u32 = 0x1D00;
@@ -162,6 +181,8 @@ pub fn build() -> Result<Image> {
         ("level_entries", OBJ_ENTRIES),
         ("inventory_a", OBJ_INVENTORY_A),
         ("inventory_b", OBJ_INVENTORY_B),
+        ("iface_vtable", OBJ_IFACE_VTABLE),
+        ("net_obj", OBJ_NET),
         ("analyzer_obj", OBJ_ANALYZER),
         ("item_a", OBJ_ITEM_A),
         ("item_b", OBJ_ITEM_B),
@@ -309,6 +330,12 @@ fn assemble_text() -> Result<(Vec<u8>, Symbols)> {
     let mut stack_plus_null = a.create_label();
     let mut stack_plus_out = a.create_label();
     let mut add_item = a.create_label();
+    let mut add_item_impl = a.create_label();
+    let mut owner_of = a.create_label();
+    let mut net_of = a.create_label();
+    let mut iface_add = a.create_label();
+    let mut iface_add_out = a.create_label();
+    let mut add_item_rbx = a.create_label();
     let mut spin = a.create_label();
     let mut leaf = a.create_label();
     let mut cc_long = a.create_label();
@@ -456,6 +483,118 @@ fn assemble_text() -> Result<(Vec<u8>, Symbols)> {
     a.ret().map_err(asm_err)?;
     a.int3().map_err(asm_err)?;
 
+    // add_item_impl(inv, item, flag) -> i32: a forma do `ServerAddItem` nativo do jogo
+    // (`+5615f30`, RESEARCH.md), byte a byte até o fim do padrão da coleta: prólogo com
+    // `mov [rsp+8],rbx` (o ponto do desvio), `rsi` = item, `edi` = sinalizador, `rbx` = inventário,
+    // duas chamadas (`owner_of`, `net_of`), o teste do bit e a chamada pela interface do
+    // inventário (`[inv+0xe0]`, entrada `0x50`: `iface_add`). Devolve o total do inventário.
+    let net_obj = u64::from(DATA_RVA + OBJ_NET);
+    a.set_label(&mut add_item_impl).map_err(asm_err)?;
+    a.db(&[
+        0x48, 0x89, 0x5c, 0x24, 0x08, // mov [rsp+8],rbx
+        0x48, 0x89, 0x6c, 0x24, 0x10, // mov [rsp+10h],rbp
+        0x48, 0x89, 0x74, 0x24, 0x18, // mov [rsp+18h],rsi
+        0x57, // push rdi
+        0x48, 0x83, 0xec, 0x30, // sub rsp,30h
+        0x48, 0x8b, 0xf2, // mov rsi,rdx
+        0x41, 0x0f, 0xb6, 0xf8, // movzx edi,r8b
+    ])
+    .map_err(asm_err)?;
+    // `mov rdx,[rip+net_obj]` (48 8b 15 disp32): um global qualquer, como no jogo.
+    a.add_instruction(
+        Instruction::with2(
+            Code::Mov_r64_rm64,
+            Register::RDX,
+            MemoryOperand::with_base_displ(Register::RIP, net_obj as i64),
+        )
+        .map_err(asm_err)?,
+    )
+    .map_err(asm_err)?;
+    a.db(&[0x48, 0x8b, 0xd9]).map_err(asm_err)?; // mov rbx,rcx
+    a.call(owner_of).map_err(asm_err)?;
+    a.db(&[0x48, 0x8b, 0xc8, 0x48, 0x8b, 0xe8])
+        .map_err(asm_err)?; // mov rcx,rax; mov rbp,rax
+    a.call(net_of).map_err(asm_err)?;
+    a.db(&[
+        0xf6, 0x80, 0xd4, 0x00, 0x00, 0x00, 0x80, // test byte [rax+0d4h],80h
+        0x75, 0x24, // jne +0x24 (a chamada pela interface)
+        0x48, 0x8b, 0x0b, // mov rcx,[rbx]
+        0x4c, 0x8d, 0x44, 0x24, 0x20, // lea r8,[rsp+20h]
+        0x48, 0x8b, 0xd5, // mov rdx,rbp
+        0x48, 0x89, 0x74, 0x24, 0x20, // mov [rsp+20h],rsi
+        0x40, 0x88, 0x7c, 0x24, 0x28, // mov [rsp+28h],dil
+        0x4c, 0x8b, 0x89, 0x60, 0x02, 0x00, 0x00, // mov r9,[rcx+260h]
+        0x48, 0x8b, 0xcb, // mov rcx,rbx
+        0x41, 0xff, 0xd1, // call r9 (o caminho do RPC: nunca tomado aqui)
+        0xeb, 0x14, // jmp +0x14 (o epílogo)
+        0x48, 0x8d, 0x8b, 0xe0, 0x00, 0x00, 0x00, // lea rcx,[rbx+0e0h]
+        0x44, 0x0f, 0xb6, 0xc7, // movzx r8d,dil
+        0x48, 0x8b, 0x01, // mov rax,[rcx]
+        0x48, 0x8b, 0xd6, // mov rdx,rsi
+        0xff, 0x50, 0x50, // call [rax+50h]
+    ])
+    .map_err(asm_err)?;
+    // Fim do padrão. O epílogo devolve o total e os registradores salvos no prólogo.
+    a.mov(eax, dword_ptr(rbx + INVENTORY_TOTAL))
+        .map_err(asm_err)?;
+    a.mov(rbx, qword_ptr(rsp + 0x40)).map_err(asm_err)?;
+    a.mov(rbp, qword_ptr(rsp + 0x48)).map_err(asm_err)?;
+    a.mov(rsi, qword_ptr(rsp + 0x50)).map_err(asm_err)?;
+    a.add(rsp, 0x30).map_err(asm_err)?;
+    a.pop(rdi).map_err(asm_err)?;
+    a.ret().map_err(asm_err)?;
+    a.int3().map_err(asm_err)?;
+
+    // owner_of(inv, global) -> o próprio inventário.
+    a.set_label(&mut owner_of).map_err(asm_err)?;
+    a.mov(rax, rcx).map_err(asm_err)?;
+    a.ret().map_err(asm_err)?;
+    a.int3().map_err(asm_err)?;
+
+    // net_of(obj) -> `net_obj`, com o bit `0x80` em `+0xd4` (posto por `initial_data`).
+    a.set_label(&mut net_of).map_err(asm_err)?;
+    a.add_instruction(
+        Instruction::with2(
+            Code::Lea_r64_m,
+            Register::RAX,
+            MemoryOperand::with_base_displ(Register::RIP, net_obj as i64),
+        )
+        .map_err(asm_err)?,
+    )
+    .map_err(asm_err)?;
+    a.ret().map_err(asm_err)?;
+    a.int3().map_err(asm_err)?;
+
+    // iface_add(iface, item, flag): o `AddItem` da interface (`rcx` = inventário + 0xe0). Como o
+    // nativo do jogo, começa com `test rdx,rdx` (item nulo não entra). Soma o `StackSize` ao
+    // total, conta a chamada e guarda o sinalizador.
+    a.set_label(&mut iface_add).map_err(asm_err)?;
+    a.test(rdx, rdx).map_err(asm_err)?;
+    a.jz(iface_add_out).map_err(asm_err)?;
+    a.mov(eax, dword_ptr(rdx + ITEM_STACK)).map_err(asm_err)?;
+    a.add(dword_ptr(rcx + (INVENTORY_TOTAL - INVENTORY_IFACE)), eax)
+        .map_err(asm_err)?;
+    a.inc(dword_ptr(rcx + (INVENTORY_COUNT - INVENTORY_IFACE)))
+        .map_err(asm_err)?;
+    a.mov(dword_ptr(rcx + (INVENTORY_FLAG - INVENTORY_IFACE)), r8d)
+        .map_err(asm_err)?;
+    a.set_label(&mut iface_add_out).map_err(asm_err)?;
+    a.ret().map_err(asm_err)?;
+    a.int3().map_err(asm_err)?;
+
+    // add_item_rbx(inv, item, flag) -> rbx depois de `add_item_impl`, que recebe `rbx` =
+    // `RBX_MAGIC`: confere que o `rbx` salvo em `[rsp+8]` na entrada volta inteiro.
+    a.set_label(&mut add_item_rbx).map_err(asm_err)?;
+    a.push(rbx).map_err(asm_err)?;
+    a.sub(rsp, 0x20).map_err(asm_err)?;
+    a.mov(rbx, RBX_MAGIC).map_err(asm_err)?;
+    a.call(add_item_impl).map_err(asm_err)?;
+    a.mov(rax, rbx).map_err(asm_err)?;
+    a.add(rsp, 0x20).map_err(asm_err)?;
+    a.pop(rbx).map_err(asm_err)?;
+    a.ret().map_err(asm_err)?;
+    a.int3().map_err(asm_err)?;
+
     // spin(): laço de 2 bytes (`jmp $`), para uma thread ficar parada num endereço conhecido.
     a.set_label(&mut spin).map_err(asm_err)?;
     a.jmp(spin).map_err(asm_err)?;
@@ -502,6 +641,11 @@ fn assemble_text() -> Result<(Vec<u8>, Symbols)> {
         ("getter", rva(&getter)?),
         ("stack_plus", rva(&stack_plus)?),
         ("add_item", rva(&add_item)?),
+        ("add_item_impl", rva(&add_item_impl)?),
+        ("owner_of", rva(&owner_of)?),
+        ("net_of", rva(&net_of)?),
+        ("iface_add", rva(&iface_add)?),
+        ("add_item_rbx", rva(&add_item_rbx)?),
         ("spin", rva(&spin)?),
         ("leaf", rva(&leaf)?),
         ("cc300", rva(&cc_long)?),
@@ -516,9 +660,29 @@ fn assemble_text() -> Result<(Vec<u8>, Symbols)> {
 
 /// Escritas iniciais da `.data` (endereços absolutos), que dependem da base: a tabela de níveis
 /// e os objetos de teste.
-pub fn initial_data(base: u64) -> Vec<(u64, Vec<u8>)> {
+///
+/// `symbols` são os da imagem (RVAs): a vtable da interface do inventário aponta para `iface_add`.
+pub fn initial_data(base: u64, symbols: &[(&'static str, u32)]) -> Result<Vec<(u64, Vec<u8>)>> {
     let at = |off: u32| base + u64::from(DATA_RVA + off);
     let mut writes = Vec::new();
+    // Inventários: a interface (`+0xe0`) aponta para a vtable sintética, cuja entrada `0x50` é
+    // `iface_add`; o objeto de `net_of` tem o bit que manda `add_item_impl` pela interface.
+    let iface_add = symbols
+        .iter()
+        .find(|(n, _)| *n == "iface_add")
+        .map(|(_, r)| base + u64::from(*r))
+        .ok_or_else(|| anyhow!("símbolo iface_add ausente"))?;
+    writes.push((
+        at(OBJ_IFACE_VTABLE) + IFACE_ADD_ITEM as u64,
+        iface_add.to_le_bytes().to_vec(),
+    ));
+    for inv in [OBJ_INVENTORY_A, OBJ_INVENTORY_B] {
+        writes.push((
+            at(inv) + INVENTORY_IFACE as u64,
+            at(OBJ_IFACE_VTABLE).to_le_bytes().to_vec(),
+        ));
+    }
+    writes.push((at(OBJ_NET) + NET_FLAG_AT as u64, vec![0x80]));
     // Objeto da tabela: ponteiro para as entradas e a contagem.
     writes.push((
         at(OBJ_TABLE) + TABLE_START as u64,
@@ -563,7 +727,7 @@ pub fn initial_data(base: u64) -> Vec<(u64, Vec<u8>)> {
     ] {
         writes.push((class_at(obj), at(cls).to_le_bytes().to_vec()));
     }
-    writes
+    Ok(writes)
 }
 
 /// O módulo instalado no processo atual.
@@ -607,7 +771,7 @@ pub fn install(dir: &Path) -> Result<Installed> {
         },
     ];
     let base = map_image(&path, IMAGE_SIZE as usize, PREFERRED_BASE, &segments)?;
-    for (addr, bytes) in initial_data(base) {
+    for (addr, bytes) in initial_data(base, &image.symbols)? {
         write_local(addr, &bytes)?;
     }
     let mut symbols: Vec<(String, u64)> = image
@@ -632,6 +796,21 @@ mod tests {
 
     /// Padrão estendido do Brain Power (spec 008, 6.6.1), do jogo.
     const BRAIN_POWER_PATTERN: &str = "8b b1 ?? ?? 00 00 4d 89 73 ?? 89 75 ?? 8d 04 16 48 8b 51 ?? 89 81 ?? ?? 00 00 e8 ?? ?? ?? ?? e8 ?? ?? ?? ?? 4c 8b b0 ?? ?? 00 00 48 63 80 ?? ?? 00 00 48 8d 0c 40 48 c1 e1 04 49 03 ce 4c 3b f1 0f 84 ?? ?? ?? ?? 0f 1f 80 00 00 00 00 41 8b 46 ?? 3b f0 7d ?? 3b 83 ?? ?? 00 00";
+
+    /// Padrão da coleta (spec 008, 6.7.4), do jogo.
+    const COLLECT_PATTERN: &str = "48 89 5c 24 08 48 89 6c 24 10 48 89 74 24 18 57 48 83 ec 30 48 8b f2 41 0f b6 f8 48 8b 15 ?? ?? ?? ?? 48 8b d9 e8 ?? ?? ?? ?? 48 8b c8 48 8b e8 e8 ?? ?? ?? ?? f6 80 ?? ?? ?? ?? ?? 75 ?? 48 8b 0b 4c 8d 44 24 20 48 8b d5 48 89 74 24 20 40 88 7c 24 28 4c 8b 89 ?? ?? ?? ?? 48 8b cb 41 ff d1 eb ?? 48 8d 8b e0 00 00 00 44 0f b6 c7 48 8b 01 48 8b d6 ff 50 50";
+
+    #[test]
+    fn add_item_impl_matches_the_game_pattern_once() {
+        let image = build().unwrap();
+        let pattern = Pattern::parse(COLLECT_PATTERN).unwrap();
+        let hits = find_all(text_of(&image), &pattern);
+        assert_eq!(hits.len(), 1, "o padrão da coleta casa uma vez");
+        assert_eq!(
+            hits[0] as u32,
+            image.rva("add_item_impl").unwrap() - TEXT_RVA
+        );
+    }
 
     fn text_of(image: &Image) -> &[u8] {
         &image.text
@@ -669,6 +848,7 @@ mod tests {
             ("sum", &[0x48u8, 0x89, 0x5c, 0x24, 0x08][..]),
             ("stack_plus", &[0x48, 0x89, 0x5c, 0x24, 0x08][..]),
             ("add_item", &[0x48, 0x89, 0x5c, 0x24, 0x08][..]),
+            ("add_item_impl", &[0x48, 0x89, 0x5c, 0x24, 0x08][..]),
             ("getter", &[0xf3, 0x0f, 0x10, 0x89][..]),
         ] {
             let at = (image.rva(name).unwrap() - TEXT_RVA) as usize;

@@ -21,8 +21,8 @@ use gt_grounded2::caves::{self, CaveCtx, var};
 use gt_grounded2::policy::{var_region, write_policy};
 use gt_grounded2::signatures::CaveBody;
 use gt_testkit::module::{
-    ANALYZER_CHARGES, ANALYZER_MAX_POWER, ITEM_STACK, RESEARCH_LEVEL, RESEARCH_POINTS, TABLE_COUNT,
-    TABLE_LIMIT, TABLE_STRIDE,
+    ANALYZER_CHARGES, ANALYZER_MAX_POWER, INVENTORY_COUNT, INVENTORY_FLAG, INVENTORY_TOTAL,
+    ITEM_STACK, RBX_MAGIC, RESEARCH_LEVEL, RESEARCH_POINTS, TABLE_COUNT, TABLE_LIMIT, TABLE_STRIDE,
 };
 use gt_testkit::{TargetOpts, TestTarget};
 use gt_ue::UeLayout;
@@ -598,6 +598,176 @@ fn observe_counts_and_rings_without_side_effects() {
 }
 
 // ---------------------------------------------------------------------------
+// Coleta multiplicada (spec 008, 6.7.4)
+// ---------------------------------------------------------------------------
+
+/// Rig com a cave da coleta em `add_item_impl` (a forma do `ServerAddItem` nativo): N = `n`, o
+/// inventário do jogador = `inventory_a` e a classe `Item`.
+fn collect_rig(n: i32) -> Rig {
+    let mut r = rig();
+    let at = r.t.symbol("add_item_impl");
+    let inv = r.t.symbol("inventory_a");
+    let class = r.t.symbol("class_item");
+    r.set_var(var::COLLECT_N, &n.to_le_bytes());
+    r.set_var(var::COLLECT_INVENTORY, &inv.to_le_bytes());
+    r.set_var(var::ITEM_CLASS, &class.to_le_bytes());
+    r.install(at, 5, vec![], |ctx| {
+        caves::build(CaveBody::Collect, ctx).unwrap()
+    });
+    r
+}
+
+impl Rig {
+    fn stack(&self, item: &str) -> i32 {
+        self.i32_at(self.t.symbol(item) + ITEM_STACK as u64)
+    }
+
+    fn set_stack(&self, item: &str, v: i32) {
+        self.poke(self.t.symbol(item) + ITEM_STACK as u64, &v.to_le_bytes());
+    }
+
+    fn inv_i32(&self, inv: &str, off: i32) -> i32 {
+        self.i32_at(self.t.symbol(inv) + off as u64)
+    }
+
+    /// `add_item_impl(inv, item, flag)` pelos símbolos; `item` vazio é o ponteiro nulo.
+    fn add(&mut self, inv: &str, item: &str, flag: u64) -> i32 {
+        let inv = self.t.symbol(inv);
+        let item = if item.is_empty() {
+            0
+        } else {
+            self.t.symbol(item)
+        };
+        self.t.call("add_item_impl", &[inv, item, flag]) as i32
+    }
+}
+
+#[test]
+fn collect_multiplies_only_player_inventory() {
+    let mut r = collect_rig(3);
+    // `Item`: pilha de 1 vira 3 antes de entrar; o inventário recebe 3 e o sinalizador.
+    assert_eq!(r.add("inventory_a", "item_a", 1), 3);
+    assert_eq!(r.stack("item_a"), 3);
+    assert_eq!(r.inv_i32("inventory_a", INVENTORY_FLAG), 1);
+    // Subclasse de `Item`: 5 vira 15; o sinalizador 0 também passa (`r8b` preservado).
+    assert_eq!(r.add("inventory_a", "item_b", 0x100), 18);
+    assert_eq!(r.stack("item_b"), 15);
+    assert_eq!(r.inv_i32("inventory_a", INVENTORY_FLAG), 0);
+    assert_eq!(r.inv_i32("inventory_a", INVENTORY_COUNT), 2);
+    // Trocar N é só a variável: ×10.
+    r.set_var(var::COLLECT_N, &10i32.to_le_bytes());
+    r.set_stack("item_a", 2);
+    assert_eq!(r.add("inventory_a", "item_a", 1), 38);
+    assert_eq!(r.stack("item_a"), 20);
+    r.finish();
+}
+
+#[test]
+fn collect_other_inventory_untouched() {
+    let mut r = collect_rig(5);
+    // Outro inventário (baú, montaria, outro jogador): o item entra como veio.
+    assert_eq!(r.add("inventory_b", "item_a", 1), 1);
+    assert_eq!(r.stack("item_a"), 1);
+    assert_eq!(r.inv_i32("inventory_b", INVENTORY_TOTAL), 1);
+    // O do jogador segue multiplicando.
+    assert_eq!(r.add("inventory_a", "item_a", 1), 5);
+    r.finish();
+}
+
+#[test]
+fn collect_zero_n_or_null_inventory_noop() {
+    let mut r = collect_rig(0);
+    // N = 0: passa direto.
+    assert_eq!(r.add("inventory_a", "item_a", 1), 1);
+    assert_eq!(r.stack("item_a"), 1);
+    // N negativo: idem.
+    r.set_var(var::COLLECT_N, &(-3i32).to_le_bytes());
+    assert_eq!(r.add("inventory_a", "item_a", 1), 2);
+    assert_eq!(r.stack("item_a"), 1);
+    // N > 0 com o inventário do jogador nulo (sem personagem): passa direto.
+    r.set_var(var::COLLECT_N, &4i32.to_le_bytes());
+    r.set_var(var::COLLECT_INVENTORY, &0u64.to_le_bytes());
+    assert_eq!(r.add("inventory_a", "item_a", 1), 3);
+    assert_eq!(r.stack("item_a"), 1);
+    // Variáveis todas zeradas (depois de sair): passa direto.
+    r.set_var(var::COLLECT_N, &0i32.to_le_bytes());
+    r.set_var(var::ITEM_CLASS, &0u64.to_le_bytes());
+    assert_eq!(r.add("inventory_a", "item_b", 1), 8);
+    assert_eq!(r.stack("item_b"), 5);
+    r.finish();
+}
+
+#[test]
+fn collect_wrong_class_or_null_item_untouched() {
+    let mut r = collect_rig(3);
+    // Objeto de outra classe: não é multiplicado (o "StackSize" dele fica).
+    let other = r.t.symbol("other_obj") + ITEM_STACK as u64;
+    r.poke(other, &7i32.to_le_bytes());
+    assert_eq!(r.add("inventory_a", "other_obj", 1), 7);
+    assert_eq!(r.i32_at(other), 7);
+    // Item nulo: a cave não desreferencia; o jogo recusa sozinho.
+    assert_eq!(r.add("inventory_a", "", 1), 7);
+    assert_eq!(r.inv_i32("inventory_a", INVENTORY_COUNT), 1);
+    // Classe `Item` não configurada (variável 0): não multiplica.
+    r.set_var(var::ITEM_CLASS, &0u64.to_le_bytes());
+    assert_eq!(r.add("inventory_a", "item_a", 1), 8);
+    assert_eq!(r.stack("item_a"), 1);
+    // Pilha 0 ou negativa: não mexe.
+    r.set_var(var::ITEM_CLASS, &r.t.symbol("class_item").to_le_bytes());
+    r.set_stack("item_a", 0);
+    r.add("inventory_a", "item_a", 1);
+    assert_eq!(r.stack("item_a"), 0);
+    r.set_stack("item_a", -4);
+    r.add("inventory_a", "item_a", 1);
+    assert_eq!(r.stack("item_a"), -4);
+    r.finish();
+}
+
+#[test]
+fn collect_caps_at_i32_max() {
+    let mut r = collect_rig(10);
+    // 0x2000_0000 × 10 passa do i32: fica no maior i32 (multiplicação em 64 bits).
+    r.set_stack("item_a", 0x2000_0000);
+    r.add("inventory_a", "item_a", 1);
+    assert_eq!(r.stack("item_a"), INT32_MAX);
+    // Já no máximo: continua no máximo.
+    r.add("inventory_a", "item_a", 1);
+    assert_eq!(r.stack("item_a"), INT32_MAX);
+    // N grande também: i32::MAX × i32::MAX cabe em 64 bits e é limitado.
+    r.set_var(var::COLLECT_N, &INT32_MAX.to_le_bytes());
+    r.set_stack("item_a", INT32_MAX);
+    r.add("inventory_a", "item_a", 1);
+    assert_eq!(r.stack("item_a"), INT32_MAX);
+    // Logo abaixo do limite: exato.
+    r.set_var(var::COLLECT_N, &2i32.to_le_bytes());
+    r.set_stack("item_a", INT32_MAX / 2);
+    r.add("inventory_a", "item_a", 1);
+    assert_eq!(r.stack("item_a"), INT32_MAX - 1);
+    r.finish();
+}
+
+#[test]
+fn collect_original_runs_with_entry_rsp() {
+    // `add_item_rbx` chama `add_item_impl` com `rbx` = `RBX_MAGIC` e devolve o `rbx` de depois: o
+    // `mov [rsp+8],rbx` original tem de ir para o `[rsp+8]` da entrada, de onde o epílogo o relê.
+    let mut r = collect_rig(3);
+    let (inv, item) = (r.t.symbol("inventory_a"), r.t.symbol("item_a"));
+    for n in [3i32, 0] {
+        r.set_var(var::COLLECT_N, &n.to_le_bytes());
+        for _ in 0..3 {
+            assert_eq!(
+                r.t.call("add_item_rbx", &[inv, item, 1]),
+                RBX_MAGIC,
+                "N = {n}"
+            );
+        }
+    }
+    // E as outras chamadas seguem funcionando (registradores e pilha do alvo intactos).
+    assert_eq!(r.t.call("sum", &[40, 2]) as i32, 42);
+    r.finish();
+}
+
+// ---------------------------------------------------------------------------
 // Conferência estática de todos os corpos
 // ---------------------------------------------------------------------------
 
@@ -644,6 +814,7 @@ fn all_bodies_pass_check() {
     for (name, body, hook, n, caps) in [
         ("brain", CaveBody::Brain, "level_point", 7, captures.clone()),
         ("analyzer", CaveBody::Analyzer, "getter", 8, vec![]),
+        ("collect", CaveBody::Collect, "add_item_impl", 5, vec![]),
     ] {
         let at = r.t.symbol(hook);
         let ctx = r.ctx(at, n, cave_at, caps);
@@ -696,12 +867,16 @@ fn all_bodies_pass_check() {
             code.len()
         );
     }
-    // Registrador inválido para a observação e corpo da coleta (Tarefa 12): erro.
+    // Registrador inválido para a observação: erro.
     let at = r.t.symbol("sum");
     let ctx = r.ctx(at, 5, cave_at, vec![]);
     assert!(caves::build_observe(&ctx, Register::EAX).is_err());
     assert!(caves::build_observe(&ctx, Register::RIP).is_err());
-    assert!(caves::build(CaveBody::Collect, &ctx).is_err());
+    // Coleta sem `StackSize` na reflexão: erro.
+    let mut ctx = r.ctx(r.t.symbol("add_item_impl"), 5, cave_at, vec![]);
+    ctx.fields.remove("StackSize");
+    let err = caves::build(CaveBody::Collect, &ctx).unwrap_err();
+    assert!(err.to_string().contains("StackSize"), "{err}");
     // Campo da reflexão faltando: erro.
     let mut ctx = r.ctx(r.t.symbol("getter"), 8, cave_at, vec![]);
     ctx.fields.remove("MaxPowerCapacity");

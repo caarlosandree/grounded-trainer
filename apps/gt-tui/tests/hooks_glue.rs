@@ -1,7 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //! `HookCheats` (spec 008, 6.11) contra o módulo sintético: o motor de verdade escreve as caves e
 //! os desvios no `gt-testtarget --module`; a reflexão vem de uma cena sintética local. Cobre a
-//! cola da TUI com o `HookRuntime` (disponibilidade, ligar, trocar valor e desligar).
+//! cola da TUI com o `HookRuntime` (disponibilidade, ligar, trocar valor e desligar), no Brain
+//! Power e na coleta.
 //! Antes: `cargo build --workspace`.
 
 use std::sync::Arc;
@@ -24,6 +25,7 @@ const ARENA_LEN: usize = 64 << 20;
 const MAINE: &str = "/Script/Maine";
 const BRAIN: &str = "brain-power";
 const ANALYZER: &str = "analisador-infinito";
+const COLLECT: &str = "coleta-multiplicada";
 const MAX_POWER: u32 = 0x980;
 const INVENTORY_OFF: u32 = 0x48;
 
@@ -89,6 +91,7 @@ fn refl() -> (SparseMem, ReflectionIndex) {
 fn hit_entry(rig: &SynthRig, def: &HookDef) -> HookEntry {
     let start = match def.id.as_str() {
         BRAIN => rig.t.symbol("level_pattern"),
+        COLLECT => rig.t.symbol("add_item_impl"),
         _ => rig.t.symbol("getter"),
     };
     let mut captures = vec![0u8; def.pattern.len()];
@@ -192,4 +195,83 @@ fn resolve_enable_set_value_and_disable() {
     let engine_ids: Vec<String> = engine.active().iter().map(|s| s.id.clone()).collect();
     assert!(!engine_ids.iter().any(|i| i == "brain-power-hook"));
     assert!(engine_ids.iter().any(|i| i == "brain-power-cave"));
+}
+
+/// A coleta pela cola da TUI: disponível com a reflexão, liga, troca o valor só na variável,
+/// pede o personagem enquanto ligada e, ao desligar, devolve só o desvio (a cave fica).
+#[test]
+fn collect_enable_set_value_and_disable() {
+    let rig = SynthRig::new();
+    let mut engine = rig.engine();
+    let (mem, index) = refl();
+    let (module, mem_headers) = rig.target.module(MODULE_NAME).unwrap();
+    let disk = Arc::new(rig.target.open_disk(module, &mem_headers).unwrap());
+    let sigs = Signatures::embedded().unwrap();
+    let ue = sigs.ue_for_version("0000-0000").unwrap();
+    let globals = Globals {
+        sigs: ue,
+        gobjects: 1,
+        names: 2,
+        verified: true,
+    };
+    let entries: Vec<HookEntry> = sigs
+        .hooks()
+        .iter()
+        .filter(|d| d.id == COLLECT)
+        .map(|d| hit_entry(&rig, d))
+        .collect();
+    assert_eq!(entries.len(), 1, "a coleta está nas assinaturas");
+    let mut hooks = HookCheats::new(module.clone(), rig.target.maps.clone(), Ok(disk), entries);
+    hooks.resolve(&mem, Some(&engine), &index, &globals);
+    let ready = ReflectionGate::Ready { verified: true };
+    assert_eq!(
+        avail_of(&hooks, &ready, COLLECT),
+        Avail::Available { verified: true }
+    );
+    assert!(!hooks.wants_pawn());
+
+    // Ligar (k = 0: ×2): cave e desvio no motor, e a TUI passa a pedir o personagem.
+    assert!(matches!(
+        hooks.enable(&mut engine, COLLECT, 0),
+        OpOutcome::Done(_)
+    ));
+    assert!(hooks.is_hooked(COLLECT));
+    assert!(hooks.wants_pawn());
+    let ids = |engine: &gt_core::engine::Engine| -> Vec<String> {
+        engine.active().iter().map(|s| s.id.clone()).collect()
+    };
+    let before = ids(&engine);
+    assert!(before.iter().any(|i| i == "coleta-multiplicada-hook"));
+    assert!(before.iter().any(|i| i == "coleta-multiplicada-cave"));
+    assert!(
+        before
+            .iter()
+            .filter_map(|i| hooks.row_of_engine_id(i))
+            .all(|row| row == COLLECT)
+    );
+
+    // Trocar o valor (k = 2: ×5) não mexe no código nem nas entradas do motor.
+    assert!(matches!(
+        hooks.set_value(&mut engine, COLLECT, 2),
+        OpOutcome::Done(_)
+    ));
+    assert_eq!(ids(&engine), before);
+    let n_at = rig.var_region().start + gt_grounded2::caves::var::COLLECT_N;
+    let mut n = [0u8; 4];
+    MemReader::new(rig.t.pid).read_exact(n_at, &mut n).unwrap();
+    assert_eq!(i32::from_le_bytes(n), 5);
+
+    // A manutenção sem personagem não tem o que dizer.
+    assert!(hooks.tick(&mem, &mut engine, None).is_empty());
+
+    // Desligar devolve só o desvio; a cave fica até sair.
+    assert!(matches!(
+        hooks.disable(&mut engine, COLLECT),
+        OpOutcome::Done(_)
+    ));
+    assert!(!hooks.is_hooked(COLLECT));
+    assert!(!hooks.wants_pawn());
+    let after = ids(&engine);
+    assert!(!after.iter().any(|i| i == "coleta-multiplicada-hook"));
+    assert!(after.iter().any(|i| i == "coleta-multiplicada-cave"));
 }

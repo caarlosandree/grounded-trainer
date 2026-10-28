@@ -503,7 +503,7 @@ impl HookRuntime {
                     field_off(refl, mem, class, FIELD_STACK_SIZE)?,
                 );
                 class_vars.push((var::ITEM_CLASS, class));
-                if def.body == CaveBody::Collect && self.inventory_off.is_none() {
+                if self.inventory_off.is_none() {
                     let name = self.env.player.inventory_field.as_deref();
                     return Err(format!(
                         "campo {} não encontrado",

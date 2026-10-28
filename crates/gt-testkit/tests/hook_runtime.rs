@@ -15,7 +15,7 @@ use gt_grounded2::catalog::HookHit;
 use gt_grounded2::caves::var;
 use gt_grounded2::hooks::{HookAvail, HookEnv, HookEvent, HookRuntime, PawnView};
 use gt_grounded2::signatures::{HookDef, Signatures};
-use gt_testkit::module::{ITEM_STACK, RESEARCH_POINTS};
+use gt_testkit::module::{INVENTORY_TOTAL, ITEM_STACK, RESEARCH_POINTS};
 use gt_testkit::rig::{MODULE_NAME, SynthRig};
 use gt_ue::synth::{SparseMem, SynthField, SynthUe};
 use gt_ue::{Names, ObjectArray, ReflectionIndex, ScanBudget, UeLayout};
@@ -25,6 +25,7 @@ const ARENA_LEN: usize = 64 << 20;
 const MAINE: &str = "/Script/Maine";
 const BRAIN: &str = "brain-power";
 const ANALYZER: &str = "analisador-infinito";
+const COLLECT: &str = "coleta-multiplicada";
 
 /// `PartyComponent.ResearchPoints` no módulo sintético e os outros campos da cena.
 const MAX_POWER: u32 = 0x980;
@@ -227,6 +228,7 @@ impl Scene {
         let def = self.def(id);
         let start = match id {
             BRAIN => self.rig.t.symbol("level_pattern"),
+            COLLECT => self.rig.t.symbol("add_item_impl"),
             _ => self.rig.t.symbol("getter"),
         };
         HookHit {
@@ -237,7 +239,7 @@ impl Scene {
     }
 
     fn hits(&self) -> Vec<HookHit> {
-        [BRAIN, ANALYZER].map(|id| self.hit(id)).to_vec()
+        [BRAIN, ANALYZER, COLLECT].map(|id| self.hit(id)).to_vec()
     }
 
     fn resolve(&mut self) -> HashMap<String, HookAvail> {
@@ -302,14 +304,14 @@ impl Scene {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn resolve_makes_the_two_hooks_available() {
+fn resolve_makes_the_three_hooks_available() {
     let mut s = scene();
     let got = s.resolve();
-    assert_eq!(got.len(), 2);
-    for id in [BRAIN, ANALYZER] {
+    assert_eq!(got.len(), 3);
+    for id in [BRAIN, ANALYZER, COLLECT] {
         assert_eq!(got[id], HookAvail::Available, "{id}");
     }
-    // O inventário do personagem vem da reflexão, sem hook de coleta.
+    // O inventário do personagem vem da reflexão.
     assert_eq!(s.rt.inventory_offset(), Some(INVENTORY_OFF));
     // Nada foi escrito só por resolver.
     assert!(s.engine.active().is_empty());
@@ -352,6 +354,30 @@ fn unavailable_reasons() {
         HookAvail::Unavailable("campo MaxPowerCapacity não encontrado".into())
     );
     assert_eq!(got[BRAIN], HookAvail::Available);
+    assert_eq!(got[COLLECT], HookAvail::Available);
+
+    // Sem `StackSize` na reflexão: só a coleta fica indisponível.
+    let mut no_stack = scene_with(Opts {
+        refl: refl(RESEARCH_POINTS as u32, &["StackSize"]),
+        ..default_opts()
+    });
+    let got = no_stack.resolve();
+    assert_eq!(
+        got[COLLECT],
+        HookAvail::Unavailable("campo StackSize não encontrado".into())
+    );
+    assert_eq!(got[BRAIN], HookAvail::Available);
+    assert_eq!(got[ANALYZER], HookAvail::Available);
+
+    // Sem o campo do inventário no personagem: a coleta não tem como saber qual é o do jogador.
+    let mut no_inv = scene_with(Opts {
+        refl: refl(RESEARCH_POINTS as u32, &["InventoryComponent"]),
+        ..default_opts()
+    });
+    assert_eq!(
+        no_inv.resolve()[COLLECT],
+        HookAvail::Unavailable("campo InventoryComponent não encontrado".into())
+    );
 
     // Sem sequência de CC livre.
     let mut no_runs = scene_with(Opts {
@@ -414,8 +440,8 @@ fn unavailable_without_room_for_vars_cuts_by_cheat_with_dependencies() {
             "{id}"
         );
     }
-    // 100 bytes: o Brain Power (24) e o analisador (56) cabem (a coleta, com a classe `Item`
-    // até 144, não cabe: `var_need` em `hooks.rs`).
+    // 100 bytes: o Brain Power (24) e o analisador (56) cabem; a coleta, com a classe `Item`
+    // até 144, não.
     let mut small = scene_with(Opts {
         var_len: Some(100),
         ..default_opts()
@@ -423,6 +449,16 @@ fn unavailable_without_room_for_vars_cuts_by_cheat_with_dependencies() {
     let got = small.resolve();
     assert_eq!(got[BRAIN], HookAvail::Available);
     assert_eq!(got[ANALYZER], HookAvail::Available);
+    assert_eq!(
+        got[COLLECT],
+        HookAvail::Unavailable("sem espaço para variáveis".into())
+    );
+    // 144 bytes: a coleta cabe.
+    let mut exact = scene_with(Opts {
+        var_len: Some(144),
+        ..default_opts()
+    });
+    assert_eq!(exact.resolve()[COLLECT], HookAvail::Available);
     // 20 bytes: nem o Brain Power.
     let mut tiny = scene_with(Opts {
         var_len: Some(16),
@@ -439,7 +475,7 @@ fn unavailable_without_room_for_vars_cuts_by_cheat_with_dependencies() {
 fn caves_of_the_hooks_fit_together_without_overlap() {
     let mut s = scene();
     s.resolve();
-    for id in [BRAIN, ANALYZER] {
+    for id in [BRAIN, ANALYZER, COLLECT] {
         s.rt.enable(&mut s.engine, id, None).unwrap();
     }
     let mut spans: Vec<(u64, u64)> = s
@@ -450,7 +486,7 @@ fn caves_of_the_hooks_fit_together_without_overlap() {
         .map(|p| (p.addr, p.addr + p.replacement.len() as u64))
         .collect();
     spans.sort();
-    assert_eq!(spans.len(), 2);
+    assert_eq!(spans.len(), 3);
     assert!(spans.windows(2).all(|w| w[0].1 <= w[1].0), "{spans:x?}");
 }
 
@@ -866,6 +902,85 @@ fn collect_inventory_cleared_on_pawn_loss() {
     s.tick(Some(0x10));
     assert_eq!(s.var_u64(var::COLLECT_INVENTORY), 0);
     // A saída zera tudo.
+    s.engine.undo_all().unwrap();
+    let region = s.rig.var_region();
+    let slack = s.bytes(region.start, (region.end - region.start) as usize);
+    assert!(slack.iter().all(|b| *b == 0));
+}
+
+impl Scene {
+    /// `add_item_impl(inv, item, 1)` no alvo; devolve o total do inventário.
+    fn add_item(&mut self, inv: u64, item: u64) -> i32 {
+        self.rig.t.call("add_item_impl", &[inv, item, 1]) as i32
+    }
+
+    fn stack(&self, item: u64) -> i32 {
+        i32::from_le_bytes(self.bytes(item + ITEM_STACK as u64, 4).try_into().unwrap())
+    }
+}
+
+#[test]
+fn collect_enable_uses_player_inventory() {
+    let mut s = scene();
+    s.resolve();
+    // Ligar escreve a classe `Item` da reflexão (136) e o N da grade (k = 1: ×3) antes do lote.
+    s.rt.enable(&mut s.engine, COLLECT, Some(1)).unwrap();
+    assert!(s.rt.is_hooked(COLLECT));
+    assert_eq!(
+        s.engine_ids(),
+        [
+            "coleta-multiplicada-cave".to_string(),
+            "coleta-multiplicada-hook".to_string()
+        ]
+    );
+    let item_class = s.refl.index.find_class(MAINE, "Item").unwrap();
+    assert_eq!(s.var_u64(var::ITEM_CLASS), item_class);
+    assert_eq!(s.var_i32(var::COLLECT_N), 3);
+    // A lista de retornos (72..136) não é usada.
+    assert!(
+        s.bytes(s.var_at(var::COLLECT_RETURNS), 64)
+            .iter()
+            .all(|b| *b == 0)
+    );
+
+    // A cena da reflexão é local; no alvo, o personagem aponta para o `inventory_a` dele e a
+    // classe é a `class_item` do módulo sintético.
+    let (inv_a, inv_b) = (s.rig.t.symbol("inventory_a"), s.rig.t.symbol("inventory_b"));
+    let item = s.rig.t.symbol("item_a");
+    let pawn = s.refl.pawn_a;
+    s.refl
+        .mem
+        .write(pawn + u64::from(INVENTORY_OFF), &inv_a.to_le_bytes());
+    s.poke(
+        s.var_at(var::ITEM_CLASS),
+        &s.rig.t.symbol("class_item").to_le_bytes(),
+    );
+    // Sem personagem no ciclo: o inventário é 0 e nada multiplica.
+    s.tick(None);
+    assert_eq!(s.add_item(inv_a, item), 1);
+    // Com o personagem: o inventário dele multiplica (1 × 3), o outro não.
+    s.tick(Some(pawn));
+    assert_eq!(s.var_u64(var::COLLECT_INVENTORY), inv_a);
+    assert_eq!(s.add_item(inv_a, item), 4);
+    assert_eq!(s.stack(item), 3);
+    assert_eq!(s.add_item(inv_b, item), 3);
+    assert_eq!(s.stack(item), 3);
+    // Trocar o valor é só a variável (k = 3: ×10).
+    s.rt.set_value(&mut s.engine, COLLECT, 3).unwrap();
+    assert_eq!(s.var_i32(var::COLLECT_N), 10);
+    assert_eq!(s.add_item(inv_a, item), 34);
+    // Desligar devolve o desvio; a cave fica e o item extra também (sem desfazer).
+    s.rt.disable(&mut s.engine, COLLECT).unwrap();
+    assert_eq!(s.engine_ids(), ["coleta-multiplicada-cave".to_string()]);
+    assert_eq!(s.add_item(inv_a, item), 64);
+    assert_eq!(s.stack(item), 30);
+    let total = i32::from_le_bytes(
+        s.bytes(inv_a + INVENTORY_TOTAL as u64, 4)
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(total, 64);
+    // A saída zera as variáveis.
     s.engine.undo_all().unwrap();
     let region = s.rig.var_region();
     let slack = s.bytes(region.start, (region.end - region.start) as usize);

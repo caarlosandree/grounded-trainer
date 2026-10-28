@@ -4763,7 +4763,10 @@ label = "+1h"
         let sigs = Signatures::embedded().unwrap();
         let hooks = sigs.hooks();
         let ids: Vec<&str> = hooks.iter().map(|h| h.id.as_str()).collect();
-        assert_eq!(ids, vec!["brain-power", "analisador-infinito"]);
+        assert_eq!(
+            ids,
+            vec!["brain-power", "analisador-infinito", "coleta-multiplicada"]
+        );
         // Os hooks não entram na lista de patches.
         assert!(sigs.ids().iter().all(|id| !ids.contains(id)));
 
@@ -4780,6 +4783,15 @@ label = "+1h"
         assert_eq!(analyzer.body, CaveBody::Analyzer);
         assert_eq!(analyzer.offset, 0);
         assert!(analyzer.value.is_none());
+
+        // Coleta: começo da função (offset 0), classe `Item`, grade 2/3/5/10 (padrão 2).
+        let collect = &hooks[2];
+        assert_eq!(collect.body, CaveBody::Collect);
+        assert_eq!((collect.offset, collect.pattern.len()), (0, 118));
+        assert_eq!(collect.object_class.as_deref(), Some("/Script/Maine.Item"));
+        let grid = collect.value.as_ref().unwrap();
+        assert_eq!(grid.points.as_deref(), Some(&[2.0, 3.0, 5.0, 10.0][..]));
+        assert_eq!(grid.format(grid.default_k), "2x");
 
         // Todos com módulo do jogo e a instrução do desvio com 5+ bytes (conferido na carga).
         for h in hooks {

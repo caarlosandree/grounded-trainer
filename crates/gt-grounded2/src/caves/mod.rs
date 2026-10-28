@@ -1,4 +1,4 @@
-//! Corpos das code caves (spec 008, 6.6.1, 6.7.1 e 6.7.3), montados com `iced-x86`.
+//! Corpos das code caves (spec 008, 6.6.1, 6.7.1, 6.7.3 e 6.7.4), montados com `iced-x86`.
 //!
 //! Toda cave tem a mesma forma:
 //!
@@ -15,6 +15,7 @@
 
 mod analyzer;
 mod brain;
+mod collect;
 mod observe;
 
 use std::collections::HashMap;
@@ -52,7 +53,8 @@ pub mod var {
     pub const COLLECT_N: u64 = 56;
     /// Coleta: inventário do jogador (`u64`).
     pub const COLLECT_INVENTORY: u64 = 64;
-    /// Coleta: 8 endereços de retorno permitidos (`u64` cada).
+    /// Coleta: 8 endereços de retorno permitidos (`u64` cada). Reservados, sem uso: o ponto da
+    /// coleta (`ServerAddItem` nativo) já separa as fontes (spec 6.7.4).
     pub const COLLECT_RETURNS: u64 = 72;
     /// Coleta: ponteiro da classe `Item` (`u64`).
     pub const ITEM_CLASS: u64 = 136;
@@ -122,9 +124,7 @@ pub fn build(body: CaveBody, ctx: &CaveCtx) -> Result<Vec<u8>> {
     match body {
         CaveBody::Brain => brain::build(ctx),
         CaveBody::Analyzer => analyzer::build(ctx),
-        CaveBody::Collect => Err(build_err(
-            "o corpo da coleta ainda não existe (depende da pesquisa no jogo)",
-        )),
+        CaveBody::Collect => collect::build(ctx),
     }
 }
 
@@ -335,7 +335,7 @@ mod game_tests {
             captures,
             fields: HashMap::from([
                 (FIELD_RESEARCH_POINTS, 0x514),
-                (FIELD_STACK_SIZE, 0x2b8),
+                (FIELD_STACK_SIZE, 0x198),
                 (FIELD_MAX_POWER_CAPACITY, 0x980),
             ]),
             layout: UeLayout::observed(),
@@ -347,8 +347,9 @@ mod game_tests {
         let occ = hex(OCC);
         let brain = ctx(0x5970ee7, "4c 8b b0 18 01 00 00", occ);
         let analyzer = ctx(0x57bd6d0, "f3 0f 10 89 74 09 00 00", vec![]);
+        let collect = ctx(0x5615f30, "48 89 5c 24 08", vec![]);
         // Ponto qualquer com uma instrução de 5 bytes, para a cave de observação.
-        let observe = ctx(0x5bbfe70, "48 89 5c 24 08", vec![]);
+        let observe = ctx(0x5615f30, "48 89 5c 24 08", vec![]);
         vec![
             (
                 "brain",
@@ -361,6 +362,11 @@ mod game_tests {
                 build(CaveBody::Analyzer, &analyzer).unwrap(),
             ),
             (
+                "collect",
+                collect.clone(),
+                build(CaveBody::Collect, &collect).unwrap(),
+            ),
+            (
                 "observe rcx",
                 observe.clone(),
                 build_observe(&observe, Register::RCX).unwrap(),
@@ -371,11 +377,8 @@ mod game_tests {
     #[test]
     fn game_bodies_fit_the_cc_run() {
         let total: usize = game_bodies().iter().map(|(_, _, c)| c.len()).sum();
-        // Os três juntos, mais a coleta estimada em 150 bytes, cabem na sequência de 1871.
-        assert!(
-            total + 150 + cave::CAVE_MARGIN <= RUN.1 as usize,
-            "{total} bytes"
-        );
+        // Todos juntos cabem na sequência de 1871.
+        assert!(total + cave::CAVE_MARGIN <= RUN.1 as usize, "{total} bytes");
         // A instrução original sai igual (nenhuma é relativa ao RIP) e o tamanho não depende do
         // endereço da cave.
         for (name, c, code) in game_bodies() {
@@ -388,6 +391,7 @@ mod game_tests {
             } else {
                 let body = match name {
                     "brain" => CaveBody::Brain,
+                    "collect" => CaveBody::Collect,
                     _ => CaveBody::Analyzer,
                 };
                 build(body, &moved).unwrap()

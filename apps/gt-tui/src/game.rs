@@ -904,16 +904,13 @@ mod tests {
                 captures: Vec::new(),
             };
         }
-        // A coleta ainda não está nas assinaturas: o `pawn` vem do corpo da cave.
-        let mut collect = hooks[0].clone();
-        collect.def.id = "coleta-multiplicada".to_string();
-        collect.def.body = CaveBody::Collect;
-        hooks.push(collect);
+        // O `pawn` vem do corpo da cave (só a coleta), com o valor da grade.
         let infos = hook_infos(&hooks, &Avail::Checking);
         let find = |id: &str| infos.iter().find(|i| i.id == id).unwrap();
         assert!(!find("brain-power").action && find("brain-power").value.is_some());
         assert!(find("brain-power").value.as_ref().unwrap().steps() > 0);
         assert!(find("coleta-multiplicada").pawn);
+        assert!(find("coleta-multiplicada").value.is_some());
         assert!(infos.iter().filter(|i| i.pawn).count() == 1);
         assert!(infos.iter().all(|i| i.hook));
     }

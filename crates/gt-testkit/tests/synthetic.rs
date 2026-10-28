@@ -144,6 +144,21 @@ fn synthetic_functions_compute() {
     assert_eq!(t.call("add_item", &[inv, t.symbol("item_b")]) as i32, 5);
     assert_eq!(t.call("add_item", &[inv, t.symbol("item_b")]) as i32, 10);
     assert_eq!(read_i32(&t, inv + 0x44), 2);
+    // add_item_impl: a forma do `ServerAddItem` do jogo, pela interface do inventário; item nulo
+    // não entra; `rbx` volta inteiro.
+    let inv_b = t.symbol("inventory_b");
+    assert_eq!(
+        t.call("add_item_impl", &[inv_b, t.symbol("item_b"), 0x101]) as i32,
+        5
+    );
+    assert_eq!(read_i32(&t, inv_b + 0x48), 1, "sinalizador em r8b");
+    assert_eq!(t.call("add_item_impl", &[inv_b, 0, 0]) as i32, 5);
+    assert_eq!(read_i32(&t, inv_b + 0x44), 1);
+    assert_eq!(
+        t.call("add_item_rbx", &[inv_b, t.symbol("item_a"), 1]),
+        gt_testkit::module::RBX_MAGIC
+    );
+    assert_eq!(read_i32(&t, inv_b + 0x40), 6);
     // Por endereço também.
     let sum = t.symbol("sum");
     assert_eq!(t.call_addr(sum, &[1, 1]) as i32, 2);
