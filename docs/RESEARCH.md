@@ -754,6 +754,21 @@ e a separação das fontes da coleta continuam em aberto.
 - **Analisador, o que falta:** observar `+57bd6d0` com `rcx` (chamadores e classes) e comparar as cargas com
   `MaxPowerCapacity` num analisador cheio e num gasto.
 
+### Pesquisa só de leitura com o jogo parado (2026-10-28)
+
+Build `c935e799-0b27c000`, partida carregada, dono ausente. Só leitura, mais uma observação de 15 s autorizada pelo dono.
+
+| O quê | Resultado |
+|---|---|
+| Reflexão viva | `CalendarComponent.CurrentTime` `DoubleProperty` `+0x170`, `GameToRealTimeRatio` `FloatProperty` `+0x18c`, `SurvivalGameState.CalendarComponent` `+0x3c0` (subclasse de `InGameGameState`), `PartyComponent.ResearchPoints` `+0x514`, `Item.StackSize` `+0x198`, `ResourceAnalyzerBuilding.MaxPowerCapacity` `+0x980`, `InventoryComponent` `+0x1450` declarado em `SurvivalCharacter` (superclasse do personagem). `gt ue player` mostra `pular-hora` e `congelar-hora` com valores coerentes |
+| Padrões | Brain Power (`+5970ec3`), analisador (`+57bd6d0`) e `AddItem` (`+5941660`, ponto `+5941669`): únicos na memória |
+| **`observe` no jogo real** | Na entrada da função do relógio (`+58c89c0`, `rcx`): 806 passagens em 15 s (~55/s, uma por quadro), um chamador (`+37f93e5`), classe `CalendarComponent` lida de fora; tudo devolvido (`gt caves`: nada nosso). **A ferramenta funciona**, então o "0 passagens" do arrastar em `+5bbfe70` vale |
+| Arrastar: inventário | Implementações pela vtable do `InventoryComponent` (`+0x8fc9210`): troca de slots `+5960fc0` (`push rbx` de 2 bytes; chama `+5bbfe70` com `rcx` = item), troca entre inventários `+5960c50`, transferir para `+5961380`, transferir de `+59611b0`, juntar pilhas `+5960590` (`mov [rsp+0x10],rbp`, 5 bytes, começo pela `.pdata`). Os thunks `exec…` começam com `push rbx`, exceto o de transferir de (`+5619580`, 5 bytes) |
+| Arrastar: controller | `SurvivalPlayerController` (vtable `+0x9051a80`) tem `ServerSwapItemSlots` (implementação `+5c37240`: `test rdx,rdx; je; push rbx`, sem ponto desviável) e `ServerTransferItem` (implementação `+5c37400`, função folha sem `.pdata` cuja primeira instrução tem 3 bytes; a validação das duas é `+d53a50`, `mov al,1; ret`) |
+| Coleta: candidatos | `SurvivalPlayerController.TryPickupItem` (thunk `+568c2b0`) chama `+5c3f5a0` (`mov [rsp+0x20],rsi`, 5 bytes, começo pela `.pdata`). No personagem: `ServerAddItems` (`+5678320`) e `TryPickupItemRow` (`+5679700`, chama `+58727e0`) |
+
+Para a próxima sessão no jogo: observar `+5c3f5a0` (pegar do chão), `+5941669` (`AddItem`, todas as fontes), `+5960590` (juntar pilhas) e `+5619580`/`+59611b9` (transferir de) enquanto o dono arrasta, junta e transfere; o arraste slot→slot não passa pela troca de slots do inventário.
+
 ## Hipóteses descartadas
 
 - (2026-10-25) "Os patches em `+57BD6D0`/`+5BBFE8C` indicam que as opções de cargas e arrastar item estavam
