@@ -369,7 +369,7 @@ Com backup do save e o FLiNG fechado, usando o `gt-patch observe`:
   analisador cheio e um gasto. Registrar se cheio é `float(MaxPowerCapacity)`.
 - [ ] **Coleta:** observar `+5941660` com `rcx` e depois com `rdx`. O dono pega do chão, colhe, pega loot, cria na
   bancada, tira do baú, solta e pega de volta. Anotar, por ação, os retornos e as classes. Achar o campo do
-  inventário do personagem (`SurvivalPlayerCharacter.InventoryComponent`) e de onde vem a pilha máxima de um item.
+  inventário do personagem (`SurvivalPlayerCharacter.InventoryComponent`) e de onde vem a pilha máxima de um item (resolvido pela decisão do dono em 2026-10-28: sem limite de pilha).
   Critério: as três fontes separáveis de baú e de item solto por retornos (até 8) ou por pontos próprios.
 - [ ] Registrar tudo no `RESEARCH.md` (versão, data, endereços, padrões dos chamadores) e as hipóteses descartadas.
 - [ ] **Portão:** se a coleta não for separável, tirar a Tarefa 12 e o cheat da spec (nota na spec, seção 11) e

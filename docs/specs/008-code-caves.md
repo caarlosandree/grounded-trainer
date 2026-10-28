@@ -283,8 +283,8 @@ Funções com unwind encadeado (`UNW_FLAG_CHAININFO`) não contam como começo d
   `ProximityInventoryComponent` não contam), atualizado no ciclo de ~10 Hz e zerado quando o personagem some (morte,
   menu, outro mundo).
 - **Sem limite de pilha** (decisão do dono em 2026-10-28): entre os 36 campos do `Item` não há pilha máxima
-  (`RESEARCH.md`, 2026-10-28); ela deve vir da linha da tabela de dados (`ItemDataRowHandle`), que a cave não lê.
-  A pilha máxima, onde quer que esteja, fica fora do alcance da cave. O ×N vale para qualquer item, inclusive ferramentas e armas.
+  (`RESEARCH.md`, 2026-10-28); a pilha máxima não está entre eles e não se sabe onde fica; a cave não a lê.
+  Ela fica fora do alcance da cave. O ×N vale para qualquer item, inclusive ferramentas e armas.
   O teste no jogo (9) anota o que o jogo faz com uma pilha acima do máximo (divide, limita ou aceita, e se vai para o
   save); se for ruim, volta ao dono.
 - **Pegar do chão multiplica, inclusive item solto pelo próprio dono** (decisão do dono em 2026-10-28: o jogo usa o
