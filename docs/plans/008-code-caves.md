@@ -281,6 +281,8 @@ variável) com as ferramentas da Tarefa 4.
 
 ### Tarefa 8: Corpos das caves (observação, analisador, Brain Power, arrastar)
 
+> Nota (2026-10-28): o arrastar saiu da Fase 6; o corpo dele é removido na Tarefa 12b.
+
 **Spec:** 6.6.1, 6.7.1, 6.7.2, 6.7.3, 4 (falha de página, sem `call`).
 
 **Files:** Create `crates/gt-grounded2/src/caves/{mod,observe,analyzer,brain,drag}.rs`; teste em
@@ -400,20 +402,48 @@ Com backup do save e o FLiNG fechado, usando o `gt-patch observe`:
 - [ ] **Step 2:** rodar → falha. **Step 3:** implementar. **Step 4:** `cargo test -p gt-grounded2 hooks` → passa.
 - [ ] **Step 5:** commit `feat(grounded2): HookRuntime`.
 
-### Tarefa 12: Coleta multiplicada (só se a Tarefa 10 liberou)
+### Tarefa 12: Coleta multiplicada
 
-**Spec:** 6.7.4.
+**Spec:** 6.7.4 (mecanismo da pesquisa de 2026-10-28; sem limite de pilha, decisão do dono).
 
-**Files:** Create `crates/gt-grounded2/src/caves/collect.rs`; Modify `signatures/generic.toml`, `caves/mod.rs`.
+**Files:** Create `crates/gt-grounded2/src/caves/collect.rs`; Modify `caves/mod.rs` (corpo `Collect`, hoje erro),
+`signatures/generic.toml` (`[[hook]] coleta-multiplicada`), `crates/gt-testkit/src/module.rs` (função sintética com a
+forma de `+5615f30`), testes em `crates/gt-testkit/tests/cave_bodies.rs` e `hook_runtime.rs`.
 
-- [ ] **Step 1: testes** (módulo sintético, `add_item` com chamadores sintéticos): `collect_only_player_inventory`,
-  `collect_caps_at_max_stack`, `collect_max_stack_one_untouched`, `collect_zero_n_or_null_inventory_noop`,
-  `collect_other_caller_untouched` (baú e item solto).
+**Interfaces — Consumes:** `CaveCtx`, `class_walk` e o layout de variáveis da Tarefa 8 (N em `56`, inventário em
+`64`, classe `Item` em `136`); `HookRuntime` (Tarefa 11) já mantém o inventário do jogador na variável `64`.
+
+- Desvio na primeira instrução de `+5615f30` (`mov [rsp+8],rbx`); padrão com bytes suficientes para ser único (o
+  `RESEARCH.md` traz um padrão único de 42 bytes; trocar os `disp`/`rel32` por curinga e estender até ficar único).
+  `object_class = "/Script/Maine.Item"`, `points = [2,3,5,10]`, `default = 2`, `unit = "x"`, categoria ITENS, nome
+  "Coleta multiplicada". A lista de retornos (`72..136`) não é usada.
+- Cave: com N > 0, inventário da variável ≠ 0 e == `rcx`, `rdx` ≠ 0 e da classe `Item`: `StackSize` (offset da
+  reflexão) = `min(StackSize × N, i32::MAX)` (multiplicação em 64 bits); senão passa direto. Instrução original com o
+  `rsp` da entrada.
+
+- [ ] **Step 1: testes** (módulo sintético, função `add_item_impl(inv, item, flag)` com a forma de `+5615f30`):
+  `collect_multiplies_only_player_inventory`, `collect_other_inventory_untouched`, `collect_zero_n_or_null_inventory_noop`,
+  `collect_wrong_class_or_null_item_untouched`, `collect_caps_at_i32_max`, `collect_original_runs_with_entry_rsp`;
+  no runtime: `collect_enable_uses_player_inventory`, `collect_inventory_cleared_on_pawn_loss` (já existe; manter).
 - [ ] **Step 2:** rodar → falha.
-- [ ] **Step 3:** implementar com o mecanismo da Tarefa 10 (lista de retornos por padrão, ou um `[[hook]]` por
-  fonte) e o `[[hook]] coleta-multiplicada` (`points = [2,3,5,10]`).
-- [ ] **Step 4:** `cargo test --workspace` → passa.
+- [ ] **Step 3:** implementar (corpo, TOML, `generic.toml`).
+- [ ] **Step 4:** `cargo build --workspace && cargo test --workspace` → passa.
 - [ ] **Step 5:** commit `feat(grounded2): coleta multiplicada`.
+
+### Tarefa 12b: Remover o arrastar
+
+**Spec:** 6.7.2 (fora da Fase 6, decisão do dono em 2026-10-28).
+
+**Files:** `signatures/generic.toml` (tirar o `[[hook]] quantidade-arrastar`), `crates/gt-grounded2/src/caves/drag.rs`
+(remover) e `mod.rs` (`CaveBody::Drag`), `signatures.rs` (regra `action` só com `Drag` → `action` sai do `[[hook]]`),
+`hooks.rs` (arme, desarme, expiração, `ArmOutcome`, `HookEvent::Drag*`), a TUI (`hooks.rs`, `controller.rs`,
+`ui.rs`, `game.rs`, `fake.rs`, `model.rs`: linha de arme, `armado: N`, textos do arrastar), os testes do arrastar e
+as variáveis `24..40` do layout (ficam reservadas, sem uso; não renumerar as outras).
+
+- [ ] **Step 1:** remover, mantendo a linha `[ação]` do `pular-hora` e todos os outros testes verdes.
+- [ ] **Step 2:** `cargo build --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
+  `cargo test --workspace` → passa; `grep -rn "arrast\|Drag\b" crates apps` sem sobras de código.
+- [ ] **Step 3:** commit `refactor: remove a quantidade ao arrastar (fora da Fase 6)`.
 
 ### Tarefa 13: `add` de `double` e `pular-hora`
 

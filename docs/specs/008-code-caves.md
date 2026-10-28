@@ -1,4 +1,4 @@
-# Spec 008 — Code caves: Brain Power, hora do dia, analisador, arrastar e coleta
+# Spec 008 — Code caves: Brain Power, hora do dia, analisador e coleta
 
 | Campo | Valor |
 |---|---|
@@ -15,14 +15,13 @@ O dono quer, na Fase 6 (conversa de 2026-10-27):
    pronto da fase.
 2. **Hora do dia**: **congelar** o relógio e uma ação que **pula 1 hora** por tecla.
 3. **Cargas infinitas do analisador** de recursos.
-4. **Quantidade ao arrastar**: o dono escolhe N e "arma"; o **próximo** item arrastado fica com N unidades (uso
-   único por tecla).
+4. ~~Quantidade ao arrastar~~: saiu da Fase 6 (decisão do dono em 2026-10-28, 6.7.2).
 5. **Coleta multiplicada** (não existe no FLiNG): ao **coletar no mundo**, ao pegar **loot de criaturas** e no
    **resultado de criação**, o item vem ×N (×2 a ×10). **Tirar do baú não multiplica** (pegar de volta um item solto multiplica, decisão de
    2026-10-28).
 
 O que é novo no motor é o **desvio com code cave**: código nosso dentro do jogo, que muda um cálculo em vez de trocar
-um valor. Brain Power, analisador, arrastar e coleta precisam disso. Os dois de hora não precisam: a pesquisa achou
+um valor. Brain Power, analisador e coleta precisam disso. Os dois de hora não precisam: a pesquisa achou
 o relógio no `CalendarComponent` do `GameState`, e congelar ou pular uma hora são escritas de valor.
 
 O FLiNG serviu só para saber **onde** o jogo faz algumas dessas coisas (`AGENTS.md` 3). Os pontos de desvio, as
@@ -35,7 +34,7 @@ caves e o código são nossos.
    das threads, diário, restauração em toda saída, recuperação depois de SIGKILL).
 2. **Dois tipos novos de escrita** no motor (6.4): **cave** (bytes na `.text`, em preenchimento `CC`) e **variável**
    (folga gravável no fim da `.data`), com política e entradas de diário próprias.
-3. **Quatro cheats por desvio** (6.6 e 6.7): `brain-power`, `analisador-infinito`, `quantidade-arrastar` e
+3. **Três cheats por desvio** (6.6 e 6.7): `brain-power`, `analisador-infinito` e
    `coleta-multiplicada` (este como **tentativa**, 6.7.4).
 4. **Dois cheats de hora por valor** (6.8): `congelar-hora` (`set`) e `pular-hora` (`add` generalizado para
    `double`).
@@ -74,7 +73,6 @@ Valem os das specs anteriores. Além deles:
 - Cave com `call`: nenhuma cave chama função do jogo (o tempo dentro dela fica limitado e nenhum endereço de retorno
   aponta para ela).
 - **Brain Power pular um nível** (decisão do dono, 6.6.1).
-- Quantidade ao arrastar mudar mais de um item por arme, ou mudar item sem o dono ter armado.
 - Coleta multiplicada multiplicar o que sai de baú ou outra transferência.
 - Pular hora "devolver" tempo.
 
@@ -119,7 +117,7 @@ ao RIP) e `jmp` de volta para a instrução seguinte.
   precisa ter).
 - O ponto é achado por padrão AOB **único** (`AGENTS.md` 4); os bytes da instrução são conferidos (`expected`); os
   offsets que a cave usa saem de curingas do padrão ou da reflexão. Bytes diferentes: `indisponível (bytes diferentes)`.
-- Instrução original relativa ao `rsp` (o `mov [rsp+8],rbx` do arrastar): a cave a executa com o `rsp` igual ao da
+- Instrução original relativa ao `rsp` (o `mov [rsp+8],rbx` da coleta): a cave a executa com o `rsp` igual ao da
   entrada (desempilha antes, ou a executa antes de empilhar).
 - A cave **preserva** todos os registradores e flags que o código do jogo usa depois do ponto (quais são, por ponto,
   fica no plano, a partir da desmontagem). Não chama nada.
@@ -152,13 +150,13 @@ excluem as imagens de módulo e exigem guarda de objeto). Entram dois tipos novo
   `CC` intactos no começo dela (o fim de função antes). O diário guarda endereço e bytes escritos **antes** da
   escrita. Escrita por `/proc/<pid>/mem` (página de código).
 - **Alocador**: várias caves podem dividir a mesma sequência; duas caves nunca se sobrepõem. Uma sequência serve se
-  `tamanho ≥ cave + 16`. Tamanhos estimados: Brain Power ~150 bytes, analisador ~50, arrastar ~60, coleta ~150 (o
+  `tamanho ≥ cave + 16`. Tamanhos estimados: Brain Power ~150 bytes, analisador ~50, coleta ~150 (o
   plano mede). A sequência de 1871 bytes cabe tudo.
 - **Variável**: na folga entre o fim do `VirtualSize` da `.data` (arredondado para cima a 8) e o fim da última página
   dela, conferida no `maps`: `rw-` e dentro do intervalo do módulo (`base` até `base + SizeOfImage`). No jogo essa
   cauda é uma VMA **anônima** (`14a41d000-14a840000 rw-p`), separada da parte mapeada do arquivo; as duas formas são
   aceitas e lida como zeros no primeiro uso da sessão. Sem guarda de objeto. O diário guarda só a
-  **região** usada, não os valores. A variável muda sem diário (o trainer troca valor; a cave do arrastar zera a
+  **região** usada, não os valores. A variável muda sem diário (o trainer troca valor; a cave escreve nas
   marca).
 - **Orçamento** (folga de `0x130` = 304 bytes depois de alinhar a 8), tabela fixa, alinhada a 8:
 
@@ -173,7 +171,7 @@ excluem as imagens de módulo e exigem guarda de objeto). Entram dois tipos novo
   | Total | 280 |
 
   Uma folga menor que 280 bytes deixa indisponível o que não couber, **por cheat, com as dependências** (a
-  observação sai primeiro; o ponteiro da classe `Item` só sai junto com o arrastar e a coleta). Na folga real (304)
+  observação sai primeiro; o ponteiro da classe `Item` só sai junto com a coleta). Na folga real (304)
   cabe tudo.
 - **Leitura pelo trainer** de variáveis com mais de uma palavra (registro do Brain Power): contador de sequência lido
   antes e depois; só aceita se forem iguais **e pares** (a cave incrementa o contador antes e depois de gravar, então
@@ -227,7 +225,7 @@ código. Desligar não muda a variável; sair a zera.
 
 - Desvio em `+57bd6d0`, padrão `f3 0f 10 89 ?? ?? 00 00 f3 0f 58 ?? f3 0f 5c ?? ?? ?? ?? ?? f3 0f 2d ?? d1 f8 c3`
   (único). Antes da instrução original, se o `rcx` for da classe `ResourceAnalyzerBuilding` (conferida como o `Item`
-  no arrastar, com o ponteiro da classe numa variável), a cave grava `float(MaxPowerCapacity)` nas cargas quando
+  na coleta, com o ponteiro da classe numa variável), a cave grava `float(MaxPowerCapacity)` nas cargas quando
   `MaxPowerCapacity > 0`.
 - **Pesquisa antes do código** (com a cave de observação): os chamadores do getter e o `ClassPrivate` do `rcx` (só
   analisadores?), e os valores de cargas e `MaxPowerCapacity` lado a lado num analisador cheio e num gasto (cheio é
@@ -235,33 +233,12 @@ código. Desligar não muda a variável; sair a zera.
 - Sem valor, mas com a variável "ligado": 0 = passa direto. Ligar grava 1 antes de instalar o desvio. Desligar
   para de encher; as cargas ficam onde estão.
 
-#### 6.7.2 `quantidade-arrastar` ("Quantidade ao arrastar")
+#### 6.7.2 `quantidade-arrastar` — fora da Fase 6
 
-- Desvio em `+5bbfe70`. Uma **variável única**: `0` = desarmado, `N > 0` = armado com N. A cave, com `rcx` não
-  nulo e **da classe `Item` ou subclasse** (sobe `ClassPrivate` → `SuperStruct` até 16 níveis, sem `call`, comparando
-  com o ponteiro da classe `Item` que o trainer põe numa variável pela reflexão), pega a variável com `xchg` (lê e
-  zera numa operação, para duas threads nunca aplicarem duas vezes) e, se era `N > 0`, grava N em `Item.StackSize`.
-  Classe errada ou ponteiro da classe zerado: não faz nada. Ler `ClassPrivate` do `rcx` só é seguro se o `rcx` for
-  sempre um `UObject` válido ali: a pesquisa (6.7.3) confirma isso registrando o `rcx` de cada chamada, e o trainer
-  lê de fora o `ClassPrivate` deles; um `rcx` que não seja objeto tira o cheat da spec (volta ao dono).
-- Linha `[ação]` com a quantidade (10, 50, 100, 250, 500, 999; padrão 100). `espaço`/`Enter` **arma**: instala o
-  desvio se ainda não estiver instalado e grava N na variável.
-- O trainer acompanha a variável a ~10 Hz: quando ela volta a 0 sem ter sido o trainer, registra
-  `Quantidade ao arrastar: aplicada (250)`. Depois do `xchg` que achou `N > 0`, a cave incrementa o **contador de
-  aplicadas**.
-- **Apertar de novo com a variável armada desarma.** O trainer não tem operação atômica na memória do jogo (as
-  escritas são cópias simples), então: lê o contador, escreve 0 na variável, espera 50 ms e relê o contador. Se ele
-  subiu, o jogo aplicou antes (`aplicada`); senão, `desarmado`. A escrita do 0 nunca causa duas aplicações: só o
-  `xchg` da cave aplica. Para trocar N armado: desarmar, mudar, armar. Com o arrastar armado, `←→` mudam só o número mostrado, que
-  fica marcado como diferente do armado (`armado: 250`) até desarmar.
-- **Expira** em 60 s: armado e não usado, o trainer desarma do mesmo jeito e registra `expirou` (ou `aplicada`).
-- **Ciclo de vida** (ação com desvio, tipo novo): não conta como ligada no topo; não é religada depois de reconectar
-  (o desvio só volta no próximo arme); com motor `stuck` ou sem motor, armar é recusado como uma ação; o desvio sai
-  na saída, no `undo_all`, no `Drop` e na recuperação como os outros. A janela de 1 s das ações (spec 006) vale.
-- **Antes de implementar**, o plano confirma no jogo qual item chega em `rcx` e se a função roda só ao arrastar (com
-  uma cave de observação, 6.7.4). Se não for o item arrastado, procura outro ponto de uma instrução de 5+ bytes; se
-  não achar, o cheat sai da spec e volta para o dono.
-- Quantidade acima da pilha máxima do item é aceita (até 999); o teste anota o que o jogo faz.
+Removido por decisão do dono em 2026-10-28. A pesquisa no jogo mostrou que mover um item para um slot vazio e trocar
+dois itens passam pelo RPC `ServerSwapItemSlots` do controller, e nem as implementações dele nem as do inventário têm
+uma instrução de 5+ bytes num ponto aceito pela 6.7.3. Só juntar pilhas (`+5960590`) tem; o dono preferiu tirar o
+cheat. O `+5bbfe70` do FLiNG não roda no arraste (0 passagens). Detalhes em `RESEARCH.md`.
 
 #### 6.7.3 Cave de observação (ferramenta de pesquisa)
 
@@ -288,35 +265,33 @@ arrastar (6.7.2), o analisador (6.7.1) e a coleta (6.7.4).
 
 Funções com unwind encadeado (`UNW_FLAG_CHAININFO`) não contam como começo de função na regra 1.
 
-#### 6.7.4 `coleta-multiplicada` ("Coleta multiplicada") — tentativa
+#### 6.7.4 `coleta-multiplicada` ("Coleta multiplicada")
 
-- **Pesquisa no plano, antes do código do cheat**: com a cave de observação no `AddItem` nativo (`+5941660`) e, se
-  preciso, nas funções que criam itens, o dono faz cada ação no jogo (pegar do chão, colher, loot de criatura, criar
-  na bancada, **tirar do baú**, soltar e pegar de volta). O resultado (chamadores por ação) vai para o `RESEARCH.md`.
-- **Mecanismo** (escolhido pela pesquisa): multiplicar o `StackSize` do item antes de ele entrar no inventário, só
-  nos caminhos das três fontes. Pode ser um desvio por fonte (no ponto de cada uma) ou um desvio no `AddItem` que
-  confere o endereço de retorno contra uma lista de até 8 chamadores achados por padrão.
-- **Só o inventário do jogador**: o trainer põe numa variável o endereço do `InventoryComponent` do personagem (pelo
-  caminho do pawn e da reflexão, pelo campo `SurvivalPlayerCharacter.InventoryComponent`; o
-  `MountInventoryComponent` e o `ProximityInventoryComponent` do personagem não contam), atualizado no ciclo de ~10 Hz junto com os cheats de valor, e zera a
-  variável quando o personagem some (morte, menu, outro mundo). A cave só multiplica se o inventário de destino for
-  igual à variável não nula.
-- **Quanto**: `StackSize × N`, **limitado à pilha máxima do item**; item de pilha máxima 1 (ferramentas, armas) não
-  muda. De onde vem a pilha máxima é parte da pesquisa; sem achar, o cheat sai pela saída abaixo.
-- O item é conferido como `Item` como no arrastar.
-- Valor: ×2, ×3, ×5, ×10 (padrão ×2), mostrado como `2x`.
-- Sem desfazer: o item extra fica no inventário depois de desligar.
-- **Saída**: se a pesquisa não conseguir separar as três fontes do baú, ou um caminho exigir desvio de duas
-  instruções, o cheat sai da spec (as outras partes seguem) e volta para o dono com o que foi achado.
-- **Pegar do chão multiplica, inclusive item solto pelo próprio dono** (decisão do dono em 2026-10-28, depois da
-  pesquisa: o jogo usa o mesmo caminho para item solto e para loot caído, e o chamador não os separa). Antes a decisão
-  era não multiplicar item solto; ela foi trocada. Baú e transferências continuam fora.
-- `set` de `GameToRealTimeRatio` (`float`) para `0`, sem valor ajustável; ao desligar, volta o original (regra `set`
-  da 006, manutenção de ~10 Hz da 007).
-- Risco: **dormir** com a hora congelada. Se o jogo mexer no campo ao dormir, a regra `set` aprende o valor como
-  original novo e pode chegar a `o jogo não deixa`; se o sono travar, o teste anota e o dono decide. A TUI não muda.
+- **Pesquisa feita** (2026-10-28, `RESEARCH.md`): todo item que entra no inventário por pegar do chão (inclusive item
+  solto pelo dono), colher, loot e criar na bancada passa pela implementação nativa do `ServerAddItem`, em
+  `+5615f30` (`rcx` = `InventoryComponent`, `rdx` = o `Item` que vai entrar, `r8b` = sinalizador). Tirar do baú e pôr
+  no baú **não** passam por ela.
+- **Desvio** na primeira instrução (`mov [rsp+8],rbx`, 5 bytes, começo pela `.pdata`), padrão único
+  `48 89 5c 24 08 48 89 6c 24 10 48 89 74 24 18 57 48 83 ec 30 48 8b f2 41 0f b6 f8 48 8b 15 ?? ?? ?? ?? 48 8b d9 e8`
+  mais bytes até ficar único (o plano fixa).
+- **Cave**: com N > 0, a variável do inventário do jogador não nula e igual a `rcx`, `rdx` não nulo e da classe `Item`
+  (subida `ClassPrivate`/`SuperStruct` como no analisador, ponteiro da classe numa variável), faz
+  `StackSize = StackSize × N`, limitado ao maior `int32` (ver o limite abaixo). Depois executa a instrução original,
+  com o `rsp` da entrada.
+- **Só o inventário do jogador**: o trainer põe numa variável o endereço do `InventoryComponent` do personagem (campo
+  `InventoryComponent`, declarado em `SurvivalCharacter`; o `MountInventoryComponent` e o
+  `ProximityInventoryComponent` não contam), atualizado no ciclo de ~10 Hz e zerado quando o personagem some (morte,
+  menu, outro mundo).
+- **Sem limite de pilha** (decisão do dono em 2026-10-28): a pilha máxima de cada item fica na tabela de dados do jogo
+  (`Item.ItemDataRowHandle`), fora do alcance da cave. O ×N vale para qualquer item, inclusive ferramentas e armas.
+  O teste no jogo (9) anota o que o jogo faz com uma pilha acima do máximo (divide, limita ou aceita, e se vai para o
+  save); se for ruim, volta ao dono.
+- **Pegar do chão multiplica, inclusive item solto pelo próprio dono** (decisão do dono em 2026-10-28: o jogo usa o
+  mesmo caminho para os dois). Baú e transferências ficam fora.
+- Valor: ×2, ×3, ×5, ×10 (padrão ×2), mostrado como `2x`. Sem desfazer: o item extra fica no inventário depois de
+  desligar.
 
-#### 6.8.2 PROGRESSÃO — `pular-hora` ("Pular 1 hora")
+### 6.8.2 PROGRESSÃO — `pular-hora` ("Pular 1 hora")
 
 Generaliza o `add` da spec 006 (que hoje é só `int`):
 
@@ -352,7 +327,7 @@ Patches com `slot` e grades existentes não mudam. O `unit` continua sufixo (`5x
 
 - `brain-power`, `coleta-multiplicada` e `analisador-infinito` são linhas `[ON ]`/`[OFF]` como os patches; os dois
   primeiros com valor (regras da spec 003, 6.2).
-- `quantidade-arrastar` e `pular-hora` são linhas `[ação]`.
+- `pular-hora` é uma linha `[ação]`.
 - `congelar-hora` é um `set` como os da 007.
 - Os desvios ligados seguem as regras dos patches: religar depois de reconectar (mesma chave de versão), suspensão
   com motor `stuck`, saída pelo motor.
@@ -385,11 +360,11 @@ Patches com `slot` e grades existentes não mudam. O `unit` continua sufixo (`5x
 | Recusas: bytes do desvio diferentes, `CC` sobrescrito, folga não zero no primeiro uso, sem espaço | Não |
 | Cave do Brain Power contra tabela sintética (fora de ordem inclusive): multiplica; limita em `L2 − 1`; nunca abaixo do ganho original; sem `L2` só limita ao `int32`; ganho ≤ 0 intacto; sem estouro; variáveis de registro | Não |
 | Cave do analisador: grava `float(Max)` só com `Max > 0` e com `rcx` da classe certa | Não |
-| Cave do arrastar: grava uma vez e zera; desarmado não grava; `rcx` nulo ou de outra classe não grava; duas threads armadas uma vez aplicam uma só | Não |
+| ~~Cave do arrastar~~ (saiu, 6.7.2) | — |
 | Cave da coleta (módulo sintético, escrito **depois** da pesquisa, com o mecanismo escolhido; os casos abaixo valem para qualquer mecanismo): multiplica só no inventário da variável; limita à pilha máxima; pilha máxima 1 intacta; N = 0 e inventário nulo não fazem nada; chamada que não é de uma das três fontes não multiplica | Não |
 | Todas as caves com as variáveis zeradas: passam direto, resultado original | Não |
 | Cada cave gerada, desmontada: sem `call`, sem `ret`, sem `int3`/`CC`; termina no `jmp` de volta | Não |
-| Desarmar o arrastar com a cave aplicando ao mesmo tempo (thread de teste): uma aplicação no máximo, e o registro diz `aplicada` ou `desarmado` conforme o contador | Não |
+| ~~Desarmar o arrastar~~ (saiu, 6.7.2) | — |
 | `pular-hora`: recusa com `v < 0` e com `v + 3600 > result_max` | Não |
 | Padrão do Brain Power com `disp` diferentes entre si ou da reflexão: `indisponível (padrão incoerente)` | Não |
 | Cave de observação: conta, guarda retornos no anel, não muda registradores nem o resultado | Não |
@@ -398,7 +373,7 @@ Patches com `slot` e grades existentes não mudam. O `unit` continua sufixo (`5x
 | `gt caves`, `gt diff` (desvio marcado como nosso) e `gt ue player` (`ResearchPoints`) contra o módulo sintético | Não |
 | Com o jogo aberto: os desvios disponíveis; `brain-power` liga e desliga parado (sem ganho durante o teste, nada vai ao save; o analisador fica de fora, porque enche as cargas); depois da saída do motor (`undo_all`), `gt diff` sem diferença e `gt caves` sem nada nosso | Sim (`#[ignore]`) |
 
-Brain Power, coleta, arrastar e pular hora **não** têm teste automático que escreve no jogo (vão para o save): são
+Brain Power, coleta e pular hora **não** têm teste automático que escreve no jogo (vão para o save): são
 testados à mão (seção 9).
 
 ## 9. Critério de pronto
@@ -413,14 +388,15 @@ Com backup do save feito pelo dono e o FLiNG fechado:
    Se der para chegar perto de um limite, um ganho que passaria de dois sobe só um, com a recompensa. Desligado,
    volta ao normal.
 3. **Analisador**: com o cheat ligado, as cargas não acabam. Desligado, voltam a gastar.
-4. **Arrastar**: armar com 250 e arrastar um item: a pilha fica com 250 e o registro diz `aplicada`; o próximo
-   arrasto não muda nada. Armar e apertar de novo desarma. Anotar o efeito de 999 num item de pilha menor e depois de salvar e carregar.
+4. ~~**Arrastar**~~: saiu da Fase 6 (6.7.2).
+
 5. **Coleta**: com ×3, pegar do chão, colher, pegar loot de uma criatura e criar um item: cada um vem ×3. Tirar do
-   baú: vem ×1. Soltar um item e pegar de volta: vem ×3 (decisão do dono).
+   baú: vem ×1. Soltar um item e pegar de volta: vem ×3 (decisão do dono). Anotar o que o jogo faz com uma pilha acima do
+   máximo (divide, limita ou aceita) e com uma ferramenta ×3, e se isso vai para o save.
 6. **Congelar hora**: o relógio para; desligado, volta. Tentar dormir com a hora congelada e anotar.
 7. **Pular hora**: cada toque avança 1 hora, com e sem a hora congelada; segurar avança no máximo uma vez por
    segundo.
-8. Reiniciar o jogo com a TUI aberta e os desvios ligados: voltam ligados depois de reconectar (o arrastar, não).
+8. Reiniciar o jogo com a TUI aberta e os desvios ligados: voltam ligados depois de reconectar .
 9. Sair da TUI com tudo ligado: `gt diff` limpo e `gt caves` sem nada nosso.
 10. `kill -9` na TUI com os desvios ligados e abrir de novo (ou `gt-patch restore`): tudo devolvido, jogo estável.
 11. O dono confirma que o jogo ficou estável e que o save carrega normal.
@@ -442,7 +418,7 @@ Com o item 2, a **Fase 6 fecha**.
 
 | Decisão | Quem |
 |---|---|
-| Fase 6 = Brain Power, hora do dia, analisador, quantidade ao arrastar e coleta multiplicada | Dono |
+| Fase 6 = Brain Power, hora do dia, analisador, quantidade ao arrastar e coleta multiplicada; o arrastar saiu em 2026-10-28 (sem ponto desviável) | Dono |
 | Brain Power como multiplicador ×2 a ×10, limitado para não pular nível | Dono |
 | Hora: congelar e pular 1 hora por tecla | Dono |
 | Arrastar: uso único por tecla, 10 a 999 | Dono |
@@ -450,7 +426,7 @@ Com o item 2, a **Fase 6 fecha**.
 | Item solto pelo dono e pego de volta multiplica (pegar do chão é um caminho só no jogo; trocado em 2026-10-28) | Dono |
 | God mode por desvio fora | IA |
 | Hora por valor (`CalendarComponent`), congelar por `GameToRealTimeRatio = 0` | IA (spike) |
-| Desvio de uma instrução de 5+ bytes; pontos próprios (Brain Power em `+5970ee7`, arrastar no começo da função) | IA |
+| Desvio de uma instrução de 5+ bytes; pontos próprios (Brain Power em `+5970ee7`, coleta na `+5615f30`) | IA |
 | Brain Power no ponto onde a tabela já está em `rax`: sem `call` na cave, offsets das instruções | IA |
 | Cave e variável como tipos novos de escrita; exceção explícita para a folga da `.data` | IA |
 | Variáveis sem diário de valor; limpeza zera a região | IA |
