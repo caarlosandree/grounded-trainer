@@ -17,11 +17,11 @@ use gt_core::modules::Module;
 use gt_core::pe::DiskImage;
 use gt_grounded2::Error;
 use gt_grounded2::catalog::{HookEntry, HookHit, HookState};
-use gt_grounded2::hooks::{ArmOutcome, HookAvail, HookEnv, HookEvent, HookRuntime, PawnView};
+use gt_grounded2::hooks::{HookAvail, HookEnv, HookEvent, HookRuntime, PawnView};
 use gt_grounded2::signatures::{CaveBody, HookDef};
 use gt_ue::ReflectionIndex;
 
-use crate::backend::{ArmReport, OpOutcome};
+use crate::backend::OpOutcome;
 use crate::model::Avail;
 use crate::values::{Globals, ReflectionGate};
 
@@ -226,50 +226,18 @@ impl HookCheats {
         outcome_of(res, id, engine, started.elapsed())
     }
 
-    /// Arma o arrastar com o ponto `k` (ou o desarma, se já está armado).
-    pub fn arm(&mut self, engine: &mut Engine, k: u64) -> ArmReport {
-        let Some(runtime) = self.runtime.as_mut() else {
-            return ArmReport::Refused(crate::model::CHECKING.to_string());
-        };
-        // O desfecho não traz a quantidade: lê-se o que estava armado antes.
-        let before = runtime.armed().map_or(0, |(n, _)| n);
-        match runtime.arm(engine, k) {
-            Ok(ArmOutcome::Armed) => ArmReport::Armed(runtime.armed().map_or(0, |(n, _)| n)),
-            Ok(ArmOutcome::Disarmed) => ArmReport::Disarmed(before),
-            Ok(ArmOutcome::Applied) => ArmReport::Applied(before),
-            Err(e) => match outcome_of(Err(e), drag_id(&self.entries), engine, Duration::ZERO) {
-                OpOutcome::Gone => ArmReport::Gone,
-                OpOutcome::Residue(cause) => ArmReport::Residue(cause),
-                OpOutcome::Refused(reason) => ArmReport::Refused(reason),
-                // `outcome_of` não produz os outros dois; recusa por garantia.
-                OpOutcome::Done(_) | OpOutcome::Foreign => {
-                    ArmReport::Refused("falha ao armar".to_string())
-                }
-            },
-        }
-    }
-
     /// Um ciclo de manutenção dos desvios.
     pub fn tick<M: ReadMem + ?Sized>(
         &mut self,
         mem: &M,
         engine: &mut Engine,
         pawn: Option<u64>,
-        now: Instant,
     ) -> Vec<HookEvent> {
         let Some(runtime) = self.runtime.as_mut() else {
             return Vec::new();
         };
-        runtime.tick(engine, mem, pawn.map(PawnView::from), now)
+        runtime.tick(engine, mem, pawn.map(PawnView::from))
     }
-}
-
-/// O `id` do desvio do arrastar (para o texto de um erro; sem ele, vazio).
-fn drag_id(entries: &[HookEntry]) -> &str {
-    entries
-        .iter()
-        .find(|e| e.def.body == CaveBody::Drag)
-        .map_or("", |e| e.def.id.as_str())
 }
 
 /// Classifica o resultado de uma operação do runtime sobre o desvio `id`. Uma falha que deixa
@@ -341,11 +309,7 @@ mod tests {
     #[test]
     fn avail_shows_the_scan_reason_before_anything_else() {
         let defs = defs();
-        let c = cheats(vec![
-            unavailable(&defs[0], "ambíguo"),
-            found(&defs[1]),
-            unavailable(&defs[2], "não encontrado"),
-        ]);
+        let c = cheats(vec![unavailable(&defs[0], "ambíguo"), found(&defs[1])]);
         let gate = ReflectionGate::Checking;
         assert_eq!(
             avail_of(&c, &gate, &defs[0].id),
@@ -357,9 +321,10 @@ mod tests {
             avail_of(&c, &ready, &defs[1].id),
             Avail::Unavailable("disco ilegível".to_string())
         );
+        // O motivo da busca vale com o índice pronto também.
         assert_eq!(
-            avail_of(&c, &ready, &defs[2].id),
-            Avail::Unavailable("não encontrado".to_string())
+            avail_of(&c, &ready, &defs[0].id),
+            Avail::Unavailable("ambíguo".to_string())
         );
     }
 

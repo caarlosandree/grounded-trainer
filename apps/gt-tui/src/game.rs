@@ -28,9 +28,9 @@ use gt_grounded2::state::PatchState;
 use gt_grounded2::ue::UeScan;
 
 use crate::backend::{
-    ArmReport, Backend, CheatInfo, Find, JobKind, OpOutcome, Recovered, ReflectionJob,
-    ReflectionNews, ReflectionOutcome, Search, SearchError, SearchFn, Session, TuiError,
-    outcome_of, recovery_outcome, restore_outcome,
+    Backend, CheatInfo, Find, JobKind, OpOutcome, Recovered, ReflectionJob, ReflectionNews,
+    ReflectionOutcome, Search, SearchError, SearchFn, Session, TuiError, outcome_of,
+    recovery_outcome, restore_outcome,
 };
 use crate::hooks::HookCheats;
 use crate::model::Avail;
@@ -134,7 +134,7 @@ fn hook_infos(hooks: &[HookEntry], gate: &Avail) -> Vec<CheatInfo> {
                 HookState::Unavailable(reason) => Avail::Unavailable(reason.clone()),
             },
             field: false,
-            action: h.def.action,
+            action: false,
             label: None,
             hook: true,
             pawn: h.def.body == CaveBody::Collect,
@@ -649,22 +649,15 @@ impl Session<GamePayload> for GameSession {
         self.hooks.set_value(engine, id, k)
     }
 
-    fn hook_arm(&mut self, k: u64) -> ArmReport {
-        let Some(engine) = self.engine.as_mut() else {
-            return ArmReport::Refused("sem motor".to_string());
-        };
-        self.hooks.arm(engine, k)
-    }
-
     fn read_pawn(&mut self) -> Option<u64> {
         self.values.read_pawn()
     }
 
-    fn hook_tick(&mut self, pawn: Option<u64>, now: Instant) -> Vec<HookEvent> {
+    fn hook_tick(&mut self, pawn: Option<u64>) -> Vec<HookEvent> {
         let Some(engine) = self.engine.as_mut() else {
             return Vec::new();
         };
-        self.hooks.tick(&self.target.reader, engine, pawn, now)
+        self.hooks.tick(&self.target.reader, engine, pawn)
     }
 }
 
@@ -903,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn hook_infos_carry_action_value_and_pawn() {
+    fn hook_infos_carry_value_and_pawn() {
         let mut hooks = hook_entries();
         for h in &mut hooks {
             h.state = HookState::Found {
@@ -918,7 +911,6 @@ mod tests {
         hooks.push(collect);
         let infos = hook_infos(&hooks, &Avail::Checking);
         let find = |id: &str| infos.iter().find(|i| i.id == id).unwrap();
-        assert!(find("quantidade-arrastar").action);
         assert!(!find("brain-power").action && find("brain-power").value.is_some());
         assert!(find("brain-power").value.as_ref().unwrap().steps() > 0);
         assert!(find("coleta-multiplicada").pawn);

@@ -11,9 +11,8 @@
 //!   variáveis e aplica `[Cave, Code]` num lote só; [`HookRuntime::disable`] devolve só o desvio
 //!   (a cave fica até sair, spec 6.3);
 //! - [`HookRuntime::set_value`] é só uma escrita na variável (6.5);
-//! - [`HookRuntime::arm`] arma e desarma o arrastar (6.7.2);
-//! - [`HookRuntime::tick`] roda a ~10 Hz: registro do Brain Power, acompanhamento do arrastar e o
-//!   inventário do jogador para a coleta (6.7.4).
+//! - [`HookRuntime::tick`] roda a ~10 Hz: registro do Brain Power e inventário do jogador para a
+//!   coleta (6.7.4).
 //!
 //! As variáveis das caves moram na folga da `.data` ([`crate::caves::var`]); quem sai do jogo (o
 //! motor) as zera. Nada aqui chama `undo_all`: o motor faz isso no `Drop`.
@@ -21,7 +20,6 @@
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use gt_core::Error as CoreError;
 use gt_core::cave::{CaveAllocator, hook_bytes};
@@ -42,11 +40,6 @@ use crate::error::{Error, Result};
 use crate::policy::{cave_allocator, var_region};
 use crate::signatures::{CaveBody, HookDef, PlayerCfg, brain_captures_from_hit};
 
-/// Quanto o trainer espera, depois de escrever 0 no arme do arrastar, antes de reler o contador
-/// de aplicadas (spec 6.7.2).
-pub const DISARM_WAIT: Duration = Duration::from_millis(50);
-/// Depois deste tempo armado e sem uso, o arrastar é desarmado (spec 6.7.2).
-pub const DRAG_EXPIRY: Duration = Duration::from_secs(60);
 /// Tentativas de uma leitura estável do registro do Brain Power por ciclo.
 const LOG_TRIES: usize = 4;
 
@@ -115,17 +108,6 @@ impl From<u64> for PawnView {
     }
 }
 
-/// O que `arm` fez.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArmOutcome {
-    /// Estava desarmado: a quantidade foi para a variável.
-    Armed,
-    /// Estava armado: foi desarmado sem o jogo ter aplicado.
-    Disarmed,
-    /// Estava armado, mas o jogo aplicou antes do desarme.
-    Applied,
-}
-
 /// Acontecimento do ciclo, para o registro da TUI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookEvent {
@@ -140,12 +122,6 @@ pub enum HookEvent {
         /// Ganhos que aconteceram entre duas leituras e não foram mostrados.
         skipped: u32,
     },
-    /// O jogo aplicou a quantidade armada (N).
-    DragApplied(i32),
-    /// Expirou (60 s armado sem uso).
-    DragExpired,
-    /// A variável foi zerada por fora, sem aplicação: o arme acabou.
-    DragDisarmed,
 }
 
 /// Ciclo de vida de um desvio no runtime.
@@ -174,17 +150,6 @@ struct Plan {
     /// A cave já está escrita no jogo (uma cave nossa sem desvio, reconhecida pelo motor): só o
     /// desvio entra ao ligar.
     cave_present: bool,
-}
-
-/// Arrastar armado.
-#[derive(Debug, Clone, Copy)]
-struct Armed {
-    n: i32,
-    /// Contador de aplicadas quando armou.
-    counter0: u64,
-    since: Instant,
-    /// Ciclos seguidos em que a variável estava 0 sem o contador ter subido.
-    zero_ticks: u32,
 }
 
 /// Registro do Brain Power lido de forma estável.
@@ -234,7 +199,6 @@ pub struct HookRuntime {
     inventory_off: Option<u32>,
     /// Último contador de sequência do Brain Power visto (ou o da hora de ligar).
     brain_seq: Option<u32>,
-    drag: Option<Armed>,
     /// Caves nossas escritas e sem desvio ativo no motor, por `id`: `(lugar, bytes)`. O `resolve`
     /// as reaproveita se a cave montada agora for igual.
     orphan_caves: HashMap<String, (u64, Vec<u8>)>,
@@ -246,23 +210,14 @@ fn core(e: CoreError) -> Error {
     Error::Core(e)
 }
 
-/// Bytes de uma variável `u64`/`i32`: `0` para o motor sem a variável.
-fn le_u64(bytes: &[u8]) -> Option<u64> {
-    Some(u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?))
-}
-
-fn le_i32(bytes: &[u8]) -> Option<i32> {
-    Some(i32::from_le_bytes(bytes.get(..4)?.try_into().ok()?))
-}
-
 /// Até onde (deslocamento final, exclusivo) as variáveis do corpo vão: o que não couber na folga
 /// deixa o desvio indisponível (spec 6.4, corte por cheat com as dependências: a classe `Item`
-/// só sai junto com o arrastar e a coleta).
+/// só sai junto com a coleta).
 fn var_need(body: CaveBody) -> u64 {
     match body {
         CaveBody::Brain => var::BRAIN_SEQ + 4,
         CaveBody::Analyzer => var::ANALYZER_CLASS + 8,
-        CaveBody::Drag | CaveBody::Collect => var::ITEM_CLASS + 8,
+        CaveBody::Collect => var::ITEM_CLASS + 8,
     }
 }
 
@@ -323,7 +278,6 @@ impl HookRuntime {
             claimed: false,
             inventory_off: None,
             brain_seq: None,
-            drag: None,
             orphan_caves: HashMap::new(),
             inventory_written: None,
         }
@@ -542,7 +496,7 @@ impl HookRuntime {
                 );
                 class_vars.push((var::ANALYZER_CLASS, class));
             }
-            CaveBody::Drag | CaveBody::Collect => {
+            CaveBody::Collect => {
                 let class = class_of(refl, &owner(def)?)?;
                 fields.insert(
                     FIELD_STACK_SIZE,
@@ -760,16 +714,12 @@ impl HookRuntime {
     }
 
     /// Desliga o desvio `id`: só o `Code` volta; a cave e as variáveis ficam até sair (spec 6.3).
-    /// Desligar o arrastar armado desarma antes (sem o registro).
     pub fn disable(&mut self, engine: &mut Engine, id: &str) -> Result<()> {
         let Some(slot) = self.slots.get(id) else {
             return Err(Error::UnknownPatch { id: id.to_string() });
         };
         if !slot.hooked {
             return Ok(());
-        }
-        if slot.def.body == CaveBody::Drag && self.drag.is_some() {
-            self.disarm(engine)?;
         }
         let undone = engine.undo(&[&hook_id(id)]).map_err(core);
         // Só sai de `hooked` quando o desvio saiu do motor: um desfazer que falhou sem tirá-lo
@@ -801,88 +751,12 @@ impl HookRuntime {
         self.slots.get(id).is_some_and(|s| s.hooked)
     }
 
-    /// Quantidade e hora do arme do arrastar, se está armado.
-    pub fn armed(&self) -> Option<(i32, Instant)> {
-        self.drag.map(|a| (a.n, a.since))
-    }
-
     /// O deslocamento do inventário no personagem, se a reflexão o achou.
     pub fn inventory_offset(&self) -> Option<u32> {
         self.inventory_off
     }
 
-    /// `id` do desvio do arrastar entre os resolvidos.
-    fn drag_id(&self) -> Option<String> {
-        self.slots
-            .values()
-            .find(|s| s.def.body == CaveBody::Drag)
-            .map(|s| s.def.id.clone())
-    }
-
-    /// Arma o arrastar com o ponto `k` da grade (a quantidade); com ele já armado, desarma.
-    /// Instala o desvio se ainda não está (spec 6.7.2).
-    pub fn arm(&mut self, engine: &mut Engine, k: u64) -> Result<ArmOutcome> {
-        self.arm_at(engine, k, Instant::now())
-    }
-
-    /// [`HookRuntime::arm`] com o relógio injetado.
-    pub fn arm_at(&mut self, engine: &mut Engine, k: u64, now: Instant) -> Result<ArmOutcome> {
-        if self.drag.is_some() {
-            return self.disarm(engine);
-        }
-        let id = self.drag_id().ok_or_else(|| Error::UnknownPatch {
-            id: "quantidade-arrastar".to_string(),
-        })?;
-        let def = self.slot_ready(&id)?.def.clone();
-        if !self.is_hooked(&id) {
-            self.enable(engine, &id, None)?;
-        }
-        let base = self.claim(engine)?;
-        let n = Self::value_of(&def, Some(k))?.unwrap_or(0);
-        let counter0 = self.drag_counter(engine, base).unwrap_or(0);
-        // A cave pode levar o valor (e zerar a variável) antes da releitura do motor: a escrita
-        // valeu, e quem decide se foi aplicado é o contador.
-        match engine.write_var(base + var::DRAG_N, &n.to_le_bytes()) {
-            Ok(()) | Err(CoreError::BytesMismatch { .. }) => {}
-            Err(e) => return Err(core(e)),
-        }
-        self.drag = Some(Armed {
-            n,
-            counter0,
-            since: now,
-            zero_ticks: 0,
-        });
-        Ok(ArmOutcome::Armed)
-    }
-
-    fn drag_counter(&self, engine: &Engine, base: u64) -> Option<u64> {
-        le_u64(&engine.read_var(base + var::DRAG_APPLIED, 8).ok()?)
-    }
-
-    /// Desarma: escreve 0, espera [`DISARM_WAIT`] e relê o contador; se ele subiu, o jogo aplicou
-    /// antes (spec 6.7.2). Só o `xchg` da cave aplica: a escrita do 0 nunca causa duas aplicações.
-    fn disarm(&mut self, engine: &mut Engine) -> Result<ArmOutcome> {
-        let Some(armed) = self.drag else {
-            return Ok(ArmOutcome::Disarmed);
-        };
-        let base = self.claim(engine)?;
-        match engine.write_var(base + var::DRAG_N, &0i32.to_le_bytes()) {
-            Ok(()) | Err(CoreError::BytesMismatch { .. }) => {}
-            Err(e) => return Err(core(e)),
-        }
-        std::thread::sleep(DISARM_WAIT);
-        self.drag = None;
-        let applied = self
-            .drag_counter(engine, base)
-            .is_some_and(|c| c > armed.counter0);
-        Ok(if applied {
-            ArmOutcome::Applied
-        } else {
-            ArmOutcome::Disarmed
-        })
-    }
-
-    /// Um ciclo (~10 Hz): o registro do Brain Power, o arrastar e o inventário do jogador.
+    /// Um ciclo (~10 Hz): o registro do Brain Power e o inventário do jogador.
     ///
     /// `pawn` é o personagem achado neste ciclo (`None` se não há: o inventário vira 0 e a coleta
     /// não multiplica nada até o personagem voltar).
@@ -891,14 +765,12 @@ impl HookRuntime {
         engine: &mut Engine,
         mem: &M,
         pawn: Option<PawnView>,
-        now: Instant,
     ) -> Vec<HookEvent> {
         let mut events = Vec::new();
         let Some(base) = self.base().filter(|_| self.claimed) else {
             return events;
         };
         self.tick_brain(engine, base, &mut events);
-        self.tick_drag(engine, base, now, &mut events);
         self.tick_inventory(engine, base, mem, pawn);
         events
     }
@@ -928,48 +800,6 @@ impl HookRuntime {
             }
             // Primeira leitura, ou o contador voltou (variáveis zeradas): só a referência.
             _ => self.brain_seq = Some(log.seq),
-        }
-    }
-
-    fn tick_drag(
-        &mut self,
-        engine: &mut Engine,
-        base: u64,
-        now: Instant,
-        events: &mut Vec<HookEvent>,
-    ) {
-        let Some(armed) = self.drag else {
-            return;
-        };
-        if self
-            .drag_counter(engine, base)
-            .is_some_and(|c| c > armed.counter0)
-        {
-            events.push(HookEvent::DragApplied(armed.n));
-            self.drag = None;
-            return;
-        }
-        if now.saturating_duration_since(armed.since) >= DRAG_EXPIRY {
-            match self.disarm(engine) {
-                Ok(ArmOutcome::Applied) => events.push(HookEvent::DragApplied(armed.n)),
-                Ok(_) => events.push(HookEvent::DragExpired),
-                Err(e) => tracing::warn!("falha ao desarmar o arrastar: {e}"),
-            }
-            return;
-        }
-        // Variável zerada e contador parado em dois ciclos seguidos: zerou por fora. (Em um ciclo
-        // só pode ser a cave entre o `xchg` e o incremento do contador.)
-        let zero = engine
-            .read_var(base + var::DRAG_N, 4)
-            .ok()
-            .and_then(|b| le_i32(&b))
-            == Some(0);
-        if let Some(a) = self.drag.as_mut() {
-            a.zero_ticks = if zero { a.zero_ticks + 1 } else { 0 };
-            if a.zero_ticks >= 2 {
-                self.drag = None;
-                events.push(HookEvent::DragDisarmed);
-            }
         }
     }
 
@@ -1080,11 +910,10 @@ mod tests {
 
     #[test]
     fn var_need_cuts_by_cheat_with_dependencies() {
-        // O corpo do Brain Power cabe em 24 bytes, o analisador em 56; arrastar e coleta
-        // levam a classe `Item` (até 144).
+        // O corpo do Brain Power cabe em 24 bytes, o analisador em 56; a coleta leva a classe
+        // `Item` (até 144).
         assert_eq!(var_need(CaveBody::Brain), 24);
         assert_eq!(var_need(CaveBody::Analyzer), 56);
-        assert_eq!(var_need(CaveBody::Drag), 144);
         assert_eq!(var_need(CaveBody::Collect), 144);
         assert!(var_need(CaveBody::Collect) <= var::TOTAL);
     }

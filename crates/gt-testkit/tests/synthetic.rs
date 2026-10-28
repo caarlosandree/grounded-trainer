@@ -98,7 +98,7 @@ fn synthetic_text_has_cc_runs_and_pointers() {
     assert_eq!(runs[0].start, t.symbol("cc300"));
     assert_eq!(runs[1].start, t.symbol("cc70"));
     // Cada função-alvo é seguida de `CC`.
-    for name in ["sum", "level_gain", "getter", "drag", "add_item"] {
+    for name in ["sum", "level_gain", "getter", "stack_plus", "add_item"] {
         assert!(t.symbol(name) >= t.module_base() + 0x1000, "{name}");
     }
 }
@@ -135,10 +135,10 @@ fn synthetic_functions_compute() {
     let analyzer = t.symbol("analyzer_obj");
     write(&t, analyzer + 0x974, &7.0f32.to_le_bytes());
     assert_eq!(t.call("getter", &[analyzer]) as i32, 7);
-    // drag: StackSize + n; item nulo devolve -1.
-    assert_eq!(t.call("drag", &[t.symbol("item_b"), 0]) as i32, 5);
-    assert_eq!(t.call("drag", &[t.symbol("item_a"), 10]) as i32, 11);
-    assert_eq!(t.call("drag", &[0, 3]) as i32, -1);
+    // stack_plus: StackSize + n; item nulo devolve -1.
+    assert_eq!(t.call("stack_plus", &[t.symbol("item_b"), 0]) as i32, 5);
+    assert_eq!(t.call("stack_plus", &[t.symbol("item_a"), 10]) as i32, 11);
+    assert_eq!(t.call("stack_plus", &[0, 3]) as i32, -1);
     // add_item: soma ao total do inventário.
     let inv = t.symbol("inventory_a");
     assert_eq!(t.call("add_item", &[inv, t.symbol("item_b")]) as i32, 5);

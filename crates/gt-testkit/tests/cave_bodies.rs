@@ -1,12 +1,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-//! Corpos das caves (spec 008, 6.6.1, 6.7.1, 6.7.2 e 6.7.3) rodando de verdade no módulo sintético
+//! Corpos das caves (spec 008, 6.6.1, 6.7.1 e 6.7.3) rodando de verdade no módulo sintético
 //! do `gt-testtarget --module`: o motor escreve a cave (montada por `gt_grounded2::caves`) e o
-//! desvio, e os testes chamam as funções-alvo (`level_gain`, `getter`, `drag`, `sum`).
+//! desvio, e os testes chamam as funções-alvo (`level_gain`, `getter`, `stack_plus`, `sum`).
 
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 use gt_core::cave::{CAVE_MARGIN, CaveAllocator, cc_runs, hook_bytes};
 use gt_core::engine::{Engine, EngineOptions, PolicyFn};
@@ -555,115 +554,6 @@ fn class_walk_stops_at_16_levels() {
 }
 
 // ---------------------------------------------------------------------------
-// Arrastar
-// ---------------------------------------------------------------------------
-
-fn drag_rig() -> Rig {
-    let mut r = rig();
-    let drag = r.t.symbol("drag");
-    let insn = r.bytes(drag, 5);
-    r.set_var(var::ITEM_CLASS, &r.t.symbol("class_item").to_le_bytes());
-    r.install(drag, 5, insn, |ctx| {
-        caves::build(CaveBody::Drag, ctx).unwrap()
-    });
-    r
-}
-
-impl Rig {
-    fn drag(&mut self, item: u64, n: i32) -> i32 {
-        self.t.call("drag", &[item, n as i64 as u64]) as i32
-    }
-
-    fn stack(&self, item: u64) -> i32 {
-        self.i32_at(item + ITEM_STACK as u64)
-    }
-
-    fn set_stack(&self, item: u64, n: i32) {
-        self.poke(item + ITEM_STACK as u64, &n.to_le_bytes());
-    }
-
-    fn applied(&self) -> u64 {
-        self.u64_at(self.var(var::DRAG_APPLIED))
-    }
-}
-
-#[test]
-fn drag_applies_once_and_counts() {
-    let mut r = drag_rig();
-    let (a, b) = (r.t.symbol("item_a"), r.t.symbol("item_b"));
-    // Desarmado: nada muda.
-    assert_eq!(r.drag(a, 0), 1);
-    assert_eq!(r.applied(), 0);
-    // Armado com 250: o próximo item recebe 250 e a variável volta a 0.
-    r.set_var(var::DRAG_N, &250i32.to_le_bytes());
-    assert_eq!(r.drag(a, 0), 250);
-    assert_eq!(r.stack(a), 250);
-    assert_eq!(r.var_i32(var::DRAG_N), 0);
-    assert_eq!(r.applied(), 1);
-    // Só uma vez.
-    assert_eq!(r.drag(b, 0), 5);
-    assert_eq!(r.applied(), 1);
-    // Subclasse de `Item` (item_b) também; `rdx` e o resto da função preservados (+ n).
-    r.set_var(var::DRAG_N, &999i32.to_le_bytes());
-    assert_eq!(r.drag(b, 1), 1000);
-    assert_eq!(r.stack(b), 999);
-    assert_eq!(r.applied(), 2);
-    r.finish();
-}
-
-#[test]
-fn drag_two_threads_apply_once() {
-    let mut r = drag_rig();
-    let (a, b) = (r.t.symbol("item_a"), r.t.symbol("item_b"));
-    r.t.start_loop("drag", &[a, 0]);
-    r.t.start_loop("drag", &[b, 0]);
-    for i in 0..40i32 {
-        r.set_stack(a, 1);
-        r.set_stack(b, 5);
-        let n = 100 + i;
-        // Escrita simples (o `write_var` do motor relê e falharia: a cave zera a variável logo).
-        r.poke(r.var(var::DRAG_N), &n.to_le_bytes());
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while r.var_i32(var::DRAG_N) != 0 {
-            assert!(Instant::now() < deadline, "ninguém aplicou o arme {i}");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        // Mais um pouco de laço: um segundo `xchg` não pode aplicar de novo.
-        std::thread::sleep(Duration::from_millis(5));
-        let (sa, sb) = (r.stack(a), r.stack(b));
-        assert!(
-            (sa == n && sb == 5) || (sa == 1 && sb == n),
-            "arme {i}: pilhas {sa} e {sb}"
-        );
-        assert_eq!(r.applied(), (i + 1) as u64);
-    }
-    let stats = r.t.stop_loops();
-    assert!(stats.calls > 0);
-    r.finish();
-}
-
-#[test]
-fn drag_wrong_class_or_null_untouched() {
-    let mut r = drag_rig();
-    let other = r.t.symbol("other_obj");
-    r.set_stack(other, 7);
-    r.set_var(var::DRAG_N, &50i32.to_le_bytes());
-    // Classe errada: não aplica e continua armado.
-    assert_eq!(r.drag(other, 0), 7);
-    assert_eq!(r.var_i32(var::DRAG_N), 50);
-    // Ponteiro nulo: a função devolve -1 e nada muda.
-    assert_eq!(r.drag(0, 0), -1);
-    assert_eq!(r.var_i32(var::DRAG_N), 50);
-    // Ponteiro da classe zerado: não aplica.
-    r.set_var(var::ITEM_CLASS, &0u64.to_le_bytes());
-    let a = r.t.symbol("item_a");
-    assert_eq!(r.drag(a, 0), 1);
-    assert_eq!(r.var_i32(var::DRAG_N), 50);
-    assert_eq!(r.applied(), 0);
-    r.finish();
-}
-
-// ---------------------------------------------------------------------------
 // Observação
 // ---------------------------------------------------------------------------
 
@@ -754,7 +644,6 @@ fn all_bodies_pass_check() {
     for (name, body, hook, n, caps) in [
         ("brain", CaveBody::Brain, "level_point", 7, captures.clone()),
         ("analyzer", CaveBody::Analyzer, "getter", 8, vec![]),
-        ("drag", CaveBody::Drag, "drag", 5, vec![]),
     ] {
         let at = r.t.symbol(hook);
         let ctx = r.ctx(at, n, cave_at, caps);
@@ -814,15 +703,15 @@ fn all_bodies_pass_check() {
     assert!(caves::build_observe(&ctx, Register::RIP).is_err());
     assert!(caves::build(CaveBody::Collect, &ctx).is_err());
     // Campo da reflexão faltando: erro.
-    let mut ctx = r.ctx(r.t.symbol("drag"), 5, cave_at, vec![]);
-    ctx.fields.remove("StackSize");
-    assert!(caves::build(CaveBody::Drag, &ctx).is_err());
+    let mut ctx = r.ctx(r.t.symbol("getter"), 8, cave_at, vec![]);
+    ctx.fields.remove("MaxPowerCapacity");
+    assert!(caves::build(CaveBody::Analyzer, &ctx).is_err());
     // Brain Power com `ResearchPoints` diferente do padrão: padrão incoerente.
     let mut ctx = r.ctx(r.t.symbol("level_point"), 7, cave_at, captures);
     ctx.fields
         .insert("ResearchPoints", RESEARCH_POINTS as u32 + 4);
     assert!(caves::build(CaveBody::Brain, &ctx).is_err());
     // Analisador num ponto que não é `movss xmm,[rcx+C]`: erro.
-    let ctx = r.ctx(r.t.symbol("drag"), 5, cave_at, vec![]);
+    let ctx = r.ctx(r.t.symbol("stack_plus"), 5, cave_at, vec![]);
     assert!(caves::build(CaveBody::Analyzer, &ctx).is_err());
 }

@@ -928,8 +928,7 @@ category = "itens"
 description = "Teste"
 pattern = "48 89 5c 24 08 90 ?? c3"
 offset = 0
-body = "drag"
-action = true
+body = "collect"
 object_class = "/Script/Maine.Item"
 [hook.value]
 type = "i32"
@@ -996,7 +995,10 @@ object_class = "/Script/Maine.ResourceAnalyzerBuilding"
         // A instrução do desvio (`mov [rsp+8],rbx`) começa no byte 1 da ocorrência.
         let text = HOOKS
             .replace("48 89 5c 24 08 90 ?? c3", "90 48 89 5c 24 08 ?? c3")
-            .replace("offset = 0\nbody = \"drag\"", "offset = 1\nbody = \"drag\"");
+            .replace(
+                "offset = 0\nbody = \"collect\"",
+                "offset = 1\nbody = \"collect\"",
+            );
         let defs = Signatures::parse(&[("generic.toml", &text)])
             .unwrap()
             .hooks()

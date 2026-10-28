@@ -59,7 +59,7 @@ pub const PDATA_FUNCTIONS: [&str; 8] = [
     "get_table",
     "level_gain",
     "getter",
-    "drag",
+    "stack_plus",
     "add_item",
     "spin",
 ];
@@ -305,9 +305,9 @@ fn assemble_text() -> Result<(Vec<u8>, Symbols)> {
     let mut get_table = a.create_label();
     let mut getter = a.create_label();
     let mut half = a.create_label();
-    let mut drag = a.create_label();
-    let mut drag_null = a.create_label();
-    let mut drag_out = a.create_label();
+    let mut stack_plus = a.create_label();
+    let mut stack_plus_null = a.create_label();
+    let mut stack_plus_out = a.create_label();
     let mut add_item = a.create_label();
     let mut spin = a.create_label();
     let mut leaf = a.create_label();
@@ -425,18 +425,18 @@ fn assemble_text() -> Result<(Vec<u8>, Symbols)> {
     a.ret().map_err(asm_err)?;
     a.int3().map_err(asm_err)?;
 
-    // drag(item, n) -> i32: `StackSize + n` do item (ou -1 com `item` nulo).
-    a.set_label(&mut drag).map_err(asm_err)?;
+    // stack_plus(item, n) -> i32: `StackSize + n` do item (ou -1 com `item` nulo).
+    a.set_label(&mut stack_plus).map_err(asm_err)?;
     a.mov(qword_ptr(rsp + 8), rbx).map_err(asm_err)?;
     a.test(rcx, rcx).map_err(asm_err)?;
-    a.jz(drag_null).map_err(asm_err)?;
+    a.jz(stack_plus_null).map_err(asm_err)?;
     a.mov(rbx, rcx).map_err(asm_err)?;
     a.mov(eax, dword_ptr(rbx + ITEM_STACK)).map_err(asm_err)?;
     a.add(eax, edx).map_err(asm_err)?;
-    a.jmp(drag_out).map_err(asm_err)?;
-    a.set_label(&mut drag_null).map_err(asm_err)?;
+    a.jmp(stack_plus_out).map_err(asm_err)?;
+    a.set_label(&mut stack_plus_null).map_err(asm_err)?;
     a.mov(eax, -1).map_err(asm_err)?;
-    a.set_label(&mut drag_out).map_err(asm_err)?;
+    a.set_label(&mut stack_plus_out).map_err(asm_err)?;
     a.mov(rbx, qword_ptr(rsp + 8)).map_err(asm_err)?;
     a.ret().map_err(asm_err)?;
     a.int3().map_err(asm_err)?;
@@ -500,7 +500,7 @@ fn assemble_text() -> Result<(Vec<u8>, Symbols)> {
         ("level_pattern", rva(&level_pattern)?),
         ("level_point", rva(&level_point)?),
         ("getter", rva(&getter)?),
-        ("drag", rva(&drag)?),
+        ("stack_plus", rva(&stack_plus)?),
         ("add_item", rva(&add_item)?),
         ("spin", rva(&spin)?),
         ("leaf", rva(&leaf)?),
@@ -667,7 +667,7 @@ mod tests {
         // Cada função-alvo começa com uma instrução de 5+ bytes que pode ser desviada.
         for (name, first) in [
             ("sum", &[0x48u8, 0x89, 0x5c, 0x24, 0x08][..]),
-            ("drag", &[0x48, 0x89, 0x5c, 0x24, 0x08][..]),
+            ("stack_plus", &[0x48, 0x89, 0x5c, 0x24, 0x08][..]),
             ("add_item", &[0x48, 0x89, 0x5c, 0x24, 0x08][..]),
             ("getter", &[0xf3, 0x0f, 0x10, 0x89][..]),
         ] {

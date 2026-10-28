@@ -112,7 +112,7 @@ pub struct CheatRow {
     /// Texto da quantidade na linha de uma ação, no lugar da formatação da grade (spec 008, 6.8.2).
     pub label: Option<String>,
     /// Desvio com cave (`[[hook]]`, spec 008): a sessão decide a disponibilidade, como nos cheats de
-    /// valor, e o arme da ação (`action`) é do arrastar, não uma execução de campo.
+    /// valor.
     pub hook: bool,
     /// O desvio precisa do personagem (inventário da coleta, spec 008, 6.7.4).
     pub pawn: bool,

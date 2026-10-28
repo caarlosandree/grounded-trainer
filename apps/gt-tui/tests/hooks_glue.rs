@@ -1,11 +1,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //! `HookCheats` (spec 008, 6.11) contra o módulo sintético: o motor de verdade escreve as caves e
 //! os desvios no `gt-testtarget --module`; a reflexão vem de uma cena sintética local. Cobre a
-//! cola da TUI com o `HookRuntime` (disponibilidade, ligar, trocar valor, armar e desligar).
+//! cola da TUI com o `HookRuntime` (disponibilidade, ligar, trocar valor e desligar).
 //! Antes: `cargo build --workspace`.
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use gt_core::mem::MemReader;
 use gt_grounded2::catalog::{HookEntry, HookState};
@@ -13,7 +12,7 @@ use gt_grounded2::hooks::HookEvent;
 use gt_grounded2::signatures::{HookDef, Signatures};
 use gt_testkit::module::{ITEM_STACK, RESEARCH_POINTS};
 use gt_testkit::rig::{MODULE_NAME, SynthRig};
-use gt_tui::backend::{ArmReport, OpOutcome};
+use gt_tui::backend::OpOutcome;
 use gt_tui::hooks::HookCheats;
 use gt_tui::model::Avail;
 use gt_tui::values::{Globals, ReflectionGate};
@@ -25,7 +24,6 @@ const ARENA_LEN: usize = 64 << 20;
 const MAINE: &str = "/Script/Maine";
 const BRAIN: &str = "brain-power";
 const ANALYZER: &str = "analisador-infinito";
-const DRAG: &str = "quantidade-arrastar";
 const MAX_POWER: u32 = 0x980;
 const INVENTORY_OFF: u32 = 0x48;
 
@@ -91,8 +89,7 @@ fn refl() -> (SparseMem, ReflectionIndex) {
 fn hit_entry(rig: &SynthRig, def: &HookDef) -> HookEntry {
     let start = match def.id.as_str() {
         BRAIN => rig.t.symbol("level_pattern"),
-        ANALYZER => rig.t.symbol("getter"),
-        _ => rig.t.symbol("drag"),
+        _ => rig.t.symbol("getter"),
     };
     let mut captures = vec![0u8; def.pattern.len()];
     MemReader::new(rig.t.pid)
@@ -116,7 +113,7 @@ fn avail_of(c: &HookCheats, gate: &ReflectionGate, id: &str) -> Avail {
 }
 
 #[test]
-fn resolve_enable_set_value_arm_and_disable() {
+fn resolve_enable_set_value_and_disable() {
     let rig = SynthRig::new();
     let mut engine = rig.engine();
     let (mem, index) = refl();
@@ -133,7 +130,7 @@ fn resolve_enable_set_value_arm_and_disable() {
     let entries: Vec<HookEntry> = sigs
         .hooks()
         .iter()
-        .filter(|d| [BRAIN, ANALYZER, DRAG].contains(&d.id.as_str()))
+        .filter(|d| [BRAIN, ANALYZER].contains(&d.id.as_str()))
         .map(|d| hit_entry(&rig, d))
         .collect();
     let mut hooks = HookCheats::new(module.clone(), rig.target.maps.clone(), Ok(disk), entries);
@@ -145,7 +142,7 @@ fn resolve_enable_set_value_arm_and_disable() {
     );
     hooks.resolve(&mem, Some(&engine), &index, &globals);
     let ready = ReflectionGate::Ready { verified: true };
-    for id in [BRAIN, ANALYZER, DRAG] {
+    for id in [BRAIN, ANALYZER] {
         assert_eq!(
             avail_of(&hooks, &ready, id),
             Avail::Available { verified: true },
@@ -182,12 +179,8 @@ fn resolve_enable_set_value_arm_and_disable() {
         OpOutcome::Refused(_)
     ));
 
-    // Arrastar: arma com a quantidade do ponto (100 = k 2), desarma ao apertar de novo.
-    assert_eq!(hooks.arm(&mut engine, 2), ArmReport::Armed(100));
-    assert!(hooks.is_hooked(DRAG));
-    assert_eq!(hooks.arm(&mut engine, 4), ArmReport::Disarmed(100));
-    // Sem o jogo aplicar nada, a manutenção não tem o que dizer.
-    let events: Vec<HookEvent> = hooks.tick(&mem, &mut engine, None, Instant::now());
+    // Sem ganho de pesquisa nenhum, a manutenção não tem o que dizer.
+    let events: Vec<HookEvent> = hooks.tick(&mem, &mut engine, None);
     assert!(events.is_empty(), "{events:?}");
 
     // Desligar devolve só o desvio.

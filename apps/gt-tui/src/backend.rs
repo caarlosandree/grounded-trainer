@@ -271,24 +271,6 @@ pub struct ReflectionNews {
     pub player_changed: Option<PlayerState>,
 }
 
-/// Resultado de apertar a tecla do arrastar (spec 008, 6.7.2): armar ou desarmar. `N` é a
-/// quantidade armada.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ArmReport {
-    /// Estava desarmado: armado com `N`.
-    Armed(i32),
-    /// Estava armado: desarmado sem o jogo ter aplicado.
-    Disarmed(i32),
-    /// Estava armado, mas o jogo aplicou antes do desarme.
-    Applied(i32),
-    /// Recusado sem deixar nada escrito (motivo).
-    Refused(String),
-    /// Falhou deixando restos no jogo (causa); só a restauração resolve.
-    Residue(String),
-    /// O jogo fechou.
-    Gone,
-}
-
 /// Relatório de um ciclo sem manutenção (sem cheats de valor, sem motor ou com o motor parado).
 pub fn idle_tick() -> TickReport {
     TickReport {
@@ -421,20 +403,14 @@ pub trait Session<P> {
         OpOutcome::Refused(format!("{id} não é um desvio"))
     }
 
-    /// Arma o arrastar com o ponto `k` da grade, ou o desarma se já estiver armado.
-    fn hook_arm(&mut self, _k: u64) -> ArmReport {
-        ArmReport::Refused("o arrastar não está disponível".to_string())
-    }
-
     /// O personagem (pawn) lido agora, só leitura: de onde a coleta acha o inventário. `None` se
     /// o personagem não está achado.
     fn read_pawn(&mut self) -> Option<u64> {
         None
     }
 
-    /// Manutenção de ~10 Hz dos desvios: o registro do Brain Power, o arrastar armado e o
-    /// inventário. `pawn` é o personagem do ciclo (`None` se não há).
-    fn hook_tick(&mut self, _pawn: Option<u64>, _now: Instant) -> Vec<HookEvent> {
+    /// Manutenção de ~10 Hz dos desvios: o registro do Brain Power e o inventário. `pawn` é o personagem do ciclo (`None` se não há).
+    fn hook_tick(&mut self, _pawn: Option<u64>) -> Vec<HookEvent> {
         Vec::new()
     }
 }

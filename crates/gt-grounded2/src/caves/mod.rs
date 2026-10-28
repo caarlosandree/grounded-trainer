@@ -1,4 +1,4 @@
-//! Corpos das code caves (spec 008, 6.6.1, 6.7.1, 6.7.2 e 6.7.3), montados com `iced-x86`.
+//! Corpos das code caves (spec 008, 6.6.1, 6.7.1 e 6.7.3), montados com `iced-x86`.
 //!
 //! Toda cave tem a mesma forma:
 //!
@@ -15,7 +15,6 @@
 
 mod analyzer;
 mod brain;
-mod drag;
 mod observe;
 
 use std::collections::HashMap;
@@ -43,10 +42,8 @@ pub mod var {
     pub const BRAIN_L2: u64 = 16;
     /// Brain Power: contador de sequência (`u32`): ímpar durante a gravação, sobe 2 por ganho.
     pub const BRAIN_SEQ: u64 = 20;
-    /// Arrastar: quantidade armada (`i32`); 0 = desarmado.
-    pub const DRAG_N: u64 = 24;
-    /// Arrastar: contador de aplicadas (`u64`).
-    pub const DRAG_APPLIED: u64 = 32;
+    // Os deslocamentos 24..40 ficam reservados, sem uso (era o arrastar, fora da Fase 6): os das
+    // outras variáveis não mudam.
     /// Analisador: ligado (`u64`, 0 ou 1).
     pub const ANALYZER_ON: u64 = 40;
     /// Analisador: ponteiro da classe `ResourceAnalyzerBuilding` (`u64`).
@@ -57,7 +54,7 @@ pub mod var {
     pub const COLLECT_INVENTORY: u64 = 64;
     /// Coleta: 8 endereços de retorno permitidos (`u64` cada).
     pub const COLLECT_RETURNS: u64 = 72;
-    /// Arrastar e coleta: ponteiro da classe `Item` (`u64`).
+    /// Coleta: ponteiro da classe `Item` (`u64`).
     pub const ITEM_CLASS: u64 = 136;
     /// Observação: contador de passagens (`u64`).
     pub const OBSERVE_COUNT: u64 = 144;
@@ -125,7 +122,6 @@ pub fn build(body: CaveBody, ctx: &CaveCtx) -> Result<Vec<u8>> {
     match body {
         CaveBody::Brain => brain::build(ctx),
         CaveBody::Analyzer => analyzer::build(ctx),
-        CaveBody::Drag => drag::build(ctx),
         CaveBody::Collect => Err(build_err(
             "o corpo da coleta ainda não existe (depende da pesquisa no jogo)",
         )),
@@ -206,7 +202,7 @@ pub(crate) fn restore(a: &mut CodeAssembler, regs: &[AsmRegister64]) -> Result<(
 }
 
 /// Confere se a classe de `obj` é `target` ou descende dela, subindo `ClassPrivate` →
-/// `SuperStruct` no máximo [`MAX_CLASS_DEPTH`] vezes, sem `call` (spec 008, 6.7.1 e 6.7.2).
+/// `SuperStruct` no máximo [`MAX_CLASS_DEPTH`] vezes, sem `call` (spec 008, 6.7.1 e 6.7.4).
 ///
 /// Salta para `matched` se achar e para `fail` se não (ponteiro nulo na cadeia ou fundo demais).
 /// `obj` e `target` não podem ser nulos (quem chama confere). Estraga `cur`, `count` e as flags.
@@ -288,10 +284,10 @@ mod tests {
 
     #[test]
     fn var_layout_matches_the_spec_table() {
-        // Brain 0..24, arrastar 24..40, analisador 40..56, coleta 56..136, Item 136, observação
+        // Brain 0..24, reservado 24..40, analisador 40..56, coleta 56..136, Item 136, observação
         // 144..280 (spec 008, 6.4).
-        assert_eq!(var::BRAIN_SEQ + 4, var::DRAG_N);
-        assert_eq!(var::DRAG_APPLIED + 8, var::ANALYZER_ON);
+        assert_eq!(var::BRAIN_SEQ + 4, 24);
+        assert_eq!(var::ANALYZER_ON, 40);
         assert_eq!(var::ANALYZER_CLASS + 8, var::COLLECT_N);
         assert_eq!(var::COLLECT_RETURNS + 8 * 8, var::ITEM_CLASS);
         assert_eq!(var::ITEM_CLASS + 8, var::OBSERVE_COUNT);
@@ -300,7 +296,6 @@ mod tests {
             var::TOTAL
         );
         for off in [
-            var::DRAG_APPLIED,
             var::ANALYZER_ON,
             var::ANALYZER_CLASS,
             var::COLLECT_INVENTORY,
@@ -352,7 +347,8 @@ mod game_tests {
         let occ = hex(OCC);
         let brain = ctx(0x5970ee7, "4c 8b b0 18 01 00 00", occ);
         let analyzer = ctx(0x57bd6d0, "f3 0f 10 89 74 09 00 00", vec![]);
-        let drag = ctx(0x5bbfe70, "48 89 5c 24 08", vec![]);
+        // Ponto qualquer com uma instrução de 5 bytes, para a cave de observação.
+        let observe = ctx(0x5bbfe70, "48 89 5c 24 08", vec![]);
         vec![
             (
                 "brain",
@@ -364,11 +360,10 @@ mod game_tests {
                 analyzer.clone(),
                 build(CaveBody::Analyzer, &analyzer).unwrap(),
             ),
-            ("drag", drag.clone(), build(CaveBody::Drag, &drag).unwrap()),
             (
                 "observe rcx",
-                drag.clone(),
-                build_observe(&drag, Register::RCX).unwrap(),
+                observe.clone(),
+                build_observe(&observe, Register::RCX).unwrap(),
             ),
         ]
     }
@@ -376,7 +371,7 @@ mod game_tests {
     #[test]
     fn game_bodies_fit_the_cc_run() {
         let total: usize = game_bodies().iter().map(|(_, _, c)| c.len()).sum();
-        // Os quatro juntos, mais a coleta estimada em 150 bytes, cabem na sequência de 1871.
+        // Os três juntos, mais a coleta estimada em 150 bytes, cabem na sequência de 1871.
         assert!(
             total + 150 + cave::CAVE_MARGIN <= RUN.1 as usize,
             "{total} bytes"
@@ -393,8 +388,7 @@ mod game_tests {
             } else {
                 let body = match name {
                     "brain" => CaveBody::Brain,
-                    "analyzer" => CaveBody::Analyzer,
-                    _ => CaveBody::Drag,
+                    _ => CaveBody::Analyzer,
                 };
                 build(body, &moved).unwrap()
             };

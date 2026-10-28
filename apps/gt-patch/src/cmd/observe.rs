@@ -1126,7 +1126,7 @@ mod tests {
         assert!(!err.contains("regra"), "{err}");
         assert!(err.contains("precisa de 5"), "{err}");
         // Os começos de função (pela `.pdata` e folha) servem.
-        for name in ["sum", "add_item", "drag", "getter", "leaf"] {
+        for name in ["sum", "add_item", "stack_plus", "getter", "leaf"] {
             plan_for(&rig, rig.t.symbol(name), reg).unwrap_or_else(|e| panic!("{name}: {e}"));
         }
         // Fora do módulo.
@@ -1270,7 +1270,7 @@ mod tests {
     #[test]
     fn observe_session_stops_by_itself_after_the_limit() {
         let rig = SynthRig::new();
-        let plan = plan_for(&rig, rig.t.symbol("drag"), Register::RCX).unwrap();
+        let plan = plan_for(&rig, rig.t.symbol("stack_plus"), Register::RCX).unwrap();
         let mut engine = rig.engine();
         let mut out = Vec::new();
         let ret = |a: u64| format!("{a:#x}");

@@ -17,8 +17,8 @@ use gt_grounded2::hooks::HookEvent;
 use gt_grounded2::signatures::Category;
 
 use crate::backend::{
-    ArmReport, Backend, CheatInfo, Find, JobKind, OpOutcome, Recovered, ReflectionJob,
-    ReflectionNews, ReflectionOutcome, Search, SearchError, SearchFn, Session, TuiError, idle_tick,
+    Backend, CheatInfo, Find, JobKind, OpOutcome, Recovered, ReflectionJob, ReflectionNews,
+    ReflectionOutcome, Search, SearchError, SearchFn, Session, TuiError, idle_tick,
 };
 use crate::model::{Avail, Model};
 
@@ -105,9 +105,6 @@ pub(crate) enum Call {
         id: String,
         k: u64,
         busy: Option<String>,
-    },
-    HookArm {
-        k: u64,
     },
     ReadPawn,
     HookTick {
@@ -229,10 +226,6 @@ pub(crate) struct FakeState {
     pub tick_reports: VecDeque<TickReport>,
     /// Disponibilidade dos desvios segundo a sessão.
     pub hook_avail: Vec<(String, Avail)>,
-    /// Resultados programados dos próximos armes do arrastar (vazia: arma com `k`, ou desarma).
-    pub arm_reports: VecDeque<ArmReport>,
-    /// O arrastar está armado (com esta quantidade) na sessão falsa.
-    pub armed: Option<i32>,
     /// Acontecimentos dos próximos ciclos de manutenção dos desvios.
     pub hook_events: VecDeque<Vec<HookEvent>>,
     /// O personagem que a sessão falsa lê.
@@ -468,11 +461,6 @@ impl FakeCtl {
             .collect();
     }
 
-    /// Programa o resultado do próximo arme do arrastar.
-    pub fn push_arm(&self, report: ArmReport) {
-        self.state().arm_reports.push_back(report);
-    }
-
     /// Programa o que a manutenção dos desvios do próximo ciclo devolve.
     pub fn push_hook_events(&self, events: Vec<HookEvent>) {
         self.state().hook_events.push_back(events);
@@ -480,10 +468,6 @@ impl FakeCtl {
 
     pub fn set_pawn(&self, pawn: Option<u64>) {
         self.state().pawn = pawn;
-    }
-
-    pub fn arms(&self) -> usize {
-        self.count(|c| matches!(c, Call::HookArm { .. }))
     }
 
     pub fn hook_ticks(&self) -> usize {
@@ -542,8 +526,6 @@ impl FakeBackend {
             controller_news: None,
             tick_reports: VecDeque::new(),
             hook_avail: Vec::new(),
-            arm_reports: VecDeque::new(),
-            armed: None,
             hook_events: VecDeque::new(),
             pawn: None,
         };
@@ -653,8 +635,6 @@ impl Backend for FakeBackend {
             return Err(TuiError::Other(e.clone()));
         }
         s.sessions += 1;
-        // Uma sessão nova (processo novo) começa com o arrastar desarmado.
-        s.armed = None;
         Ok(FakeSession {
             ctl: self.ctl.clone(),
             engine: engine && search.disk.is_ok(),
@@ -924,41 +904,16 @@ impl Session<()> for FakeSession {
         })
     }
 
-    fn hook_arm(&mut self, k: u64) -> ArmReport {
-        let mut s = self.ctl.state();
-        s.calls.push(Call::HookArm { k });
-        let report = s.arm_reports.pop_front().unwrap_or(match s.armed {
-            Some(n) => ArmReport::Disarmed(n),
-            None => ArmReport::Armed(i32::try_from(k).unwrap_or(i32::MAX)),
-        });
-        s.armed = match &report {
-            ArmReport::Armed(n) => Some(*n),
-            ArmReport::Refused(_) | ArmReport::Residue(_) => s.armed,
-            _ => None,
-        };
-        report
-    }
-
     fn read_pawn(&mut self) -> Option<u64> {
         let mut s = self.ctl.state();
         s.calls.push(Call::ReadPawn);
         s.pawn
     }
 
-    fn hook_tick(&mut self, pawn: Option<u64>, _now: Instant) -> Vec<HookEvent> {
+    fn hook_tick(&mut self, pawn: Option<u64>) -> Vec<HookEvent> {
         let mut s = self.ctl.state();
         s.calls.push(Call::HookTick { pawn });
-        let events = s.hook_events.pop_front().unwrap_or_default();
-        // Como a sessão real: aplicar, expirar ou zerar por fora acaba com o arme.
-        if events.iter().any(|e| {
-            matches!(
-                e,
-                HookEvent::DragApplied(_) | HookEvent::DragExpired | HookEvent::DragDisarmed
-            )
-        }) {
-            s.armed = None;
-        }
-        events
+        s.hook_events.pop_front().unwrap_or_default()
     }
 }
 

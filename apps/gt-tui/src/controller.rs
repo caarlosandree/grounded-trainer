@@ -17,7 +17,7 @@ use gt_grounded2::hooks::HookEvent;
 use gt_grounded2::ue::UE_ID;
 
 use crate::backend::{
-    ArmReport, Backend, CheatInfo, Find, JobKind, OpOutcome, Recovered, ReflectionOutcome, Search,
+    Backend, CheatInfo, Find, JobKind, OpOutcome, Recovered, ReflectionOutcome, Search,
     SearchError, Session,
 };
 use crate::keys::Action;
@@ -61,8 +61,6 @@ const ACTION_PLAYER_MISSING: &str = "personagem não encontrado";
 /// Recusas da ação que dependem da procura do controller.
 const SEARCHING_PLAYER: &str = "procurando o personagem";
 const WAIT_SEARCH: &str = "aguarde a procura";
-/// Nome do arrastar nas linhas do registro (spec 008, 6.7.2).
-const DRAG_LABEL: &str = "Quantidade ao arrastar";
 
 /// Janela depois de uma execução da ação que escreveu, e intervalo mínimo entre duas linhas
 /// de registro com o mesmo motivo (spec 006, 6.6).
@@ -291,7 +289,7 @@ impl<B: Backend> Controller<B> {
             called = self.run_pending_swap(now, draw);
         }
         self.maintain_fields(now);
-        self.maintain_hooks(now);
+        self.maintain_hooks();
         called
     }
 
@@ -1136,16 +1134,12 @@ impl<B: Backend> Controller<B> {
 }
 
 impl<B: Backend> Controller<B> {
-    /// Manutenção de ~10 Hz dos desvios (spec 008, 6.11): o registro do Brain Power, o arrastar
-    /// armado e o inventário da coleta. Como a dos cheats de valor, não é operação e fica
+    /// Manutenção de ~10 Hz dos desvios (spec 008, 6.11): o registro do Brain Power e o
+    /// inventário da coleta. Como a dos cheats de valor, não é operação e fica
     /// suspensa com o diário não resolvido, sem motor ou com o jogo possivelmente parado.
-    fn maintain_hooks(&mut self, now: Instant) {
+    fn maintain_hooks(&mut self) {
         let field_pawn = self.cycle_pawn.take();
-        let active = self
-            .model
-            .cheats
-            .iter()
-            .any(|r| r.hook && (r.on || r.applied_k.is_some()));
+        let active = self.model.cheats.iter().any(|r| r.hook && r.on);
         if !active {
             return;
         }
@@ -1162,7 +1156,7 @@ impl<B: Backend> Controller<B> {
             (true, Some(pawn)) => pawn,
             (true, None) => self.session_call(|s| s.read_pawn()).flatten(),
         };
-        let Some(events) = self.session_call(|s| s.hook_tick(pawn, now)) else {
+        let Some(events) = self.session_call(|s| s.hook_tick(pawn)) else {
             return;
         };
         for e in events {
@@ -1171,7 +1165,7 @@ impl<B: Backend> Controller<B> {
     }
 
     /// Põe um acontecimento da manutenção dos desvios no registro, com os textos da spec 008
-    /// (6.6.1 e 6.7.2).
+    /// (6.6.1).
     fn hook_event(&mut self, e: HookEvent) {
         match e {
             HookEvent::BrainGain {
@@ -1189,25 +1183,6 @@ impl<B: Backend> Controller<B> {
                 }
                 self.event(text);
             }
-            HookEvent::DragApplied(n) => {
-                self.clear_armed();
-                self.event(format!("{DRAG_LABEL}: aplicada ({n})"));
-            }
-            HookEvent::DragExpired => {
-                self.clear_armed();
-                self.event(format!("{DRAG_LABEL}: expirou"));
-            }
-            HookEvent::DragDisarmed => {
-                self.clear_armed();
-                self.event(format!("{DRAG_LABEL}: desarmado"));
-            }
-        }
-    }
-
-    /// O arrastar deixou de estar armado: a linha para de mostrar `armado`.
-    fn clear_armed(&mut self) {
-        for row in self.model.cheats.iter_mut().filter(|r| r.hook && r.action) {
-            row.applied_k = None;
         }
     }
 }
@@ -1521,9 +1496,6 @@ impl<B: Backend> Controller<B> {
             self.throttled_event(id, why, text, now);
             return false;
         }
-        if row.hook {
-            return self.run_arm(row, now);
-        }
         let k = Self::shown_k(row);
         let target = id.to_string();
         let Some(outcome) = self.session_call(|s| s.field_action(&target, k)) else {
@@ -1580,58 +1552,6 @@ impl<B: Backend> Controller<B> {
                 self.throttled_event(id, why, format!("{name}: {why}"), now);
                 false
             }
-        }
-    }
-
-    /// Arma o arrastar com o valor mostrado, ou o desarma se já está armado (spec 008, 6.7.2). A
-    /// janela de 1 s e as recusas dos passos anteriores são as das ações. Devolve `true` se chamou
-    /// a sessão numa operação.
-    fn run_arm(&mut self, row: &CheatRow, now: Instant) -> bool {
-        let (id, name) = (row.id.as_str(), row.name.as_str());
-        let k = Self::shown_k(row);
-        let Some(report) = self.session_call(|s| s.hook_arm(k)) else {
-            return false;
-        };
-        match report {
-            ArmReport::Armed(n) => {
-                self.action_wrote(id, now);
-                self.set_armed(id, Some(k));
-                self.event(format!("{DRAG_LABEL}: armado ({n})"));
-                true
-            }
-            ArmReport::Disarmed(_) => {
-                self.action_wrote(id, now);
-                self.set_armed(id, None);
-                self.event(format!("{DRAG_LABEL}: desarmado"));
-                true
-            }
-            ArmReport::Applied(n) => {
-                self.action_wrote(id, now);
-                self.set_armed(id, None);
-                self.event(format!("{DRAG_LABEL}: aplicada ({n})"));
-                true
-            }
-            ArmReport::Refused(reason) => {
-                self.throttled_event(id, &reason, format!("{name}: {reason}"), now);
-                false
-            }
-            ArmReport::Residue(cause) => {
-                self.note_op(id);
-                self.mark_residue(&[id.to_string()]);
-                self.event(format!("{name}: falhou deixando restos no jogo ({cause})"));
-                true
-            }
-            ArmReport::Gone => {
-                self.on_game_closed(now);
-                true
-            }
-        }
-    }
-
-    /// Guarda (ou tira) o ponto da grade com que o arrastar está armado.
-    fn set_armed(&mut self, id: &str, k: Option<u64>) {
-        if let Some(row) = self.model.cheats.iter_mut().find(|r| r.id == id) {
-            row.applied_k = k;
         }
     }
 
@@ -5489,7 +5409,6 @@ mod tests {
     }
 
     const BRAIN: &str = "brain-power";
-    const DRAG: &str = "quantidade-arrastar";
     const COLLECT: &str = "coleta-multiplicada";
 
     fn brain_info() -> CheatInfo {
@@ -5498,16 +5417,6 @@ mod tests {
             "Brain Power rápido",
             points(&[2.0, 3.0, 5.0, 10.0], 0, Some("x")),
         )
-    }
-
-    fn drag_info() -> CheatInfo {
-        let mut c = hook_info(
-            DRAG,
-            "Quantidade ao arrastar",
-            points(&[10.0, 50.0, 100.0, 250.0, 500.0, 999.0], 2, None),
-        );
-        c.action = true;
-        c
     }
 
     fn collect_info() -> CheatInfo {
@@ -5520,12 +5429,11 @@ mod tests {
         c
     }
 
-    /// Conectado em 0 com o Brain Power e o arrastar, disponíveis pela sessão.
+    /// Conectado em 0 com o Brain Power, disponível pela sessão.
     fn with_hooks() -> H {
         let mut h = H::new();
-        h.ctl.set_catalog(vec![brain_info(), drag_info()]);
-        h.ctl
-            .set_hook_avail(&[(BRAIN, available()), (DRAG, available())]);
+        h.ctl.set_catalog(vec![brain_info()]);
+        h.ctl.set_hook_avail(&[(BRAIN, available())]);
         h.connect(0);
         h
     }
@@ -5676,191 +5584,6 @@ mod tests {
         assert!(!h.row(BRAIN).on);
     }
 
-    fn press_drag(h: &mut H, ms: u64) -> bool {
-        h.toggle(DRAG, ms)
-    }
-
-    #[test]
-    fn drag_arm_disarm_expire_texts() {
-        let mut h = with_hooks();
-        // Arma com o valor mostrado (100): vira `armado`, sem ficar ligado nem desejado.
-        assert!(press_drag(&mut h, 100));
-        assert!(h.ctl.calls().contains(&Call::HookArm { k: 2 }));
-        assert_eq!(event_count(&h, "Quantidade ao arrastar: armado (2)"), 1);
-        assert_eq!(h.row(DRAG).applied_k, Some(2));
-        assert!(!h.row(DRAG).on && h.c.desired().is_empty());
-        assert_eq!(h.c.model.counts(), (1, 1), "uma ação não conta no topo");
-
-        // As setas mudam só o número mostrado.
-        assert!(!h.key(Action::Inc, 500));
-        assert_eq!(h.row(DRAG).k, 3);
-        assert_eq!(h.row(DRAG).applied_k, Some(2));
-        assert_eq!(
-            hook_calls(&h, |c| matches!(c, Call::HookSetValue { .. })),
-            0
-        );
-
-        // Apertar de novo (fora da janela de 1 s) desarma.
-        assert!(press_drag(&mut h, 1_200));
-        assert_eq!(event_count(&h, "Quantidade ao arrastar: desarmado"), 1);
-        assert_eq!(h.row(DRAG).applied_k, None);
-
-        // O jogo aplica: o acompanhamento de 100 ms registra `aplicada (N)`.
-        assert!(press_drag(&mut h, 2_500));
-        assert_eq!(h.row(DRAG).applied_k, Some(3));
-        h.ctl.push_hook_events(vec![HookEvent::DragApplied(250)]);
-        h.tick(2_600);
-        assert_eq!(event_count(&h, "Quantidade ao arrastar: aplicada (250)"), 1);
-        assert_eq!(h.row(DRAG).applied_k, None);
-
-        // Expira depois de 60 s armado.
-        assert!(press_drag(&mut h, 4_000));
-        h.ctl.push_hook_events(vec![HookEvent::DragExpired]);
-        h.tick(4_100);
-        assert_eq!(event_count(&h, "Quantidade ao arrastar: expirou"), 1);
-        assert_eq!(h.row(DRAG).applied_k, None);
-
-        // O jogo aplicou antes do desarme.
-        assert!(press_drag(&mut h, 6_000));
-        h.ctl.push_arm(ArmReport::Applied(250));
-        assert!(press_drag(&mut h, 7_100));
-        assert_eq!(event_count(&h, "Quantidade ao arrastar: aplicada (250)"), 2);
-        assert_eq!(h.row(DRAG).applied_k, None);
-
-        // A variável zerada por fora acaba com o arme.
-        assert!(press_drag(&mut h, 9_000));
-        h.ctl.push_hook_events(vec![HookEvent::DragDisarmed]);
-        h.tick(9_100);
-        assert_eq!(event_count(&h, "Quantidade ao arrastar: desarmado"), 2);
-        assert_eq!(h.row(DRAG).applied_k, None);
-        assert_eq!(enables(&h, DRAG), 0, "o arme instala o desvio, não o ligar");
-    }
-
-    #[test]
-    fn action_window_1s() {
-        let mut h = with_hooks();
-        assert!(press_drag(&mut h, 100));
-        // A janela de 1 s vale também para o arme: o segundo aperto é descartado.
-        assert!(!press_drag(&mut h, 500));
-        assert!(!press_drag(&mut h, 1_000));
-        assert_eq!(h.ctl.arms(), 1);
-        assert_eq!(event_count(&h, "Quantidade ao arrastar: aguarde"), 1);
-        assert!(press_drag(&mut h, 1_150));
-        assert_eq!(h.ctl.arms(), 2);
-        assert_eq!(h.row(DRAG).applied_k, None);
-    }
-
-    #[test]
-    fn drag_arm_refused_when_stuck() {
-        let mut h = with_hooks();
-        h.ctl.set_stuck(true);
-        assert!(!press_drag(&mut h, 100));
-        assert!(!press_drag(&mut h, 200));
-        assert_eq!(
-            event_count(
-                &h,
-                "Quantidade ao arrastar: não foi possível ligar (o jogo pode ter ficado parado; aperte r)"
-            ),
-            1
-        );
-        assert_eq!(h.ctl.arms(), 0);
-        assert_eq!(h.row(DRAG).applied_k, None);
-        assert!(!h.c.op_counts.contains_key(DRAG));
-
-        // Sem motor (disco ilegível): a mesma mensagem do ligar.
-        let mut h = H::new();
-        let mut spec = SearchSpec::new(vec![drag_info()]);
-        spec.disk = Err("disco ilegível".to_string());
-        h.ctl.set_default_search(spec);
-        h.ctl.set_hook_avail(&[(DRAG, available())]);
-        h.connect(0);
-        assert!(!press_drag(&mut h, 100));
-        assert_eq!(
-            event_count(
-                &h,
-                "Quantidade ao arrastar: não foi possível ligar (o motor não está aberto)"
-            ),
-            1
-        );
-        assert_eq!(h.ctl.arms(), 0);
-    }
-
-    #[test]
-    fn drag_arm_checking_and_unavailable_states() {
-        // Verificando a reflexão: só avisa, sem chamar a sessão.
-        let mut h = H::new();
-        h.ctl.set_catalog(vec![drag_info()]);
-        h.ctl.set_hook_avail(&[(DRAG, Avail::Checking)]);
-        h.connect(0);
-        assert!(!press_drag(&mut h, 100));
-        assert_eq!(
-            event_count(
-                &h,
-                "Quantidade ao arrastar: verificando a reflexão do jogo; tente de novo em instantes"
-            ),
-            1
-        );
-        assert_eq!(h.ctl.arms(), 0);
-
-        // Indisponível: o motivo da conferência, com o `indisponível (…)` da tela.
-        let mut h = H::new();
-        h.ctl.set_catalog(vec![drag_info()]);
-        h.ctl
-            .set_hook_avail(&[(DRAG, unavailable("sem espaço para a cave"))]);
-        h.connect(0);
-        assert!(!press_drag(&mut h, 100));
-        assert_eq!(
-            event_count(
-                &h,
-                "Quantidade ao arrastar: indisponível (sem espaço para a cave)"
-            ),
-            1
-        );
-        assert_eq!(h.ctl.arms(), 0);
-    }
-
-    #[test]
-    fn drag_arm_refusal_from_the_session_is_not_an_operation() {
-        let mut h = with_hooks();
-        h.ctl
-            .push_arm(ArmReport::Refused("sem espaço para a cave".to_string()));
-        assert!(!press_drag(&mut h, 100));
-        assert_eq!(
-            event_count(&h, "Quantidade ao arrastar: sem espaço para a cave"),
-            1
-        );
-        assert_eq!(h.row(DRAG).applied_k, None);
-        // A recusa não abriu a janela de 1 s.
-        assert!(press_drag(&mut h, 150));
-    }
-
-    #[test]
-    fn drag_not_rearmed_on_reconnect() {
-        let mut h = with_hooks();
-        // O Brain Power é religado; o arrastar armado não.
-        assert!(h.toggle(BRAIN, 100));
-        assert!(press_drag(&mut h, 1_500));
-        assert_eq!(h.row(DRAG).applied_k, Some(2));
-        h.reopen(2_000, 4_100);
-        assert_eq!(h.row(DRAG).applied_k, None);
-        assert!(!h.c.desired().contains_key(DRAG));
-        h.tick(4_200);
-        h.tick(6_000);
-        h.tick(30_000);
-        assert_eq!(h.ctl.arms(), 1, "nenhum arme novo só por reconectar");
-        assert_eq!(
-            enables(&h, DRAG),
-            0,
-            "nenhum desvio reinstalado só por reconectar"
-        );
-        assert_eq!(enables(&h, BRAIN), 2);
-        assert_eq!(h.row(DRAG).applied_k, None);
-        // A linha mostra desarmada: só um novo aperto arma.
-        assert!(press_drag(&mut h, 31_000));
-        assert_eq!(h.ctl.arms(), 2);
-        assert_eq!(h.row(DRAG).applied_k, Some(2));
-    }
-
     #[test]
     fn brain_log_line_and_skipped() {
         let mut h = with_hooks();
@@ -5929,7 +5652,7 @@ mod tests {
     }
 
     #[test]
-    fn hook_tick_only_with_a_hook_on_or_armed() {
+    fn hook_tick_only_with_a_hook_on() {
         let mut h = with_hooks();
         h.tick(100);
         assert_eq!(h.ctl.hook_ticks(), 0);

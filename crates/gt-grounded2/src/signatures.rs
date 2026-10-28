@@ -291,8 +291,6 @@ pub enum CaveBody {
     Brain,
     /// Analisador infinito (6.7.1).
     Analyzer,
-    /// Quantidade ao arrastar (6.7.2).
-    Drag,
     /// Coleta multiplicada (6.7.4).
     Collect,
 }
@@ -302,7 +300,6 @@ impl CaveBody {
         match text {
             "brain" => Some(CaveBody::Brain),
             "analyzer" => Some(CaveBody::Analyzer),
-            "drag" => Some(CaveBody::Drag),
             "collect" => Some(CaveBody::Collect),
             _ => None,
         }
@@ -332,10 +329,8 @@ pub struct HookDef {
     pub body: CaveBody,
     /// Grade por lista de pontos do valor ajustável, se o corpo tem valor.
     pub value: Option<ValueGrid>,
-    /// Ação por tecla com desvio (hoje só o arrastar): não conta como ligada no topo.
-    pub action: bool,
     /// Classe do objeto que a cave confere (`Pacote.Nome`) e dona do campo que ela escreve: `Item`
-    /// no arrastar e na coleta, `ResourceAnalyzerBuilding` no analisador. O Brain Power não tem
+    /// na coleta, `ResourceAnalyzerBuilding` no analisador. O Brain Power não tem
     /// (usa a `party_class` do `[ue.player]`).
     pub object_class: Option<String>,
 }
@@ -552,7 +547,6 @@ struct GenericHook {
     pattern: String,
     offset: usize,
     body: Option<String>,
-    action: Option<bool>,
     value: Option<ValueBlock>,
     /// Classe dona do objeto que a cave confere (`Pacote.Nome`); obrigatória fora do `brain`.
     object_class: Option<String>,
@@ -1077,14 +1071,10 @@ fn build_hook(file: &str, raw: GenericHook) -> Result<HookDef> {
         Some(text) => CaveBody::parse(text).ok_or_else(|| {
             err(
                 "body",
-                &format!("`{text}` não é brain, analyzer, drag nem collect"),
+                &format!("`{text}` não é brain, analyzer nem collect"),
             )
         })?,
     };
-    let action = raw.action.unwrap_or(false);
-    if action && body != CaveBody::Drag {
-        return Err(err("action", "só vale no corpo drag"));
-    }
     let value = match (&raw.value, body) {
         (Some(_), CaveBody::Analyzer) => {
             return Err(err("value", "o corpo analyzer não tem valor"));
@@ -1127,7 +1117,6 @@ fn build_hook(file: &str, raw: GenericHook) -> Result<HookDef> {
         offset: raw.offset,
         body,
         value,
-        action,
         object_class,
     })
 }
@@ -4761,7 +4750,6 @@ label = "+1h"
 
     const ANALYZER_BODY: &str =
         "body = \"analyzer\"\nobject_class = \"/Script/Maine.ResourceAnalyzerBuilding\"\n";
-    const DRAG_CLASS: &str = "object_class = \"/Script/Maine.Item\"\n";
     const POINTS: &str = "[hook.value]\ntype = \"i32\"\npoints = [2, 3, 5]\ndefault = 3\n";
 
     fn hook_err(extra: &str) -> String {
@@ -4775,17 +4763,13 @@ label = "+1h"
         let sigs = Signatures::embedded().unwrap();
         let hooks = sigs.hooks();
         let ids: Vec<&str> = hooks.iter().map(|h| h.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec!["brain-power", "analisador-infinito", "quantidade-arrastar"]
-        );
+        assert_eq!(ids, vec!["brain-power", "analisador-infinito"]);
         // Os hooks não entram na lista de patches.
         assert!(sigs.ids().iter().all(|id| !ids.contains(id)));
 
         let brain = &hooks[0];
         assert_eq!(brain.body, CaveBody::Brain);
         assert_eq!((brain.offset, brain.pattern.len()), (36, 91));
-        assert!(!brain.action);
         let grid = brain.value.as_ref().unwrap();
         assert_eq!(grid.points.as_deref(), Some(&[2.0, 3.0, 5.0, 10.0][..]));
         assert_eq!((grid.default_k, grid.steps()), (0, 3));
@@ -4795,18 +4779,8 @@ label = "+1h"
         let analyzer = &hooks[1];
         assert_eq!(analyzer.body, CaveBody::Analyzer);
         assert_eq!(analyzer.offset, 0);
-        assert!(analyzer.value.is_none() && !analyzer.action);
+        assert!(analyzer.value.is_none());
 
-        let drag = &hooks[2];
-        assert_eq!(drag.body, CaveBody::Drag);
-        assert!(drag.action);
-        let grid = drag.value.as_ref().unwrap();
-        assert_eq!(
-            grid.points.as_deref(),
-            Some(&[10.0, 50.0, 100.0, 250.0, 500.0, 999.0][..])
-        );
-        assert_eq!(grid.value(grid.default_k), 100.0);
-        assert_eq!(grid.unit, None);
         // Todos com módulo do jogo e a instrução do desvio com 5+ bytes (conferido na carga).
         for h in hooks {
             assert_eq!(h.module, crate::GAME_EXE);
@@ -4837,31 +4811,6 @@ label = "+1h"
             matches!(&err, Error::Signature { field, .. } if field == "offset"),
             "{err}"
         );
-    }
-
-    #[test]
-    fn hook_action_only_drag() {
-        let ok = parse(&[(
-            "generic.toml",
-            &hook_toml(&format!(
-                "body = \"drag\"\naction = true\n{DRAG_CLASS}{POINTS}"
-            )),
-        )])
-        .unwrap();
-        assert!(ok.hooks()[0].action);
-        // Sem `action`, o padrão é falso.
-        let plain = parse(&[(
-            "generic.toml",
-            &hook_toml(&format!("body = \"drag\"\n{DRAG_CLASS}{POINTS}")),
-        )])
-        .unwrap();
-        assert!(!plain.hooks()[0].action);
-        for body in ["brain", "collect"] {
-            let err = hook_err(&format!("body = \"{body}\"\naction = true\n{POINTS}"));
-            assert!(err.contains("action"), "{err}");
-        }
-        let err = hook_err("body = \"analyzer\"\naction = true\n");
-        assert!(err.contains("action"), "{err}");
     }
 
     #[test]
@@ -4901,14 +4850,14 @@ label = "+1h"
 
     #[test]
     fn hook_object_class_rules() {
-        // O analisador, o arrastar e a coleta trazem a classe; ela fica em `HookDef`.
+        // O analisador e a coleta trazem a classe; ela fica em `HookDef`.
         let ok = parse(&[("generic.toml", &hook_toml(ANALYZER_BODY))]).unwrap();
         assert_eq!(
             ok.hooks()[0].object_class.as_deref(),
             Some("/Script/Maine.ResourceAnalyzerBuilding")
         );
         // Sem ela, o campo é obrigatório fora do Brain Power.
-        for body in ["analyzer", "drag", "collect"] {
+        for body in ["analyzer", "collect"] {
             let value = if body == "analyzer" { "" } else { POINTS };
             let err = hook_err(&format!("body = \"{body}\"\n{value}"));
             assert!(err.contains("object_class"), "{body}: {err}");
@@ -4921,7 +4870,7 @@ label = "+1h"
             "body = \"brain\"\nobject_class = \"/Script/Maine.PartyComponent\"\n{POINTS}"
         ));
         assert!(err.contains("party_class"), "{err}");
-        // Os embutidos: arrastar e analisador com a classe, Brain Power sem.
+        // Os embutidos: o analisador com a classe, Brain Power sem.
         let sigs = Signatures::embedded().unwrap();
         let class = |id: &str| {
             sigs.hooks()
@@ -4931,10 +4880,6 @@ label = "+1h"
                 .object_class
                 .clone()
         };
-        assert_eq!(
-            class("quantidade-arrastar").as_deref(),
-            Some("/Script/Maine.Item")
-        );
         assert_eq!(
             class("analisador-infinito").as_deref(),
             Some("/Script/Maine.ResourceAnalyzerBuilding")

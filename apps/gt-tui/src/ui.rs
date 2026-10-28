@@ -318,7 +318,7 @@ fn cheat_line(
         }
         // Uma ação não liga nem desliga: pede uma execução (spec 006, 6.6).
         CheatStatus::Off if row.action => (
-            format!("[ação]{unverified_mark}{}", armed_text(row)),
+            format!("[ação]{unverified_mark}"),
             Style::new().fg(Color::Cyan),
             true,
         ),
@@ -371,19 +371,6 @@ fn cheat_line(
         spans.push(Span::raw(format!(" {}", value_text(row, value))));
     }
     Line::from(spans)
-}
-
-/// ` armado` com o arrastar armado na quantidade mostrada, ou ` armado: 250` quando a quantidade
-/// mostrada difere da armada (spec 008, 6.7.2); vazio sem arme.
-fn armed_text(row: &CheatRow) -> String {
-    let (Some(applied), Some(spec)) = (row.applied_k, &row.value) else {
-        return String::new();
-    };
-    if applied == row.k {
-        " armado".to_string()
-    } else {
-        format!(" armado: {}", spec.format(applied))
-    }
 }
 
 /// Corta `text` em `max` colunas, com `…` no fim quando perde caracteres.
@@ -595,7 +582,7 @@ mod tests {
         m.conn = connected();
         let mut on = row("Cargas infinitas", Category::Itens, ok());
         on.on = true;
-        let off = row("Duplicar ao arrastar", Category::Itens, ok());
+        let off = row("Duplicar itens", Category::Itens, ok());
         let unverified = row(
             "Sem conferir",
             Category::Itens,
@@ -614,7 +601,7 @@ mod tests {
         speed_row.value = Some(speed());
         speed_row.k = 2;
         m.cheats = vec![on, off, unverified, missing, residue, again, speed_row];
-        // Ordem visível: God mode, Cargas infinitas, Duplicar ao arrastar, ...
+        // Ordem visível: God mode, Cargas infinitas, Duplicar itens, ...
         m.selected = 2;
         let lines = screen(&m);
 
@@ -632,8 +619,8 @@ mod tests {
             line_with(&lines, header);
         }
         assert!(line_with(&lines, "Cargas infinitas").contains("[ON ]"));
-        let selected = line_with(&lines, "Duplicar ao arrastar");
-        assert!(selected.contains("> Duplicar ao arrastar"), "{selected}");
+        let selected = line_with(&lines, "Duplicar itens");
+        assert!(selected.contains("> Duplicar itens"), "{selected}");
         assert!(selected.contains("[OFF]"));
         assert!(!selected.contains('?'));
         assert!(line_with(&lines, "Sem conferir").contains("[OFF] ?"));
@@ -1055,51 +1042,6 @@ mod tests {
             line.trim_end().chars().count() <= MIN_WIDTH as usize,
             "{line}"
         );
-    }
-
-    /// A grade do arrastar: lista de pontos, sem unidade.
-    fn drag_grid() -> ValueGrid {
-        ValueGrid {
-            ty: ValueType::I32,
-            min: 10.0,
-            max: 999.0,
-            step: 0.0,
-            default_k: 2,
-            unit: None,
-            decimals: 0,
-            points: Some(vec![10.0, 50.0, 100.0, 250.0, 500.0, 999.0]),
-        }
-    }
-
-    #[test]
-    fn armed_drag_shows_armado_and_the_armed_amount_when_it_differs() {
-        let mut m = Model::new(false);
-        m.conn = connected();
-        let mut r = row("Quantidade ao arrastar", Category::Itens, ok());
-        r.hook = true;
-        r.action = true;
-        r.value = Some(drag_grid());
-        r.k = 2;
-        m.cheats = vec![r];
-        // Desarmado: só a ação e a quantidade.
-        let lines = screen(&m);
-        let line = line_with(&lines, "Quantidade ao arrastar");
-        assert!(line.contains("[ação]") && line.contains("+100"), "{line}");
-        assert!(!line.contains("armado"), "{line}");
-        // Armado na quantidade mostrada.
-        m.cheats[0].applied_k = Some(2);
-        let lines = screen(&m);
-        let line = line_with(&lines, "Quantidade ao arrastar");
-        assert!(line.contains("[ação]") && line.contains("armado"), "{line}");
-        assert!(!line.contains("armado:"), "{line}");
-        // As setas mudaram só o número mostrado: a linha diz o que está armado.
-        m.cheats[0].k = 4;
-        let lines = screen(&m);
-        let line = line_with(&lines, "Quantidade ao arrastar");
-        assert!(line.contains("armado: 100"), "{line}");
-        assert!(line.contains("+500"), "{line}");
-        // Uma ação armada não aparece como ligada.
-        assert!(!line.contains("[ON ]"), "{line}");
     }
 
     #[test]
