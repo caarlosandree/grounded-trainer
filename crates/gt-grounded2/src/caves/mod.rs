@@ -43,8 +43,7 @@ pub mod var {
     pub const BRAIN_L2: u64 = 16;
     /// Brain Power: contador de sequência (`u32`): ímpar durante a gravação, sobe 2 por ganho.
     pub const BRAIN_SEQ: u64 = 20;
-    // Os deslocamentos 24..40 ficam reservados, sem uso (era o arrastar, fora da Fase 6): os das
-    // outras variáveis não mudam.
+    // Os deslocamentos 24..40 ficam reservados, sem uso: os das outras variáveis não mudam.
     /// Analisador: ligado (`u64`, 0 ou 1).
     pub const ANALYZER_ON: u64 = 40;
     /// Analisador: ponteiro da classe `ResourceAnalyzerBuilding` (`u64`).

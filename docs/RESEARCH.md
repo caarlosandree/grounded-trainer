@@ -749,7 +749,7 @@ e a separação das fontes da coleta continuam em aberto.
   `Item` (ou subclasse) **e** o item arrastado. Hipótese não confirmada: o `+5bbfe70` (que o FLiNG usa em
   `aobdragitemamount`) rodaria ao **dividir** uma pilha, e não ao arrastar.
 - **Coleta, o que falta:** observar `+5941669` com `rcx` e `rdx` enquanto o dono pega do chão, colhe, pega loot, cria
-  na bancada, tira do baú e solta e pega de volta; achar de onde vem a pilha máxima de um item. Sem separar as
+  na bancada, tira do baú e solta e pega de volta; achar de onde vem a pilha máxima de um item (resolvido pela decisão do dono em 2026-10-28: sem limite de pilha). Sem separar as
   fontes, a coleta sai da spec (6.7.4).
 - **Analisador, o que falta:** observar `+57bd6d0` com `rcx` (chamadores e classes) e comparar as cargas com
   `MaxPowerCapacity` num analisador cheio e num gasto.

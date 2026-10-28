@@ -282,8 +282,9 @@ Funções com unwind encadeado (`UNW_FLAG_CHAININFO`) não contam como começo d
   `InventoryComponent`, declarado em `SurvivalCharacter`; o `MountInventoryComponent` e o
   `ProximityInventoryComponent` não contam), atualizado no ciclo de ~10 Hz e zerado quando o personagem some (morte,
   menu, outro mundo).
-- **Sem limite de pilha** (decisão do dono em 2026-10-28): a pilha máxima de cada item fica na tabela de dados do jogo
-  (`Item.ItemDataRowHandle`), fora do alcance da cave. O ×N vale para qualquer item, inclusive ferramentas e armas.
+- **Sem limite de pilha** (decisão do dono em 2026-10-28): o `Item` não tem campo de pilha máxima (a reflexão
+  mostra só `StackSize` e `ItemDataRowHandle`, a linha da tabela de dados do item) e a cave não lê tabelas; a pilha
+  máxima, onde quer que esteja, fica fora do alcance da cave. O ×N vale para qualquer item, inclusive ferramentas e armas.
   O teste no jogo (9) anota o que o jogo faz com uma pilha acima do máximo (divide, limita ou aceita, e se vai para o
   save); se for ruim, volta ao dono.
 - **Pegar do chão multiplica, inclusive item solto pelo próprio dono** (decisão do dono em 2026-10-28: o jogo usa o
@@ -339,7 +340,7 @@ Patches com `slot` e grades existentes não mudam. O `unit` continua sufixo (`5x
 
 - Antes do primeiro teste que escreve no jogo, o dono faz backup do save (`AGENTS.md` 3).
 - **Brain Power** e **coleta**: o progresso e os itens extras vão para o save (propósito dos cheats).
-- **Analisador**: cargas cheias ficam depois de desligar. **Arrastar**: pilhas acima do máximo podem ir para o save.
+- **Analisador**: cargas cheias ficam depois de desligar. **Coleta**: pilhas acima do máximo podem ir para o save.
 - **Hora**: `pular-hora` muda a hora salva; `congelar-hora` devolve o original ao desligar.
 - `AGENTS.md` 3 ganha a ressalva dos desvios: escrita de cave em `CC` e de variáveis na folga da `.data` (exceção à
   regra da 005), cave mantida até sair, limpeza com conferência do `pc`, variáveis sem diário de valor.
@@ -361,7 +362,7 @@ Patches com `slot` e grades existentes não mudam. O `unit` continua sufixo (`5x
 | Cave do Brain Power contra tabela sintética (fora de ordem inclusive): multiplica; limita em `L2 − 1`; nunca abaixo do ganho original; sem `L2` só limita ao `int32`; ganho ≤ 0 intacto; sem estouro; variáveis de registro | Não |
 | Cave do analisador: grava `float(Max)` só com `Max > 0` e com `rcx` da classe certa | Não |
 | ~~Cave do arrastar~~ (saiu, 6.7.2) | — |
-| Cave da coleta (módulo sintético, escrito **depois** da pesquisa, com o mecanismo escolhido; os casos abaixo valem para qualquer mecanismo): multiplica só no inventário da variável; limita à pilha máxima; pilha máxima 1 intacta; N = 0 e inventário nulo não fazem nada; chamada que não é de uma das três fontes não multiplica | Não |
+| Cave da coleta (módulo sintético, escrito **depois** da pesquisa, com o mecanismo escolhido; os casos abaixo valem para qualquer mecanismo): multiplica só no inventário da variável; limita ao maior `int32`; `StackSize` ≤ 0 intacto; N = 0 e inventário nulo não fazem nada; chamada que não é de uma das três fontes não multiplica | Não |
 | Todas as caves com as variáveis zeradas: passam direto, resultado original | Não |
 | Cada cave gerada, desmontada: sem `call`, sem `ret`, sem `int3`/`CC`; termina no `jmp` de volta | Não |
 | ~~Desarmar o arrastar~~ (saiu, 6.7.2) | — |
@@ -393,8 +394,7 @@ Com backup do save feito pelo dono e o FLiNG fechado:
 5. **Coleta**: com ×3, pegar do chão, colher, pegar loot de uma criatura e criar um item: cada um vem ×3. Tirar do
    baú: vem ×1. Soltar um item e pegar de volta: vem ×3 (decisão do dono). Anotar o que o jogo faz com uma pilha acima do
    máximo (divide, limita ou aceita) e com uma ferramenta ×3, e se isso vai para o save. Com o inventário cheio, anotar
-   o que acontece com o item recusado (o jogo pode deixá-lo no chão já multiplicado, e pegar de novo multiplica de
-   novo). Conferir que a coleta aparece disponível (padrão único na memória).
+   se o item recusado fica no chão e se, ao pegá-lo de novo, o ×N se aplica de novo. Conferir que a coleta aparece disponível (padrão único na memória).
 6. **Congelar hora**: o relógio para; desligado, volta. Tentar dormir com a hora congelada e anotar.
 7. **Pular hora**: cada toque avança 1 hora, com e sem a hora congelada; segurar avança no máximo uma vez por
    segundo.
@@ -434,7 +434,7 @@ Com o item 2, a **Fase 6 fecha**.
 | Variáveis sem diário de valor; limpeza zera a região | IA |
 | Cave mantida ao desligar; apagada na saída só sem thread dentro (`pc`), até 5 tentativas | IA |
 | Arrastar com uma variável só (0 = desarmado), `xchg`, conferência da classe `Item`, desarmar na segunda tecla e expirar em 60 s | IA |
-| Coleta: só o inventário do jogador (variável mantida pelo trainer), limitado à pilha máxima, pilha 1 intacta | IA |
+| Coleta: só o inventário do jogador (variável mantida pelo trainer), limitado ao maior `int32`, `StackSize` ≤ 0 intacto | IA |
 | Padrão do Brain Power estendido para conferir registradores e o offset de `ResearchPoints` | IA |
 | Orçamento fixo das variáveis; observação uma de cada vez, no `gt-patch` | IA |
 | Desarmar sem operação atômica: escrever 0 e decidir pelo contador de aplicadas | IA |
