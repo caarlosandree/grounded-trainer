@@ -650,6 +650,48 @@ fn disable_failure_leaving_the_hook_pending_reinstalls_after_the_restore() {
 }
 
 #[test]
+fn enable_after_restore_of_a_failed_enable_claims_the_vars_again() {
+    // A 1ª pausa do motor (a do `enable`) escreve e não consegue desfazer: `[Cave, Code]` ficam
+    // pendentes, com a folga já reclamada.
+    let mut s = scene_with(Opts {
+        pause: Some(PauseConfig {
+            fault: Some(Fault::WriteAndRollbackFail),
+            hook_on_pause: 1,
+            ..PauseConfig::default()
+        }),
+        ..default_opts()
+    });
+    s.resolve();
+    let original = s.level_point_bytes();
+    assert!(s.rt.enable(&mut s.engine, BRAIN, Some(1)).is_err());
+    let mut pending = s.engine.pending_ids();
+    pending.sort();
+    assert_eq!(
+        pending,
+        [
+            "brain-power-cave".to_string(),
+            "brain-power-hook".to_string()
+        ]
+    );
+    assert!(!s.rt.is_hooked(BRAIN));
+    // O `r`: o `restore_pending` resolve os restos e, sem desvio vivo, zera e solta a folga.
+    s.engine.restore_pending().unwrap();
+    assert!(s.engine.pending_ids().is_empty());
+    assert!(s.engine.vars().is_empty());
+    assert_eq!(s.level_point_bytes(), original);
+    // Ligar de novo reclama a folga outra vez e a cave funciona.
+    s.rt.enable(&mut s.engine, BRAIN, Some(1)).unwrap();
+    assert!(s.rt.is_hooked(BRAIN));
+    assert_eq!(s.engine.vars().len(), 1);
+    assert_eq!(s.var_i32(var::BRAIN_N), 3);
+    s.set_points(0);
+    s.gain(10);
+    assert_eq!(s.points(), 30);
+    s.engine.undo_all().unwrap();
+    assert_eq!(s.level_point_bytes(), original);
+}
+
+#[test]
 fn recognize_installed_drops_a_hooked_flag_the_engine_does_not_have() {
     let mut s = scene();
     s.resolve();

@@ -193,8 +193,6 @@ pub struct HookRuntime {
     env: HookEnv,
     /// Por `id`.
     slots: HashMap<String, Slot>,
-    /// A folga já foi reclamada no motor.
-    claimed: bool,
     /// Deslocamento do `InventoryComponent` no personagem, se a reflexão o achou.
     inventory_off: Option<u32>,
     /// Último contador de sequência do Brain Power visto (ou o da hora de ligar).
@@ -275,7 +273,6 @@ impl HookRuntime {
         Self {
             env,
             slots: HashMap::new(),
-            claimed: false,
             inventory_off: None,
             brain_seq: None,
             orphan_caves: HashMap::new(),
@@ -286,6 +283,16 @@ impl HookRuntime {
     /// Base das variáveis (começo da folga), se há folga.
     fn base(&self) -> Option<u64> {
         self.env.var_region.as_ref().map(|r| r.start)
+    }
+
+    /// A folga está reclamada no motor agora? Vem do motor, não de um cache: o `restore_pending`
+    /// (ou o `undo_all`) a zera e a solta por fora do runtime, e o próximo `enable` tem de
+    /// reclamá-la de novo.
+    fn claimed(&self, engine: &Engine) -> bool {
+        self.env
+            .var_region
+            .as_ref()
+            .is_some_and(|r| engine.vars().iter().any(|v| v.addr == r.start))
     }
 
     /// Tamanho da folga em bytes.
@@ -430,14 +437,6 @@ impl HookRuntime {
                 },
             );
             found.push(def.id.clone());
-        }
-        if self
-            .env
-            .var_region
-            .as_ref()
-            .is_some_and(|r| engine.vars().iter().any(|v| v.addr == r.start))
-        {
-            self.claimed = true;
         }
         found
     }
@@ -610,9 +609,11 @@ impl HookRuntime {
                 id: String::new(),
                 state: "sem espaço para variáveis".to_string(),
             })?;
-        if !self.claimed {
+        if !self.claimed(engine) {
             engine.claim_vars(region.clone()).map_err(core)?;
-            self.claimed = true;
+            // Folga nova (toda zero): o que o runtime lembra dela não vale mais.
+            self.inventory_written = None;
+            self.brain_seq = None;
         }
         Ok(region.start)
     }
@@ -767,7 +768,7 @@ impl HookRuntime {
         pawn: Option<PawnView>,
     ) -> Vec<HookEvent> {
         let mut events = Vec::new();
-        let Some(base) = self.base().filter(|_| self.claimed) else {
+        let Some(base) = self.base().filter(|_| self.claimed(engine)) else {
             return events;
         };
         self.tick_brain(engine, base, &mut events);
