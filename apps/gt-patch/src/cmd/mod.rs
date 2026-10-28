@@ -2,6 +2,7 @@
 //! escolha dos patches e o texto do relatório de recuperação.
 
 pub mod list;
+pub mod observe;
 pub mod profile;
 pub mod restore;
 pub mod run;
@@ -10,9 +11,9 @@ pub mod toggle;
 use std::io::{self, Write};
 
 use anyhow::Context;
-use gt_core::engine::Engine;
+use gt_core::engine::{BatchReport, Engine};
 use gt_core::journal::{DiscardReason, JournalLock, JournalStore};
-use gt_core::patch::{PatchSpec, Validated, validate};
+use gt_core::patch::{PatchKind, PatchSpec, Validated, validate};
 use gt_core::recovery::{RecoveryReport, recover};
 use gt_core::session::Shutdown;
 use gt_core::suspend::PauseConfig;
@@ -139,6 +140,38 @@ pub fn report_unrestored(engine: &Engine) {
     }
 }
 
+/// Fecha o comando depois do `undo_all` (spec 6.7): lista o que foi restaurado e o que não foi
+/// (bytes de outro), trata o jogo que fechou no meio e deixa o aviso dos patches que ficaram.
+///
+/// Daqui em diante o terminal pode ter fechado: falha ao escrever em `out` não interrompe nada.
+pub fn report_undone(
+    engine: &Engine,
+    undone: Result<BatchReport, gt_core::Error>,
+    out: &mut dyn Write,
+) -> anyhow::Result<()> {
+    match undone {
+        Ok(batch) => {
+            for id in &batch.restored {
+                let _ = writeln!(out, "restaurado: {id}");
+            }
+            for id in &batch.foreign {
+                let _ = writeln!(out, "não restaurado: {id} (bytes alterados por outro)");
+            }
+            let _ = out.flush();
+            Ok(())
+        }
+        Err(gt_core::Error::ProcessGone { .. }) => {
+            let _ = writeln!(out, "o jogo fechou; nada a restaurar");
+            let _ = out.flush();
+            Ok(())
+        }
+        Err(err) => {
+            report_unrestored(engine);
+            Err(err.into())
+        }
+    }
+}
+
 /// Alvo aberto e o estado de cada patch do catálogo.
 pub fn open_catalog(pid: Option<i32>) -> anyhow::Result<(Target, CatalogScan)> {
     let target = Target::open(pid)?;
@@ -165,6 +198,7 @@ pub fn select_patches(scan: &CatalogScan, ids: &[String]) -> anyhow::Result<Vec<
                 addr,
                 expected: def.expected,
                 replacement: def.replacement,
+                kind: PatchKind::Code,
             })?;
             Ok(Selected { patch, unverified })
         })

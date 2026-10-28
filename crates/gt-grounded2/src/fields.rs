@@ -14,14 +14,15 @@ use gt_core::Error as CoreError;
 use gt_core::engine::{BatchReport, Engine, SetOutcome};
 use gt_core::journal::GuardBytes;
 use gt_core::mem::ReadMem;
-use gt_ue::read::read_u32;
+use gt_core::value::ValueType;
+use gt_ue::read::read_vec;
 use gt_ue::{ObjectArray, ReflectionIndex};
 
 use crate::player::{
     Absent, AddRefusal, FieldAction, FieldCatalog, FieldValues, GameStateAbsent, MissingKind,
-    ObjSnap, PlayerSnapshot, ResolvedField, ResolvedRule, decode_value, desired_bytes,
-    format_value, missing_kind, plan_add, plan_tick, read_game_state, read_player, read_world,
-    value_is_sane,
+    ObjSnap, PlayerSnapshot, ResolvedField, ResolvedRule, add_kind, decode_value, desired_bytes,
+    encode_value, format_value, missing_kind, plan_add, plan_tick, read_game_state, read_player,
+    read_world, value_is_sane,
 };
 use crate::signatures::{FieldKind, FieldRoot, LockMode};
 
@@ -62,19 +63,32 @@ pub enum Note {
 }
 
 /// Resultado de uma execução da ação de somar (spec 006, 6.6).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ActionOutcome {
-    /// Somou e a releitura confirmou.
-    Done { before: i32, after: i32 },
+    /// Somou e a releitura confirmou. `after` é o valor relido (com a releitura "maior ou igual" ele pode
+    /// passar do pedido); `note` é um aviso para o registro (spec 008, 6.8.2).
+    Done {
+        before: f64,
+        after: f64,
+        note: Option<String>,
+    },
     /// Recusada nos passos 1 a 4, com o texto para o registro.
     Refused(String),
     /// Recusada depois de ler o jogo (passos 3 a 5): conta como operação, mas não abre a janela.
     RefusedAfterRead(String),
     /// O controller está ausente ou inválido: quem chama pede a procura.
     NeedsController,
-    /// A releitura não bateu: o jogo mudou o valor durante a escrita (valor lido). Sem nova tentativa.
-    Raced { read: i32 },
+    /// A releitura exata não bateu: o jogo mudou o valor durante a escrita (valor lido). Sem nova tentativa.
+    Raced { read: f64 },
 }
+
+/// Folga, em segundos, acima da qual uma releitura "maior ou igual" ganha o aviso de que o relógio
+/// andou mais que o esperado (spec 008, 6.8.2). É um número do código, não do motor.
+const CLOCK_SLACK: f64 = 300.0;
+/// Aviso no registro quando a releitura passa de `v + quantidade + CLOCK_SLACK`.
+const CLOCK_NOTE: &str = "(o relógio andou mais que o esperado)";
+/// Recusa quando a releitura "maior ou igual" fica abaixo do mínimo: o jogo sobrescreveu a escrita.
+const NOT_TAKEN: &str = "não pegou, aperte de novo";
 
 /// Janela de briga de um `set` com o jogo, por cheat e objeto.
 #[derive(Debug, Default)]
@@ -161,6 +175,9 @@ pub struct TickReport {
     pub events: Vec<String>,
     /// Desde quando o `Pawn` está nulo (para a nova procura do controller, spec 6.3).
     pub pawn_null_since: Option<Instant>,
+    /// O pawn (personagem) lido neste ciclo; `None` se o personagem não está achado. É o que o
+    /// `HookRuntime` usa para achar o inventário do jogador (spec 008, 6.7.4).
+    pub pawn: Option<u64>,
     /// Estado do caminho do `game_state`; `None` se nenhum `set` dessa raiz está ligado (ou o
     /// controller falhou antes de o mundo ser lido). `player` segue só o pawn.
     pub world: Option<WorldState>,
@@ -330,6 +347,7 @@ impl FieldRuntime {
             notes: HashMap::new(),
             events: Vec::new(),
             pawn_null_since: None,
+            pawn: None,
             world: None,
         };
         // Os `set` da raiz `game_state` em `on`: o que o mundo mantém.
@@ -405,6 +423,7 @@ impl FieldRuntime {
             report.events.push("personagem encontrado".to_string());
         }
         self.found = Some(true);
+        report.pawn = Some(snapshot.pawn);
         if self.last_pawn != Some(snapshot.pawn) {
             // Objeto novo: o `maps` é relido antes de escrever nele.
             if let Err(e) = engine.refresh_data_maps() {
@@ -746,16 +765,21 @@ impl FieldRuntime {
         objects: &ObjectArray,
         controller: Option<u64>,
         id: &str,
-        amount: i32,
+        amount: f64,
     ) -> ActionOutcome {
         let Some(controller) = controller else {
             return ActionOutcome::NeedsController;
         };
-        let result_max = match self.catalog.get(id) {
+        let (result_max, at_least, kind) = match self.catalog.get(id) {
             Some(Ok(ResolvedField {
-                rule: ResolvedRule::Add { result_max, .. },
+                rule:
+                    ResolvedRule::Add {
+                        field,
+                        result_max,
+                        at_least,
+                    },
                 ..
-            })) => *result_max,
+            })) => (*result_max, *at_least, add_kind(field)),
             _ => return ActionOutcome::Refused("ação indisponível".to_string()),
         };
         let (obj, addr, guard) =
@@ -776,11 +800,15 @@ impl FieldRuntime {
                 Err(e) => tracing::warn!("falha ao reler o maps: {e}"),
             }
         }
-        let Ok(raw) = read_u32(mem, addr) else {
+        let read_current = || {
+            read_vec(mem, addr, kind.size() as usize)
+                .ok()
+                .map(|bytes| decode_value(kind, &bytes))
+        };
+        let Some(before) = read_current() else {
             return ActionOutcome::RefusedAfterRead("valor atual ilegível".to_string());
         };
-        let before = raw as i32;
-        let after = match plan_add(before, amount, result_max) {
+        let after = match plan_add(kind, before, amount, result_max) {
             Ok(v) => v,
             Err(AddRefusal::OutOfRange) => {
                 return ActionOutcome::RefusedAfterRead("valor atual fora da faixa".to_string());
@@ -789,11 +817,38 @@ impl FieldRuntime {
                 return ActionOutcome::RefusedAfterRead("passaria do máximo".to_string());
             }
         };
-        match engine.write_data(addr, &after.to_le_bytes(), &guard) {
-            Ok(()) => ActionOutcome::Done { before, after },
-            Err(CoreError::BytesMismatch { .. }) => match read_u32(mem, addr) {
-                Ok(read) => ActionOutcome::Raced { read: read as i32 },
-                Err(_) => ActionOutcome::RefusedAfterRead("valor atual ilegível".to_string()),
+        let bytes = encode_value(kind, after);
+        if at_least {
+            let ty = if kind == FieldKind::Double {
+                ValueType::F64
+            } else {
+                ValueType::I32
+            };
+            return match engine.write_data_at_least(addr, &bytes, &guard, after, ty) {
+                Ok(read) => ActionOutcome::Done {
+                    before,
+                    after: read,
+                    note: (read > after + CLOCK_SLACK).then(|| CLOCK_NOTE.to_string()),
+                },
+                // O jogo sobrescreveu a escrita: sem nova tentativa, o dono aperta de novo.
+                Err(CoreError::BytesMismatch { .. }) => {
+                    ActionOutcome::RefusedAfterRead(NOT_TAKEN.to_string())
+                }
+                Err(e) => {
+                    tracing::debug!(id, "escrita da ação recusada: {e}");
+                    ActionOutcome::RefusedAfterRead("escrita recusada".to_string())
+                }
+            };
+        }
+        match engine.write_data(addr, &bytes, &guard) {
+            Ok(()) => ActionOutcome::Done {
+                before,
+                after,
+                note: None,
+            },
+            Err(CoreError::BytesMismatch { .. }) => match read_current() {
+                Some(read) => ActionOutcome::Raced { read },
+                None => ActionOutcome::RefusedAfterRead("valor atual ilegível".to_string()),
             },
             Err(e) => {
                 tracing::debug!(id, "escrita da ação recusada: {e}");
@@ -902,6 +957,7 @@ mod tests {
             default_k: 6,
             unit: Some("x".into()),
             decimals: 2,
+            points: None,
         };
         assert_eq!(format_value(Some(&grid), FieldKind::Float, 1.0), "1.00x");
         // Fora da faixa da grade: o valor do jogo aparece como é, sem ser preso a ela.

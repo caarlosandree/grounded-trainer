@@ -77,7 +77,7 @@ use std::time::{Duration, Instant};
 use gt_core::journal::Loaded;
 use gt_tui::backend::{JobKind, ReflectionJob};
 
-const FIELDS: [&str; 19] = [
+const FIELDS: [&str; 21] = [
     "vida-infinita",
     "stamina-infinita",
     "comida-infinita",
@@ -97,6 +97,8 @@ const FIELDS: [&str; 19] = [
     "gravidade",
     "construir-sem-ingredientes",
     "dano-recebido",
+    "pular-hora",
+    "congelar-hora",
 ];
 
 /// Roda um trabalho da tarefa de reflexão nesta thread e junta o resultado na sessão.
@@ -384,4 +386,127 @@ fn world_cheats_toggle_and_restore() {
     }
     assert!(session.pending_ids().is_empty());
     assert_eq!(store.peek().unwrap(), Loaded::Missing);
+}
+
+// ---- desvios com cave (spec 008, 8; plano 008, tarefa 17) ----
+
+const BRAIN_POWER: &str = "brain-power";
+
+/// Roda `gt --json <args...>` com o diário em `state` (o `XDG_STATE_HOME` do teste) e devolve o
+/// JSON da saída.
+fn gt_json(state: &std::path::Path, args: &[&str]) -> serde_json::Value {
+    let out = std::process::Command::new(gt_testkit::bin_path("gt"))
+        .env("XDG_STATE_HOME", state)
+        .arg("--json")
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`gt --json {}` falhou: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+/// `(kind, id)` das entradas nossas que o `gt caves` lista.
+fn caves_entries(v: &serde_json::Value) -> Vec<(String, String)> {
+    v["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["kind"].as_str().unwrap().to_string(),
+                e["id"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// `brain-power` liga e desliga com o jogo parado (sem ganho de pesquisa durante o teste): o
+/// desvio e a cave aparecem no `gt caves` enquanto ligado; desligado, só a cave fica; depois do
+/// `undo_all`, o `gt diff` não mostra diferença e o `gt caves` não mostra nada nosso (spec 008, 8).
+#[test]
+#[ignore = "exige o jogo aberto e escreve nele (faça o backup do save antes)"]
+fn brain_power_toggles_and_undo_all_leaves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    // O mesmo diretório que o `gt` acha pelo `XDG_STATE_HOME`: ele vê o diário do teste.
+    let store = JournalStore::new(dir.path().join("grounded-trainer"));
+    let lock = Arc::new(store.lock().unwrap());
+    let mut backend = GameBackend::new(None, store.clone(), lock);
+    let Find::Found(pid) = backend.find() else {
+        panic!("o jogo está aberto?");
+    };
+    let search = (backend.search_fn())(pid, None, None).unwrap();
+    if search.version_key != KNOWN_BUILD {
+        eprintln!("pulado: build diferente ({})", search.version_key);
+        return;
+    }
+    let k = search
+        .cheats
+        .iter()
+        .find(|c| c.id == BRAIN_POWER)
+        .expect("brain-power no catálogo")
+        .value
+        .as_ref()
+        .map_or(0, |g| g.default_k);
+    assert!(matches!(backend.recover(), Recovered::Clean { .. }));
+    let mut session = backend.open(search, true).unwrap();
+    assert!(session.has_engine());
+    run_job(&mut session, JobKind::Index);
+    let avail = session
+        .hook_avail()
+        .into_iter()
+        .find(|(id, _)| id == BRAIN_POWER)
+        .map(|(_, a)| a);
+    assert!(
+        matches!(avail, Some(Avail::Available { .. })),
+        "brain-power: {avail:?}"
+    );
+
+    // Liga: o desvio e a cave são nossos no `gt caves`.
+    let on = session.hook_enable(BRAIN_POWER, k);
+    assert!(matches!(on, OpOutcome::Done(_)), "{on:?}");
+    let mut entries = caves_entries(&gt_json(dir.path(), &["caves"]));
+    entries.sort();
+    eprintln!("ligado: {entries:?}");
+    assert!(
+        entries.contains(&("cave".to_string(), format!("{BRAIN_POWER}-cave"))),
+        "{entries:?}"
+    );
+    assert!(
+        entries.contains(&("desvio".to_string(), format!("{BRAIN_POWER}-hook"))),
+        "{entries:?}"
+    );
+
+    // Desliga: só o desvio sai; a cave fica até a saída (spec 6.3).
+    let off = session.hook_disable(BRAIN_POWER);
+    assert!(matches!(off, OpOutcome::Done(_)), "{off:?}");
+    let entries = caves_entries(&gt_json(dir.path(), &["caves"]));
+    assert_eq!(
+        entries,
+        [("cave".to_string(), format!("{BRAIN_POWER}-cave"))],
+        "desligado"
+    );
+
+    // Saída: tudo devolvido.
+    let (restored, foreign) = session.undo_all();
+    eprintln!("undo_all: restaurados {restored:?}, de outro {foreign:?}");
+    assert!(foreign.is_empty(), "{foreign:?}");
+    assert!(session.pending_ids().is_empty());
+    assert_eq!(store.peek().unwrap(), Loaded::Missing);
+    let diff = gt_json(dir.path(), &["diff"]);
+    assert_eq!(
+        diff["chunks"].as_array().unwrap().len(),
+        0,
+        "gt diff: {diff}"
+    );
+    let caves = gt_json(dir.path(), &["caves"]);
+    assert!(caves_entries(&caves).is_empty(), "{caves}");
+    assert!(caves["vars"].as_array().unwrap().is_empty(), "{caves}");
+    for run in caves["runs"].as_array().unwrap() {
+        assert!(run["ours"].as_array().unwrap().is_empty(), "{run}");
+    }
 }

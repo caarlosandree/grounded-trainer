@@ -7,6 +7,7 @@ pub mod exit;
 #[cfg(test)]
 pub(crate) mod fake;
 pub mod game;
+pub mod hooks;
 pub mod keys;
 pub mod logfile;
 pub mod model;

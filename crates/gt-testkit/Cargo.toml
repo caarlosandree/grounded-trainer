@@ -14,10 +14,10 @@ gt-core = { workspace = true, features = ["write", "test-support"] }
 # Cena de reflexão sintética do `gt-testtarget --ue` e as definições que casam com ela.
 gt-grounded2 = { workspace = true, features = ["write"] }
 gt-ue = { workspace = true, features = ["synth"] }
+iced-x86.workspace = true
 nix = { workspace = true, features = ["signal"] }
 serde_json.workspace = true
-
-[dev-dependencies]
+# O alvo grava o módulo sintético num diretório temporário do `TestTarget`.
 tempfile.workspace = true
 
 [lints]

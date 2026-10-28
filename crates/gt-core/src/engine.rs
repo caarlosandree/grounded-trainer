@@ -35,6 +35,29 @@
 //! - **Jogo fechou**: `Err(ProcessGone)`; o motor já descartou ativos, pendentes e o
 //!   diário sem escrever. Sem rodar operação, [`Engine::discard_gone`] faz o mesmo.
 //!
+//! # Desvio e cave (spec 008, 6.3)
+//!
+//! Um patch é de um de dois tipos ([`PatchKind`]): `Code` (o desvio, de instruções inteiras) ou
+//! `Cave` (código nosso sobre preenchimento `0xCC`). Para a cave, qualquer `pc` dentro do
+//! trecho e qualquer thread de posição desconhecida são perigo. [`Engine::undo_all`] e a
+//! recuperação ([`Engine::restore_entries`]) trabalham em **duas fases**: primeiro todos os
+//! `Code`, depois as `Cave`, estas com [`CAVE_PAUSE_ATTEMPTS`] tentativas e
+//! [`CAVE_PAUSE_WAIT`] entre elas. Uma `Cave` só é desfeita se nenhum `Code` ficou sem
+//! resolver (senão o desvio ainda aponta para ela): ela fica no registro como pendente e no
+//! diário. A cave que não pôde ser desfeita (`ThreadsInPatch`) também vira pendente.
+//!
+//! # Variáveis das caves (spec 008, 6.4)
+//!
+//! Um terceiro tipo de escrita, **sem pausa**: a folga entre o fim da `.data` e o fim da página,
+//! que [`Engine::claim_vars`] reclama (região `rw-` no `maps`, toda zerada, gravada no diário
+//! antes de qualquer escrita). [`Engine::write_var`] e [`Engine::read_var`] só tocam dentro
+//! dela. O diário guarda a região, não os valores. No fim do [`Engine::undo_all`], no `Drop` e
+//! na recuperação (e no [`Engine::restore_pending`] que resolve uma pendência) a região
+//! inteira volta a zeros ([`Engine::clear_vars`]), **se** nenhum desvio (`Code`) nem cave
+//! nossos estão ativos ou pendentes (uma cave que ficou com uma thread dentro ainda pode
+//! gravar) e o `maps` ainda mostra a região `rw-`; senão ela fica no diário. Toda cave é
+//! segura com as variáveis zeradas.
+//!
 //! # Escrita em dados (spec 005, 6.6)
 //!
 //! Um segundo tipo de escrita, **sem pausa**: campos de dados do jogo, numa região permitida
@@ -42,10 +65,12 @@
 //! identidade do objeto (bytes de guarda relidos imediatamente antes). [`Engine::write_data`]
 //! não vai ao diário (barras: não há original a restaurar). [`Engine::set_bits`] limpa bits
 //! e grava a entrada no diário **antes** de escrever; [`Engine::set_word`] faz o mesmo com um
-//! valor inteiro (spec 006, 6.4). [`Engine::restore_field`], o `undo_all`, o `Drop` e a
-//! recuperação devolvem os bits da máscara (ou o valor inteiro) ao original ([`decide_data`]).
+//! valor inteiro (spec 006, 6.4). [`Engine::write_data_at_least`] é a escrita de dados cuja
+//! releitura aceita "maior ou igual" (um campo que o jogo continua mexendo; spec 008, 6.8.2).
+//! [`Engine::restore_field`], o `undo_all`, o `Drop` e a recuperação devolvem os bits da máscara (ou o valor inteiro) ao original ([`decide_data`]).
 //! Uma entrada viva por par (`id`, endereço) ([`data_key`]).
 
+use std::ops::Range;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -53,17 +78,18 @@ use nix::sys::signal::Signal;
 
 use crate::journal::{
     DataAction, DataEntry, DataMode, EntryAction, GuardBytes, Journal, JournalEntry, JournalLock,
-    JournalStore, data_key, decide_data, decide_entry,
+    JournalStore, Loaded, VarRegion, data_key, decide_data, decide_entry,
 };
 use crate::maps::{MapRegion, read_maps};
 use crate::mem::{MemWriter, Pidfd};
 use crate::patch::{
-    Direction, PatchSpec, Validated, WritePolicy, is_dangerous, overlaps, validate,
+    Direction, PatchKind, PatchSpec, Validated, WritePolicy, is_dangerous, overlaps, validate,
 };
 use crate::procinfo::{Identity, ThreadPos, check_alive, identity};
 use crate::suspend::{
     Fault, HookPoint, PauseConfig, PauseGuard, Thread, is_stopped_now, pause, resume_points,
 };
+use crate::value::ValueType;
 use crate::{Error, Result};
 
 /// Política de escrita calculada a partir do `maps` atual (relido antes de cada lote).
@@ -75,6 +101,15 @@ pub type DataPolicyFn = Box<dyn FnMut(&[MapRegion]) -> WritePolicy>;
 
 /// Maior escrita em dados aceita, em bytes.
 const MAX_DATA_WRITE: usize = 8;
+
+/// Tentativas da pausa ao desfazer caves (spec 008, 6.3).
+pub const CAVE_PAUSE_ATTEMPTS: u32 = 5;
+
+/// Espera entre as tentativas da pausa ao desfazer caves (spec 008, 6.3).
+pub const CAVE_PAUSE_WAIT: Duration = Duration::from_millis(100);
+
+/// Maior região de variáveis aceita, em bytes (uma página: a folga da `.data` é menor).
+pub const MAX_VARS_LEN: u64 = 4096;
 
 /// Parâmetros do motor.
 #[derive(Debug, Clone)]
@@ -111,6 +146,9 @@ pub struct RestoreReport {
     pub foreign: Vec<String>,
     /// Entradas fora da política de escrita: não tocadas e mantidas no diário.
     pub outside_policy: Vec<String>,
+    /// Caves não tentadas porque ainda restava um desvio sem resolver (o desvio aponta para
+    /// elas): não tocadas e mantidas no diário.
+    pub deferred: Vec<String>,
 }
 
 /// Quais fronteiras perdidas valem na regra de perigo de uma escrita.
@@ -337,6 +375,8 @@ pub struct Engine {
     data_pending: Vec<DataEntry>,
     /// Falha injetada nas escritas em dados (só para testes).
     data_fault: Option<DataFault>,
+    /// Regiões de variáveis reclamadas (spec 008, 6.4), ainda sem zerar.
+    vars: Vec<VarRegion>,
 }
 
 impl Engine {
@@ -366,7 +406,7 @@ impl Engine {
         if before != after {
             return Err(Error::ProcessGone { pid });
         }
-        Ok(Engine {
+        let mut engine = Engine {
             pid,
             identity: before,
             pidfd,
@@ -387,7 +427,19 @@ impl Engine {
             data: Vec::new(),
             data_pending: Vec::new(),
             data_fault: None,
-        })
+            vars: Vec::new(),
+        };
+        // Regiões de variáveis que um diário do mesmo processo ainda guarda (a recuperação as
+        // manteve): sem isto o primeiro diário deste motor as apagaria e a limpeza nunca mais
+        // aconteceria. Só regiões válidas; não grava nada.
+        if let Ok(Loaded::Ok(j)) = engine.store.peek()
+            && j.pid == engine.identity.pid
+            && j.start_time == engine.identity.start_time
+            && j.boot_id == engine.identity.boot_id
+        {
+            engine.adopt_vars(&j.vars);
+        }
+        Ok(engine)
     }
 
     /// Aplica um lote de patches (spec 6.2, passos 1–8). Tudo ou nada.
@@ -406,11 +458,13 @@ impl Engine {
 
     /// Desfaz todos os patches ativos e restaura os bits de todas as entradas de dados (os
     /// restaurados e os já originais vão em `restored`; os descartados, em `foreign`). As
-    /// duas partes são tentadas mesmo que a primeira falhe; o primeiro erro volta.
+    /// partes são tentadas mesmo que a anterior falhe; o primeiro erro volta. Os patches
+    /// saem em duas fases: os desvios (`Code`) e depois as caves (spec 008, 6.3). Por último
+    /// as variáveis voltam a zeros ([`Engine::clear_vars`]), a não ser que ainda reste um desvio
+    /// ou uma cave (pendentes): então elas ficam até o `restore_pending` (ou o `Drop`).
     pub fn undo_all(&mut self) -> Result<BatchReport> {
         self.retry_resume()?;
-        let result = self.undo_inner(|_| true);
-        let patches = self.finish(result);
+        let patches = self.undo_all_patches();
         if matches!(patches, Err(Error::ProcessGone { .. })) {
             return patches;
         }
@@ -420,12 +474,85 @@ impl Engine {
             let result = self.restore_data_inner(|_| true);
             self.finish(result)
         };
+        // Por último, as variáveis (spec 008, 6.3): só se nenhum desvio nosso continua vivo.
+        let vars = if self.vars.is_empty() {
+            Ok(())
+        } else {
+            let result = self.clear_vars_inner();
+            self.finish(result)
+        };
         let mut report = patches?;
         let data = data?;
+        vars?;
         report.restored.extend(data.restored);
         report.restored.extend(data.dropped);
         report.foreign.extend(data.foreign);
         Ok(report)
+    }
+
+    /// Os patches do `undo_all`, em duas fases (spec 008, 6.3): todos os `Code` e, só se
+    /// nenhum ficou sem resolver, as `Cave`. A cave que não pôde ser desfeita vira pendente
+    /// (e o erro, como `ThreadsInPatch`, volta).
+    fn undo_all_patches(&mut self) -> Result<BatchReport> {
+        let result = self.undo_inner(|v| v.spec.kind == PatchKind::Code);
+        let mut report = self.finish(result)?;
+        if !self.active.iter().any(|v| v.spec.kind == PatchKind::Cave) {
+            return Ok(report);
+        }
+        if !caves_may_resolve(&self.journal_entries()) {
+            // Um desvio pendente ainda aponta para as caves: não são tocadas, mas passam a
+            // pendentes (aparecem em `pending_ids` e o `restore_pending` as resolve depois do
+            // desvio, na ordem certa) em vez de ficarem ativas sem ninguém relatar.
+            tracing::warn!("há desvio sem desfazer; as caves ficam pendentes sem serem tocadas");
+            self.caves_to_pending("há desvio sem desfazer");
+            return Ok(report);
+        }
+        let result =
+            self.with_cave_pause(|engine| engine.undo_inner(|v| v.spec.kind == PatchKind::Cave));
+        match self.finish(result) {
+            Ok(caves) => {
+                report.restored.extend(caves.restored);
+                report.foreign.extend(caves.foreign);
+                report.pause = report.pause.max(caves.pause);
+                report.danger_retries += caves.danger_retries;
+                report.timeout_retries += caves.timeout_retries;
+                Ok(report)
+            }
+            Err(e @ Error::ProcessGone { .. }) => Err(e),
+            Err(e) => {
+                // O desvio já saiu, então a cave é inalcançável: fica no diário, como
+                // pendente, para a próxima execução (ou o `Drop`) tentar de novo.
+                self.caves_to_pending(&e.to_string());
+                Err(e)
+            }
+        }
+    }
+
+    /// Passa as caves ativas para pendentes (sem tocar na memória) e regrava o diário.
+    fn caves_to_pending(&mut self, why: &str) {
+        let (caves, rest): (Vec<Validated>, Vec<Validated>) = std::mem::take(&mut self.active)
+            .into_iter()
+            .partition(|v| v.spec.kind == PatchKind::Cave);
+        self.active = rest;
+        for v in &caves {
+            let entry = entry_of(v);
+            if !self.pending.contains(&entry) {
+                tracing::warn!(id = %v.spec.id, motivo = %why, "cave não desfeita; mantida no diário");
+                self.pending.push(entry);
+            }
+        }
+        self.save_logged(self.stuck);
+    }
+
+    /// Roda `f` com a pausa das caves ([`CAVE_PAUSE_ATTEMPTS`] tentativas, [`CAVE_PAUSE_WAIT`]
+    /// entre elas) e devolve a configuração de antes.
+    fn with_cave_pause<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let saved = (self.pause_cfg.max_attempts, self.pause_cfg.retry_wait);
+        self.pause_cfg.max_attempts = CAVE_PAUSE_ATTEMPTS;
+        self.pause_cfg.retry_wait = CAVE_PAUSE_WAIT;
+        let out = f(self);
+        (self.pause_cfg.max_attempts, self.pause_cfg.retry_wait) = saved;
+        out
     }
 
     /// Define a política das escritas em dados (e esquece a calculada antes).
@@ -449,6 +576,23 @@ impl Engine {
     pub fn write_data(&mut self, addr: u64, bytes: &[u8], guard: &[GuardBytes]) -> Result<()> {
         self.retry_resume()?;
         let result = self.write_data_inner(addr, bytes, guard);
+        self.finish(result)
+    }
+
+    /// Como [`Engine::write_data`], mas a releitura aceita "maior ou igual" (spec 008, 6.8.2): o valor
+    /// relido, decodificado como `ty`, tem de ser `>= min`. Serve a um campo que o próprio jogo continua
+    /// mexendo (o relógio soma a cada quadro), onde a releitura nunca é exata. Devolve o valor relido;
+    /// um valor `< min` (ou ilegível como `ty`) é [`Error::BytesMismatch`]. `bytes` tem o tamanho de `ty`.
+    pub fn write_data_at_least(
+        &mut self,
+        addr: u64,
+        bytes: &[u8],
+        guard: &[GuardBytes],
+        min: f64,
+        ty: ValueType,
+    ) -> Result<f64> {
+        self.retry_resume()?;
+        let result = self.write_data_at_least_inner(addr, bytes, guard, min, ty);
         self.finish(result)
     }
 
@@ -510,7 +654,19 @@ impl Engine {
     /// restauradas pela regra de [`decide_data`]. Uma escrita que falha mantém a entrada.
     pub fn restore_data(&mut self, entries: Vec<DataEntry>) -> Result<RestoreReport> {
         self.retry_resume()?;
-        for e in &entries {
+        self.adopt_data(&entries);
+        let result =
+            self.restore_data_inner(|e| entries.iter().any(|x| data_key(x) == data_key(e)));
+        self.finish(result)
+    }
+
+    /// Põe entradas de dados vindas do diário entre as pendentes, **sem** ler nem escrever nem
+    /// gravar o diário (como o [`Engine::adopt_vars`]): elas passam a constar de todo diário que o
+    /// motor grava até serem resolvidas. A recuperação as adota antes de restaurar os patches,
+    /// para que uma falha ali não as tire do disco. As já conhecidas (mesmo `id` e endereço) são
+    /// ignoradas.
+    pub fn adopt_data(&mut self, entries: &[DataEntry]) {
+        for e in entries {
             let key = data_key(e);
             let known = self
                 .data
@@ -521,14 +677,90 @@ impl Engine {
                 self.data_pending.push(e.clone());
             }
         }
-        let result =
-            self.restore_data_inner(|e| entries.iter().any(|x| data_key(x) == data_key(e)));
-        self.finish(result)
     }
 
     /// Entradas de dados vivas (bits limpos ou valor inteiro escrito, uma por par `id` e endereço).
     pub fn data_entries(&self) -> &[DataEntry] {
         &self.data
+    }
+
+    /// Reclama a região de variáveis das caves na folga da `.data` (spec 008, 6.4): confere a
+    /// identidade do processo, que a região inteira é `rw-` (sem execução) no `maps` atual e que
+    /// todos os bytes são zero, e grava a região no diário **antes** de qualquer escrita nela.
+    /// Reclamar de novo a mesma região é um no-op; uma região que a cobre em parte é
+    /// [`Error::BadPatch`]. Que a região é a folga da imagem do jogo quem a calcula garante
+    /// (`gt_grounded2::policy::var_region`).
+    pub fn claim_vars(&mut self, region: Range<u64>) -> Result<()> {
+        self.retry_resume()?;
+        let result = self.claim_vars_inner(region);
+        self.finish(result)
+    }
+
+    /// Escreve `bytes` numa variável, **sem pausa** e sem guarda de objeto: identidade do
+    /// processo → o trecho inteiro dentro de uma região reclamada ([`Error::VarOutsideRegion`])
+    /// → escrita e releitura.
+    pub fn write_var(&mut self, addr: u64, bytes: &[u8]) -> Result<()> {
+        self.retry_resume()?;
+        let result = self.write_var_inner(addr, bytes);
+        self.finish(result)
+    }
+
+    /// Lê `len` bytes de uma variável, só dentro de uma região reclamada
+    /// ([`Error::VarOutsideRegion`]).
+    pub fn read_var(&self, addr: u64, len: usize) -> Result<Vec<u8>> {
+        if !self.in_vars(addr, len) {
+            return Err(Error::VarOutsideRegion { addr });
+        }
+        let mut buf = vec![0u8; len];
+        self.writer.read_exact(addr, &mut buf)?;
+        Ok(buf)
+    }
+
+    /// Regiões de variáveis reclamadas e ainda não zeradas.
+    pub fn vars(&self) -> &[VarRegion] {
+        &self.vars
+    }
+
+    /// Põe regiões vindas do diário entre as reclamadas, **sem** ler nem escrever nem gravar o
+    /// diário: elas passam a constar do diário que o motor grava e [`Engine::clear_vars`] as
+    /// zera quando nenhum desvio nosso continua vivo. O diário não é de confiança: cada região
+    /// passa pelo mesmo filtro do [`Engine::claim_vars`] (1 a [`MAX_VARS_LEN`] bytes, início
+    /// múltiplo de 8, sem sobrepor outra). Devolve as **recusadas** (com `warn`), que o motor
+    /// não guarda e portanto saem do diário na próxima gravação.
+    pub fn adopt_vars(&mut self, regions: &[VarRegion]) -> Vec<VarRegion> {
+        let mut rejected = Vec::new();
+        for r in regions {
+            if self.vars.contains(r) {
+                continue;
+            }
+            match self.check_var_region(r.addr, r.len) {
+                Ok(()) => self.vars.push(*r),
+                Err(reason) => {
+                    tracing::warn!(addr = r.addr, len = r.len, %reason, "região de variáveis do diário recusada");
+                    rejected.push(*r);
+                }
+            }
+        }
+        rejected
+    }
+
+    /// Regrava o diário com o estado em memória. Cuidado: entradas de patches só entram no
+    /// registro do motor quando são restauradas (os dados, com [`Engine::adopt_data`]); chamar
+    /// antes disso tira-as do disco. A recuperação só usa quando não há entrada a restaurar.
+    pub fn save_journal_now(&self) {
+        self.save_final();
+    }
+
+    /// Zera todas as regiões de variáveis (spec 008, 6.4), **se** nenhum desvio (`Code`) nem cave
+    /// nossos estão ativos ou pendentes (uma cave que ficou com uma thread dentro ainda pode
+    /// gravar nas variáveis), a identidade do processo bate e o `maps` ainda mostra a região
+    /// `rw-`. Não confere os valores (ninguém mais usa a folga). Quando alguma condição falha, a
+    /// região fica no registro e no diário e nada é escrito. Uma escrita que falha mantém a
+    /// região e devolve o primeiro erro. Sem pausa.
+    pub fn clear_vars(&mut self) -> Result<()> {
+        self.retry_resume()?;
+        let result = self.clear_vars_inner();
+        self.finish(result)
     }
 
     /// Troca os bytes do patch ativo `id` por `new` numa pausa (spec 003 6.7).
@@ -562,6 +794,7 @@ impl Engine {
     /// não escreve nada (o SIGCONT que falhou ainda é tentado antes).
     pub fn restore_pending(&mut self) -> Result<RestoreReport> {
         let entries = self.pending.clone();
+        let had_pending = !entries.is_empty() || !self.data_pending.is_empty();
         let mut report = self.restore_entries(entries)?;
         let data = self.data_pending.clone();
         if !data.is_empty() {
@@ -569,6 +802,16 @@ impl Engine {
             report.restored.extend(r.restored);
             report.dropped.extend(r.dropped);
             report.foreign.extend(r.foreign);
+        }
+        // Resolvida a pendência (uma cave que ficou com uma thread dentro, por exemplo), as
+        // variáveis que ela segurava podem voltar a zeros. Só quando havia pendência: sem ela,
+        // as variáveis são de patches em uso.
+        if had_pending && !self.vars.is_empty() {
+            match self.clear_vars() {
+                Ok(()) => {}
+                Err(e @ Error::ProcessGone { .. }) => return Err(e),
+                Err(e) => tracing::warn!(erro = %e, "variáveis não zeradas agora"),
+            }
         }
         Ok(report)
     }
@@ -580,6 +823,16 @@ impl Engine {
             .iter()
             .map(|e| e.id.clone())
             .chain(self.data_pending.iter().map(|e| e.id.clone()))
+            .collect()
+    }
+
+    /// Trechos das caves que o motor tem no jogo: as ativas e as pendentes (uma cave que ficou
+    /// com thread dentro). Quem aloca caves os tira do que oferece (`CaveAllocator::reserve`).
+    pub fn cave_ranges(&self) -> Vec<Range<u64>> {
+        self.journal_entries()
+            .iter()
+            .filter(|e| e.kind == PatchKind::Cave)
+            .map(JournalEntry::range)
             .collect()
     }
 
@@ -687,6 +940,7 @@ impl Engine {
             self.pending.clear();
             self.data.clear();
             self.data_pending.clear();
+            self.vars.clear();
             self.stuck = false;
             if let Err(e) = self.store.clear() {
                 tracing::error!(erro = %e, "falha ao limpar o diário");
@@ -778,6 +1032,64 @@ impl Engine {
             });
         }
         self.write_data_verified("dados", addr, bytes)
+    }
+
+    fn write_data_at_least_inner(
+        &mut self,
+        addr: u64,
+        bytes: &[u8],
+        guard: &[GuardBytes],
+        min: f64,
+        ty: ValueType,
+    ) -> Result<f64> {
+        if bytes.len() != ty.size() {
+            return Err(Error::BadPatch {
+                id: "dados".to_owned(),
+                reason: format!(
+                    "escrita de {} bytes para um valor de {} bytes",
+                    bytes.len(),
+                    ty.size()
+                ),
+            });
+        }
+        self.check_data_write(addr, bytes.len(), guard)?;
+        // O jogo escreve entre a nossa escrita e a releitura (só para testes).
+        let written = match self.data_fault.clone() {
+            Some(DataFault::ThirdValue(third)) => {
+                self.data_fault = None;
+                third
+            }
+            _ => bytes.to_vec(),
+        };
+        let result = self.write_data_at_least_verified(addr, &written, min, ty);
+        if result.is_err() {
+            self.data_maps = None;
+        }
+        result
+    }
+
+    /// Escreve `bytes`, relê e aceita se o valor relido é `>= min`.
+    fn write_data_at_least_verified(
+        &self,
+        addr: u64,
+        bytes: &[u8],
+        min: f64,
+        ty: ValueType,
+    ) -> Result<f64> {
+        self.writer.write(addr, bytes).map_err(|e| match e {
+            Error::PermissionDenied { .. } | Error::Unmapped { .. } => Error::WriteRefused { addr },
+            e => e,
+        })?;
+        let mut back = vec![0u8; ty.size()];
+        self.writer.read_exact(addr, &mut back)?;
+        match decode_le(ty, &back) {
+            Some(v) if v >= min => Ok(v),
+            _ => Err(Error::BytesMismatch {
+                id: "dados".to_owned(),
+                expected: format!(">= {min}"),
+                found: hex(&back),
+            }),
+        }
     }
 
     /// Entrada viva do par (`id`, `addr`).
@@ -1112,6 +1424,123 @@ impl Engine {
         }
     }
 
+    /// O trecho `[addr, addr + len)` cabe inteiro numa região de variáveis reclamada.
+    fn in_vars(&self, addr: u64, len: usize) -> bool {
+        let Some(end) = addr.checked_add(len as u64) else {
+            return false;
+        };
+        len > 0
+            && self
+                .vars
+                .iter()
+                .any(|v| v.addr <= addr && end <= v.range().end)
+    }
+
+    /// Forma de uma região de variáveis: 1 a [`MAX_VARS_LEN`] bytes, início múltiplo de 8, sem
+    /// estourar o espaço de endereços e sem sobrepor outra região já reclamada.
+    fn check_var_region(&self, addr: u64, len: u64) -> std::result::Result<(), String> {
+        let end = addr.checked_add(len);
+        if len == 0 || len > MAX_VARS_LEN || !addr.is_multiple_of(8) || end.is_none() {
+            return Err(format!(
+                "região de variáveis {addr:#x} com {len} bytes (1 a {MAX_VARS_LEN} bytes, alinhada a 8)"
+            ));
+        }
+        let end = end.unwrap_or(addr);
+        if self
+            .vars
+            .iter()
+            .any(|v| v.addr < end && addr < v.range().end)
+        {
+            return Err("a região se sobrepõe a outra já reclamada".to_owned());
+        }
+        Ok(())
+    }
+
+    fn claim_vars_inner(&mut self, region: Range<u64>) -> Result<()> {
+        let bad = |reason: String| Error::BadPatch {
+            id: "variáveis".to_owned(),
+            reason,
+        };
+        check_alive(&self.identity)?;
+        let len = region.end.saturating_sub(region.start);
+        let wanted = VarRegion {
+            addr: region.start,
+            len,
+        };
+        if self.vars.contains(&wanted) {
+            return Ok(());
+        }
+        self.check_var_region(region.start, len).map_err(bad)?;
+        let maps = read_maps(self.pid)?;
+        if !rw_policy(&maps).allows(&region) {
+            return Err(Error::VarsNotWritable { addr: region.start });
+        }
+        let mut now = vec![0u8; len as usize];
+        match self.writer.read_exact(region.start, &mut now) {
+            Ok(()) => {}
+            Err(Error::Unmapped { .. }) => {
+                return Err(Error::VarsNotWritable { addr: region.start });
+            }
+            Err(e) => return Err(e),
+        }
+        if let Some(i) = now.iter().position(|b| *b != 0) {
+            return Err(Error::VarsNotZero {
+                addr: region.start + i as u64,
+            });
+        }
+        // A região entra no diário antes de qualquer escrita nela.
+        self.vars.push(wanted);
+        if let Err(e) = self.save_journal(false) {
+            self.vars.retain(|v| *v != wanted);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn write_var_inner(&mut self, addr: u64, bytes: &[u8]) -> Result<()> {
+        check_alive(&self.identity)?;
+        if !self.in_vars(addr, bytes.len()) {
+            return Err(Error::VarOutsideRegion { addr });
+        }
+        self.write_verified("variável", addr, bytes)
+    }
+
+    fn clear_vars_inner(&mut self) -> Result<()> {
+        if self.vars.is_empty() {
+            return Ok(());
+        }
+        // Um desvio vivo aponta para a cave; uma cave que ficou (thread dentro) ainda pode
+        // gravar nas variáveis. Em qualquer dos casos a folga continua como está.
+        if !self.journal_entries().is_empty() {
+            tracing::warn!("há desvio ou cave ativo ou pendente; as variáveis ficam como estão");
+            return Ok(());
+        }
+        check_alive(&self.identity)?;
+        let maps = read_maps(self.pid)?;
+        let rw = rw_policy(&maps);
+        let mut failed: Option<Error> = None;
+        for v in self.vars.clone() {
+            if !rw.allows(&v.range()) {
+                tracing::warn!(
+                    addr = v.addr,
+                    "a região de variáveis não é mais `rw-`; mantida no diário"
+                );
+                continue;
+            }
+            let zeros = vec![0u8; usize::try_from(v.len).unwrap_or(0)];
+            match self.write_verified("variáveis", v.addr, &zeros) {
+                Ok(()) => self.vars.retain(|x| *x != v),
+                Err(e @ Error::ProcessGone { .. }) => return Err(e),
+                Err(e) => {
+                    tracing::error!(addr = v.addr, erro = %e, "falha ao zerar as variáveis; mantidas no diário");
+                    failed.get_or_insert(e);
+                }
+            }
+        }
+        self.save_final();
+        failed.map_or(Ok(()), Err)
+    }
+
     fn apply_inner(&mut self, batch: Vec<Validated>) -> Result<BatchReport> {
         if batch.is_empty() {
             return Ok(BatchReport::default());
@@ -1199,6 +1628,12 @@ impl Engine {
             .position(|v| v.spec.id == id)
             .ok_or_else(|| Error::NotActive { id: id.to_owned() })?;
         let old = self.active[index].clone();
+        if old.spec.kind == PatchKind::Cave {
+            return Err(Error::BadPatch {
+                id: id.to_owned(),
+                reason: "uma cave não troca de valor".to_owned(),
+            });
+        }
         check_alive(&self.identity)?;
         let policy = self.current_policy()?;
         if !policy.allows(&old.spec.range()) {
@@ -1212,6 +1647,7 @@ impl Engine {
             addr: old.spec.addr,
             expected: old.spec.expected.clone(),
             replacement: new.clone(),
+            kind: old.spec.kind,
         })?;
         if fresh.replacement_starts != old.replacement_starts {
             return Err(Error::BoundariesChanged { id: id.to_owned() });
@@ -1353,7 +1789,7 @@ impl Engine {
         let policy = self.current_policy()?;
         let mut report = RestoreReport::default();
         let mut resolved: Vec<JournalEntry> = Vec::new();
-        let mut ops = Vec::new();
+        let (mut code_ops, mut cave_ops) = (Vec::new(), Vec::new());
         for e in entries {
             if !policy.allows(&e.range()) {
                 // Não conta como resolvida: os bytes podem ser nossos, então a entrada
@@ -1371,13 +1807,21 @@ impl Engine {
                 addr: e.addr,
                 expected: e.original.clone(),
                 replacement: e.replacement.clone(),
+                kind: e.kind,
             };
             match validate(spec) {
-                Ok(v) => ops.push(Op {
-                    v,
-                    danger: Danger::Both,
-                    kind: Kind::Restore(e),
-                }),
+                Ok(v) => {
+                    let kind = v.spec.kind;
+                    let op = Op {
+                        v,
+                        danger: Danger::Both,
+                        kind: Kind::Restore(e),
+                    };
+                    match kind {
+                        PatchKind::Code => code_ops.push(op),
+                        PatchKind::Cave => cave_ops.push(op),
+                    }
+                }
                 Err(err) => {
                     tracing::warn!(id = %e.id, erro = %err, "entrada inválida; não tocada");
                     report.foreign.push(e.id.clone());
@@ -1385,28 +1829,63 @@ impl Engine {
                 }
             }
         }
-        let (to_write, skipped) = self.presort(ops)?;
-        let mut outcomes: Vec<(Op, Option<Skip>)> =
-            skipped.into_iter().map(|(op, s)| (op, Some(s))).collect();
-        if !to_write.is_empty() {
-            let pass = self.run_pass(&to_write)?;
-            outcomes.extend(to_write.into_iter().zip(pass.outcomes));
-        }
-        for (op, outcome) in outcomes {
-            let Kind::Restore(e) = op.kind else { continue };
-            match outcome {
-                None => report.restored.push(e.id.clone()),
-                Some(Skip::Dropped) => report.dropped.push(e.id.clone()),
-                Some(Skip::Foreign) => {
-                    tracing::warn!(id = %e.id, "bytes de outro na entrada do diário; não tocada");
-                    report.foreign.push(e.id.clone());
+        // Fase 1: os desvios. Fase 2: as caves, só se nenhum desvio ficou sem resolver
+        // (senão ele ainda aponta para elas) e com a pausa mais paciente (spec 008, 6.3).
+        self.restore_phase(code_ops, &mut report, &mut resolved)?;
+        if !cave_ops.is_empty() {
+            if caves_may_resolve(&self.journal_entries()) {
+                self.with_cave_pause(|engine| {
+                    engine.restore_phase(cave_ops, &mut report, &mut resolved)
+                })?;
+            } else {
+                for op in cave_ops {
+                    tracing::warn!(
+                        id = %op.v.spec.id,
+                        "há desvio sem resolver; cave não tocada e mantida no diário"
+                    );
+                    report.deferred.push(op.v.spec.id.clone());
                 }
             }
-            resolved.push(e);
         }
         self.forget(&resolved);
         self.save_final();
         Ok(report)
+    }
+
+    /// Uma fase da restauração: decide cada entrada, escreve as que precisam e fecha o
+    /// diário (as resolvidas saem do registro). Falha por perigo ou prazo devolve o erro e
+    /// mantém tudo o que esta fase tocava.
+    fn restore_phase(
+        &mut self,
+        ops: Vec<Op>,
+        report: &mut RestoreReport,
+        resolved: &mut Vec<JournalEntry>,
+    ) -> Result<()> {
+        if !ops.is_empty() {
+            let (to_write, skipped) = self.presort(ops)?;
+            let mut outcomes: Vec<(Op, Option<Skip>)> =
+                skipped.into_iter().map(|(op, s)| (op, Some(s))).collect();
+            if !to_write.is_empty() {
+                let pass = self.run_pass(&to_write)?;
+                outcomes.extend(to_write.into_iter().zip(pass.outcomes));
+            }
+            for (op, outcome) in outcomes {
+                let Kind::Restore(e) = op.kind else { continue };
+                match outcome {
+                    None => report.restored.push(e.id.clone()),
+                    Some(Skip::Dropped) => report.dropped.push(e.id.clone()),
+                    Some(Skip::Foreign) => {
+                        tracing::warn!(id = %e.id, "bytes de outro na entrada do diário; não tocada");
+                        report.foreign.push(e.id.clone());
+                    }
+                }
+                resolved.push(e);
+            }
+        }
+        // O que esta fase resolveu sai do registro já, para a conferência da fase seguinte.
+        self.forget(resolved);
+        self.save_final();
+        Ok(())
     }
 
     /// Intenção no diário, passagem pausada e tratamento da falha (desfazer e restaurar).
@@ -1766,7 +2245,7 @@ impl Engine {
             .chain(self.data_pending.iter())
             .cloned()
             .collect();
-        if entries.is_empty() && data.is_empty() && !paused_by_us {
+        if entries.is_empty() && data.is_empty() && self.vars.is_empty() && !paused_by_us {
             return self.store.clear();
         }
         self.store.save(&Journal {
@@ -1777,6 +2256,7 @@ impl Engine {
             paused_by_us,
             entries,
             data,
+            vars: self.vars.clone(),
         })
     }
 
@@ -1814,7 +2294,7 @@ impl Drop for Engine {
             Err(Error::ProcessGone { .. }) => return,
             Err(e) => tracing::error!(erro = %e, "falha ao retomar o jogo na saída"),
         }
-        if !self.active.is_empty() || !self.data.is_empty() {
+        if !self.active.is_empty() || !self.data.is_empty() || !self.vars.is_empty() {
             match self.undo_all() {
                 Ok(_) => {}
                 Err(Error::ProcessGone { .. }) => return,
@@ -1837,7 +2317,18 @@ impl Drop for Engine {
                 Err(e) => tracing::error!(erro = %e, "falha ao restaurar os bits do diário"),
             }
         }
-        if !self.journal_entries().is_empty() || !self.data_pending.is_empty() {
+        // Depois de resolver o resto: se um desvio pendente saiu agora, as variáveis também.
+        if !self.vars.is_empty() {
+            match self.clear_vars() {
+                Ok(()) => {}
+                Err(Error::ProcessGone { .. }) => return,
+                Err(e) => tracing::error!(erro = %e, "falha ao zerar as variáveis na saída"),
+            }
+        }
+        if !self.journal_entries().is_empty()
+            || !self.data_pending.is_empty()
+            || !self.vars.is_empty()
+        {
             tracing::error!(
                 "alguns patches não puderam ser restaurados; a próxima execução do trainer vai restaurar"
             );
@@ -1852,10 +2343,33 @@ fn entry_of(v: &Validated) -> JournalEntry {
         original: v.spec.expected.clone(),
         replacement: v.spec.replacement.clone(),
         next: None,
+        kind: v.spec.kind,
     }
 }
 
+/// Decisão pura da segunda fase: `unresolved` são as entradas ainda no registro (ativas e
+/// pendentes). As caves só podem ser desfeitas se nenhum desvio (`Code`) continua sem
+/// resolver, porque um desvio vivo aponta para a cave.
+fn caves_may_resolve(unresolved: &[JournalEntry]) -> bool {
+    unresolved.iter().all(|e| e.kind != PatchKind::Code)
+}
+
+/// Regiões `rw-` privadas (sem execução, sem compartilhamento) do `maps`: onde as variáveis
+/// das caves podem morar.
+fn rw_policy(maps: &[MapRegion]) -> WritePolicy {
+    WritePolicy::new(
+        maps.iter()
+            .filter(|r| r.perms.read && r.perms.write && !r.perms.exec && !r.perms.shared)
+            .map(|r| r.start..r.end)
+            .collect(),
+    )
+}
+
 fn has_lost(v: &Validated, danger: Danger) -> bool {
+    // Numa cave toda posição vale: as threads são sempre lidas.
+    if v.spec.kind == PatchKind::Cave && !matches!(danger, Danger::None) {
+        return true;
+    }
     match danger {
         Danger::One(Direction::Apply) => !v.lost_on_apply().is_empty(),
         Danger::One(Direction::Undo) => !v.lost_on_undo().is_empty(),
@@ -1894,6 +2408,16 @@ fn hex(bytes: &[u8]) -> String {
         .join(" ")
 }
 
+/// Os bytes (little-endian) como número do tipo `ty`; `None` se o tamanho não é o do tipo.
+fn decode_le(ty: ValueType, bytes: &[u8]) -> Option<f64> {
+    Some(match ty {
+        ValueType::I32 => f64::from(i32::from_le_bytes(bytes.try_into().ok()?)),
+        ValueType::U32 => f64::from(u32::from_le_bytes(bytes.try_into().ok()?)),
+        ValueType::F32 => f64::from(f32::from_le_bytes(bytes.try_into().ok()?)),
+        ValueType::F64 => f64::from_le_bytes(bytes.try_into().ok()?),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1904,6 +2428,7 @@ mod tests {
             addr: 0x1000,
             expected: expected.to_vec(),
             replacement: replacement.to_vec(),
+            kind: PatchKind::Code,
         })
         .unwrap()
     }
@@ -1914,6 +2439,91 @@ mod tests {
 
     fn io_error() -> Error {
         Error::Io(std::io::Error::other("sigcont"))
+    }
+
+    fn entry(id: &str, kind: PatchKind) -> JournalEntry {
+        JournalEntry {
+            id: id.into(),
+            addr: 0x1000,
+            original: vec![0x90],
+            replacement: vec![0xCC],
+            next: None,
+            kind,
+        }
+    }
+
+    #[test]
+    fn rw_policy_takes_private_rw_regions_only() {
+        use crate::maps::{MapPath, Perms};
+        let region = |start: u64, end: u64, r, w, x, shared| MapRegion {
+            start,
+            end,
+            perms: Perms {
+                read: r,
+                write: w,
+                exec: x,
+                shared,
+            },
+            offset: 0,
+            path: MapPath::Anonymous,
+        };
+        let maps = [
+            region(0x1000, 0x2000, true, true, false, false),
+            region(0x2000, 0x3000, true, true, false, false),
+            region(0x3000, 0x4000, true, false, false, false),
+            region(0x4000, 0x5000, true, true, true, false),
+            region(0x5000, 0x6000, true, true, false, true),
+        ];
+        let p = rw_policy(&maps);
+        // Vizinhas `rw-` fundem; leitura, `rwx` e compartilhada ficam de fora.
+        assert!(p.allows(&(0x1ff8..0x2008)));
+        assert!(!p.allows(&(0x2ff8..0x3008)));
+        for out in [0x3000..0x3008, 0x4000..0x4008, 0x5000..0x5008] {
+            assert!(!p.allows(&out), "{out:?}");
+        }
+    }
+
+    #[test]
+    fn recovery_keeps_cave_while_code_unresolved() {
+        // Um desvio que continua sem resolver (fora da política, por exemplo) segura a cave.
+        let code = entry("desvio", PatchKind::Code);
+        let cave = entry("cave", PatchKind::Cave);
+        assert!(!caves_may_resolve(&[code.clone(), cave.clone()]));
+        assert!(!caves_may_resolve(std::slice::from_ref(&code)));
+        // Com o desvio resolvido (saiu do registro, inclusive o de bytes de outro), a cave segue.
+        assert!(caves_may_resolve(std::slice::from_ref(&cave)));
+        assert!(caves_may_resolve(&[]));
+        assert!(caves_may_resolve(&[cave.clone(), cave]));
+    }
+
+    #[test]
+    fn cave_threads_are_always_dangerous_in_both_directions() {
+        let cave = validate(PatchSpec {
+            id: "c".into(),
+            addr: 0x1000,
+            expected: vec![0xCC; 8],
+            replacement: vec![0x90; 8],
+            kind: PatchKind::Cave,
+        })
+        .unwrap();
+        for danger in [
+            Danger::One(Direction::Apply),
+            Danger::One(Direction::Undo),
+            Danger::Both,
+        ] {
+            assert!(has_lost(&cave, danger));
+            let stopped = |pc| thread(Some(ThreadPos::Stopped { pc, syscall: None }));
+            assert!(thread_dangerous(&cave, danger, &stopped(0x1000)));
+            assert!(thread_dangerous(&cave, danger, &stopped(0x1007)));
+            assert!(!thread_dangerous(&cave, danger, &stopped(0x1008)));
+            assert!(thread_dangerous(&cave, danger, &thread(None)));
+            assert!(thread_dangerous(
+                &cave,
+                danger,
+                &thread(Some(ThreadPos::Running))
+            ));
+        }
+        assert_eq!(entry_of(&cave).kind, PatchKind::Cave);
     }
 
     #[test]

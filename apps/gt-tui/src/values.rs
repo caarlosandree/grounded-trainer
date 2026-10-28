@@ -12,7 +12,7 @@ use gt_core::engine::Engine;
 use gt_core::mem::MemReader;
 use gt_grounded2::fields::{ActionOutcome, FieldRuntime, PlayerState, TickReport};
 use gt_grounded2::player::{
-    Absent, ControllerFind, FieldCatalog, controller_needs_search, find_controller,
+    Absent, ControllerFind, FieldCatalog, controller_needs_search, find_controller, read_player,
 };
 use gt_grounded2::signatures::{FieldDef, FieldRule, UeSigs};
 use gt_grounded2::ue::{DISK_UNREADABLE, GlobalState, UeScan};
@@ -89,8 +89,23 @@ pub fn field_infos(defs: &[FieldDef], avail: &Avail) -> Vec<CheatInfo> {
             avail: avail.clone(),
             field: true,
             action: matches!(d.rule, FieldRule::Add { .. }),
+            label: d.label.clone(),
+            hook: false,
+            pawn: false,
         })
         .collect()
+}
+
+/// O que a reflexão da sessão já diz aos desvios (spec 008, 6.11): eles esperam o índice como os
+/// cheats de valor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReflectionGate {
+    /// Não há como ler a reflexão (motivo).
+    Unavailable(String),
+    /// O índice ainda não chegou (`verificando…`).
+    Checking,
+    /// Índice bom; `verified` é falso para as globais sem o `rva` conferido.
+    Ready { verified: bool },
 }
 
 /// Índice e catálogo de uma conexão, e a execução dos cheats.
@@ -178,6 +193,66 @@ impl ValueCheats {
         }
     }
 
+    /// A reflexão da sessão vista pelos desvios.
+    pub fn gate(&self) -> ReflectionGate {
+        match (&self.globals, &self.reflection) {
+            (Err(reason), _) => ReflectionGate::Unavailable(reason.clone()),
+            (Ok(g), Some(_)) => ReflectionGate::Ready {
+                verified: g.verified,
+            },
+            (Ok(_), None) => match &self.index_failure {
+                Some(reason) => ReflectionGate::Unavailable(reason.clone()),
+                None => ReflectionGate::Checking,
+            },
+        }
+    }
+
+    /// O índice da reflexão e as globais, se já há um índice bom.
+    pub fn reflection_parts(&self) -> Option<(Arc<ReflectionIndex>, &Globals)> {
+        let globals = self.globals.as_ref().ok()?;
+        let r = self.reflection.as_ref()?;
+        Some((r.index.clone(), globals))
+    }
+
+    /// O leitor de memória do processo.
+    pub fn reader(&self) -> MemReader {
+        self.reader
+    }
+
+    /// O pawn do personagem, lido agora a partir do controller guardado. Não escreve nada nem
+    /// toca no estado dos cheats de valor; só mantém o controller guardado como o `tick`: o
+    /// controller inválido é esquecido e o pawn nulo marca desde quando (`needs_controller`
+    /// depende dos dois, e sem cheat de valor ligado só esta leitura os vê). `None` sem índice,
+    /// sem controller ou com o personagem ausente.
+    pub fn read_pawn(&mut self) -> Option<u64> {
+        let (index, globals) = self.reflection_parts()?;
+        let r = self.reflection.as_ref()?;
+        let controller = self.controller?;
+        let objects = ObjectArray::read(&self.reader, &globals.sigs.layout, globals.gobjects)
+            .map_err(|e| tracing::debug!("tabela de objetos ilegível: {e}"))
+            .ok()?;
+        let read = read_player(&self.reader, &index, &r.catalog, &objects, controller);
+        match read {
+            Ok(snapshot) => {
+                self.pawn_null_since = None;
+                Some(snapshot.pawn)
+            }
+            Err(Absent::ControllerInvalid) => {
+                self.controller = None;
+                self.pawn_null_since = None;
+                None
+            }
+            Err(Absent::PawnNull) => {
+                self.pawn_null_since.get_or_insert_with(Instant::now);
+                None
+            }
+            Err(_) => {
+                self.pawn_null_since = None;
+                None
+            }
+        }
+    }
+
     /// A definição do cheat de valor `id`.
     fn def(&self, id: &str) -> Option<&FieldDef> {
         self.defs.iter().find(|d| d.id == id)
@@ -225,7 +300,7 @@ impl ValueCheats {
         let amount = match self.def(id) {
             Some(d) if matches!(d.rule, FieldRule::Add { .. }) => {
                 match d.value.as_ref().map(|g| g.value(k)) {
-                    Some(v) if v.is_finite() && v >= 0.0 && v <= f64::from(i32::MAX) => v as i32,
+                    Some(v) if v.is_finite() && v >= 0.0 => v,
                     _ => return ActionOutcome::Refused("quantidade inválida".to_string()),
                 }
             }
@@ -703,6 +778,12 @@ mod tests {
         assert!(find("somar-ciencia").action && find("somar-ciencia").value.is_some());
         assert!(!find("carga").action && find("carga").value.is_some());
         assert!(!find("vida-infinita").action && find("vida-infinita").value.is_none());
+        // O `pular-hora` é uma ação de grade com um ponto só e carrega o `label` do TOML.
+        let hour = find("pular-hora");
+        assert!(hour.action);
+        assert_eq!(hour.label.as_deref(), Some("+1h"));
+        assert_eq!(hour.value.as_ref().map(|g| g.steps()), Some(0));
+        assert_eq!(find("somar-ciencia").label, None);
     }
 
     fn controller_outcome(data: ControllerData) -> ReflectionOutcome {
@@ -783,6 +864,76 @@ mod tests {
             Some(PlayerState::Absent(Absent::ControllerAmbiguous))
         );
         assert!(news.retry);
+    }
+
+    /// `ValueCheats` contra o `gt-testtarget --ue` (cena sintética viva), com o índice e o
+    /// controller guardado já mesclados. Antes: `cargo build --workspace`.
+    fn live_cheats() -> (gt_testkit::TestTarget, ValueCheats) {
+        let t = gt_testkit::TestTarget::spawn_with(gt_testkit::TargetOpts {
+            ue: true,
+            ..gt_testkit::TargetOpts::default()
+        });
+        let ue = t.ue.unwrap();
+        let reader = MemReader::new(t.pid);
+        let (sigs, defs) = synth_signatures();
+        let layout = sigs.layout;
+        let names = Names::new(&reader, ue.names).unwrap();
+        let objects = ObjectArray::read(&reader, &layout, ue.gobjects).unwrap();
+        let index =
+            ReflectionIndex::build(&reader, &layout, &objects, &names, &ScanBudget::standard())
+                .unwrap();
+        let catalog = FieldCatalog::resolve(&index, &reader, &sigs.player, &defs);
+        let globals = Ok(Globals {
+            sigs,
+            gobjects: ue.gobjects,
+            names: ue.names,
+            verified: false,
+        });
+        let mut v = ValueCheats::new(reader, defs, globals);
+        v.merge(outcome(Ok((index, catalog))));
+        v.merge(controller_outcome(Ok(ControllerFind::Found(ue.controller))));
+        (t, v)
+    }
+
+    fn poke(t: &gt_testkit::TestTarget, addr: u64, bytes: &[u8]) {
+        gt_core::mem::MemWriter::open(t.pid)
+            .unwrap()
+            .write(addr, bytes)
+            .unwrap();
+    }
+
+    #[test]
+    fn read_pawn_keeps_the_stored_controller_like_the_tick() {
+        let (t, mut v) = live_cheats();
+        let ue = t.ue.unwrap();
+        let now = Instant::now();
+        // Personagem lido: nada a procurar.
+        assert_eq!(v.read_pawn(), Some(ue.pawn));
+        assert!(!v.needs_controller(now));
+        // Pawn nulo (trocou de mundo): lê `None`, marca desde quando e, passados 30 s, pede a
+        // procura, sem nenhum cheat de valor ligado.
+        poke(&t, ue.pawn_field_addr, &0u64.to_le_bytes());
+        assert_eq!(v.read_pawn(), None);
+        assert!(v.pawn_null_since.is_some());
+        assert!(!v.needs_controller(now));
+        assert!(v.needs_controller(Instant::now() + Duration::from_secs(31)));
+        // O pawn volta: a marca cai.
+        poke(&t, ue.pawn_field_addr, &ue.pawn.to_le_bytes());
+        assert_eq!(v.read_pawn(), Some(ue.pawn));
+        assert_eq!(v.pawn_null_since, None);
+        // Controller inválido (a tabela não aponta mais para ele): é esquecido e a procura é
+        // pedida na hora.
+        let index = ue.controller + u64::from(gt_ue::UeLayout::observed().uobject.index);
+        poke(&t, index, &0xFFFF_FF00u32.to_le_bytes());
+        assert_eq!(v.read_pawn(), None);
+        assert_eq!(v.controller, None);
+        assert!(v.needs_controller(now));
+        // Nenhum estado dos cheats de valor foi tocado.
+        assert!(
+            v.reflection
+                .as_ref()
+                .is_some_and(|r| r.runtime.desired_values().is_empty())
+        );
     }
 
     #[test]

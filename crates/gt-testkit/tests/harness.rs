@@ -376,8 +376,10 @@ fn restore_discards_dead_process_journal() {
                 original: NOP3.to_vec(),
                 replacement: NOP2_NOP.to_vec(),
                 next: None,
+                kind: gt_core::patch::PatchKind::Code,
             }],
             data: Vec::new(),
+            vars: Vec::new(),
         })
         .unwrap();
     let out = restore(dir.path());
@@ -417,8 +419,10 @@ fn restore_skips_entry_outside_exec_region() {
                 original: NOP3.to_vec(),
                 replacement: NOP2_NOP.to_vec(),
                 next: None,
+                kind: gt_core::patch::PatchKind::Code,
             }],
             data: Vec::new(),
+            vars: Vec::new(),
         })
         .unwrap();
     let out = restore(dir.path());

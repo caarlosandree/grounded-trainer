@@ -261,6 +261,8 @@ separada do `slot` num tipo próprio, usado pelos patches (que continuam com `sl
 Na TUI, valem as regras da spec 003 (6.2) para valores: as setas mudam o valor mostrado também com o cheat desligado,
 indisponível ou com religar pendente; ligar e religar usam o valor mostrado.
 
+> **Nota (spec 008, 6.9):** `[field.value]` também aceita `points = [...]` (lista estritamente crescente, com o `default` dentro; um ponto só vale, sem `←→`) no lugar de `min`/`max`/`step`, e um `label` opcional que troca o texto da quantidade. O `type` ganha `f64`, só no `add` de `double`. Grades `min`/`max`/`step` e `type` `i32`/`f32` não mudam.
+
 ### 6.6 Regra `add` (ação)
 
 Um `[[field]]` com `rule = "add"` tem um único campo `int`, o bloco `[field.value]` (a quantidade a somar, `i32`, com
@@ -305,6 +307,8 @@ Um `[[field]]` com `rule = "add"` tem um único campo `int`, o bloco `[field.val
 - Uma ação nunca está "ligada": não entra nos desejados, não é religada depois de reconectar, não tem manutenção e não
   é tocada na saída, no `undo_all`, no `Drop` do motor nem na recuperação. Ela tem o mesmo `indisponível (<motivo>)` e
   `verificando…` dos outros cheats de valor (spec 005, 6.7).
+
+> **Nota (spec 008, 6.8.2):** o `add` é generalizado. Além do `int` da ciência, ele aceita `kind = "double"` (8 bytes de leitura e de escrita, grade `f64`; `kind = "float"` continua recusado) e `at_least = true`: a releitura passa a aceitar "maior ou igual" a `v + quantidade` (o relógio do jogo anda a cada quadro, então nunca é exata); abaixo disso é `não pegou, aperte de novo`, sem repetir sozinho. Sem `at_least`, a releitura exata da ciência não muda. O `[[field]]` também ganha `owner_class` (a classe que declara o primeiro salto do caminho, conferida a cada leitura) para campos de uma subclasse do `GameState`, como o `CalendarComponent` do `SurvivalGameState`. Esses recursos servem o `pular-hora` e o `congelar-hora` da spec 008.
 
 ### 6.7 Os cheats
 

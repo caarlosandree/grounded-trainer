@@ -126,6 +126,23 @@ pub enum Error {
     #[error("o cheat {id} tem uma entrada de outro objeto neste endereço")]
     DataEntryOtherObject { id: String },
 
+    /// A região de variáveis das caves (folga da `.data`) não é `rw-` no `maps` atual, ou não
+    /// pôde ser lida ou escrita.
+    #[error("a folga de variáveis em {addr:#x} não é gravável no jogo")]
+    VarsNotWritable { addr: u64 },
+
+    /// A região de variáveis não está zerada: outro uso, ou restos de uma execução anterior.
+    #[error("a folga de variáveis tem bytes diferentes de zero em {addr:#x}; nada foi reclamado")]
+    VarsNotZero { addr: u64 },
+
+    /// Escrita ou leitura de variável fora da região reclamada.
+    #[error("variável em {addr:#x} fora da região reclamada")]
+    VarOutsideRegion { addr: u64 },
+
+    /// Código de cave, desvio ou relocação que não pode ser montado ou não passou na conferência.
+    #[error("cave inválida: {reason}")]
+    BadCave { reason: String },
+
     /// Outro `gt-patch` já segura a trava do diário.
     #[error("outro gt-patch ou gt-tui já está em execução")]
     AlreadyRunning,

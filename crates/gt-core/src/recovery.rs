@@ -6,7 +6,17 @@
 //! funciona com o jogo fechado. A recuperação é genérica (não conhece o jogo) e só
 //! escreve onde cada byte é o original ou o nosso; por isso a política de escrita é
 //! só "a entrada cabe inteira em memória executável do `maps` atual e tem no máximo
-//! [`MAX_PATCH_LEN`] bytes". Entrada fora disso é de outro: não é tocada e sai do diário.
+//! [`MAX_PATCH_LEN`] bytes" ([`MAX_CAVE_LEN`] para uma cave). Entrada fora disso é de outro:
+//! não é tocada e sai do diário.
+//!
+//! A ordem é a do motor (spec 008, 6.3): primeiro os desvios (`Code`), depois as caves, estas
+//! com a pausa mais paciente e só se nenhum desvio ficou sem resolver (ver
+//! [`Engine::restore_entries`]).
+//!
+//! As regiões de variáveis das caves (`vars` do diário) entram no motor antes de tudo e só
+//! são zeradas no fim, se nenhum desvio ficou sem resolver e o `maps` ainda as mostra `rw-`
+//! (a recuperação é genérica e não conhece o módulo: vale a identidade do processo do diário).
+//! Região mantida aparece como [`VARS_ID`] em `kept`.
 //!
 //! As entradas de dados (bits, spec 005 6.6; valor inteiro, spec 006 6.8) não passam por essa
 //! política: cada uma é decidida por [`crate::journal::decide_data`], com a guarda do objeto
@@ -23,10 +33,13 @@ use crate::journal::{
     DiscardReason, Journal, JournalEntry, JournalLock, JournalStore, Loaded, Recovery, decide,
 };
 use crate::maps::{MapRegion, read_maps};
-use crate::patch::{MAX_PATCH_LEN, WritePolicy};
+use crate::patch::{MAX_CAVE_LEN, MAX_PATCH_LEN, PatchKind, WritePolicy};
 use crate::procinfo::{Identity, ProcStat, boot_id, read_stat};
 use crate::suspend::{PauseConfig, open_checked};
 use crate::{Error, Result};
+
+/// `id` com que as regiões de variáveis não zeradas aparecem em [`RecoveryReport::kept`].
+pub const VARS_ID: &str = "variáveis";
 
 /// O que a recuperação fez.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -147,7 +160,7 @@ pub fn recover(
         .entries
         .iter()
         .cloned()
-        .partition(|e| e.original.len() <= MAX_PATCH_LEN && exec.allows(&e.range()));
+        .partition(|e| e.original.len() <= max_entry_len(e.kind) && exec.allows(&e.range()));
     for e in outside {
         tracing::warn!(
             id = %e.id,
@@ -156,7 +169,7 @@ pub fn recover(
         );
         report.foreign.push(e.id);
     }
-    if eligible.is_empty() && journal.data.is_empty() {
+    if eligible.is_empty() && journal.data.is_empty() && journal.vars.is_empty() {
         store.clear()?;
         return Ok(report);
     }
@@ -190,6 +203,24 @@ pub fn recover(
         Err(Error::ProcessGone { .. }) => return finish_gone(store, report),
         Err(e) => return Err(e),
     };
+    // As regiões de variáveis e os dados entram no registro do motor antes de tudo (os dados
+    // como pendentes, sem escrever): o diário que ele regrava os mantém mesmo que uma falha
+    // abandone a recuperação no meio (uma cave com thread dentro, um prazo de pausa), em vez de
+    // tirá-los do disco antes de resolvidos.
+    engine.adopt_data(&journal.data);
+    // Região do diário que não passa no filtro do motor (tamanho, alinhamento, sobreposição)
+    // não é tocada: sai do diário como entrada de outro.
+    let rejected = engine.adopt_vars(&journal.vars);
+    if !rejected.is_empty() {
+        report.foreign.push(VARS_ID.to_owned());
+        // Regravar agora, com as entradas ainda fora do registro do motor, as tiraria do disco
+        // antes de restauradas ("diário primeiro"). Só vale quando não há entrada a restaurar
+        // (os dados já foram adotados); senão a gravação das próximas etapas já tira as regiões
+        // recusadas.
+        if eligible.is_empty() {
+            engine.save_journal_now();
+        }
+    }
     // O motor regrava o diário só com as entradas que ainda não resolveu (as de fora
     // de memória executável já saíram) e o apaga quando não sobra nenhuma. As de dados
     // entram como pendentes do motor e saem quando resolvidas.
@@ -199,6 +230,7 @@ pub fn recover(
             report.dropped = r.dropped;
             report.foreign.extend(r.foreign);
             report.kept = r.outside_policy;
+            report.kept.extend(r.deferred);
         }
         Err(Error::ProcessGone { .. }) => {
             report.discarded = Some(DiscardReason::ProcessGone);
@@ -224,6 +256,21 @@ pub fn recover(
             }
         }
     }
+    // Por último (spec 008, 6.3): as variáveis, que só são zeradas se nenhum desvio nosso
+    // continua sem resolver.
+    if !engine.vars().is_empty() {
+        match engine.clear_vars() {
+            Ok(()) => {}
+            Err(Error::ProcessGone { .. }) => {
+                report.discarded = Some(DiscardReason::ProcessGone);
+                return Ok(report);
+            }
+            Err(e) => tracing::warn!(erro = %e, "variáveis não zeradas agora"),
+        }
+        if !engine.vars().is_empty() {
+            report.kept.push(VARS_ID.to_owned());
+        }
+    }
     if !report.kept.is_empty() {
         tracing::warn!(
             ids = ?report.kept,
@@ -231,6 +278,14 @@ pub fn recover(
         );
     }
     Ok(report)
+}
+
+/// Maior entrada que a recuperação aceita tocar, por tipo.
+fn max_entry_len(kind: PatchKind) -> usize {
+    match kind {
+        PatchKind::Code => MAX_PATCH_LEN,
+        PatchKind::Cave => MAX_CAVE_LEN,
+    }
 }
 
 /// Estado atual do processo do diário; `None` se ele não existe mais.
@@ -296,6 +351,12 @@ mod tests {
         assert!(p.allows(&(0x1ffe..0x2002)));
         assert!(!p.allows(&(0x2ffe..0x3002)));
         assert!(!p.allows(&(0x3000..0x3003)));
+    }
+
+    #[test]
+    fn entry_length_limit_depends_on_kind() {
+        assert_eq!(max_entry_len(PatchKind::Code), 64);
+        assert_eq!(max_entry_len(PatchKind::Cave), 4096);
     }
 
     #[test]

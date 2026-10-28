@@ -3,11 +3,10 @@
 use std::io::{self, Write};
 use std::time::Duration;
 
-use gt_core::Error;
 use gt_core::session::run_until_shutdown;
 
 use super::{
-    begin_and_show, location, open_catalog, open_engine, report_unrestored, select_patches,
+    begin_and_show, location, open_catalog, open_engine, report_undone, select_patches,
     warn_unverified,
 };
 
@@ -41,26 +40,5 @@ pub fn run(pid: Option<i32>, ids: &[String]) -> anyhow::Result<()> {
     let undone = engine.undo_all();
 
     // Daqui em diante o terminal pode ter fechado: falha ao escrever não interrompe nada.
-    let mut out = io::stdout().lock();
-    match undone {
-        Ok(batch) => {
-            for id in &batch.restored {
-                let _ = writeln!(out, "restaurado: {id}");
-            }
-            for id in &batch.foreign {
-                let _ = writeln!(out, "não restaurado: {id} (bytes alterados por outro)");
-            }
-            let _ = out.flush();
-            Ok(())
-        }
-        Err(Error::ProcessGone { .. }) => {
-            let _ = writeln!(out, "o jogo fechou; nada a restaurar");
-            let _ = out.flush();
-            Ok(())
-        }
-        Err(err) => {
-            report_unrestored(&engine);
-            Err(err.into())
-        }
-    }
+    report_undone(&engine, undone, &mut io::stdout().lock())
 }

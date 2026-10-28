@@ -339,8 +339,7 @@ fn cheat_line(
                         + "indisponível ()".chars().count()
                         + again.chars().count()
                         + 1
-                        + usize::from(row.action)
-                        + value_text(value, row.k).chars().count();
+                        + value_text(row, value).chars().count();
                     truncate(reason, width.saturating_sub(fixed))
                 }
                 None => reason.clone(),
@@ -369,12 +368,7 @@ fn cheat_line(
         Span::styled(state, style),
     ];
     if has_value && let Some(value) = &row.value {
-        let text = if row.action {
-            format!(" +{}", value_text(value, row.k))
-        } else {
-            format!(" {}", value_text(value, row.k))
-        };
-        spans.push(Span::raw(text));
+        spans.push(Span::raw(format!(" {}", value_text(row, value))));
     }
     Line::from(spans)
 }
@@ -392,9 +386,19 @@ fn truncate(text: &str, max: usize) -> String {
     out
 }
 
-/// `1.5x ◀ ▶`.
-fn value_text(spec: &ValueGrid, k: u64) -> String {
-    format!("{} ◀ ▶", spec.format(k))
+/// O valor da linha: `1.5x ◀ ▶`, ou `+100 ◀ ▶` numa ação. O `label` do TOML (`+1h`) vale no lugar do
+/// número formatado; uma grade de um ponto só (sem `←→`) não mostra as setas (spec 008, 6.8.2 e 6.9).
+fn value_text(row: &CheatRow, spec: &ValueGrid) -> String {
+    let shown = match &row.label {
+        Some(label) => label.clone(),
+        None if row.action => format!("+{}", spec.format(row.k)),
+        None => spec.format(row.k),
+    };
+    if spec.steps() == 0 {
+        shown
+    } else {
+        format!("{shown} ◀ ▶")
+    }
 }
 
 /// Quebra `text` em linhas de até `width` colunas, nas palavras.
@@ -473,6 +477,9 @@ mod tests {
             desired: false,
             field: false,
             action: false,
+            label: None,
+            hook: false,
+            pawn: false,
             note: None,
         }
     }
@@ -526,6 +533,7 @@ mod tests {
             default_k: 2,
             unit: Some("x".into()),
             decimals: 1,
+            points: None,
         }
     }
 
@@ -574,7 +582,7 @@ mod tests {
         m.conn = connected();
         let mut on = row("Cargas infinitas", Category::Itens, ok());
         on.on = true;
-        let off = row("Duplicar ao arrastar", Category::Itens, ok());
+        let off = row("Duplicar itens", Category::Itens, ok());
         let unverified = row(
             "Sem conferir",
             Category::Itens,
@@ -593,7 +601,7 @@ mod tests {
         speed_row.value = Some(speed());
         speed_row.k = 2;
         m.cheats = vec![on, off, unverified, missing, residue, again, speed_row];
-        // Ordem visível: God mode, Cargas infinitas, Duplicar ao arrastar, ...
+        // Ordem visível: God mode, Cargas infinitas, Duplicar itens, ...
         m.selected = 2;
         let lines = screen(&m);
 
@@ -611,8 +619,8 @@ mod tests {
             line_with(&lines, header);
         }
         assert!(line_with(&lines, "Cargas infinitas").contains("[ON ]"));
-        let selected = line_with(&lines, "Duplicar ao arrastar");
-        assert!(selected.contains("> Duplicar ao arrastar"), "{selected}");
+        let selected = line_with(&lines, "Duplicar itens");
+        assert!(selected.contains("> Duplicar itens"), "{selected}");
         assert!(selected.contains("[OFF]"));
         assert!(!selected.contains('?'));
         assert!(line_with(&lines, "Sem conferir").contains("[OFF] ?"));
@@ -943,6 +951,7 @@ mod tests {
             default_k: 9,
             unit: None,
             decimals: 0,
+            points: None,
         }
     }
 
@@ -961,6 +970,54 @@ mod tests {
         assert!(line.contains("[ação]"), "{line}");
         assert!(line.contains("+1000"), "{line}");
         assert!(!line.contains("[ON ]") && !line.contains("[OFF]"), "{line}");
+    }
+
+    /// A grade do `pular-hora`: um ponto só, `f64`.
+    fn one_hour() -> ValueGrid {
+        ValueGrid {
+            ty: ValueType::F64,
+            min: 3600.0,
+            max: 3600.0,
+            step: 0.0,
+            default_k: 0,
+            unit: None,
+            decimals: 0,
+            points: Some(vec![3600.0]),
+        }
+    }
+
+    #[test]
+    fn action_with_label_and_one_point_has_no_arrows() {
+        let mut m = Model::new(false);
+        m.conn = connected();
+        let mut r = row("Pular 1 hora", Category::Progressao, ok());
+        r.field = true;
+        r.action = true;
+        r.value = Some(one_hour());
+        r.label = Some("+1h".to_string());
+        m.cheats = vec![r];
+        let lines = screen(&m);
+        let line = line_with(&lines, "Pular 1 hora");
+        assert!(line.contains("[ação]"), "{line}");
+        assert!(line.contains("+1h"), "{line}");
+        // O `label` vale no lugar do número, sem `+` a mais e sem as setas (um ponto só).
+        assert!(!line.contains("++1h") && !line.contains("3600"), "{line}");
+        assert!(!line.contains('◀') && !line.contains('▶'), "{line}");
+    }
+
+    #[test]
+    fn one_point_grid_without_label_shows_the_number_without_arrows() {
+        let mut m = Model::new(false);
+        m.conn = connected();
+        let mut r = row("Pular 1 hora", Category::Progressao, ok());
+        r.field = true;
+        r.action = true;
+        r.value = Some(one_hour());
+        m.cheats = vec![r];
+        let lines = screen(&m);
+        let line = line_with(&lines, "Pular 1 hora");
+        assert!(line.contains("+3600"), "{line}");
+        assert!(!line.contains('◀'), "{line}");
     }
 
     #[test]
@@ -985,6 +1042,30 @@ mod tests {
             line.trim_end().chars().count() <= MIN_WIDTH as usize,
             "{line}"
         );
+    }
+
+    #[test]
+    fn hook_row_with_value_shows_on_and_the_unit() {
+        let mut m = Model::new(false);
+        m.conn = connected();
+        let mut r = row("Brain Power rápido", Category::Progressao, ok());
+        r.hook = true;
+        r.on = true;
+        r.value = Some(ValueGrid {
+            ty: ValueType::I32,
+            min: 2.0,
+            max: 10.0,
+            step: 0.0,
+            default_k: 0,
+            unit: Some("x".to_string()),
+            decimals: 0,
+            points: Some(vec![2.0, 3.0, 5.0, 10.0]),
+        });
+        r.k = 2;
+        m.cheats = vec![r];
+        let lines = screen(&m);
+        let line = line_with(&lines, "Brain Power rápido");
+        assert!(line.contains("[ON ]") && line.contains("5x ◀ ▶"), "{line}");
     }
 
     #[test]

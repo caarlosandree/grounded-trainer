@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use gt_core::procinfo::Identity;
 use gt_grounded2::fields::{ActionOutcome, TickReport};
+use gt_grounded2::hooks::HookEvent;
 use gt_grounded2::signatures::Category;
 
 use crate::backend::{
@@ -91,6 +92,24 @@ pub(crate) enum Call {
     FieldTick {
         on: Vec<String>,
     },
+    HookEnable {
+        id: String,
+        k: u64,
+        busy: Option<String>,
+    },
+    HookDisable {
+        id: String,
+        busy: Option<String>,
+    },
+    HookSetValue {
+        id: String,
+        k: u64,
+        busy: Option<String>,
+    },
+    ReadPawn,
+    HookTick {
+        pawn: Option<u64>,
+    },
 }
 
 /// O que uma busca devolve (a parte que o teste programa).
@@ -125,6 +144,9 @@ pub(crate) fn field(id: &str, avail: Avail) -> CheatInfo {
         avail,
         field: true,
         action: false,
+        label: None,
+        hook: false,
+        pawn: false,
     }
 }
 
@@ -138,6 +160,9 @@ pub(crate) fn cheat(id: &str, avail: Avail) -> CheatInfo {
         avail,
         field: false,
         action: false,
+        label: None,
+        hook: false,
+        pawn: false,
     }
 }
 
@@ -199,6 +224,12 @@ pub(crate) struct FakeState {
     pub controller_news: Option<bool>,
     /// Relatórios dos próximos ciclos (vazia: ciclo sem manutenção).
     pub tick_reports: VecDeque<TickReport>,
+    /// Disponibilidade dos desvios segundo a sessão.
+    pub hook_avail: Vec<(String, Avail)>,
+    /// Acontecimentos dos próximos ciclos de manutenção dos desvios.
+    pub hook_events: VecDeque<Vec<HookEvent>>,
+    /// O personagem que a sessão falsa lê.
+    pub pawn: Option<u64>,
 }
 
 fn lock(state: &Mutex<FakeState>) -> MutexGuard<'_, FakeState> {
@@ -423,6 +454,26 @@ impl FakeCtl {
         self.state().tick_reports.push_back(report);
     }
 
+    pub fn set_hook_avail(&self, avail: &[(&str, Avail)]) {
+        self.state().hook_avail = avail
+            .iter()
+            .map(|(id, a)| (id.to_string(), a.clone()))
+            .collect();
+    }
+
+    /// Programa o que a manutenção dos desvios do próximo ciclo devolve.
+    pub fn push_hook_events(&self, events: Vec<HookEvent>) {
+        self.state().hook_events.push_back(events);
+    }
+
+    pub fn set_pawn(&self, pawn: Option<u64>) {
+        self.state().pawn = pawn;
+    }
+
+    pub fn hook_ticks(&self) -> usize {
+        self.count(|c| matches!(c, Call::HookTick { .. }))
+    }
+
     pub fn job_runs(&self, kind: JobKind) -> usize {
         self.count(|c| matches!(c, Call::JobRun { kind: k, .. } if *k == kind))
     }
@@ -474,6 +525,9 @@ impl FakeBackend {
             action_wants: false,
             controller_news: None,
             tick_reports: VecDeque::new(),
+            hook_avail: Vec::new(),
+            hook_events: VecDeque::new(),
+            pawn: None,
         };
         FakeBackend {
             ctl: FakeCtl(Arc::new(Mutex::new(state))),
@@ -787,8 +841,9 @@ impl Session<()> for FakeSession {
             .action_outcomes
             .pop_front()
             .unwrap_or(ActionOutcome::Done {
-                before: 0,
-                after: i32::try_from(k).unwrap_or(i32::MAX),
+                before: 0.0,
+                after: k as f64,
+                note: None,
             });
         if out == ActionOutcome::NeedsController {
             s.action_wants = true;
@@ -820,6 +875,45 @@ impl Session<()> for FakeSession {
         let mut s = self.ctl.state();
         s.calls.push(Call::FieldTick { on: on.to_vec() });
         s.tick_reports.pop_front().unwrap_or_else(idle_tick)
+    }
+
+    fn hook_avail(&self) -> Vec<(String, Avail)> {
+        self.ctl.state().hook_avail.clone()
+    }
+
+    fn hook_enable(&mut self, id: &str, k: u64) -> OpOutcome {
+        self.op(|busy| Call::HookEnable {
+            id: id.to_string(),
+            k,
+            busy,
+        })
+    }
+
+    fn hook_disable(&mut self, id: &str) -> OpOutcome {
+        self.op(|busy| Call::HookDisable {
+            id: id.to_string(),
+            busy,
+        })
+    }
+
+    fn hook_set_value(&mut self, id: &str, k: u64) -> OpOutcome {
+        self.op(|busy| Call::HookSetValue {
+            id: id.to_string(),
+            k,
+            busy,
+        })
+    }
+
+    fn read_pawn(&mut self) -> Option<u64> {
+        let mut s = self.ctl.state();
+        s.calls.push(Call::ReadPawn);
+        s.pawn
+    }
+
+    fn hook_tick(&mut self, pawn: Option<u64>) -> Vec<HookEvent> {
+        let mut s = self.ctl.state();
+        s.calls.push(Call::HookTick { pawn });
+        s.hook_events.pop_front().unwrap_or_default()
     }
 }
 

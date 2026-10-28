@@ -16,9 +16,10 @@ use gt_grounded2::fields::{ActionOutcome, FieldRuntime, Note, PlayerState, World
 use gt_grounded2::player::{Absent, FieldCatalog, FieldValues, read_player};
 use gt_grounded2::policy::data_policy;
 use gt_testkit::ue::{
-    AUTO_COMPLETE_OFF, CACHED_OFF, CAPACITY_OFF, DAMAGE_MULT_OFF, DAMAGE_OFF, DIE_BYTE,
-    ENEMY_DAMAGE_OFF, GRAVITY_OFF, GROUND_MULT_OFF, HAULING_OFF, HEALTH_OFF, JUMP_OFF,
-    MODE_MANAGER_OFF, PARTY_OFF, RECIPES_OFF, SCIENCE_OFF, SETTINGS_OFF, SWIM_MULT_OFF, WORLD_OFF,
+    AUTO_COMPLETE_OFF, CACHED_OFF, CAPACITY_OFF, CLOCK_START, CURRENT_TIME_OFF, DAMAGE_MULT_OFF,
+    DAMAGE_OFF, DIE_BYTE, ENEMY_DAMAGE_OFF, GRAVITY_OFF, GROUND_MULT_OFF, HAULING_OFF, HEALTH_OFF,
+    JUMP_OFF, MODE_MANAGER_OFF, PARTY_OFF, RECIPES_OFF, SCIENCE_OFF, SETTINGS_OFF, SWIM_MULT_OFF,
+    TIME_RATIO_OFF, TIME_RATIO_START, WORLD_OFF,
 };
 use gt_testkit::{TargetOpts, TestTarget, UeAddrs, synth_signatures};
 use gt_ue::{Names, ObjectArray, ReflectionIndex, ScanBudget, UeLayout};
@@ -113,15 +114,39 @@ impl Scene {
     }
 
     fn action(&mut self, controller: Option<u64>, amount: i32) -> ActionOutcome {
+        self.run("somar-ciencia", controller, f64::from(amount))
+    }
+
+    /// A ação `pular-hora` (um `double` com a releitura "maior ou igual", spec 008, 6.8.2).
+    fn skip(&mut self, controller: Option<u64>, amount: f64) -> ActionOutcome {
+        self.run("pular-hora", controller, amount)
+    }
+
+    fn run(&mut self, id: &str, controller: Option<u64>, amount: f64) -> ActionOutcome {
         self.runtime.run_action(
             &mut self.engine,
             &self.reader,
             &self.index,
             &self.objects,
             controller,
-            "somar-ciencia",
+            id,
             amount,
         )
+    }
+
+    fn clock(&self) -> u64 {
+        self.ue.calendar + u64::from(CURRENT_TIME_OFF)
+    }
+
+    /// `CalendarComponent.GameToRealTimeRatio` (o `congelar-hora`, spec 008, 6.8.1).
+    fn ratio(&self) -> u64 {
+        self.ue.calendar + u64::from(TIME_RATIO_OFF)
+    }
+
+    fn f64_at(&self, addr: u64) -> f64 {
+        let mut b = [0u8; 8];
+        self.reader.read_exact(addr, &mut b).unwrap();
+        f64::from_le_bytes(b)
     }
 
     fn i32_at(&self, addr: u64) -> i32 {
@@ -756,16 +781,18 @@ fn action_adds_and_rereads() {
     assert_eq!(
         s.action(c, 1000),
         ActionOutcome::Done {
-            before: 500,
-            after: 1500
+            before: 500.0,
+            after: 1500.0,
+            note: None,
         }
     );
     assert_eq!(s.i32_at(s.science()), 1500);
     assert_eq!(
         s.action(c, 100),
         ActionOutcome::Done {
-            before: 1500,
-            after: 1600
+            before: 1500.0,
+            after: 1600.0,
+            note: None,
         }
     );
     // Sem diário e sem entrada no motor: a ação não é reversível.
@@ -776,8 +803,9 @@ fn action_adds_and_rereads() {
     assert_eq!(
         s.action(c, 1000),
         ActionOutcome::Done {
-            before: 99_000,
-            after: 100_000
+            before: 99_000.0,
+            after: 100_000.0,
+            note: None,
         }
     );
 }
@@ -788,7 +816,7 @@ fn action_raced_when_game_writes_during_the_write() {
     let c = Some(s.ue.controller);
     s.engine
         .inject_data_fault_for_test(Some(DataFault::ThirdValue(777i32.to_le_bytes().to_vec())));
-    assert_eq!(s.action(c, 1000), ActionOutcome::Raced { read: 777 });
+    assert_eq!(s.action(c, 1000), ActionOutcome::Raced { read: 777.0 });
     // Não tenta de novo: o valor do jogo fica como está.
     assert_eq!(s.i32_at(s.science()), 777);
     assert!(s.engine.data_entries().is_empty());
@@ -819,6 +847,140 @@ fn action_refusals() {
     s.poke(s.ue.level + u64::from(WORLD_OFF), &0u64.to_le_bytes());
     assert_eq!(s.action(c, 1000), refused("estado do jogo ausente"));
     assert_eq!(s.i32_at(s.science()), 99_500);
+}
+
+/// A ciência (`add` de `int`) segue com a releitura exata: um valor acima do pedido é uma corrida.
+#[test]
+fn science_unchanged_still_rereads_exactly() {
+    let mut s = scene();
+    let c = Some(s.ue.controller);
+    s.engine
+        .inject_data_fault_for_test(Some(DataFault::ThirdValue(1505i32.to_le_bytes().to_vec())));
+    // 500 + 1000 = 1500 pedido; o jogo deixou 1505 (acima, mas não exato): `Raced`, sem aceitar "≥".
+    assert_eq!(s.action(c, 1000), ActionOutcome::Raced { read: 1505.0 });
+    assert_eq!(s.i32_at(s.science()), 1505);
+}
+
+const SKIP: f64 = 3600.0;
+
+#[test]
+fn add_double_applied_at_least() {
+    let mut s = scene();
+    let c = Some(s.ue.controller);
+    assert_eq!(s.f64_at(s.clock()), CLOCK_START);
+    // Sem o jogo mexendo: a releitura é exata e vale (aceita igual).
+    assert_eq!(
+        s.skip(c, SKIP),
+        ActionOutcome::Done {
+            before: CLOCK_START,
+            after: CLOCK_START + SKIP,
+            note: None,
+        }
+    );
+    assert_eq!(s.f64_at(s.clock()), CLOCK_START + SKIP);
+    // O jogo soma ao relógio entre a escrita e a releitura: acima do pedido, mas dentro dos 300.
+    let before = CLOCK_START + SKIP;
+    s.engine
+        .inject_data_fault_for_test(Some(DataFault::ThirdValue(
+            (before + SKIP + 12.5).to_le_bytes().to_vec(),
+        )));
+    assert_eq!(
+        s.skip(c, SKIP),
+        ActionOutcome::Done {
+            before,
+            after: before + SKIP + 12.5,
+            note: None,
+        }
+    );
+    // No limite exato dos 300, ainda sem nota.
+    let before = before + SKIP + 12.5;
+    s.engine
+        .inject_data_fault_for_test(Some(DataFault::ThirdValue(
+            (before + SKIP + 300.0).to_le_bytes().to_vec(),
+        )));
+    assert!(matches!(
+        s.skip(c, SKIP),
+        ActionOutcome::Done { note: None, .. }
+    ));
+    // Sem diário e sem entrada no motor: a ação não é reversível.
+    assert_eq!(s.store.peek().unwrap(), Loaded::Missing);
+    assert!(s.engine.data_entries().is_empty());
+}
+
+#[test]
+fn add_double_note_above_300() {
+    let mut s = scene();
+    let c = Some(s.ue.controller);
+    // O relógio andou 400 s além do esperado: vale, com o aviso no registro.
+    s.engine
+        .inject_data_fault_for_test(Some(DataFault::ThirdValue(
+            (CLOCK_START + SKIP + 400.0).to_le_bytes().to_vec(),
+        )));
+    assert_eq!(
+        s.skip(c, SKIP),
+        ActionOutcome::Done {
+            before: CLOCK_START,
+            after: CLOCK_START + SKIP + 400.0,
+            note: Some("(o relógio andou mais que o esperado)".to_string()),
+        }
+    );
+    assert_eq!(s.f64_at(s.clock()), CLOCK_START + SKIP + 400.0);
+}
+
+#[test]
+fn add_double_below_not_taken() {
+    let mut s = scene();
+    let c = Some(s.ue.controller);
+    let not_taken = || ActionOutcome::RefusedAfterRead("não pegou, aperte de novo".to_string());
+    // O jogo sobrescreveu o relógio com o valor de antes: não pegou, sem repetir sozinho.
+    s.engine
+        .inject_data_fault_for_test(Some(DataFault::ThirdValue(
+            CLOCK_START.to_le_bytes().to_vec(),
+        )));
+    assert_eq!(s.skip(c, SKIP), not_taken());
+    assert_eq!(s.f64_at(s.clock()), CLOCK_START);
+    // Um pouco abaixo de `v + 3600` também é "não pegou".
+    s.engine
+        .inject_data_fault_for_test(Some(DataFault::ThirdValue(
+            (CLOCK_START + SKIP - 1.0).to_le_bytes().to_vec(),
+        )));
+    assert_eq!(s.skip(c, SKIP), not_taken());
+    assert_eq!(s.f64_at(s.clock()), CLOCK_START + SKIP - 1.0);
+    assert!(s.engine.data_entries().is_empty());
+    assert_eq!(s.store.peek().unwrap(), Loaded::Missing);
+}
+
+#[test]
+fn add_double_refuses_negative_and_over_max() {
+    let mut s = scene();
+    let c = Some(s.ue.controller);
+    let after_read = |text: &str| ActionOutcome::RefusedAfterRead(text.to_string());
+    for bad in [-1.0, 1_000_000_001.0, f64::NAN, f64::INFINITY] {
+        s.poke(s.clock(), &bad.to_le_bytes());
+        assert_eq!(s.skip(c, SKIP), after_read("valor atual fora da faixa"));
+    }
+    // `v + 3600 > result_max`: não passa do teto.
+    s.poke(s.clock(), &999_996_401.0f64.to_le_bytes());
+    assert_eq!(s.skip(c, SKIP), after_read("passaria do máximo"));
+    assert_eq!(s.f64_at(s.clock()), 999_996_401.0);
+    // No teto exato vale.
+    s.poke(s.clock(), &999_996_400.0f64.to_le_bytes());
+    assert_eq!(
+        s.skip(c, SKIP),
+        ActionOutcome::Done {
+            before: 999_996_400.0,
+            after: 1_000_000_000.0,
+            note: None,
+        }
+    );
+    // O mundo some do nível: o caminho recusa, sem tocar no relógio.
+    let before = s.f64_at(s.clock());
+    s.poke(s.ue.level + u64::from(WORLD_OFF), &0u64.to_le_bytes());
+    assert_eq!(
+        s.skip(c, SKIP),
+        ActionOutcome::Refused("estado do jogo ausente".into())
+    );
+    assert_eq!(s.f64_at(s.clock()), before);
 }
 
 #[test]
@@ -1275,4 +1437,56 @@ fn world_bool_game_rewrite_becomes_new_original() {
     assert_eq!(s.u8_at(s.recipes()), 1);
     assert_eq!(s.u8_at(s.auto_complete()), 0);
     assert_eq!(s.store.peek().unwrap(), Loaded::Missing);
+}
+
+// ---- `congelar-hora` (spec 008, 6.8.1): `set` do `GameToRealTimeRatio` para 0, raiz `game_state` ----
+
+#[test]
+fn freeze_time_set_and_restore() {
+    let mut s = scene();
+    let on = ["congelar-hora"];
+    assert_eq!(s.f32_at(s.ratio()), TIME_RATIO_START);
+    // Liga: o relógio para (razão 0) sem nota nem evento do cheat; o mundo na primeira leitura não é transição.
+    let first = s.tick(&on);
+    assert_eq!(first.world, Some(WorldState::Found));
+    assert!(first.notes.is_empty(), "{:?}", first.notes);
+    assert_eq!(s.f32_at(s.ratio()), 0.0);
+    assert_eq!(journal_data_len(&s), 1);
+    // Os ciclos seguintes não escrevem nada de novo.
+    let again = s.tick(&on);
+    assert!(again.notes.is_empty() && again.events.is_empty());
+    assert_eq!(journal_data_len(&s), 1);
+    // `pular-hora` não mexe na razão: os dois convivem.
+    let c = Some(s.ue.controller);
+    assert!(matches!(s.skip(c, SKIP), ActionOutcome::Done { .. }));
+    assert_eq!(s.f32_at(s.ratio()), 0.0);
+    // Desliga: volta o original.
+    let r = s.runtime.turn_off(&mut s.engine, "congelar-hora").unwrap();
+    assert_eq!(r.restored, vec!["congelar-hora".to_string()]);
+    assert_eq!(s.f32_at(s.ratio()), TIME_RATIO_START);
+    assert_eq!(s.store.peek().unwrap(), Loaded::Missing);
+}
+
+#[test]
+fn freeze_time_game_change_becomes_new_original() {
+    let mut s = scene();
+    let on = ["congelar-hora"];
+    s.tick(&on);
+    assert_eq!(s.f32_at(s.ratio()), 0.0);
+    // O jogo mexe no campo (por exemplo, ao dormir): vira o original novo e o cheat volta a congelar.
+    s.poke(s.ratio(), &120.0f32.to_le_bytes());
+    let changed = s.tick(&on);
+    assert_eq!(s.f32_at(s.ratio()), 0.0);
+    assert!(
+        changed
+            .events
+            .iter()
+            .any(|e| e.contains("Congelar hora do dia") && e.contains("novo original")),
+        "{:?}",
+        changed.events
+    );
+    assert!(changed.notes.is_empty(), "{:?}", changed.notes);
+    // Ao desligar, volta o valor que o jogo escreveu, não o de antes do cheat.
+    s.runtime.turn_off(&mut s.engine, "congelar-hora").unwrap();
+    assert_eq!(s.f32_at(s.ratio()), 120.0);
 }

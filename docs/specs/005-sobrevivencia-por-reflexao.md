@@ -283,6 +283,8 @@ Toda escrita de valor é precedida, no mesmo ciclo, da revalidação de 6.3 (pas
 - só objetos do caminho do jogador são tocados. Outro personagem com os mesmos componentes (criaturas, um segundo
   `SurvivalCharacter`) nunca é escrito, porque o endereço sai sempre do `Controller.Pawn` revalidado.
 
+> **Nota (spec 008, 6.4):** a regra "fora das imagens de módulo" vale para as escritas de **valor** desta spec. A spec 008 abre uma **exceção explícita**, só para a folga entre o fim do `VirtualSize` da `.data` do executável e o fim da última página dela (as variáveis das code caves), com política própria no motor: região `rw-` privada dentro do módulo, todos os bytes zero no primeiro uso, sem guarda de objeto e sem diário de valor. Ela vai para o `AGENTS.md` 3. A `.data` fora dessa folga continua nunca escrita.
+
 Se qualquer conferência falhar, nada é escrito naquele ciclo, e o cheat mostra o motivo (6.7).
 
 ### 6.5 Os cheats

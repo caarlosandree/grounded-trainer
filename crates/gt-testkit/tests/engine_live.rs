@@ -19,6 +19,7 @@ use gt_core::recovery::recover;
 use gt_core::suspend::{
     Fault, HookPoint, PauseConfig, is_stopped_now, open_checked, pause, sample_pcs, wait_until,
 };
+use gt_core::value::ValueType;
 use gt_testkit::{TargetOpts, TestTarget};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
@@ -208,6 +209,7 @@ fn patch(id: &str, addr: u64, expected: &[u8], replacement: &[u8]) -> Validated 
         addr,
         expected: expected.to_vec(),
         replacement: replacement.to_vec(),
+        kind: gt_core::patch::PatchKind::Code,
     })
     .unwrap()
 }
@@ -302,6 +304,7 @@ fn apply_and_undo_on_exec_page() {
                     original: NOP3.to_vec(),
                     replacement: NOP2_NOP.to_vec(),
                     next: None,
+                    kind: gt_core::patch::PatchKind::Code,
                 }]
             );
         }
@@ -313,6 +316,235 @@ fn apply_and_undo_on_exec_page() {
     assert!(engine.active().is_empty());
     assert!(missing(&env));
     assert!(wait_all_running(t.pid), "{:?}", states(t.pid));
+}
+
+/// Cave de 16 bytes sobre o preenchimento `0xCC` da página executável do alvo.
+fn cave(id: &str, addr: u64) -> Validated {
+    let mut code = vec![0x48, 0xFF, 0xC0, 0xC3]; // inc rax; ret
+    code.resize(16, 0x90);
+    validate(PatchSpec {
+        id: id.into(),
+        addr,
+        expected: vec![0xCC; 16],
+        replacement: code,
+        kind: gt_core::patch::PatchKind::Cave,
+    })
+    .unwrap()
+}
+
+#[test]
+fn undo_all_undoes_code_then_cave() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let cave_addr = t.exec_page + 0x100;
+    let mut engine = open_engine(
+        t.pid,
+        &env,
+        vec![exec2_range(&t), page_range(&t, t.exec_page)],
+        None,
+    );
+    let batch = vec![patch("p", t.exec2, &NOP3, &NOP2_NOP), cave("c", cave_addr)];
+    engine.apply(batch).unwrap();
+    assert_eq!(bytes_at(t.pid, cave_addr, 4), [0x48, 0xFF, 0xC0, 0xC3]);
+    match env.store.peek().unwrap() {
+        Loaded::Ok(j) => {
+            let kinds: Vec<_> = j.entries.iter().map(|e| (e.id.as_str(), e.kind)).collect();
+            assert!(
+                kinds.contains(&("c", gt_core::patch::PatchKind::Cave)),
+                "{kinds:?}"
+            );
+        }
+        other => panic!("diário inesperado: {other:?}"),
+    }
+    let report = engine.undo_all().unwrap();
+    let mut restored = report.restored.clone();
+    restored.sort();
+    assert_eq!(restored, vec!["c".to_string(), "p".to_string()]);
+    assert_eq!(bytes_at(t.pid, t.exec2, 3), NOP3);
+    assert_eq!(bytes_at(t.pid, cave_addr, 16), vec![0xCC; 16]);
+    assert!(engine.active().is_empty());
+    assert!(engine.pending_ids().is_empty());
+    assert!(missing(&env));
+    assert!(wait_all_running(t.pid), "{:?}", states(t.pid));
+}
+
+#[test]
+fn restore_keeps_cave_while_code_unresolved() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let cave_addr = t.exec_page + 0x100;
+    // A política só cobre a página da cave: o desvio (em `exec2`) fica sem resolver.
+    let mut engine = open_engine(t.pid, &env, vec![page_range(&t, t.exec_page)], None);
+    engine.apply(vec![cave("c", cave_addr)]).unwrap();
+    let code = JournalEntry {
+        id: "p".into(),
+        addr: t.exec2,
+        original: NOP3.to_vec(),
+        replacement: NOP2_NOP.to_vec(),
+        next: None,
+        kind: gt_core::patch::PatchKind::Code,
+    };
+    let cave_entry = JournalEntry {
+        id: "c".into(),
+        addr: cave_addr,
+        original: vec![0xCC; 16],
+        replacement: bytes_at(t.pid, cave_addr, 16),
+        next: None,
+        kind: gt_core::patch::PatchKind::Cave,
+    };
+    let report = engine
+        .restore_entries(vec![code, cave_entry.clone()])
+        .unwrap();
+    assert_eq!(report.outside_policy, vec!["p".to_string()]);
+    assert_eq!(report.deferred, vec!["c".to_string()]);
+    assert!(report.restored.is_empty(), "{report:?}");
+    // A cave continua escrita e as duas entradas continuam no diário.
+    assert_eq!(bytes_at(t.pid, cave_addr, 4), [0x48, 0xFF, 0xC0, 0xC3]);
+    match env.store.peek().unwrap() {
+        Loaded::Ok(j) => {
+            let ids: Vec<_> = j.entries.iter().map(|e| e.id.as_str()).collect();
+            assert!(ids.contains(&"p") && ids.contains(&"c"), "{ids:?}");
+        }
+        other => panic!("diário inesperado: {other:?}"),
+    }
+    // O desvio continua pendente no registro: a cave segue adiada.
+    let report = engine.restore_entries(vec![cave_entry]).unwrap();
+    assert_eq!(report.deferred, vec!["c".to_string()], "{report:?}");
+    assert_eq!(bytes_at(t.pid, cave_addr, 4), [0x48, 0xFF, 0xC0, 0xC3]);
+}
+
+/// Alvo do gancho de ordem: o PID e os trechos (endereço e bytes originais) a conferir.
+static ORDER_PID: AtomicI32 = AtomicI32::new(0);
+static ORDER_PROBES: Mutex<Vec<(u64, Vec<u8>)>> = Mutex::new(Vec::new());
+/// Para cada trecho, se estava com os bytes originais dentro da pausa do gancho.
+static ORDER_SEEN: Mutex<Option<Vec<bool>>> = Mutex::new(None);
+
+fn order_hook(point: HookPoint) {
+    if point != HookPoint::InPause {
+        return;
+    }
+    let pid = ORDER_PID.load(Ordering::SeqCst);
+    let probes = ORDER_PROBES.lock().unwrap().clone();
+    let seen = probes
+        .iter()
+        .map(|(addr, original)| bytes_at(pid, *addr, original.len()) == *original)
+        .collect();
+    *ORDER_SEEN.lock().unwrap() = Some(seen);
+}
+
+#[test]
+fn undo_all_runs_every_code_before_any_cave() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let (c1, c2) = (t.exec_page + 0x100, t.exec_page + 0x200);
+    let (p1, p2) = (t.exec2, t.exec2 + 8);
+    // A pausa do gancho é a 3ª do motor: 1ª = aplicar o lote, 2ª = fase dos `Code`, 3ª = fase das
+    // `Cave`. Ali, todos os desvios já têm de ter saído e todas as caves ainda estar escritas,
+    // mesmo com o lote aplicado em ordem trocada (cave, desvio, cave, desvio).
+    ORDER_PID.store(t.pid, Ordering::SeqCst);
+    *ORDER_PROBES.lock().unwrap() = vec![
+        (c1, vec![0xCC; 16]),
+        (p1, NOP3.to_vec()),
+        (c2, vec![0xCC; 16]),
+        (p2, NOP3.to_vec()),
+    ];
+    *ORDER_SEEN.lock().unwrap() = None;
+    let mut engine = open_engine_with(
+        t.pid,
+        &env,
+        vec![exec2_range(&t), page_range(&t, t.exec_page)],
+        PauseConfig {
+            hook: Some(order_hook),
+            hook_on_pause: 3,
+            ..PauseConfig::default()
+        },
+    );
+    engine
+        .apply(vec![
+            cave("c1", c1),
+            patch("p1", p1, &NOP3, &NOP2_NOP),
+            cave("c2", c2),
+            patch("p2", p2, &NOP3, &NOP2_NOP),
+        ])
+        .unwrap();
+    engine.undo_all().unwrap();
+    let seen = ORDER_SEEN.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        Some(vec![false, true, false, true]),
+        "[c1, p1, c2, p2] originais na pausa das caves"
+    );
+    for addr in [p1, p2] {
+        assert_eq!(bytes_at(t.pid, addr, 3), NOP3);
+    }
+    for addr in [c1, c2] {
+        assert_eq!(bytes_at(t.pid, addr, 16), vec![0xCC; 16]);
+    }
+    assert!(missing(&env));
+}
+
+static PENDING_CODE_ALLOW: AtomicBool = AtomicBool::new(false);
+
+#[test]
+fn undo_all_with_pending_code_parks_caves() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let cave_addr = t.exec_page + 0x100;
+    let (exec2, cave_page) = (exec2_range(&t), page_range(&t, t.exec_page));
+    // Enquanto `PENDING_CODE_ALLOW` é falso a política só cobre a página da cave: o desvio fica
+    // sem resolver (fora da política) e continua no diário.
+    let policy: PolicyFn = Box::new(move |_maps| {
+        if PENDING_CODE_ALLOW.load(Ordering::SeqCst) {
+            WritePolicy::new(vec![exec2.clone(), cave_page.clone()])
+        } else {
+            WritePolicy::new(vec![cave_page.clone()])
+        }
+    });
+    let opts = EngineOptions {
+        version_key: "teste".into(),
+        pause: PauseConfig::default(),
+    };
+    let mut engine = Engine::open(t.pid, None, env.store.clone(), &env.lock, policy, opts).unwrap();
+    engine.apply(vec![cave("c", cave_addr)]).unwrap();
+    let code = JournalEntry {
+        id: "p".into(),
+        addr: t.exec2,
+        original: NOP3.to_vec(),
+        replacement: NOP2_NOP.to_vec(),
+        next: None,
+        kind: gt_core::patch::PatchKind::Code,
+    };
+    let report = engine.restore_entries(vec![code]).unwrap();
+    assert_eq!(report.outside_policy, vec!["p".to_string()], "{report:?}");
+    assert_eq!(engine.pending_ids(), vec!["p".to_string()]);
+
+    // O desvio pendente ainda apontaria para a cave: `undo_all` não a toca, mas ela deixa de
+    // ficar ativa sem ninguém saber e passa a pendente, ao lado do desvio.
+    let report = engine.undo_all().unwrap();
+    assert!(report.restored.is_empty(), "{report:?}");
+    assert_eq!(bytes_at(t.pid, cave_addr, 4), [0x48, 0xFF, 0xC0, 0xC3]);
+    assert!(engine.active().is_empty());
+    let mut pending = engine.pending_ids();
+    pending.sort();
+    assert_eq!(pending, vec!["c".to_string(), "p".to_string()]);
+    match env.store.peek().unwrap() {
+        Loaded::Ok(j) => {
+            let mut ids: Vec<_> = j.entries.iter().map(|e| e.id.as_str()).collect();
+            ids.sort();
+            assert_eq!(ids, vec!["c", "p"]);
+        }
+        other => panic!("diário inesperado: {other:?}"),
+    }
+
+    // Com o desvio dentro da política, `restore_pending` resolve os dois (o desvio já estava
+    // original; a cave sai depois dele).
+    PENDING_CODE_ALLOW.store(true, Ordering::SeqCst);
+    let report = engine.restore_pending().unwrap();
+    assert_eq!(report.dropped, vec!["p".to_string()], "{report:?}");
+    assert_eq!(report.restored, vec!["c".to_string()], "{report:?}");
+    assert_eq!(bytes_at(t.pid, cave_addr, 16), vec![0xCC; 16]);
+    assert!(engine.pending_ids().is_empty());
+    assert!(missing(&env));
 }
 
 #[test]
@@ -771,6 +1003,7 @@ fn restore_entries_handles_mixed_bytes() {
         original: vec![0x90; 4],
         replacement: new.to_vec(),
         next: None,
+        kind: gt_core::patch::PatchKind::Code,
     };
     let report = engine.restore_entries(vec![entry]).unwrap();
     assert_eq!(report.restored, vec!["meio".to_string()]);
@@ -1267,6 +1500,7 @@ fn set_replacement_changes_executed_value() {
             original: VALUE_11.to_vec(),
             replacement: VALUE_33.to_vec(),
             next: None,
+            kind: gt_core::patch::PatchKind::Code,
         }]
     );
 
@@ -1466,6 +1700,7 @@ fn set_replacement_dirty_leaves_pending_with_next() {
             original: VALUE_11.to_vec(),
             replacement: VALUE_22.to_vec(),
             next: Some(VALUE_33.to_vec()),
+            kind: gt_core::patch::PatchKind::Code,
         }]
     );
 
@@ -1673,6 +1908,117 @@ fn write_data_guard_mismatch_skips() {
         .read_exact(obj.word, &mut back)
         .unwrap();
     assert_eq!(f32::from_le_bytes(back), 7.0);
+}
+
+/// Valor `f64` no endereço.
+fn f64_at(t: &TestTarget, addr: u64) -> f64 {
+    let mut b = [0u8; 8];
+    MemReader::new(t.pid).read_exact(addr, &mut b).unwrap();
+    f64::from_le_bytes(b)
+}
+
+#[test]
+fn write_data_at_least_accepts_exact_and_above() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    let want = 7200.0f64;
+    // Releitura exata: igual ao pedido, que é o mínimo.
+    let read = engine
+        .write_data_at_least(
+            obj.word,
+            &want.to_le_bytes(),
+            &obj.guard,
+            want,
+            ValueType::F64,
+        )
+        .unwrap();
+    assert_eq!(read, want);
+    assert_eq!(f64_at(&t, obj.word), want);
+    // O jogo soma ao relógio entre a escrita e a releitura: acima do mínimo ainda vale.
+    engine.inject_data_fault_for_test(Some(DataFault::ThirdValue(
+        (want + 12.5).to_le_bytes().to_vec(),
+    )));
+    let read = engine
+        .write_data_at_least(
+            obj.word,
+            &want.to_le_bytes(),
+            &obj.guard,
+            want,
+            ValueType::F64,
+        )
+        .unwrap();
+    assert_eq!(read, want + 12.5);
+    // Sem diário: é uma escrita de dados sem desfazer.
+    assert_eq!(env.store.peek().unwrap(), Loaded::Missing);
+}
+
+#[test]
+fn write_data_at_least_below_is_bytes_mismatch() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    let want = 7200.0f64;
+    // O jogo sobrescreveu com um valor menor que o mínimo.
+    engine.inject_data_fault_for_test(Some(DataFault::ThirdValue(
+        (want - 3600.0).to_le_bytes().to_vec(),
+    )));
+    let err = engine
+        .write_data_at_least(
+            obj.word,
+            &want.to_le_bytes(),
+            &obj.guard,
+            want,
+            ValueType::F64,
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::BytesMismatch { .. }), "{err:?}");
+    // Um NaN também não é "maior ou igual".
+    engine.inject_data_fault_for_test(Some(DataFault::ThirdValue(f64::NAN.to_le_bytes().to_vec())));
+    let err = engine
+        .write_data_at_least(
+            obj.word,
+            &want.to_le_bytes(),
+            &obj.guard,
+            want,
+            ValueType::F64,
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::BytesMismatch { .. }), "{err:?}");
+}
+
+#[test]
+fn write_data_at_least_keeps_data_rules() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let obj = data_obj(&t);
+    let mut engine = data_engine(&t, &env, &obj);
+    // Fora da política de dados.
+    let err = engine
+        .write_data_at_least(t.exec_page, &[0; 8], &[], 0.0, ValueType::F64)
+        .unwrap_err();
+    assert!(matches!(err, Error::DataOutsidePolicy { .. }), "{err:?}");
+    // Guarda diferente: nada é escrito.
+    poke(&t, obj.word, &5f64.to_le_bytes());
+    poke(&t, t.big_region + 3, &[0x00]);
+    let err = engine
+        .write_data_at_least(
+            obj.word,
+            &9f64.to_le_bytes(),
+            &obj.guard,
+            9.0,
+            ValueType::F64,
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::GuardMismatch { .. }), "{err:?}");
+    assert_eq!(f64_at(&t, obj.word), 5.0);
+    // O tamanho dos bytes é o do tipo.
+    let err = engine
+        .write_data_at_least(obj.word, &9f32.to_le_bytes(), &[], 9.0, ValueType::F64)
+        .unwrap_err();
+    assert!(matches!(err, Error::BadPatch { .. }), "{err:?}");
 }
 
 #[test]
@@ -2190,4 +2536,592 @@ fn undo_all_and_drop_restore_whole() {
     }
     assert_eq!(word_bytes(&t, obj.word), OLD);
     assert_eq!(env.store.peek().unwrap(), Loaded::Missing);
+}
+
+// ---------------------------------------------------------------------------
+// Variáveis das caves na folga da `.data` (plano 008, tarefa 3)
+// ---------------------------------------------------------------------------
+
+/// Região de variáveis de teste: 280 bytes (o total do orçamento) em `big_region`, que é
+/// `rw-` e zerada.
+fn vars_region(t: &TestTarget) -> Range<u64> {
+    let start = t.big_region + 0x800;
+    start..start + 280
+}
+
+fn vars_in_journal(env: &Env) -> Vec<gt_core::journal::VarRegion> {
+    match env.store.peek().unwrap() {
+        Loaded::Ok(j) => j.vars,
+        Loaded::Missing => Vec::new(),
+        other => panic!("diário inesperado: {other:?}"),
+    }
+}
+
+#[test]
+fn claim_vars_requires_zero() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let region = vars_region(&t);
+    let mut engine = open_engine(t.pid, &env, Vec::new(), None);
+    // Um byte diferente de zero no meio: recusa, sem diário e sem região reclamada.
+    poke(&t, region.start + 100, &[0x01]);
+    let err = engine.claim_vars(region.clone()).unwrap_err();
+    assert!(
+        matches!(err, Error::VarsNotZero { addr } if addr == region.start + 100),
+        "{err:?}"
+    );
+    assert!(engine.vars().is_empty());
+    assert_eq!(env.store.peek().unwrap(), Loaded::Missing);
+    // Zerado: reclama, e a região vai ao diário (só endereço e tamanho).
+    poke(&t, region.start + 100, &[0x00]);
+    engine.claim_vars(region.clone()).unwrap();
+    assert_eq!(
+        vars_in_journal(&env),
+        vec![gt_core::journal::VarRegion {
+            addr: region.start,
+            len: 280
+        }]
+    );
+    // A mesma região de novo é um no-op; uma que a corta em parte é recusada.
+    engine.claim_vars(region.clone()).unwrap();
+    assert_eq!(engine.vars().len(), 1);
+    let err = engine
+        .claim_vars(region.start + 8..region.end + 8)
+        .unwrap_err();
+    assert!(matches!(err, Error::BadPatch { .. }), "{err:?}");
+    assert_eq!(engine.vars().len(), 1);
+}
+
+#[test]
+fn claim_vars_refuses_non_rw_and_bad_shapes() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let mut engine = open_engine(t.pid, &env, Vec::new(), None);
+    // Página executável (`r-x`) e página ilegível (`---`): não são `rw-`.
+    for start in [t.exec2, t.region_start + t.page] {
+        let err = engine.claim_vars(start..start + 64).unwrap_err();
+        assert!(matches!(err, Error::VarsNotWritable { .. }), "{err:?}");
+    }
+    // Trecho que invade a página vizinha não `rw-`.
+    let err = engine
+        .claim_vars(t.region_start + t.page - 8..t.region_start + t.page + 8)
+        .unwrap_err();
+    assert!(matches!(err, Error::VarsNotWritable { .. }), "{err:?}");
+    // Vazia, desalinhada e grande demais.
+    let start = t.big_region + 0x800;
+    for bad in [start..start, start + 4..start + 32, start..start + 4104] {
+        let err = engine.claim_vars(bad).unwrap_err();
+        assert!(matches!(err, Error::BadPatch { .. }), "{err:?}");
+    }
+    assert!(engine.vars().is_empty());
+    assert_eq!(env.store.peek().unwrap(), Loaded::Missing);
+}
+
+#[test]
+fn write_var_outside_region_refused() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let region = vars_region(&t);
+    let mut engine = open_engine(t.pid, &env, Vec::new(), None);
+    // Antes de reclamar, nada é variável.
+    let err = engine.write_var(region.start, &[1]).unwrap_err();
+    assert!(matches!(err, Error::VarOutsideRegion { .. }), "{err:?}");
+    engine.claim_vars(region.clone()).unwrap();
+    // Dentro: escreve e lê de volta.
+    engine
+        .write_var(region.start + 8, &7i32.to_le_bytes())
+        .unwrap();
+    assert_eq!(
+        engine.read_var(region.start + 8, 4).unwrap(),
+        7i32.to_le_bytes()
+    );
+    engine
+        .write_var(region.end - 8, &9u64.to_le_bytes())
+        .unwrap();
+    // Fora (antes, cruzando o fim, depois) e vazia: recusa e não escreve nada.
+    for (addr, len) in [
+        (region.start - 1, 1),
+        (region.end - 4, 8),
+        (region.end, 1),
+        (region.start, 0),
+    ] {
+        let bytes = vec![0xEEu8; len];
+        let err = engine.write_var(addr, &bytes).unwrap_err();
+        assert!(matches!(err, Error::VarOutsideRegion { .. }), "{err:?}");
+        let err = engine.read_var(addr, len).unwrap_err();
+        assert!(matches!(err, Error::VarOutsideRegion { .. }), "{err:?}");
+    }
+    assert_eq!(bytes_at(t.pid, region.start - 1, 1), [0]);
+    assert_eq!(bytes_at(t.pid, region.end - 4, 4), [0, 0, 0, 0]);
+    assert_eq!(bytes_at(t.pid, region.end, 1), [0]);
+}
+
+#[test]
+fn undo_all_zeros_vars_after_caves() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let region = vars_region(&t);
+    let cave_addr = t.exec_page + 0x100;
+    let mut engine = open_engine(
+        t.pid,
+        &env,
+        vec![exec2_range(&t), page_range(&t, t.exec_page)],
+        None,
+    );
+    engine.claim_vars(region.clone()).unwrap();
+    engine.write_var(region.start, &5i32.to_le_bytes()).unwrap();
+    engine.write_var(region.end - 8, &[0xAA; 8]).unwrap();
+    engine
+        .apply(vec![
+            patch("p", t.exec2, &NOP3, &NOP2_NOP),
+            cave("c", cave_addr),
+        ])
+        .unwrap();
+    engine.undo_all().unwrap();
+    assert_eq!(bytes_at(t.pid, region.start, 280), vec![0u8; 280]);
+    assert_eq!(bytes_at(t.pid, cave_addr, 16), vec![0xCC; 16]);
+    assert!(engine.vars().is_empty());
+    assert!(missing(&env));
+    // Já zerada, a região pode ser reclamada de novo.
+    engine.claim_vars(region).unwrap();
+}
+
+#[test]
+fn drop_zeros_vars() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let region = vars_region(&t);
+    {
+        let mut engine = open_engine(t.pid, &env, Vec::new(), None);
+        engine.claim_vars(region.clone()).unwrap();
+        engine.write_var(region.start + 40, &[1; 8]).unwrap();
+        assert_eq!(vars_in_journal(&env).len(), 1);
+    }
+    assert_eq!(bytes_at(t.pid, region.start, 280), vec![0u8; 280]);
+    assert!(missing(&env));
+}
+
+#[test]
+fn vars_not_zeroed_while_code_active() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let region = vars_region(&t);
+    let mut engine = open_engine(t.pid, &env, vec![exec2_range(&t)], None);
+    engine.claim_vars(region.clone()).unwrap();
+    engine.write_var(region.start, &5i32.to_le_bytes()).unwrap();
+    engine
+        .apply(vec![patch("p", t.exec2, &NOP3, &NOP2_NOP)])
+        .unwrap();
+    // Com o desvio ativo, limpar não escreve nada e a região continua no diário.
+    engine.clear_vars().unwrap();
+    assert_eq!(bytes_at(t.pid, region.start, 4), 5i32.to_le_bytes());
+    assert_eq!(engine.vars().len(), 1);
+    assert_eq!(vars_in_journal(&env).len(), 1);
+    // Sem o desvio, zera.
+    engine.undo(&["p"]).unwrap();
+    engine.clear_vars().unwrap();
+    assert_eq!(bytes_at(t.pid, region.start, 4), [0; 4]);
+    assert!(engine.vars().is_empty());
+    assert!(missing(&env));
+}
+
+#[test]
+fn restore_pending_without_pending_keeps_vars() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let region = vars_region(&t);
+    let mut engine = open_engine(t.pid, &env, Vec::new(), None);
+    engine.claim_vars(region.clone()).unwrap();
+    engine.write_var(region.start, &5i32.to_le_bytes()).unwrap();
+    // Sem nada pendente, as variáveis são de patches em uso: não são tocadas.
+    engine.restore_pending().unwrap();
+    assert_eq!(bytes_at(t.pid, region.start, 4), 5i32.to_le_bytes());
+    assert_eq!(engine.vars().len(), 1);
+}
+
+static DENY_POLICY_VARS: AtomicBool = AtomicBool::new(false);
+
+#[test]
+fn undo_all_and_drop_keep_vars_when_code_cannot_be_undone() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let region = vars_region(&t);
+    let range = exec2_range(&t);
+    let policy: PolicyFn = Box::new(move |_maps| {
+        if DENY_POLICY_VARS.load(Ordering::SeqCst) {
+            WritePolicy::new(Vec::new())
+        } else {
+            WritePolicy::new(vec![range.clone()])
+        }
+    });
+    let opts = EngineOptions {
+        version_key: "teste".into(),
+        pause: PauseConfig::default(),
+    };
+    let mut engine = Engine::open(t.pid, None, env.store.clone(), &env.lock, policy, opts).unwrap();
+    engine.claim_vars(region.clone()).unwrap();
+    engine.write_var(region.start, &5i32.to_le_bytes()).unwrap();
+    engine
+        .apply(vec![patch("p", t.exec2, &NOP3, &NOP2_NOP)])
+        .unwrap();
+    DENY_POLICY_VARS.store(true, Ordering::SeqCst);
+    engine.undo_all().unwrap_err();
+    assert_eq!(bytes_at(t.pid, region.start, 4), 5i32.to_le_bytes());
+    drop(engine);
+    // O desvio ficou (a política recusou): a variável também, e as duas no diário.
+    assert_eq!(bytes_at(t.pid, t.exec2, 3), NOP2_NOP);
+    assert_eq!(bytes_at(t.pid, region.start, 4), 5i32.to_le_bytes());
+    match env.store.peek().unwrap() {
+        Loaded::Ok(j) => {
+            assert_eq!(j.entries.len(), 1);
+            assert_eq!(j.vars.len(), 1);
+        }
+        other => panic!("diário inesperado: {other:?}"),
+    }
+    // A próxima execução (política normal) desfaz o desvio e zera as variáveis.
+    DENY_POLICY_VARS.store(false, Ordering::SeqCst);
+    let report = recover(&env.store, &env.lock, &PauseConfig::default()).unwrap();
+    assert_eq!(report.restored, vec!["p".to_string()], "{report:?}");
+    assert!(report.kept.is_empty(), "{report:?}");
+    assert_eq!(bytes_at(t.pid, t.exec2, 3), NOP3);
+    assert_eq!(bytes_at(t.pid, region.start, 4), [0; 4]);
+    assert!(missing(&env));
+}
+
+#[test]
+fn recovery_zeros_vars_after_crash() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let region = vars_region(&t);
+    let cave_addr = t.exec_page + 0x100;
+    let mut engine = open_engine(
+        t.pid,
+        &env,
+        vec![exec2_range(&t), page_range(&t, t.exec_page)],
+        None,
+    );
+    engine.claim_vars(region.clone()).unwrap();
+    engine.write_var(region.start + 24, &[3; 8]).unwrap();
+    engine
+        .apply(vec![
+            patch("p", t.exec2, &NOP3, &NOP2_NOP),
+            cave("c", cave_addr),
+        ])
+        .unwrap();
+    // Simula o SIGKILL: o motor some sem desfazer nada, o diário fica.
+    std::mem::forget(engine);
+    assert_eq!(vars_in_journal(&env).len(), 1);
+    let report = recover(&env.store, &env.lock, &PauseConfig::default()).unwrap();
+    let mut restored = report.restored.clone();
+    restored.sort();
+    assert_eq!(
+        restored,
+        vec!["c".to_string(), "p".to_string()],
+        "{report:?}"
+    );
+    assert!(report.kept.is_empty(), "{report:?}");
+    assert_eq!(bytes_at(t.pid, t.exec2, 3), NOP3);
+    assert_eq!(bytes_at(t.pid, cave_addr, 16), vec![0xCC; 16]);
+    assert_eq!(bytes_at(t.pid, region.start, 280), vec![0u8; 280]);
+    assert!(missing(&env));
+}
+
+#[test]
+fn recovery_keeps_vars_when_region_is_not_rw_anymore() {
+    let t = TestTarget::spawn();
+    let env = env();
+    // Diário de um processo igual, mas a região já não é `rw-` (página executável).
+    let id = identity(t.pid).unwrap();
+    env.store
+        .save(&gt_core::journal::Journal {
+            boot_id: id.boot_id,
+            pid: id.pid,
+            start_time: id.start_time,
+            version_key: "teste".into(),
+            paused_by_us: false,
+            entries: Vec::new(),
+            data: Vec::new(),
+            vars: vec![gt_core::journal::VarRegion {
+                addr: t.exec2,
+                len: 64,
+            }],
+        })
+        .unwrap();
+    let report = recover(&env.store, &env.lock, &PauseConfig::default()).unwrap();
+    assert_eq!(report.kept, vec!["variáveis".to_string()], "{report:?}");
+    assert_eq!(bytes_at(t.pid, t.exec2, 4), [0x90; 4]);
+    assert_eq!(
+        vars_in_journal(&env),
+        vec![gt_core::journal::VarRegion {
+            addr: t.exec2,
+            len: 64
+        }]
+    );
+}
+
+#[test]
+fn clear_vars_keeps_region_while_code_pending() {
+    let t = TestTarget::spawn();
+    let env = env();
+    let region = vars_region(&t);
+    // A política só cobre a página da cave: o desvio fica fora e continua pendente.
+    let mut engine = open_engine(t.pid, &env, vec![page_range(&t, t.exec_page)], None);
+    engine.claim_vars(region.clone()).unwrap();
+    engine.write_var(region.start, &5i32.to_le_bytes()).unwrap();
+    let code = JournalEntry {
+        id: "p".into(),
+        addr: t.exec2,
+        original: NOP3.to_vec(),
+        replacement: NOP2_NOP.to_vec(),
+        next: None,
+        kind: gt_core::patch::PatchKind::Code,
+    };
+    let report = engine.restore_entries(vec![code]).unwrap();
+    assert_eq!(report.outside_policy, vec!["p".to_string()]);
+    engine.clear_vars().unwrap();
+    assert_eq!(bytes_at(t.pid, region.start, 4), 5i32.to_le_bytes());
+    assert_eq!(engine.vars().len(), 1);
+    assert_eq!(vars_in_journal(&env).len(), 1);
+}
+
+/// Diário do processo do alvo com estas regiões de variáveis e nenhuma entrada.
+fn save_vars_journal(env: &Env, t: &TestTarget, vars: Vec<gt_core::journal::VarRegion>) {
+    let id = identity(t.pid).unwrap();
+    env.store
+        .save(&gt_core::journal::Journal {
+            boot_id: id.boot_id,
+            pid: id.pid,
+            start_time: id.start_time,
+            version_key: "teste".into(),
+            paused_by_us: false,
+            entries: Vec::new(),
+            data: Vec::new(),
+            vars,
+        })
+        .unwrap();
+}
+
+#[test]
+fn recovery_refuses_malformed_vars_from_journal() {
+    use gt_core::journal::VarRegion;
+    let t = TestTarget::spawn();
+    let env = env();
+    let base = t.big_region + 0x800;
+    // Boa: 64 bytes. Grande demais (nem aloca). Desalinhada. Sobreposta à boa.
+    let good = VarRegion {
+        addr: base,
+        len: 64,
+    };
+    let huge = VarRegion {
+        addr: base + 0x1000,
+        len: 1 << 40,
+    };
+    let big = VarRegion {
+        addr: base + 0x2000,
+        len: 4104,
+    };
+    let unaligned = VarRegion {
+        addr: base + 0x4004,
+        len: 64,
+    };
+    let overlap = VarRegion {
+        addr: base + 32,
+        len: 64,
+    };
+    for addr in [
+        good.addr + 8,
+        huge.addr,
+        big.addr,
+        unaligned.addr,
+        overlap.addr + 40,
+    ] {
+        poke(&t, addr, &[0xAB; 8]);
+    }
+    save_vars_journal(&env, &t, vec![good, huge, big, unaligned, overlap]);
+    let report = recover(&env.store, &env.lock, &PauseConfig::default()).unwrap();
+    assert_eq!(report.foreign, vec!["variáveis".to_string()], "{report:?}");
+    assert!(report.kept.is_empty(), "{report:?}");
+    // A boa foi zerada; o resto não foi tocado (nada escrito fora do que passou no filtro).
+    assert_eq!(bytes_at(t.pid, good.addr, 64), vec![0u8; 64]);
+    // O byte da sobreposição que ficava depois da região boa (`+72`) não foi tocado.
+    assert_eq!(bytes_at(t.pid, overlap.addr + 40, 8), [0xAB; 8]);
+    for addr in [huge.addr, big.addr, unaligned.addr] {
+        assert_eq!(bytes_at(t.pid, addr, 8), [0xAB; 8], "{addr:#x}");
+    }
+    assert!(missing(&env));
+}
+
+#[test]
+fn recovery_with_only_malformed_vars_clears_the_journal() {
+    use gt_core::journal::VarRegion;
+    let t = TestTarget::spawn();
+    let env = env();
+    let addr = t.big_region + 0x804;
+    poke(&t, addr, &[0xAB; 8]);
+    save_vars_journal(&env, &t, vec![VarRegion { addr, len: 64 }]);
+    let report = recover(&env.store, &env.lock, &PauseConfig::default()).unwrap();
+    assert_eq!(report.foreign, vec!["variáveis".to_string()], "{report:?}");
+    assert_eq!(bytes_at(t.pid, addr, 8), [0xAB; 8]);
+    assert!(missing(&env));
+}
+
+#[test]
+fn open_adopts_vars_kept_by_recovery_with_code_pending() {
+    use gt_core::journal::VarRegion;
+    let t = TestTarget::spawn();
+    let env = env();
+    let region = vars_region(&t);
+    let second = t.big_region + 0x1000;
+    // Um desvio que a recuperação não consegue desfazer: a thread do `syscall_page` está
+    // parada com o `pc` no meio do trecho, e voltar o "original" (que aqui é o prefixo `66`
+    // sobre a `syscall`) perderia a fronteira dela. O diário é "invertido" de propósito: a
+    // memória já tem o `replacement`, então nada é poke antes (um poke deixaria a thread
+    // reiniciar a `syscall` sobre o código novo).
+    let addr = t.syscall_page + 20;
+    let original = [0x66, 0x66, 0x66, 0x66, 0x66, 0x90];
+    let replacement = [0x0F, 0x05, 0x90, 0x90, 0x90, 0x90];
+    poke(&t, region.start, &[7; 8]);
+    let id = identity(t.pid).unwrap();
+    env.store
+        .save(&gt_core::journal::Journal {
+            boot_id: id.boot_id,
+            pid: id.pid,
+            start_time: id.start_time,
+            version_key: "teste".into(),
+            paused_by_us: false,
+            entries: vec![JournalEntry {
+                id: "sys".into(),
+                addr,
+                original: original.to_vec(),
+                replacement: replacement.to_vec(),
+                next: None,
+                kind: gt_core::patch::PatchKind::Code,
+            }],
+            data: Vec::new(),
+            vars: vec![VarRegion {
+                addr: region.start,
+                len: 280,
+            }],
+        })
+        .unwrap();
+    let err = recover(&env.store, &env.lock, &PauseConfig::default()).unwrap_err();
+    assert!(matches!(err, Error::ThreadsInPatch { .. }), "{err:?}");
+    // Nada foi zerado e o diário mantém o desvio e a região.
+    assert_eq!(bytes_at(t.pid, region.start, 8), [7; 8]);
+    match env.store.peek().unwrap() {
+        Loaded::Ok(j) => {
+            assert_eq!(j.entries.len(), 1);
+            assert_eq!(j.vars.len(), 1);
+        }
+        other => panic!("diário inesperado: {other:?}"),
+    }
+    // Um motor novo (a sessão seguinte) adota a região do diário, e o diário que ele regrava
+    // ainda a tem.
+    let mut engine = open_engine(t.pid, &env, Vec::new(), None);
+    assert_eq!(
+        engine.vars(),
+        [VarRegion {
+            addr: region.start,
+            len: 280
+        }]
+    );
+    engine.claim_vars(second..second + 64).unwrap();
+    assert_eq!(vars_in_journal(&env).len(), 2);
+    // A limpeza posterior zera as duas.
+    engine.clear_vars().unwrap();
+    assert_eq!(bytes_at(t.pid, region.start, 8), [0; 8]);
+    assert!(engine.vars().is_empty());
+    assert!(missing(&env));
+}
+
+#[test]
+fn open_ignores_vars_of_another_process_and_malformed_ones() {
+    use gt_core::journal::{Journal, VarRegion};
+    let t = TestTarget::spawn();
+    let env = env();
+    let region = vars_region(&t);
+    let id = identity(t.pid).unwrap();
+    let journal = |start_time, vars| Journal {
+        boot_id: id.boot_id.clone(),
+        pid: id.pid,
+        start_time,
+        version_key: "teste".into(),
+        paused_by_us: false,
+        entries: Vec::new(),
+        data: Vec::new(),
+        vars,
+    };
+    let good = VarRegion {
+        addr: region.start,
+        len: 64,
+    };
+    // Outro processo (horário de início diferente): nada é adotado.
+    env.store
+        .save(&journal(id.start_time + 1, vec![good]))
+        .unwrap();
+    assert!(open_engine(t.pid, &env, Vec::new(), None).vars().is_empty());
+    // Mesmo processo, uma região malformada e uma boa: só a boa.
+    let bad = VarRegion {
+        addr: region.start + 0x400,
+        len: 1 << 40,
+    };
+    env.store
+        .save(&journal(id.start_time, vec![bad, good]))
+        .unwrap();
+    let engine = open_engine(t.pid, &env, Vec::new(), None);
+    assert_eq!(engine.vars(), [good]);
+    std::mem::forget(engine);
+}
+
+#[test]
+fn recovery_keeps_eligible_entry_when_vars_are_malformed_and_restore_fails() {
+    use gt_core::journal::{Journal, VarRegion};
+    let t = TestTarget::spawn();
+    let env = env();
+    let region = vars_region(&t);
+    poke(&t, region.start, &[7; 8]);
+    // Mesmo desvio "invertido" do teste de adoção: a thread parada na `syscall` o impede de
+    // ser desfeito (`ThreadsInPatch`). Junto vão uma região boa e uma malformada.
+    let addr = t.syscall_page + 20;
+    let entry = JournalEntry {
+        id: "sys".into(),
+        addr,
+        original: vec![0x66, 0x66, 0x66, 0x66, 0x66, 0x90],
+        replacement: vec![0x0F, 0x05, 0x90, 0x90, 0x90, 0x90],
+        next: None,
+        kind: gt_core::patch::PatchKind::Code,
+    };
+    let id = identity(t.pid).unwrap();
+    let bad = VarRegion {
+        addr: region.start + 0x400,
+        len: 1 << 40,
+    };
+    let good = VarRegion {
+        addr: region.start,
+        len: 64,
+    };
+    env.store
+        .save(&Journal {
+            boot_id: id.boot_id,
+            pid: id.pid,
+            start_time: id.start_time,
+            version_key: "teste".into(),
+            paused_by_us: false,
+            entries: vec![entry.clone()],
+            data: Vec::new(),
+            vars: vec![bad, good],
+        })
+        .unwrap();
+    let err = recover(&env.store, &env.lock, &PauseConfig::default()).unwrap_err();
+    assert!(matches!(err, Error::ThreadsInPatch { .. }), "{err:?}");
+    // A entrada elegível continua no diário (nunca foi tirada do disco antes de restaurada) e
+    // a região boa também; nada foi zerado, porque o desvio segue pendente.
+    match env.store.peek().unwrap() {
+        Loaded::Ok(j) => {
+            assert_eq!(j.entries, vec![entry]);
+            assert!(j.vars.contains(&good), "{:?}", j.vars);
+        }
+        other => panic!("diário inesperado: {other:?}"),
+    }
+    assert_eq!(bytes_at(t.pid, region.start, 8), [7; 8]);
 }

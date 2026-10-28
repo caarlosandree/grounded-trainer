@@ -1,10 +1,13 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Apoio aos testes de integração: inicia e encerra o `gt-testtarget`.
 
-use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdout, Command, Stdio};
 
+pub mod module;
+pub mod rig;
 pub mod ue;
 
 pub use ue::{UeAddrs, synth_signatures};
@@ -56,6 +59,32 @@ pub struct TestTarget {
     pub page: u64,
     /// Reflexão sintética (só com `ue`).
     pub ue: Option<UeAddrs>,
+    /// Módulo sintético (só com `module`).
+    pub module: Option<ModuleAddrs>,
+    /// Diretório do arquivo do módulo sintético; apagado junto com o alvo.
+    module_dir: Option<tempfile::TempDir>,
+    /// Saída do alvo, para as respostas dos comandos.
+    reader: BufReader<ChildStdout>,
+}
+
+/// O módulo sintético (`gt-synthetic.exe`) do alvo.
+#[derive(Debug, Clone)]
+pub struct ModuleAddrs {
+    /// Onde a imagem foi mapeada.
+    pub base: u64,
+    /// Arquivo da imagem (o "disco" do `gt diff`).
+    pub path: PathBuf,
+    /// Endereço absoluto de cada símbolo ([`module::build`] lista os nomes).
+    pub symbols: BTreeMap<String, u64>,
+}
+
+/// O que as threads de `loop` fizeram até o `stop`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopStats {
+    /// Chamadas feitas, somadas de todas as threads.
+    pub calls: u64,
+    /// Resultados distintos (`rax`), em ordem crescente; no máximo 64.
+    pub results: Vec<u64>,
 }
 
 /// Opções de [`TestTarget::spawn_with`].
@@ -67,6 +96,9 @@ pub struct TargetOpts {
     pub spin_value: bool,
     /// Monta a reflexão sintética de [`ue::build`] numa arena da própria memória.
     pub ue: bool,
+    /// Grava e mapeia o módulo sintético `gt-synthetic.exe` ([`module`]) e aceita os comandos
+    /// `call`, `loop`, `stop` e `park`.
+    pub module: bool,
 }
 
 fn parse_hex(v: &serde_json::Value) -> u64 {
@@ -92,6 +124,10 @@ impl TestTarget {
         if opts.ue {
             cmd.arg("--ue");
         }
+        let module_dir = opts.module.then(|| tempfile::tempdir().unwrap());
+        if let Some(dir) = &module_dir {
+            cmd.arg("--module").arg(dir.path());
+        }
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -103,6 +139,16 @@ impl TestTarget {
         let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
         // O `stdin` do filho continua aberto dentro de `child`: ele só termina
         // quando o `Drop` mata o processo.
+        let module = v.get("module").map(|m| ModuleAddrs {
+            base: parse_hex(&m["base"]),
+            path: PathBuf::from(m["path"].as_str().unwrap()),
+            symbols: m["symbols"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(name, addr)| (name.clone(), parse_hex(addr)))
+                .collect(),
+        });
         TestTarget {
             pid: v["pid"].as_i64().unwrap() as i32,
             marker: parse_hex(&v["marker"]),
@@ -137,9 +183,130 @@ impl TestTarget {
                 mode_manager: parse_hex(&u["mode_manager"]),
                 settings: parse_hex(&u["settings"]),
                 cdo_settings: parse_hex(&u["cdo_settings"]),
+                calendar: parse_hex(&u["calendar"]),
             }),
+            module,
+            module_dir,
+            reader,
             child,
         }
+    }
+
+    /// Base do módulo sintético. Entra em pânico sem `module`.
+    pub fn module_base(&self) -> u64 {
+        self.module.as_ref().unwrap().base
+    }
+
+    /// Diretório onde está o arquivo do módulo sintético (o que a política de confiança lista).
+    pub fn module_dir(&self) -> &Path {
+        self.module_dir.as_ref().unwrap().path()
+    }
+
+    /// Arquivo do módulo sintético. Entra em pânico sem `module`.
+    pub fn module_path(&self) -> &Path {
+        &self.module.as_ref().unwrap().path
+    }
+
+    /// Endereço absoluto de um símbolo do módulo sintético (`sum`, `level_gain`, `cc300`, ...).
+    /// Entra em pânico se o nome não existir.
+    pub fn symbol(&self, name: &str) -> u64 {
+        match self.module.as_ref().unwrap().symbols.get(name) {
+            Some(addr) => *addr,
+            None => panic!("símbolo {name} não existe no módulo sintético"),
+        }
+    }
+
+    /// O alvo como o `Target::open` o montaria para o jogo, mas com o diretório do módulo sintético
+    /// confiável: `maps`, `modules` e a identidade lidos agora. Entra em pânico sem `module`.
+    pub fn module_target(&self) -> gt_grounded2::resolve::Target {
+        let maps = gt_core::maps::read_maps(self.pid).unwrap();
+        let reader = gt_core::mem::MemReader::new(self.pid);
+        let policy = gt_core::modules::TrustPolicy::new(vec![self.module_dir().to_path_buf()]);
+        let root = PathBuf::from(format!("/proc/{}/root", self.pid));
+        let modules = gt_core::modules::discover(&maps, &reader, &policy, &root).unwrap();
+        gt_grounded2::resolve::Target {
+            pid: self.pid,
+            identity: gt_core::procinfo::identity(self.pid).unwrap(),
+            discarded: Vec::new(),
+            maps,
+            reader,
+            modules,
+            non_pe: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Envia uma linha de comando ao alvo e devolve a linha de resposta, sem o fim de linha.
+    pub fn command(&mut self, line: &str) -> String {
+        let stdin = self.child.stdin.as_mut().unwrap();
+        writeln!(stdin, "{line}").unwrap();
+        stdin.flush().unwrap();
+        let mut reply = String::new();
+        let n = self.reader.read_line(&mut reply).unwrap();
+        assert!(n > 0, "o alvo fechou a saída ao responder `{line}`");
+        reply.trim_end().to_string()
+    }
+
+    /// Resposta `ok ...` de um comando; pânico se o alvo respondeu erro.
+    fn command_ok(&mut self, line: &str) -> Vec<String> {
+        let reply = self.command(line);
+        let mut parts = reply.split_whitespace().map(str::to_string);
+        assert_eq!(parts.next().as_deref(), Some("ok"), "`{line}`: {reply}");
+        parts.collect()
+    }
+
+    /// Chama uma função do módulo (símbolo ou endereço) com até 4 argumentos inteiros e devolve
+    /// `rax`.
+    pub fn call(&mut self, function: &str, args: &[u64]) -> u64 {
+        let line = format!("call {function}{}", fmt_args(args));
+        let reply = self.command_ok(&line);
+        parse_u64(&reply[0])
+    }
+
+    /// Como [`TestTarget::call`], mas com o símbolo ou endereço já formatado como número.
+    pub fn call_addr(&mut self, addr: u64, args: &[u64]) -> u64 {
+        self.call(&format!("{addr:#x}"), args)
+    }
+
+    /// Inicia uma thread que chama a função em laço até [`TestTarget::stop_loops`].
+    pub fn start_loop(&mut self, function: &str, args: &[u64]) {
+        let line = format!("loop {function}{}", fmt_args(args));
+        self.command_ok(&line);
+    }
+
+    /// Para todas as threads de [`TestTarget::start_loop`] e devolve o que elas fizeram.
+    pub fn stop_loops(&mut self) -> LoopStats {
+        let reply = self.command_ok("stop");
+        let results = reply
+            .get(1)
+            .map(|csv| {
+                csv.split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(parse_u64)
+                    .collect()
+            })
+            .unwrap_or_default();
+        LoopStats {
+            calls: parse_u64(&reply[0]),
+            results,
+        }
+    }
+
+    /// Cria uma thread que salta para `addr`; o código ali precisa ser um laço (ex.: o símbolo
+    /// `spin`, ou `EB FE` escrito pelo teste). Devolve o TID da thread.
+    pub fn park(&mut self, addr: u64) -> i32 {
+        let reply = self.command_ok(&format!("park {addr:#x}"));
+        reply[0].parse().unwrap()
+    }
+}
+
+fn fmt_args(args: &[u64]) -> String {
+    args.iter().map(|a| format!(" {a:#x}")).collect()
+}
+
+fn parse_u64(s: &str) -> u64 {
+    match s.strip_prefix("0x") {
+        Some(hex) => u64::from_str_radix(hex, 16).unwrap(),
+        None => s.parse().unwrap(),
     }
 }
 

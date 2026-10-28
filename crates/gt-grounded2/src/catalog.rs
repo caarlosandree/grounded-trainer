@@ -15,7 +15,7 @@ use gt_core::scan::Pattern;
 
 use crate::policy::exec_ranges;
 use crate::resolve::Target;
-use crate::signatures::{GlobalDef, PatchDef, Signatures, UeSigs};
+use crate::signatures::{GlobalDef, HookDef, PatchDef, Signatures, UeSigs, hook_insn};
 use crate::state::{PatchState, StateInputs, compute_state};
 use crate::ue::{
     DISK_UNREADABLE, GlobalSearch, GlobalState, Occurrence, UE_ID, UeScan, build_scan, data_ranges,
@@ -30,6 +30,40 @@ pub struct Entry {
     pub state: PatchState,
 }
 
+/// Uma ocorrência única de um `[[hook]]` no processo (spec 008, 6.2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HookHit {
+    pub def: HookDef,
+    /// Endereço da instrução do desvio (início da ocorrência + `def.offset`).
+    pub addr: u64,
+    /// Bytes da **ocorrência inteira** do padrão, lidos da memória: de onde as caves tiram os
+    /// curingas (deslocamentos). A instrução do desvio começa em `def.offset`.
+    pub captures: Vec<u8>,
+}
+
+impl HookHit {
+    /// Bytes da instrução do desvio, decodificados na ocorrência (o `expected` do desvio).
+    pub fn insn(&self) -> Result<Vec<u8>> {
+        hook_insn(&self.captures, self.def.offset)
+    }
+}
+
+/// Estado de um `[[hook]]` na varredura.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HookState {
+    /// Ocorrência única na memória, com os bytes lidos e uma instrução de 5+ bytes no `offset`.
+    Found { addr: u64, captures: Vec<u8> },
+    /// Não dá para usar: o motivo, em pt-BR (`não encontrado`, `ambíguo`, ...).
+    Unavailable(String),
+}
+
+/// Um `[[hook]]` e o estado dele no processo.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HookEntry {
+    pub def: HookDef,
+    pub state: HookState,
+}
+
 /// Resultado da varredura do catálogo.
 #[derive(Debug, Clone)]
 pub struct CatalogScan {
@@ -40,6 +74,8 @@ pub struct CatalogScan {
     /// Módulo onde os patches valem.
     pub module_name: String,
     pub entries: Vec<Entry>,
+    /// Os `[[hook]]` pedidos e o estado de cada um, na ordem do arquivo.
+    pub hooks: Vec<HookEntry>,
     /// O módulo, para o cálculo da política de escrita (usado pelo `open_engine`).
     pub module: Module,
     /// Cabeçalho do arquivo em disco, já conferido com a memória. `None` se não pôde ser lido
@@ -108,6 +144,73 @@ pub fn resolve(
         .collect()
 }
 
+/// Calcula o estado de cada `[[hook]]` a partir de leituras já feitas: `mem` tem um item por
+/// definição, na mesma ordem de `defs`, e `current(addr, len)` lê a memória do alvo.
+///
+/// O padrão de um desvio tem de ser único na memória (como o de um patch); os bytes da ocorrência
+/// inteira vão em `captures`. A conferência com o disco e com o diário do desvio é de quem instala
+/// (`HookRuntime`): um desvio nosso já instalado faz o padrão sumir da memória.
+pub fn resolve_hooks(
+    defs: &[HookDef],
+    mem: &[MemScan],
+    current: impl Fn(u64, usize) -> Option<Vec<u8>>,
+) -> Vec<HookEntry> {
+    defs.iter()
+        .zip(mem)
+        .map(|(def, memory)| {
+            let state = match (memory.verdict, memory.hits.first()) {
+                (Verdict::Many(_), _) => HookState::Unavailable("ambíguo".to_string()),
+                (Verdict::InconclusiveNone | Verdict::InconclusiveUnique, _) => {
+                    HookState::Unavailable("inconclusivo".to_string())
+                }
+                (Verdict::None, _) | (Verdict::Unique, None) => {
+                    HookState::Unavailable("não encontrado".to_string())
+                }
+                (Verdict::Unique, Some(&hit)) => match current(hit, def.pattern.len()) {
+                    None => HookState::Unavailable("ocorrência ilegível".to_string()),
+                    Some(captures) => match hook_insn(&captures, def.offset) {
+                        Err(err) => HookState::Unavailable(err.to_string()),
+                        Ok(_) => HookState::Found {
+                            addr: hit + def.offset as u64,
+                            captures,
+                        },
+                    },
+                },
+            };
+            HookEntry {
+                def: def.clone(),
+                state,
+            }
+        })
+        .collect()
+}
+
+/// Mantém os desvios cujo `id` está em `ids`, na ordem do arquivo. Com `None`, devolve todos.
+pub fn select_hooks(hooks: &[HookDef], ids: Option<&[String]>) -> Vec<HookDef> {
+    hooks
+        .iter()
+        .filter(|h| ids.is_none_or(|ids| ids.contains(&h.id)))
+        .cloned()
+        .collect()
+}
+
+impl CatalogScan {
+    /// Os desvios achados (estado `Found`), com a ocorrência para as caves.
+    pub fn hook_hits(&self) -> Vec<HookHit> {
+        self.hooks
+            .iter()
+            .filter_map(|h| match &h.state {
+                HookState::Found { addr, captures } => Some(HookHit {
+                    def: h.def.clone(),
+                    addr: *addr,
+                    captures: captures.clone(),
+                }),
+                HookState::Unavailable(_) => None,
+            })
+            .collect()
+    }
+}
+
 /// Lê o estado de todos os patches de `sigs` no processo `target`.
 ///
 /// Busca o padrão de todos os patches numa única passada pelas seções executáveis do módulo
@@ -164,6 +267,7 @@ fn scan_defs(
     let version_key = mem_headers.version_key();
     let has_version_file = sigs.has_version(&version_key);
     let defs = select_defs(sigs.for_version(&version_key), ids);
+    let hook_defs = select_hooks(sigs.hooks(), ids);
     let ue_sigs = if wants_ue(ids) {
         sigs.ue_for_version(&version_key)
     } else {
@@ -199,7 +303,7 @@ fn scan_defs(
                 .map_err(|_| "versão do disco difere da memória".to_string())
         });
 
-    let (entries, disk, ue) = match disk_headers {
+    let (entries, disk, ue, hooks) = match disk_headers {
         Err(cause) => {
             let empty: Vec<MemScan> = defs
                 .iter()
@@ -219,7 +323,14 @@ fn scan_defs(
                 locked,
             );
             let ue = ue_sigs.map(unreadable_ue);
-            (entries, None, ue)
+            let hooks = hook_defs
+                .iter()
+                .map(|def| HookEntry {
+                    def: def.clone(),
+                    state: HookState::Unavailable("disco ilegível".to_string()),
+                })
+                .collect();
+            (entries, None, ue, hooks)
         }
         Ok(headers) => {
             let ranges = exec_ranges(module, &headers);
@@ -236,10 +347,11 @@ fn scan_defs(
                 .as_ref()
                 .map(|ue| vec![&ue.gobjects, &ue.names])
                 .unwrap_or_default();
-            // Os padrões das globais vão depois dos dos patches, na mesma passada.
+            // Os padrões dos desvios e os das globais vão depois dos dos patches, na mesma passada.
             let patterns: Vec<Pattern> = defs
                 .iter()
                 .map(|d| d.pattern.clone())
+                .chain(hook_defs.iter().map(|h| h.pattern.clone()))
                 .chain(globals.iter().map(|g| g.pattern.pattern.clone()))
                 .collect();
             let mut mem = if patterns.is_empty() {
@@ -247,7 +359,10 @@ fn scan_defs(
             } else {
                 scan_memory(&target.reader, &ranges, &patterns)?
             };
-            let global_mem = mem.split_off(defs.len());
+            let mut global_mem = mem.split_off(defs.len());
+            let hook_mem: Vec<MemScan> = global_mem
+                .drain(..hook_defs.len().min(global_mem.len()))
+                .collect();
             // O disco só é lido se algum patch ou global não tem `rva`; senão a memória vale sozinha.
             let disk_scan = if needs_disk(&defs, &globals) {
                 disk_hits(target, module, &mem_headers, &defs, &globals, &ranges).map(Some)
@@ -275,7 +390,8 @@ fn scan_defs(
                 journal_arg,
                 locked,
             );
-            (entries, Some(headers), ue)
+            let hooks = resolve_hooks(&hook_defs, &hook_mem, current);
+            (entries, Some(headers), ue, hooks)
         }
     };
     Ok(CatalogScan {
@@ -283,6 +399,7 @@ fn scan_defs(
         has_version_file,
         module_name: GAME_EXE.to_string(),
         entries,
+        hooks,
         module: module.clone(),
         disk,
         ue,
@@ -515,8 +632,10 @@ rva = 0x1000
                 original: ORIGINAL.to_vec(),
                 replacement: NEW.to_vec(),
                 next: None,
+                kind: gt_core::patch::PatchKind::Code,
             }],
             data: Vec::new(),
+            vars: Vec::new(),
         }
     }
 
@@ -741,6 +860,7 @@ rva = 0x1000
             has_version_file: false,
             module_name: GAME_EXE.into(),
             entries,
+            hooks: Vec::new(),
             module: Module::default(),
             disk: None,
             ue: None,
@@ -798,5 +918,157 @@ rva = 0x1000
         assert_eq!(err.to_string(), "patch desconhecido: nao-existe");
         let err = select(&scan_two, &ids(&["teste-codificacao", "nao-existe"])).unwrap_err();
         assert!(matches!(err, Error::UnknownPatch { .. }));
+    }
+
+    const HOOKS: &str = r#"
+[[hook]]
+id = "quantidade"
+name = "Quantidade"
+category = "itens"
+description = "Teste"
+pattern = "48 89 5c 24 08 90 ?? c3"
+offset = 0
+body = "collect"
+object_class = "/Script/Maine.Item"
+[hook.value]
+type = "i32"
+points = [10, 50]
+default = 10
+
+[[hook]]
+id = "analisador"
+name = "Analisador"
+category = "itens"
+description = "Teste"
+pattern = "f3 0f 10 89 ?? ?? 00 00 c3"
+offset = 0
+body = "analyzer"
+object_class = "/Script/Maine.ResourceAnalyzerBuilding"
+"#;
+
+    const OCCURRENCE: [u8; 8] = [0x48, 0x89, 0x5C, 0x24, 0x08, 0x90, 0x11, 0xC3];
+
+    fn hook_defs() -> Vec<HookDef> {
+        Signatures::parse(&[("generic.toml", HOOKS)])
+            .unwrap()
+            .hooks()
+            .to_vec()
+    }
+
+    fn read_occurrence(addr: u64, len: usize) -> Option<Vec<u8>> {
+        (addr == HIT).then(|| OCCURRENCE[..len.min(OCCURRENCE.len())].to_vec())
+    }
+
+    #[test]
+    fn resolve_hooks_returns_whole_occurrence() {
+        let defs = hook_defs();
+        let entries = resolve_hooks(&defs, &[unique(HIT), none()], read_occurrence);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].state,
+            HookState::Found {
+                addr: HIT,
+                captures: OCCURRENCE.to_vec(),
+            }
+        );
+        assert_eq!(
+            entries[1].state,
+            HookState::Unavailable("não encontrado".into())
+        );
+        let scan = CatalogScan {
+            hooks: entries,
+            ..catalog(Vec::new())
+        };
+        let hits = scan.hook_hits();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].def.id, "quantidade");
+        assert_eq!(
+            (hits[0].addr, &hits[0].captures[..]),
+            (HIT, &OCCURRENCE[..])
+        );
+        // A instrução do desvio, decodificada na ocorrência, é o `expected` (5 bytes).
+        assert_eq!(hits[0].insn().unwrap(), OCCURRENCE[..5].to_vec());
+    }
+
+    #[test]
+    fn resolve_hooks_adds_offset_to_addr() {
+        // A instrução do desvio (`mov [rsp+8],rbx`) começa no byte 1 da ocorrência.
+        let text = HOOKS
+            .replace("48 89 5c 24 08 90 ?? c3", "90 48 89 5c 24 08 ?? c3")
+            .replace(
+                "offset = 0\nbody = \"collect\"",
+                "offset = 1\nbody = \"collect\"",
+            );
+        let defs = Signatures::parse(&[("generic.toml", &text)])
+            .unwrap()
+            .hooks()
+            .to_vec();
+        let bytes = vec![0x90, 0x48, 0x89, 0x5C, 0x24, 0x08, 0x11, 0xC3];
+        let read = |addr: u64, len: usize| (addr == HIT).then(|| bytes[..len].to_vec());
+        let entries = resolve_hooks(&defs[..1], &[unique(HIT)], read);
+        assert_eq!(
+            entries[0].state,
+            HookState::Found {
+                addr: HIT + 1,
+                captures: bytes.clone(),
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_hooks_refuses_what_is_not_unique_or_readable() {
+        let defs = hook_defs();
+        let many = MemScan {
+            hits: vec![HIT, HIT + 0x40],
+            unreadable_bytes: 0,
+            verdict: Verdict::Many(2),
+        };
+        let inconclusive = MemScan {
+            hits: Vec::new(),
+            unreadable_bytes: 16,
+            verdict: Verdict::InconclusiveNone,
+        };
+        let reasons = |mem: &[MemScan], read: fn(u64, usize) -> Option<Vec<u8>>| -> Vec<String> {
+            resolve_hooks(&defs, mem, read)
+                .into_iter()
+                .map(|e| match e.state {
+                    HookState::Unavailable(why) => why,
+                    HookState::Found { .. } => "achado".to_string(),
+                })
+                .collect()
+        };
+        assert_eq!(
+            reasons(&[many, inconclusive], read_occurrence),
+            vec!["ambíguo", "inconclusivo"]
+        );
+        // Ocorrência única que a memória não deixa ler.
+        assert_eq!(
+            reasons(&[unique(HIT), none()], |_, _| None),
+            vec!["ocorrência ilegível", "não encontrado"]
+        );
+        // Bytes em que a instrução do desvio tem só 3 bytes: indisponível, nunca achado.
+        let short = |_: u64, _: usize| Some(vec![0x48, 0x89, 0xD8, 0x90, 0x90, 0x90, 0x11, 0xC3]);
+        let out = reasons(&[unique(HIT), none()], short);
+        assert!(out[0].contains("instrução do desvio inválida"), "{out:?}");
+    }
+
+    #[test]
+    fn select_hooks_keeps_listed_in_file_order() {
+        let defs = hook_defs();
+        let names = |ids: Option<&[String]>| -> Vec<String> {
+            select_hooks(&defs, ids).into_iter().map(|h| h.id).collect()
+        };
+        assert_eq!(names(None), vec!["quantidade", "analisador"]);
+        assert_eq!(
+            names(Some(&ids(&["analisador", "quantidade"]))),
+            vec!["quantidade", "analisador"]
+        );
+        assert_eq!(
+            names(Some(&ids(&["analisador", "fantasma"]))),
+            vec!["analisador"]
+        );
+        // Um filtro só de patches (ou o `@ue`) não pede desvios.
+        assert!(names(Some(&ids(&["outro", "@ue"]))).is_empty());
+        assert!(names(Some(&[])).is_empty());
     }
 }

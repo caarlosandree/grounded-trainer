@@ -7,13 +7,29 @@
 //! que escreve o imediato do `mov eax, imm32` em `value_word`.
 //! Argumento opcional `--ue`: monta a reflexão sintética (`gt_testkit::ue`) numa arena `rw` e
 //! informa os endereços na chave `ue`.
+//! Argumento opcional `--module <dir>`: grava `gt-synthetic.exe` em `<dir>` e o mapeia como uma
+//! imagem do jogo (`gt_testkit::module`); a base, o arquivo e os símbolos saem na chave `module`.
+//!
+//! Depois da linha de partida, lê comandos de uma linha no `stdin` e responde uma linha no
+//! `stdout` (`ok ...` ou `err ...`), até o `stdin` fechar:
+//! - `call <função> [args...]`: chama a função (símbolo do módulo ou endereço) no formato x64 do
+//!   Windows com até 4 argumentos inteiros e responde `ok <rax em hex>`;
+//! - `loop <função> [args...]`: thread que chama a função em laço até `stop`; responde `ok`;
+//! - `stop`: para todos os laços e responde `ok <chamadas> <resultados distintos em hex, vírgula>`;
+//! - `park <endereço>`: thread que salta para o endereço (o código ali precisa ser um laço) e
+//!   responde `ok <tid>`.
 
-use std::io::{Read, Write};
+use std::collections::HashMap;
+use std::io::{BufRead, Write};
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use gt_core::mem::test_support::{
-    allow_any_tracer, anon_rw, exec_code, exec_page, guarded_pages, page_size, pipe_never_written,
-    readonly_shared_page, spawn_thread_at, value_code, write_local,
+    allow_any_tracer, anon_rw, call_win64, exec_code, exec_page, guarded_pages, page_size,
+    pipe_never_written, readonly_shared_page, spawn_thread_at, value_code, write_local,
 };
 use gt_core::procinfo::{ThreadPos, list_tids, read_task_stat, read_thread_pos};
 
@@ -35,11 +51,11 @@ fn syscall_code(fd: i32) -> Vec<u8> {
     code
 }
 
-/// Cria uma thread em `addr` e espera `ready` aceitar o TID novo (poll a cada 1 ms).
+/// Cria uma thread em `addr`, espera `ready` aceitar o TID novo (poll a cada 1 ms) e o devolve.
 fn spawn_and_wait(
     addr: u64,
     ready: impl Fn(i32) -> Result<bool, Box<dyn std::error::Error>>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<i32, Box<dyn std::error::Error>> {
     let pid = std::process::id() as i32;
     let before = list_tids(pid)?;
     spawn_thread_at(addr)?;
@@ -47,7 +63,7 @@ fn spawn_and_wait(
     loop {
         for tid in list_tids(pid)? {
             if !before.contains(&tid) && ready(tid)? {
-                return Ok(());
+                return Ok(tid);
             }
         }
         if start.elapsed() > READY_TIMEOUT {
@@ -57,10 +73,128 @@ fn spawn_and_wait(
     }
 }
 
+/// Resultados distintos que cada laço guarda no máximo.
+const MAX_DISTINCT: usize = 64;
+
+/// Thread de `loop`: chamadas feitas e resultados distintos, devolvidos pelo `join`.
+struct LoopThread {
+    handle: JoinHandle<(u64, Vec<u64>)>,
+}
+
+/// Estado dos comandos do `stdin`.
+struct Commands {
+    symbols: HashMap<String, u64>,
+    loops: Vec<LoopThread>,
+    /// Pede às threads de `loop` que terminem.
+    stop: Arc<AtomicBool>,
+}
+
+/// Número decimal, hexadecimal (`0x`) ou negativo (complemento de 2).
+fn parse_num(text: &str) -> Result<u64, String> {
+    let parsed = match text.strip_prefix("0x") {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => text
+            .parse::<u64>()
+            .ok()
+            .or_else(|| text.parse::<i64>().ok().map(|v| v as u64)),
+    };
+    parsed.ok_or_else(|| format!("número inválido: {text}"))
+}
+
+impl Commands {
+    /// Endereço de uma função: símbolo do módulo ou número.
+    fn resolve(&self, name: &str) -> Result<u64, String> {
+        match self.symbols.get(name) {
+            Some(addr) => Ok(*addr),
+            None => parse_num(name).map_err(|_| format!("símbolo desconhecido: {name}")),
+        }
+    }
+
+    /// Endereço e até 4 argumentos de `call` e `loop`.
+    fn target_and_args<'a>(
+        &self,
+        parts: &mut impl Iterator<Item = &'a str>,
+    ) -> Result<(u64, [u64; 4]), String> {
+        let name = parts.next().ok_or("falta a função")?;
+        let addr = self.resolve(name)?;
+        let mut args = [0u64; 4];
+        for (i, text) in parts.enumerate() {
+            *args.get_mut(i).ok_or("no máximo 4 argumentos")? = parse_num(text)?;
+        }
+        Ok((addr, args))
+    }
+
+    /// Executa um comando e devolve o resto da resposta `ok` (com espaço na frente, ou vazio).
+    fn handle(&mut self, line: &str) -> Result<String, String> {
+        let mut parts = line.split_whitespace();
+        match parts.next() {
+            Some("call") => {
+                let (addr, args) = self.target_and_args(&mut parts)?;
+                Ok(format!(" {:#x}", call_win64(addr, args)))
+            }
+            Some("loop") => {
+                let (addr, args) = self.target_and_args(&mut parts)?;
+                let flag = Arc::clone(&self.stop);
+                let handle = std::thread::spawn(move || {
+                    let mut calls = 0u64;
+                    let mut results: Vec<u64> = Vec::new();
+                    // Pelo menos uma chamada, mesmo que o `stop` chegue antes de a thread rodar.
+                    loop {
+                        let ret = call_win64(addr, args);
+                        calls += 1;
+                        if results.len() < MAX_DISTINCT && !results.contains(&ret) {
+                            results.push(ret);
+                        }
+                        if flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+                    }
+                    (calls, results)
+                });
+                self.loops.push(LoopThread { handle });
+                Ok(String::new())
+            }
+            Some("stop") => {
+                self.stop.store(true, Ordering::Relaxed);
+                let mut calls = 0u64;
+                let mut results: Vec<u64> = Vec::new();
+                for thread in self.loops.drain(..) {
+                    let (n, found) = thread.handle.join().map_err(|_| "laço entrou em pânico")?;
+                    calls += n;
+                    for r in found {
+                        if !results.contains(&r) {
+                            results.push(r);
+                        }
+                    }
+                }
+                self.stop.store(false, Ordering::Relaxed);
+                results.sort_unstable();
+                let csv: Vec<String> = results.iter().map(|r| format!("{r:#x}")).collect();
+                Ok(format!(" {calls} {}", csv.join(",")))
+            }
+            Some("park") => {
+                let addr = self.resolve(parts.next().ok_or("falta o endereço")?)?;
+                let pid = std::process::id() as i32;
+                let tid = spawn_and_wait(addr, |tid| {
+                    Ok(read_task_stat(pid, tid)?.is_some_and(|s| s.state == 'R'))
+                })
+                .map_err(|e| e.to_string())?;
+                Ok(format!(" {tid}"))
+            }
+            Some(other) => Err(format!("comando desconhecido: {other}")),
+            None => Err("comando vazio".to_string()),
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let spin = std::env::args().skip(1).any(|a| a == "--spin");
     let spin_value = std::env::args().skip(1).any(|a| a == "--spin-value");
     let with_ue = std::env::args().skip(1).any(|a| a == "--ue");
+    let module_dir = std::env::args()
+        .skip(1)
+        .skip_while(|a| a != "--module")
+        .nth(1);
     allow_any_tracer()?;
 
     // Montado em tempo de execução para o literal não existir em `.rodata`.
@@ -110,7 +244,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             write_local(*addr, bytes)?;
         }
         format!(
-            ",\"ue\":{{\"gobjects\":\"{:#x}\",\"names\":\"{:#x}\",\"controller\":\"{:#x}\",\"pawn\":\"{:#x}\",\"creature\":\"{:#x}\",\"pawn_field_addr\":\"{:#x}\",\"health\":\"{:#x}\",\"alt_pawn\":\"{:#x}\",\"hauling\":\"{:#x}\",\"movement\":\"{:#x}\",\"creature_hauling\":\"{:#x}\",\"creature_movement\":\"{:#x}\",\"level\":\"{:#x}\",\"world\":\"{:#x}\",\"game_state\":\"{:#x}\",\"party\":\"{:#x}\",\"mode_manager\":\"{:#x}\",\"settings\":\"{:#x}\",\"cdo_settings\":\"{:#x}\"}}",
+            ",\"ue\":{{\"gobjects\":\"{:#x}\",\"names\":\"{:#x}\",\"controller\":\"{:#x}\",\"pawn\":\"{:#x}\",\"creature\":\"{:#x}\",\"pawn_field_addr\":\"{:#x}\",\"health\":\"{:#x}\",\"alt_pawn\":\"{:#x}\",\"hauling\":\"{:#x}\",\"movement\":\"{:#x}\",\"creature_hauling\":\"{:#x}\",\"creature_movement\":\"{:#x}\",\"level\":\"{:#x}\",\"world\":\"{:#x}\",\"game_state\":\"{:#x}\",\"party\":\"{:#x}\",\"mode_manager\":\"{:#x}\",\"settings\":\"{:#x}\",\"cdo_settings\":\"{:#x}\",\"calendar\":\"{:#x}\"}}",
             a.gobjects,
             a.names,
             a.controller,
@@ -129,16 +263,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             a.party,
             a.mode_manager,
             a.settings,
-            a.cdo_settings
+            a.cdo_settings,
+            a.calendar
         )
     } else {
         String::new()
     };
 
+    // Módulo sintético: arquivo no diretório dado, imagem mapeada como a do jogo.
+    let mut symbols: HashMap<String, u64> = HashMap::new();
+    let module_json = match module_dir {
+        Some(dir) => {
+            let installed = gt_testkit::module::install(Path::new(&dir))?;
+            symbols.extend(installed.symbols.iter().cloned());
+            let map: serde_json::Map<String, serde_json::Value> = installed
+                .symbols
+                .iter()
+                .map(|(name, addr)| (name.clone(), format!("{addr:#x}").into()))
+                .collect();
+            let json = serde_json::json!({
+                "base": format!("{:#x}", installed.base),
+                "path": installed.path.to_string_lossy(),
+                "symbols": map,
+            });
+            format!(",\"module\":{json}")
+        }
+        None => String::new(),
+    };
+
     let mut out = std::io::stdout().lock();
     writeln!(
         out,
-        "{{\"pid\":{},\"marker\":\"{:#x}\",\"marker_len\":{},\"exec_page\":\"{:#x}\",\"exec2\":\"{:#x}\",\"spin_page\":\"{:#x}\",\"syscall_page\":\"{:#x}\",\"value_page\":\"{:#x}\",\"value_word\":\"{:#x}\",\"region_start\":\"{:#x}\",\"big_region\":\"{:#x}\",\"big_len\":{},\"ro_shared\":\"{:#x}\",\"page\":{}{}}}",
+        "{{\"pid\":{},\"marker\":\"{:#x}\",\"marker_len\":{},\"exec_page\":\"{:#x}\",\"exec2\":\"{:#x}\",\"spin_page\":\"{:#x}\",\"syscall_page\":\"{:#x}\",\"value_page\":\"{:#x}\",\"value_word\":\"{:#x}\",\"region_start\":\"{:#x}\",\"big_region\":\"{:#x}\",\"big_len\":{},\"ro_shared\":\"{:#x}\",\"page\":{}{}{}}}",
         std::process::id(),
         marker.as_ptr() as u64,
         marker.len(),
@@ -154,14 +310,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ro_shared,
         page,
         ue,
+        module_json,
     )?;
     out.flush()?;
     drop(out);
 
-    // Espera o pai fechar o stdin.
-    let mut stdin = std::io::stdin().lock();
-    let mut byte = [0u8; 1];
-    while stdin.read(&mut byte)? > 0 {}
+    // Atende os comandos até o pai fechar o stdin.
+    let mut state = Commands {
+        symbols,
+        loops: Vec::new(),
+        stop: Arc::new(AtomicBool::new(false)),
+    };
+    for line in std::io::stdin().lock().lines() {
+        let reply = match state.handle(&line?) {
+            Ok(reply) => format!("ok{reply}"),
+            Err(err) => format!("err {err}"),
+        };
+        let mut out = std::io::stdout().lock();
+        if writeln!(out, "{reply}").and_then(|()| out.flush()).is_err() {
+            break;
+        }
+    }
 
     // Mantém o marcador vivo até aqui.
     std::hint::black_box(&marker);

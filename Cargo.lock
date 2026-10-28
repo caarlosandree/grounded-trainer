@@ -628,6 +628,7 @@ version = "0.1.0"
 dependencies = [
  "gt-core",
  "gt-ue",
+ "iced-x86",
  "serde",
  "tempfile",
  "thiserror 2.0.21",
@@ -644,6 +645,7 @@ dependencies = [
  "gt-core",
  "gt-grounded2",
  "gt-testkit",
+ "gt-ue",
  "serde_json",
  "tempfile",
  "tracing",
@@ -658,6 +660,7 @@ dependencies = [
  "gt-core",
  "gt-grounded2",
  "gt-ue",
+ "iced-x86",
  "nix 0.31.3",
  "serde_json",
  "tempfile",

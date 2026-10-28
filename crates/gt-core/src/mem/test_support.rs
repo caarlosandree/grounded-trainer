@@ -165,6 +165,115 @@ pub fn spawn_thread_at(addr: u64) -> Result<()> {
     Ok(())
 }
 
+/// Trecho de uma imagem mapeada por [`map_image`].
+#[derive(Debug, Clone, Copy)]
+pub struct ImageSegment {
+    /// Deslocamento a partir do início da imagem; múltiplo da página.
+    pub rva: usize,
+    /// Tamanho; múltiplo da página.
+    pub len: usize,
+    /// Deslocamento no arquivo (múltiplo da página) para trechos de arquivo; `None` para um trecho
+    /// anônimo.
+    pub file_offset: Option<u64>,
+    /// `PROT_*` do trecho.
+    pub prot: libc::c_int,
+}
+
+/// `PROT_READ` das imagens mapeadas.
+pub const PROT_R: libc::c_int = libc::PROT_READ;
+/// `PROT_READ | PROT_WRITE` das imagens mapeadas.
+pub const PROT_RW: libc::c_int = libc::PROT_READ | libc::PROT_WRITE;
+/// `PROT_READ | PROT_EXEC` das imagens mapeadas.
+pub const PROT_RX: libc::c_int = libc::PROT_READ | libc::PROT_EXEC;
+
+/// Mapeia uma imagem do tamanho `total` com a forma do jogo: trechos `MAP_PRIVATE` do arquivo
+/// `path` (cada um `r--`, `r-x` ou `rw-`) e trechos anônimos `rw-p`; o que não for coberto fica
+/// `PROT_NONE`. Tenta `preferred` como base e, se estiver ocupado, deixa o kernel escolher.
+/// Devolve a base.
+///
+/// Só para testes. As páginas vivem até o processo terminar. O arquivo precisa ter bytes até o fim
+/// de cada trecho de arquivo, senão o acesso depois do fim dá `SIGBUS`.
+pub fn map_image(
+    path: &std::path::Path,
+    total: usize,
+    preferred: u64,
+    segments: &[ImageSegment],
+) -> Result<u64> {
+    use std::os::fd::AsRawFd;
+
+    let file = std::fs::File::open(path)?;
+    let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+    // SAFETY: reserva nova; `MAP_FIXED_NOREPLACE` recusa (`EEXIST`) em vez de sobrescrever um
+    // mapeamento existente, e com endereço nulo o kernel escolhe uma região livre.
+    let mut base = unsafe {
+        libc::mmap(
+            preferred as *mut libc::c_void,
+            total,
+            libc::PROT_NONE,
+            flags | libc::MAP_FIXED_NOREPLACE,
+            -1,
+            0,
+        )
+    };
+    if base == libc::MAP_FAILED || base as u64 != preferred {
+        if base != libc::MAP_FAILED {
+            // Kernel antigo que ignora a flag e tratou o endereço como dica.
+            // SAFETY: desfaz a reserva que acabamos de criar, sem outros usos.
+            unsafe { libc::munmap(base, total) };
+        }
+        // SAFETY: reserva nova com endereço nulo (o kernel escolhe uma região livre).
+        base = unsafe { libc::mmap(ptr::null_mut(), total, libc::PROT_NONE, flags, -1, 0) };
+        if base == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error().into());
+        }
+    }
+    for seg in segments {
+        if seg.rva + seg.len > total {
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidInput, "trecho fora da imagem").into(),
+            );
+        }
+        // SAFETY: `rva + len <= total`, então o trecho está dentro da reserva acima.
+        let at = unsafe { base.cast::<u8>().add(seg.rva) }.cast::<libc::c_void>();
+        match seg.file_offset {
+            Some(offset) => {
+                // SAFETY: `MAP_FIXED` sobre um trecho da nossa própria reserva (ninguém mais o
+                // usa); o arquivo fica aberto durante a chamada e o mapeamento o sobrevive.
+                let p = unsafe {
+                    libc::mmap(
+                        at,
+                        seg.len,
+                        seg.prot,
+                        libc::MAP_PRIVATE | libc::MAP_FIXED,
+                        file.as_raw_fd(),
+                        offset as libc::off_t,
+                    )
+                };
+                if p == libc::MAP_FAILED {
+                    return Err(io::Error::last_os_error().into());
+                }
+            }
+            None => protect(at, seg.len, seg.prot)?,
+        }
+    }
+    Ok(base as u64)
+}
+
+/// Chama `addr` como função da convenção x64 do Windows (`rcx`, `rdx`, `r8`, `r9`; resultado em
+/// `rax`) na thread atual.
+///
+/// Só para testes: `addr` deve ser o começo de uma função desse formato que retorna e só toca a
+/// memória do próprio processo.
+pub fn call_win64(addr: u64, args: [u64; 4]) -> u64 {
+    // SAFETY: pelo contrato acima, `addr` é o começo de uma função x64 do Windows com até 4
+    // argumentos inteiros, que o compilador chama com a convenção `win64` (espaço de sombra e
+    // registradores salvos incluídos).
+    let f: extern "win64" fn(u64, u64, u64, u64) -> u64 = unsafe {
+        std::mem::transmute::<usize, extern "win64" fn(u64, u64, u64, u64) -> u64>(addr as usize)
+    };
+    f(args[0], args[1], args[2], args[3])
+}
+
 /// Cria um pipe e devolve o fd de **leitura**; a ponta de escrita fica aberta e
 /// vazada, então ler dele bloqueia para sempre sem gastar CPU.
 pub fn pipe_never_written() -> Result<i32> {

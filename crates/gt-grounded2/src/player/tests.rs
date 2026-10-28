@@ -4,11 +4,12 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use gt_core::value::{ValueGrid, ValueType};
 use gt_ue::synth::{SparseMem, SynthField, SynthUe};
 use gt_ue::{Names, ObjectArray, ReflectionIndex, ScanBudget, UeLayout};
 
 use super::*;
-use crate::signatures::{Category, FieldKind, FieldRoot, GameStateCfg};
+use crate::signatures::{Category, FieldKind, FieldRoot, GameStateCfg, ResearchCfg};
 
 const ARENA: u64 = 0x1000_0000;
 const ARENA_LEN: usize = 64 << 20;
@@ -43,6 +44,16 @@ fn int(name: &'static str, offset: u32) -> SynthField {
         kind: "IntProperty",
         offset,
         size: 4,
+        bool_mask: None,
+    }
+}
+
+fn double(name: &'static str, offset: u32) -> SynthField {
+    SynthField {
+        name,
+        kind: "DoubleProperty",
+        offset,
+        size: 8,
         bool_mask: None,
     }
 }
@@ -106,6 +117,14 @@ const WORLD_OFF: u32 = 0x40;
 const GAME_STATE_OFF: u32 = 0x48;
 const PARTY_OFF: u32 = 0x38;
 const SCIENCE_OFF: u32 = 0x30;
+/// `SurvivalGameState.CalendarComponent` (subclasse do `InGameGameState`) e `CalendarComponent.CurrentTime`
+/// (`double`, spec 008, 6.8).
+const CALENDAR_OFF: u32 = 0x68;
+const CURRENT_TIME_OFF: u32 = 0x30;
+/// Relógio inicial da cena, em segundos.
+const START_TIME: f64 = 123_456.5;
+/// `PartyComponent.ResearchPoints` (spec 008, 6.10).
+const RESEARCH_OFF: u32 = 0x34;
 /// `InGameGameState.SurvivalModeManagerComponent` e `SurvivalModeManagerComponent.GameModeSettings`.
 const MODE_MANAGER_OFF: u32 = 0x40;
 const SETTINGS_OFF: u32 = 0x30;
@@ -142,6 +161,8 @@ struct World {
     movement: u64,
     mode_manager: u64,
     settings: u64,
+    /// `CalendarComponent` do `SurvivalGameState` (o `GameState` vivo).
+    calendar: u64,
     /// Configurações de um CDO (bit `cdo_flag` nas `ObjectFlags`), da mesma classe das vivas.
     cdo_settings: u64,
 }
@@ -190,6 +211,8 @@ fn cfg() -> PlayerCfg {
         pawn_class: format!("{MAINE}.SurvivalPlayerCharacter"),
         alt_pawn_fields: vec!["CachedSurvivalPlayerCharacter".into()],
         game_state: None,
+        research: None,
+        inventory_field: None,
     }
 }
 
@@ -202,6 +225,11 @@ fn cfg_gs() -> PlayerCfg {
             world_class: "/Script/Engine.World".into(),
             game_state_field: "GameState".into(),
             game_state_class: format!("{MAINE}.InGameGameState"),
+        }),
+        research: Some(ResearchCfg {
+            party_field: "PartyComponent".into(),
+            party_class: format!("{MAINE}.PartyComponent"),
+            points_field: "ResearchPoints".into(),
         }),
         ..cfg()
     }
@@ -223,6 +251,8 @@ fn lock(
         object: object.into(),
         object_class: format!("{MAINE}.{class}"),
         root: FieldRoot::Pawn,
+        owner_class: None,
+        label: None,
         value: None,
         rule: FieldRule::Lock {
             field: field.into(),
@@ -243,6 +273,8 @@ fn bits(id: &str, object: &str, class: &str, fields: &[&str]) -> FieldDef {
         object: object.into(),
         object_class: format!("{MAINE}.{class}"),
         root: FieldRoot::Pawn,
+        owner_class: None,
+        label: None,
         value: None,
         rule: FieldRule::ClearBits {
             fields: fields.iter().map(|s| s.to_string()).collect(),
@@ -433,6 +465,29 @@ fn world(omit: &[&str]) -> World {
             object("SurvivalModeManagerComponent", MODE_MANAGER_OFF),
         ]),
     );
+    // O `GameState` vivo é um `SurvivalGameState`: o `CalendarComponent` mora na subclasse, não no
+    // `InGameGameState`. Um irmão (`OtherGameState`) tem o mesmo campo e serve de classe dona errada.
+    let survival_game_state_c = s.add_class(
+        maine,
+        "SurvivalGameState",
+        Some(game_state_c),
+        0x80,
+        &keep(vec![object("CalendarComponent", CALENDAR_OFF)]),
+    );
+    s.add_class(
+        maine,
+        "OtherGameState",
+        Some(game_state_c),
+        0x80,
+        &keep(vec![object("CalendarComponent", CALENDAR_OFF)]),
+    );
+    let calendar_c = s.add_class(
+        maine,
+        "CalendarComponent",
+        Some(object_c),
+        0x40,
+        &keep(vec![double("CurrentTime", CURRENT_TIME_OFF)]),
+    );
     let mode_manager_c = s.add_class(
         maine,
         "SurvivalModeManagerComponent",
@@ -462,7 +517,10 @@ fn world(omit: &[&str]) -> World {
         "PartyComponent",
         Some(object_c),
         0x40,
-        &keep(vec![int("ScienceFound", SCIENCE_OFF)]),
+        &keep(vec![
+            int("ScienceFound", SCIENCE_OFF),
+            int("ResearchPoints", RESEARCH_OFF),
+        ]),
     );
     let health_c = s.add_class(
         maine,
@@ -540,8 +598,10 @@ fn world(omit: &[&str]) -> World {
     // O controller e o pawn compartilham o `Outer` (o nível persistente), como no jogo.
     let level = s.add_object(level_c, "PersistentLevel", maine);
     let world = s.add_object(world_c, "World_0", maine);
-    let game_state = s.add_object(game_state_c, "GameState_0", level);
+    let game_state = s.add_object(survival_game_state_c, "GameState_0", level);
     let party = s.add_object(party_c, "Party", game_state);
+    let calendar = s.add_object(calendar_c, "Calendar", game_state);
+    s.set(game_state, CALENDAR_OFF, &calendar.to_le_bytes());
     s.set(level, WORLD_OFF, &world.to_le_bytes());
     s.set(world, GAME_STATE_OFF, &game_state.to_le_bytes());
     s.set(game_state, PARTY_OFF, &party.to_le_bytes());
@@ -617,6 +677,7 @@ fn world(omit: &[&str]) -> World {
         movement,
         mode_manager,
         settings,
+        calendar,
         cdo_settings,
     };
     // Valores iniciais: tudo cheio, sem dano, temperatura neutra e bits ligados como no jogo.
@@ -630,6 +691,12 @@ fn world(omit: &[&str]) -> World {
         .write(hauling + u64::from(CAPACITY_OFF), &20i32.to_le_bytes());
     w.mem
         .write(party + u64::from(SCIENCE_OFF), &7400i32.to_le_bytes());
+    w.mem
+        .write(party + u64::from(RESEARCH_OFF), &2150i32.to_le_bytes());
+    w.mem.write(
+        calendar + u64::from(CURRENT_TIME_OFF),
+        &START_TIME.to_le_bytes(),
+    );
     w
 }
 
@@ -1223,6 +1290,8 @@ fn set_def(
         object: object.into(),
         object_class: format!("{MAINE}.{class}"),
         root: FieldRoot::Pawn,
+        owner_class: None,
+        label: None,
         value: None,
         rule: FieldRule::Set {
             fields: fields.iter().map(|s| s.to_string()).collect(),
@@ -1242,10 +1311,13 @@ fn add_def() -> FieldDef {
         object: "PartyComponent".into(),
         object_class: format!("{MAINE}.PartyComponent"),
         root: FieldRoot::GameState,
+        owner_class: None,
+        label: None,
         value: None,
         rule: FieldRule::Add {
             field: "ScienceFound".into(),
             result_max: 100_000,
+            at_least: false,
         },
     }
 }
@@ -1387,10 +1459,18 @@ fn resolves_new_fields_by_name() {
     };
     assert_eq!(ciencia.root, FieldRoot::GameState);
     assert_eq!(ciencia.object_path[0].field.offset, PARTY_OFF);
-    let ResolvedRule::Add { field, result_max } = &ciencia.rule else {
+    let ResolvedRule::Add {
+        field,
+        result_max,
+        at_least,
+    } = &ciencia.rule
+    else {
         panic!("ciência não é add");
     };
     assert_eq!((field.offset, *result_max), (SCIENCE_OFF, 100_000));
+    // A ciência segue com a releitura exata e sem classe dona.
+    assert!(!at_least);
+    assert_eq!(ciencia.owner_class, None);
 }
 
 #[test]
@@ -1644,6 +1724,8 @@ fn world_defs() -> Vec<FieldDef> {
         object: "SurvivalModeManagerComponent.GameModeSettings".into(),
         object_class: format!("{MAINE}.SurvivalGameModeSettings"),
         root: FieldRoot::GameState,
+        owner_class: None,
+        label: None,
         value: None,
         rule,
     };
@@ -1900,9 +1982,12 @@ fn read_game_state_refuses_add_with_pawn_root() {
         object: "HaulingComponent".into(),
         object_class: format!("{MAINE}.HaulingComponent"),
         root: FieldRoot::Pawn,
+        owner_class: None,
+        label: None,
         rule: FieldRule::Add {
             field: "Capacity".into(),
             result_max: 1000,
+            at_least: false,
         },
         ..add_def()
     });
@@ -1926,25 +2011,221 @@ fn read_game_state_refuses_add_with_pawn_root() {
     assert!(!snap.missing.contains_key("somar-carga"));
 }
 
+// ---- add de `double` e classe dona do primeiro salto (spec 008, 6.8) ----
+
+/// O `pular-hora` do `generic.toml`, com a classe dona dada.
+fn pular_def(owner: Option<&str>) -> FieldDef {
+    FieldDef {
+        id: "pular-hora".into(),
+        name: "Pular 1 hora".into(),
+        category: Category::Progressao,
+        description: String::new(),
+        object: "CalendarComponent".into(),
+        object_class: format!("{MAINE}.CalendarComponent"),
+        root: FieldRoot::GameState,
+        owner_class: owner.map(|c| format!("{MAINE}.{c}")),
+        label: Some("+1h".into()),
+        value: Some(ValueGrid {
+            ty: ValueType::F64,
+            min: 3600.0,
+            max: 3600.0,
+            step: 0.0,
+            default_k: 0,
+            unit: None,
+            decimals: 0,
+            points: Some(vec![3600.0]),
+        }),
+        rule: FieldRule::Add {
+            field: "CurrentTime".into(),
+            result_max: 1_000_000_000,
+            at_least: true,
+        },
+    }
+}
+
+fn pular_catalog(w: &World, owner: Option<&str>) -> FieldCatalog {
+    FieldCatalog::resolve(&w.index, &w.mem, &cfg_gs(), &[pular_def(owner)])
+}
+
+fn read_pular(
+    w: &World,
+    catalog: &FieldCatalog,
+) -> Result<(u64, u64, Vec<GuardBytes>), GameStateAbsent> {
+    read_game_state(
+        &w.mem,
+        &w.index,
+        catalog,
+        &w.objects,
+        w.controller,
+        "pular-hora",
+    )
+}
+
+#[test]
+fn double_field_resolves_with_owner_class() {
+    let w = world(&[]);
+    let catalog = pular_catalog(&w, Some("SurvivalGameState"));
+    assert_eq!(catalog.avail("pular-hora"), Ok(()));
+    let Some(Ok(resolved)) = catalog.get("pular-hora") else {
+        panic!("pular-hora não resolvido");
+    };
+    // O campo do primeiro salto vem da classe dona, e o `double` tem 8 bytes.
+    assert_eq!(resolved.object_path[0].field.offset, CALENDAR_OFF);
+    assert!(resolved.owner_class.is_some());
+    let ResolvedRule::Add {
+        field,
+        result_max,
+        at_least,
+    } = &resolved.rule
+    else {
+        panic!("pular-hora não é add");
+    };
+    assert_eq!(
+        (field.offset, field.size, *result_max, *at_least),
+        (CURRENT_TIME_OFF, 8, 1_000_000_000, true)
+    );
+    // O caminho lê o `CalendarComponent` e o endereço do `double`.
+    let (obj, addr, guard) = read_pular(&w, &catalog).unwrap();
+    assert_eq!(obj, w.calendar);
+    assert_eq!(addr, w.calendar + u64::from(CURRENT_TIME_OFF));
+    assert!(!guard.is_empty());
+}
+
+#[test]
+fn owner_class_mismatch_refused() {
+    let w = world(&[]);
+    // `OtherGameState` é filha do `InGameGameState` e tem o mesmo campo, mas o `GameState` vivo é um
+    // `SurvivalGameState`: o cheat resolve (a reflexão está certa) e a leitura recusa no salto `GameState`.
+    let catalog = pular_catalog(&w, Some("OtherGameState"));
+    assert_eq!(catalog.avail("pular-hora"), Ok(()));
+    assert_eq!(
+        read_pular(&w, &catalog),
+        Err(GameStateAbsent::Missing("GameState".into()))
+    );
+    // O relatório mostra o mesmo motivo e o resto do catálogo segue lendo.
+    let mut all = defs();
+    all.push(pular_def(Some("OtherGameState")));
+    all.push(add_def());
+    let catalog = FieldCatalog::resolve(&w.index, &w.mem, &cfg_gs(), &all);
+    let report = player_report(&w.mem, &w.index, &catalog, &w.objects, w.controller).unwrap();
+    assert_eq!(
+        report_field(&report, "pular-hora"),
+        &FieldReportValue::Unavailable {
+            reason: "GameState ausente ou de classe inesperada".into()
+        }
+    );
+    assert!(matches!(
+        report_field(&report, "somar-ciencia"),
+        FieldReportValue::Add { .. }
+    ));
+    // Sem classe dona o `GameState` vivo é conferido só como `InGameGameState`, onde o campo não existe.
+    let catalog = pular_catalog(&w, None);
+    assert_eq!(
+        catalog.avail("pular-hora"),
+        Err("campo CalendarComponent não encontrado".to_string())
+    );
+}
+
+#[test]
+fn owner_class_must_exist_and_descend_from_game_state() {
+    let w = world(&[]);
+    let catalog = pular_catalog(&w, Some("NaoExiste"));
+    assert_eq!(
+        catalog.avail("pular-hora"),
+        Err("classe NaoExiste não encontrada".to_string())
+    );
+    // Uma classe que não é filha do `game_state_class` é uma reflexão incoerente.
+    let catalog = pular_catalog(&w, Some("PartyComponent"));
+    assert_eq!(
+        catalog.avail("pular-hora"),
+        Err("reflexão incoerente".to_string())
+    );
+    // O campo sumindo da classe dona vira o motivo de sempre.
+    let w = world(&["CurrentTime"]);
+    let catalog = pular_catalog(&w, Some("SurvivalGameState"));
+    assert_eq!(
+        catalog.avail("pular-hora"),
+        Err("campo CurrentTime não encontrado".to_string())
+    );
+}
+
+#[test]
+fn double_add_needs_a_double_property() {
+    let w = world(&[]);
+    // Um `int` (`ScienceFound`) pedido como `double`: tipo e tamanho não batem.
+    let mut def = pular_def(Some("SurvivalGameState"));
+    def.object = "PartyComponent".into();
+    def.object_class = format!("{MAINE}.PartyComponent");
+    def.owner_class = None;
+    def.rule = FieldRule::Add {
+        field: "ScienceFound".into(),
+        result_max: 1_000_000_000,
+        at_least: true,
+    };
+    let catalog = FieldCatalog::resolve(&w.index, &w.mem, &cfg_gs(), &[def]);
+    assert_eq!(
+        catalog.avail("pular-hora"),
+        Err("reflexão incoerente".to_string())
+    );
+}
+
+#[test]
+fn report_shows_double_current_value() {
+    let w = world(&[]);
+    let catalog = pular_catalog(&w, Some("SurvivalGameState"));
+    let report = player_report(&w.mem, &w.index, &catalog, &w.objects, w.controller).unwrap();
+    assert_eq!(
+        report_field(&report, "pular-hora"),
+        &FieldReportValue::Add {
+            addr: w.calendar + u64::from(CURRENT_TIME_OFF),
+            current: START_TIME,
+        }
+    );
+}
+
 #[test]
 fn plan_add_cases() {
-    assert_eq!(plan_add(7400, 1000, 100_000), Ok(8400));
-    assert_eq!(plan_add(-1, 1000, 100_000), Err(AddRefusal::OutOfRange));
-    assert_eq!(plan_add(100_001, 1, 100_000), Err(AddRefusal::OutOfRange));
+    let int = |current: i32, amount: i32, max: i64| {
+        plan_add(FieldKind::Int, f64::from(current), f64::from(amount), max)
+    };
+    assert_eq!(int(7400, 1000, 100_000), Ok(8400.0));
+    assert_eq!(int(-1, 1000, 100_000), Err(AddRefusal::OutOfRange));
+    assert_eq!(int(100_001, 1, 100_000), Err(AddRefusal::OutOfRange));
+    assert_eq!(int(99_500, 1000, 100_000), Err(AddRefusal::WouldExceed));
+    assert_eq!(int(99_000, 1000, 100_000), Ok(100_000.0));
+    // Perto de `i32::MAX`: a soma é em 64 bits e não estoura; o resultado tem de caber em `i32`.
     assert_eq!(
-        plan_add(99_500, 1000, 100_000),
+        int(i32::MAX, i32::MAX, i64::MAX),
         Err(AddRefusal::WouldExceed)
     );
-    assert_eq!(plan_add(99_000, 1000, 100_000), Ok(100_000));
-    // Perto de `i32::MAX`: a soma é em 64 bits e não estoura.
     assert_eq!(
-        plan_add(i32::MAX, i32::MAX, i64::MAX),
+        int(i32::MAX - 1, 1, i64::from(i32::MAX)),
+        Ok(f64::from(i32::MAX))
+    );
+    assert_eq!(
+        int(i32::MAX, 1, i64::from(i32::MAX)),
         Err(AddRefusal::WouldExceed)
     );
-    assert_eq!(plan_add(i32::MAX - 1, 1, i64::from(i32::MAX)), Ok(i32::MAX));
+}
+
+#[test]
+fn add_double_refuses_negative_and_over_max() {
+    let double =
+        |current: f64, amount: f64| plan_add(FieldKind::Double, current, amount, 1_000_000_000);
+    assert_eq!(double(7200.5, 3600.0), Ok(10_800.5));
+    assert_eq!(double(0.0, 3600.0), Ok(3600.0));
+    // Valor atual negativo, acima do teto ou que não é número: recusa.
+    assert_eq!(double(-0.5, 3600.0), Err(AddRefusal::OutOfRange));
+    assert_eq!(double(1_000_000_001.0, 3600.0), Err(AddRefusal::OutOfRange));
+    assert_eq!(double(f64::NAN, 3600.0), Err(AddRefusal::OutOfRange));
+    assert_eq!(double(f64::INFINITY, 3600.0), Err(AddRefusal::OutOfRange));
+    // A soma passaria do teto (`v + 3600 > result_max`): recusa; no teto exato, vale.
+    assert_eq!(double(999_996_401.0, 3600.0), Err(AddRefusal::WouldExceed));
+    assert_eq!(double(999_996_400.0, 3600.0), Ok(1_000_000_000.0));
+    // O `double` passa de `i32::MAX` sem problema.
     assert_eq!(
-        plan_add(i32::MAX, 1, i64::from(i32::MAX)),
-        Err(AddRefusal::WouldExceed)
+        plan_add(FieldKind::Double, 3_000_000_000.0, 3600.0, i64::MAX),
+        Ok(3_000_003_600.0)
     );
 }
 
@@ -1996,7 +2277,7 @@ fn report_includes_set_and_add() {
         report_field(&report, "somar-ciencia"),
         &FieldReportValue::Add {
             addr: w.party + u64::from(SCIENCE_OFF),
-            current: 1234,
+            current: 1234.0,
         }
     );
 }
@@ -2028,6 +2309,84 @@ fn report_game_state_path() {
     // Sem cheat de `game_state` no catálogo, não há caminho a mostrar.
     let plain = FieldCatalog::resolve(&w.index, &w.mem, &cfg_gs(), &defs());
     assert_eq!(report_with(&w, &plain).game_state, vec![]);
+}
+
+#[test]
+fn ue_player_shows_research_points() {
+    let w = world(&[]);
+    let catalog = full_catalog(&w, &cfg_gs());
+    let report = report_with(&w, &catalog);
+    assert_eq!(
+        report.research_points,
+        Some(ResearchPointsReport::Value {
+            addr: w.party + u64::from(RESEARCH_OFF),
+            current: 2150,
+        })
+    );
+    // O valor acompanha a memória a cada leitura.
+    w.mem
+        .write(w.party + u64::from(RESEARCH_OFF), &(-5i32).to_le_bytes());
+    assert_eq!(
+        report_with(&w, &catalog).research_points,
+        Some(ResearchPointsReport::Value {
+            addr: w.party + u64::from(RESEARCH_OFF),
+            current: -5,
+        })
+    );
+    // Não depende de cheat nenhum no catálogo (só do caminho do `GameState`).
+    let plain = FieldCatalog::resolve(&w.index, &w.mem, &cfg_gs(), &defs());
+    assert!(matches!(
+        report_with(&w, &plain).research_points,
+        Some(ResearchPointsReport::Value { current: -5, .. })
+    ));
+    // Sem o bloco no `[ue.player]`, não há linha.
+    let none = FieldCatalog::resolve(&w.index, &w.mem, &cfg(), &defs());
+    assert_eq!(report_with(&w, &none).research_points, None);
+}
+
+#[test]
+fn research_points_unavailable_says_why() {
+    // Campo que falta na reflexão.
+    let w = world(&["ResearchPoints"]);
+    let catalog = full_catalog(&w, &cfg_gs());
+    assert_eq!(
+        report_with(&w, &catalog).research_points,
+        Some(ResearchPointsReport::Unavailable {
+            reason: "campo ResearchPoints não encontrado".into()
+        })
+    );
+    // Salto do caminho quebrado: o motivo é o do `GameState`.
+    let w = world(&[]);
+    let catalog = full_catalog(&w, &cfg_gs());
+    w.write_u64(w.world + u64::from(GAME_STATE_OFF), 0);
+    assert_eq!(
+        report_with(&w, &catalog).research_points,
+        Some(ResearchPointsReport::Unavailable {
+            reason: "GameState ausente ou de classe inesperada".into()
+        })
+    );
+    // `PartyComponent` nulo ou de outra classe.
+    w.write_u64(w.world + u64::from(GAME_STATE_OFF), w.game_state);
+    w.write_u64(w.game_state + u64::from(PARTY_OFF), w.hauling);
+    assert_eq!(
+        report_with(&w, &catalog).research_points,
+        Some(ResearchPointsReport::Unavailable {
+            reason: "PartyComponent ausente ou de classe inesperada".into()
+        })
+    );
+    // Classe do `PartyComponent` fora das assinaturas.
+    let w = world(&[]);
+    let mut bad = cfg_gs();
+    if let Some(r) = bad.research.as_mut() {
+        r.party_class = format!("{MAINE}.NaoExiste");
+    }
+    let catalog = full_catalog(&w, &bad);
+    assert_eq!(
+        report_with(&w, &catalog).research_points,
+        Some(ResearchPointsReport::Unavailable {
+            reason: "classe NaoExiste não encontrada".into()
+        })
+    );
 }
 
 #[test]
@@ -2301,6 +2660,7 @@ fn report_catalog(w: &World) -> FieldCatalog {
                 default_k: 5,
                 unit: Some("x".into()),
                 decimals: 2,
+                points: None,
             });
         }
         d

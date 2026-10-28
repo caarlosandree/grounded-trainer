@@ -685,6 +685,136 @@ Build `c935e799-0b27c000`, backup do save feito pelo dono, FLiNG fechado, traine
   descartou relação com o cheat. Se voltar a acontecer construindo muito com o cheat ligado, investigar memória de
   vídeo.
 
+## Sessão de 2026-10-27 (Fase 6): pontos da spec 008
+
+Build `c935e799-0b27c000`, partida carregada, FLiNG fechado. Leitura com `gt scan`, `gt disasm`, `gt ue class` e
+`scratch/p11/instances.py`. O spike da hora (escrita direta, original devolvido) foi feito sem o trainer.
+
+| O quê | Resultado |
+|---|---|
+| **Hora: caminho** | `BP_SurvivalGameState_C` → `SurvivalGameState.CalendarComponent` (`+0x3c0`) → `CalendarComponent` (instância viva com outer `BP_SurvivalGameState_C`; outras duas são dos CDOs `Default__SurvivalGameState` e `Default__BP_SurvivalGameState_C`) |
+| **Hora: campos** | `CurrentTime` (`DoubleProperty`, `+0x170`, segundos de jogo; 1496055 no dia 17, 14:34), `GameToRealTimeRatio` (`FloatProperty`, `+0x18c`, 30), `TimeMultiplier` (`FloatProperty`, `+0x190`, 1,0), `SecondsPerMinute` 60, `MinutesPerHour` 60, `HoursPerDay` 24, `StartGameHour` 7. Logo depois de `+0x170` (fora da reflexão) ficam dia, hora e minuto derivados (`int32` em `+0x178`, `+0x17c`, `+0x180`) |
+| **Hora: código** | `+58c8a0d` `mulss xmm7,[rbx+0x18c]`; `+58c8a2a` `addsd xmm0,[rbx+0x170]` / `movsd [rbx+0x170],xmm0` (o ponto do `aobdaytime` do FLiNG, `rbx` = `CalendarComponent`); em seguida `call +58a8190` recalcula a hora derivada |
+| **Spike: congelar** | `GameToRealTimeRatio = 0`: `CurrentTime` parado por 4 s; devolvido 30, voltou a andar (60 s de jogo em 2 s) |
+| **Spike: +1 hora** | `CurrentTime += 3600`: dia 17 14:46 → 15:47 em 1,5 s; a hora e o minuto derivados foram recalculados pelo jogo |
+| **Brain Power: função** | `+5970e80`, `rcx` = `PartyComponent`, `edx` = ganho. `+5970ec3` `mov esi,[rcx+0x514]` (6 bytes, `ResearchPoints`); `+5970ed0` `lea eax,[rsi+rdx]`; `+5970ed7` `mov [rcx+0x514],eax`. Depois `call +59e1390` devolve um objeto com a tabela de níveis (`[+0x118]` início, `[+0x120]` contagem, `0x30` bytes por nível, limite em `+0x10`); o laço acha o primeiro nível com `antigo < limite ≤ novo` (`+5970f18`, o ponto do `aobresearchlevelup`), faz `inc [rbx+0x518]` (nível) e soma a recompensa em `ScienceFound` (`+0x510`, `add [rbx+0x510],edi` em `+5970f83`). **Sobe no máximo um nível por chamada** |
+| **Analisador** | O padrão do `aobcharges` (`f3 0f 10 89 ?? ?? 00 00 f3 0f 58 ?? f3 0f 5c ?? ?? ?? ?? ?? f3 0f 2d ?? d1 f8 c3`) é único em `+57bd6d0`: é uma função inteira (`movss xmm1,[rcx+0x974]; addss; subss; cvtss2si; sar; ret`), getter arredondado das cargas. `+57bd6c0` é o getter de `MaxPowerCapacity` (`mov eax,[rcx+0x980]; ret`). `ResourceAnalyzerBuilding`: `PowerReservoir` (`+0x940`, 64 bytes), `MaxPowerCapacity` (`+0x980`), `InitialCharges` (`+0x984`), `HoursPerCharge` (`+0x990`) |
+| **Arrastar** | Função `+5bbfe70` (`mov [rsp+8],rbx`, 5 bytes, no começo); argumentos `rcx`, `edx`, `r8`, `r9d`; `+5bbfe8c` `mov rdi,rcx` é o ponto do `aobdragitemamount`. Qual item é o `rcx` não foi confirmado |
+| **Espaço** | `.data` com `VirtualSize` `0x6bbecc` a partir de `0x14a184000`: folga de `0x134` bytes até o fim da página (`0x14a840000`; `0x130` alinhando a 8), numa VMA anônima `rw-p` (`14a41d000-14a840000`) separada da parte mapeada do arquivo |
+
+- Os três desvios da spec 008 usam **uma instrução** de 5+ bytes (`+5970ec3`, `+57bd6d0`, `+5bbfe70`); os do FLiNG
+  em Brain Power e arrastar cobrem duas.
+- Os padrões `aobresearchlevelup` do FLiNG (duas variantes) não acham nada neste build (registrador base mudou para
+  `rbx`, já anotado na Fase 5).
+- **Ponto escolhido para o Brain Power: `+5970ee7`** `mov r14,[rax+0x118]` (7 bytes), logo depois de `call +59e1390`:
+  ali `rbx` = `PartyComponent`, `esi` = valor antigo, `[rbx+0x514]` = novo e `rax` = objeto da tabela, sem precisar
+  de `call` na cave. Padrão `4c 8b b0 ?? ?? 00 00 48 63 80 ?? ?? 00 00 48 8d 0c 40 48 c1 e1 04 49 03 ce 4c 3b f1`:
+  único. `+59e1390` inicializa um estático na primeira chamada (`call +14f5690` com guarda em `+a76aca0`).
+- **Chamadores de `+5970e80`**: um só, `call` em `+5971304` (função `+5971180`), que busca o ganho num mapa por chave
+  (ganho por fonte). Nenhuma referência por ponteiro (vtable).
+- **Arrastar**: padrão do começo da função `48 89 5c 24 08 48 89 6c 24 10 48 89 74 24 18 57 48 83 ec 20 41 8b e9 49
+  8b d8 8b f2 48 8b f9 48 85 c9 74 ?? e8`: único, em `+5bbfe70`.
+- **Coleta (`AddItem`)**: as `UFunction` do `InventoryComponent` têm o `Func` em `+0xd8` (lido por
+  `scratch/p12/funcs.py`, lista `Children` em `UStruct+0x48`, `Next` em `+0x28`). O `execAddItem` (`+5616c30`) chama a
+  interface em `InventoryComponent+0xe0`, entrada `0x50` da vtable: no inventário do jogador (`InventoryComponent`
+  com outer `BP_SurvivalPlayerCharacter_Gellarde_C`) é `+5942240`, ajuste de `this` (`-0xe0`) e `jmp +5941660`
+  (`AddItem` nativo, `rcx` = inventário, `rdx` = item). Outras: `ServerAddItem` `+56185c0`,
+  `ServerCreateAndAddItem` `+5618aa0`, `ServerCraftRecipe` `+5618690`, `ServerTransferItemFrom` `+5619580`.
+  Quem chama o `AddItem` em cada ação do jogo ainda não foi observado.
+- **Espaço para caves** (medido no `.exe` em disco pelo revisor da spec 008): só 4 sequências de `CC` com 64+ bytes
+  na `.text`: RVA `0xdd1cbe` (66), `0xddfd08` (248), `0xdfe8b1` (1871) e `0xe2889a` (102).
+- O motor já confere o `pc` de cada thread durante a pausa (`gt-core/src/patch.rs`, `is_dangerous`).
+
+### Sessão no jogo (Tarefa 10, parcial) com o `gt-patch observe`
+
+Mesmo build (`c935e799-0b27c000`), partida carregada, FLiNG fechado, com o dono. O jogo foi conferido limpo com
+`gt caves` (`nosso: nada`) antes e depois. A sessão durou ~15 min e **não fechou** a pesquisa: o ponto do arrastar
+e a separação das fontes da coleta continuam em aberto.
+
+| Ponto observado | Como | Resultado |
+|---|---|---|
+| Arrastar `+5bbfe70` (`rcx`) | `observe` por 150 s; o dono arrastou um item de slot para slot e do inventário para o baú | **0 passagens**: a função **não roda no arraste** (nem entre slots nem para o baú) |
+| `AddItem` nativo `+5941660` | desmontagem | Começa com `test rdx,rdx` (3 bytes). Só é alcançado por dois `jmp`: o thunk da interface em `+594224a` (entrada `+5942240`) e `+5960bf6`, além das chamadas virtuais `[vtable+0x50]` da interface em `InventoryComponent+0xe0` |
+| Coleta: ponto viável | desmontagem | `+5941669` `mov [rsp+0x18],r8b` (5 bytes), logo depois de `test rdx,rdx; je` e antes de qualquer `push`: ali `[rsp]` é o endereço de retorno. Cumpre a regra 3 do ponto aceito (prefixo sem pilha) |
+| Analisador `+57bd6d0` | desmontagem | O getter é uma **função folha**: sem entrada na `.pdata`, começa logo depois de `CC`. Cumpre a regra 2 do ponto aceito |
+
+- **O que não funcionou e por quê:** o `observe` recusou o thunk (`+5942240`) e o getter (`+57bd6d0`), porque a regra
+  da spec 008 6.7.3 então só aceitava começo de função **pela `.pdata`**, que exclui as funções folha.
+  Em vez disso a regra foi corrigida: o ponto é aceito se a desmontagem desde a entrada da função provar que `rsp` não
+  mudou até ele (folha ou prefixo sem pilha; spec 6.7.3, plano Tarefa 9b), e o `observe` passou a aceitar os três
+  pontos acima.
+- **Arrastar, o que falta:** achar o ponto que roda no arraste. Candidatos (ainda **não** observados): os nativos de
+  `ServerSwapItemSlots`, `ServerSwapItemSlotsBetweenInventories`, `ServerTransferItemTo`/`ServerTransferItemFrom` e
+  `ServerMergeItemStacks` (os `Func` em `UFunction+0xd8`, seguindo o thunk até o nativo). Critério: `rcx` sempre um
+  `Item` (ou subclasse) **e** o item arrastado. Hipótese não confirmada: o `+5bbfe70` (que o FLiNG usa em
+  `aobdragitemamount`) rodaria ao **dividir** uma pilha, e não ao arrastar.
+- **Coleta, o que falta:** observar `+5941669` com `rcx` e `rdx` enquanto o dono pega do chão, colhe, pega loot, cria
+  na bancada, tira do baú e solta e pega de volta. Feito em 2026-10-28: as fontes foram separadas pela `+5615f30`
+  (baú fora; ver as linhas da bancada e do baú na sessão de 2026-10-28). A pilha máxima do item fica fora do alcance
+  da cave; resolvido pela decisão do dono (sem limite de pilha, 2026-10-28).
+- **Analisador, o que falta:** observar `+57bd6d0` com `rcx` (chamadores e classes) e comparar as cargas com
+  `MaxPowerCapacity` num analisador cheio e num gasto.
+
+### Pesquisa só de leitura com o jogo parado (2026-10-28)
+
+Build `c935e799-0b27c000`, partida carregada, dono ausente. Só leitura, mais uma observação de 15 s autorizada pelo dono.
+
+| O quê | Resultado |
+|---|---|
+| Reflexão viva | `CalendarComponent.CurrentTime` `DoubleProperty` `+0x170`, `GameToRealTimeRatio` `FloatProperty` `+0x18c`, `SurvivalGameState.CalendarComponent` `+0x3c0` (subclasse de `InGameGameState`), `PartyComponent.ResearchPoints` `+0x514`, `Item.StackSize` `+0x198`, `ResourceAnalyzerBuilding.MaxPowerCapacity` `+0x980`, `InventoryComponent` `+0x1450` declarado em `SurvivalCharacter` (superclasse do personagem). `gt ue player` mostra `pular-hora` e `congelar-hora` com valores coerentes |
+| Padrões | Brain Power (`+5970ec3`), analisador (`+57bd6d0`) e `AddItem` (`+5941660`, ponto `+5941669`): únicos na memória |
+| **`observe` no jogo real** | Na entrada da função do relógio (`+58c89c0`, `rcx`): 806 passagens em 15 s (~55/s, uma por quadro), um chamador (`+37f93e5`), classe `CalendarComponent` lida de fora; tudo devolvido (`gt caves`: nada nosso). **A ferramenta funciona**, então o "0 passagens" do arrastar em `+5bbfe70` vale |
+| Arrastar: inventário | Implementações pela vtable do `InventoryComponent` (`+0x8fc9210`): troca de slots `+5960fc0` (`push rbx` de 2 bytes; chama `+5bbfe70` com `rcx` = item), troca entre inventários `+5960c50`, transferir para `+5961380`, transferir de `+59611b0`, juntar pilhas `+5960590` (`mov [rsp+0x10],rbp`, 5 bytes, começo pela `.pdata`). Os thunks `exec…` começam com `push rbx`, exceto o de transferir de (`+5619580`, 5 bytes) |
+| Arrastar: controller | `SurvivalPlayerController` (vtable `+0x9051a80`) tem `ServerSwapItemSlots` (implementação `+5c37240`: `test rdx,rdx; je; push rbx`, sem ponto desviável) e `ServerTransferItem` (implementação `+5c37400`, função folha sem `.pdata` cuja primeira instrução tem 3 bytes; a validação das duas é `+d53a50`, `mov al,1; ret`) |
+| Coleta: candidatos | `SurvivalPlayerController.TryPickupItem` (thunk `+568c2b0`) chama `+5c3f5a0` (`mov [rsp+0x20],rsi`, 5 bytes, começo pela `.pdata`). No personagem: `ServerAddItems` (`+5678320`) e `TryPickupItemRow` (`+5679700`, chama `+58727e0`) |
+
+Para a próxima sessão no jogo: observar `+5c3f5a0` (pegar do chão), `+5941669` (`AddItem`, todas as fontes), `+5960590` (juntar pilhas) e `+5619580`/`+59611b9` (transferir de) enquanto o dono arrasta, junta e transfere; o arraste slot→slot não passa pela troca de slots do inventário.
+
+### Sessão no jogo de 2026-10-28 (Tarefa 10): coleta e arrastar
+
+Build `c935e799-0b27c000`, partida carregada, dono jogando, FLiNG fechado. `gt-patch observe`; tudo devolvido no fim de
+cada observação (`gt caves`: nada nosso).
+
+| Observação | Ações do dono | Resultado |
+|---|---|---|
+| `AddItem` em `+5941669`, `rcx` | pegar do chão, colher, loot, soltar e pegar (sem bancada nem baú por perto) | 9 passagens, todas de dois chamadores de Blueprint: `+5615fa6` (5) e `+5616cf1` (3, o thunk `execAddItem`); `rcx` sempre `InventoryComponent` |
+| `+5615f30` (função nativa que cria o item e chama o `AddItem` pela interface; 10 chamadores diretos), `rcx` | soltar e pegar de volta; colher; matar uma criatura e pegar o item no chão | 6 passagens: `+58b8b35` (nativo, 2: soltar+pegar e o item da criatura pego no chão) e `+5618680` (retorno do thunk `execServerAddItem`, 4: colheita e o loot que entra direto) |
+| Juntar pilhas (`+5960590`, implementação do `InventoryComponent`), `r8` | arrastar para slot vazio; juntar duas pilhas do mesmo item; trocar dois itens diferentes | 1 passagem (o juntar), pelo thunk `execServerMergeItemStacks` (`+5618e9a`); `r8` = `Item`. Arrastar para slot vazio e trocar não passam por ali |
+
+- **Coleta:** pegar do chão é um caminho só (`+58b8b35` → `+5615f30`), seja item solto pelo dono ou loot caído; o
+  chamador não separa os dois. Colheita e loot direto vêm pelo `ServerAddItem` (Blueprint) → `+5615f30`. A
+  `+5615f30` é o ponto comum das três fontes vistas (começa com `mov [rsp+8],rbx`, 5 bytes, começo pela `.pdata`;
+  padrão único `48 89 5c 24 08 48 89 6c 24 10 48 89 74 24 18 57 48 83 ec 30 48 8b f2 41 0f b6 f8 48 8b 15 26 8c 14 05 48 8b d9 e8 46 ef e9 fb`).
+  Ainda não observados: criar na bancada e tirar do baú.
+- **Bancada e baú** (na base, `+5615f30`, `rcx`): criar vários itens na bancada deu uma passagem por item, pelo
+  `execServerAddItem` (`+5618680`); tirar do baú e pôr no baú **não** passaram pela `+5615f30`. Logo, um desvio na
+  `+5615f30` cobre chão (inclusive item solto), colheita, loot e bancada, e deixa o baú de fora.
+- **Analisador:** observar o getter `+57bd6d0` (aceito pela regra da função folha) com o dono abrindo e olhando o
+  analisador por 240 s deu **0 passagens**: a interface não lê as cargas por ele; a chamada deve vir só ao analisar
+  (sem recurso à mão, não testado). Leitura direta de 21 `BP_ResourceAnalyzer_Augusta_C`: cargas (`float`, `+0x974`)
+  4,0 com `MaxPowerCapacity` 4 (uma em 3,0), `InitialCharges` 4, `HoursPerCharge` 1 — cheio é `float(MaxPowerCapacity)`.
+  Falta confirmar no critério de pronto que gastar uma carga passa pelo getter.
+- **Pilha máxima:** `gt ue class Item` no jogo vivo (build `c935e799-0b27c000`): `/Script/Maine.Item` com 36 campos.
+  Filtrando por stack|max|data|row|handle aparecem só `CustomMaxDurability` (`FloatProperty`, `+0x158`),
+  `ItemDataRowHandle` (`StructProperty` de 40 bytes, `+0x168`) e `StackSize` (`IntProperty`, `+0x198`). Nenhum campo
+  de pilha máxima entre os 36.
+- **Arrastar:** mover para slot vazio e trocar passam pelo RPC `ServerSwapItemSlots` do controller, cujas implementações
+  (controller `+5c37240` → stubs de envio `+5616a00`/`+5616a60`; inventário `+5960fc0`) não têm ponto desviável na
+  entrada. Juntar pilhas tem (`+5960590`).
+
+## Sessão de 2026-10-28 (Fase 6): critério de pronto da spec 008 no jogo
+
+Build `c935e799-0b27c000`, backup do save feito pelo dono, FLiNG fechado, trainer do branch `spec-008-code-caves`
+(`9855077`).
+
+| O quê | Resultado |
+|---|---|
+| Teste `#[ignore]` `brain_power_toggles_and_undo_all_leaves_nothing` (release) | Passou em 5 s: cave e desvio do Brain Power instalados, desligado, `undo_all` sem nada nosso (`gt diff` e `gt caves`). O `cargo test --workspace -- --ignored` completo em debug passou de 15 min e foi interrompido pelo `timeout`; o jogo foi conferido limpo depois |
+| Analisador: getter `+57bd6d0` ao analisar (`gt-patch observe`, `rcx`) | 5 passagens, um chamador (`+5582973`), `rcx` sempre `BP_ResourceAnalyzer_Augusta_C`: a cave só vê analisadores |
+| Pela TUI, com o dono | Brain Power multiplicado (critério de pronto), analisador sem gastar cargas, coleta multiplicada (baú ×1), congelar hora, pular 1 hora (`2540107 → 2543707`); o save carregou normal |
+| Travamento | Com a TUI aberta e vários cheats ligados, a `GameThread` ficou a 99,5% de CPU com o `pc` dentro de `libnvidia-glcore.so` (driver de vídeo), `rcx` avançando; nenhuma thread nas nossas caves e nenhum retorno para o exe na pilha. A TUI saiu e desfez tudo (`gt diff` sem alteração); a trava continuou sem nada nosso instalado e o jogo voltou sozinho minutos depois. Conclusão: trava do jogo ou do driver, não das caves |
+| Não testado | Dormir com a hora congelada; inventário cheio, pilha acima do máximo e ferramenta com a coleta |
+
 ## Hipóteses descartadas
 
 - (2026-10-25) "Os patches em `+57BD6D0`/`+5BBFE8C` indicam que as opções de cargas e arrastar item estavam
@@ -696,3 +826,9 @@ Build `c935e799-0b27c000`, backup do save feito pelo dono, FLiNG fechado, traine
   `MaxSprintSpeed` e o jogo multiplica por `CustomGroundSpeedMultiplier`.
 - (2026-10-26) "A ciência é alcançável pelo `CachedPartyComponent` do controller": continua nulo com a partida
   carregada; o caminho é pelo `World.GameState`.
+- (2026-10-27) "O arrastar de um item passa pelo `+5bbfe70` (o `aobdragitemamount` do FLiNG)": o `gt-patch observe` ficou
+  150 s no ponto, com o dono arrastando um item entre slots e do inventário para o baú, e contou **0 passagens**. A
+  função existe e o padrão é único, mas não roda no arraste.
+- (2026-10-27) "O `observe` pode aceitar só começo de função pela `.pdata`": ele recusou o getter do analisador
+  (`+57bd6d0`) e a entrada da interface do `AddItem` (`+5942240`), que são funções folha sem entrada na `.pdata`. A
+  regra passou a aceitar também folha e prefixo sem pilha provados pela desmontagem (spec 008 6.7.3).

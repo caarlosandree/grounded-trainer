@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::patch::PatchKind;
 use crate::procinfo::{ProcStat, is_dead, is_stopped};
 use crate::{Error, Result};
 
@@ -154,6 +155,10 @@ pub struct JournalEntry {
     /// Bytes novos, só durante uma troca de valor (spec 003 6.7); `None` fora dela.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "hex_opt")]
     pub next: Option<Vec<u8>>,
+    /// Tipo do patch (spec 008). Diários antigos não têm o campo e leem como `Code`; `Code`
+    /// não é gravado.
+    #[serde(default, skip_serializing_if = "PatchKind::is_code")]
+    pub kind: PatchKind,
 }
 
 impl JournalEntry {
@@ -264,6 +269,23 @@ pub fn data_key(e: &DataEntry) -> (&str, u64) {
     (e.id.as_str(), e.addr)
 }
 
+/// Região de variáveis das caves na folga da `.data` (spec 008, 6.4): o diário guarda só o
+/// endereço e o tamanho, nunca os valores. Na saída e na recuperação a região inteira volta a zeros.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VarRegion {
+    #[serde(with = "hex_addr")]
+    pub addr: u64,
+    /// Tamanho em bytes.
+    pub len: u64,
+}
+
+impl VarRegion {
+    /// Intervalo de endereços da região.
+    pub fn range(&self) -> Range<u64> {
+        self.addr..self.addr.saturating_add(self.len)
+    }
+}
+
 /// Conteúdo do diário: identidade do processo e os patches ativos.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Journal {
@@ -277,6 +299,9 @@ pub struct Journal {
     /// Bits limpos em dados (Fase 5). Diários antigos não têm a chave.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub data: Vec<DataEntry>,
+    /// Regiões de variáveis das caves (spec 008). Diários antigos não têm a chave.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vars: Vec<VarRegion>,
 }
 
 /// Resultado da leitura do diário.
@@ -631,6 +656,7 @@ mod tests {
             original: original.to_vec(),
             replacement: replacement.to_vec(),
             next: None,
+            kind: PatchKind::Code,
         }
     }
 
@@ -643,6 +669,7 @@ mod tests {
             paused_by_us: false,
             entries,
             data: Vec::new(),
+            vars: Vec::new(),
         }
     }
 
@@ -748,6 +775,35 @@ mod tests {
     }
 
     #[test]
+    fn old_journal_without_vars_reads() {
+        // Diário gravado antes da spec 008: sem a chave `vars` (nem `data`).
+        let text = r#"{
+            "boot_id": "boot-a", "pid": 4242, "start_time": 1000,
+            "version_key": "c935e799-0a1b2c", "paused_by_us": false,
+            "entries": [{"id": "god_mode", "addr": "0x140123456",
+                         "original": "48", "replacement": "90"}]
+        }"#;
+        let back: Journal = serde_json::from_str(text).unwrap();
+        assert!(back.vars.is_empty() && back.data.is_empty());
+        assert_eq!(back.entries.len(), 1);
+        // Gravar de novo não escreve a chave vazia.
+        assert!(!serde_json::to_string(&back).unwrap().contains("\"vars\""));
+        let j = back;
+        // Com a região, a chave aparece, o endereço é hexadecimal e o diário volta igual.
+        let with = Journal {
+            vars: vec![VarRegion {
+                addr: 0x1_4a41_d000,
+                len: 280,
+            }],
+            ..j
+        };
+        let text = serde_json::to_string(&with).unwrap();
+        assert!(text.contains("\"vars\""), "{text}");
+        assert!(text.contains("\"0x14a41d000\""), "{text}");
+        assert_eq!(serde_json::from_str::<Journal>(&text).unwrap(), with);
+    }
+
+    #[test]
     fn data_entries_other_process_discarded() {
         let j = Journal {
             data: vec![data_entry(0x07, 0x01, 0x06)],
@@ -781,6 +837,24 @@ mod tests {
         assert!(text.contains("\"0x140123456\""), "{text}");
         let back: Journal = serde_json::from_str(&text).unwrap();
         assert_eq!(back, j);
+    }
+
+    #[test]
+    fn journal_entry_without_kind_reads_as_code() {
+        let old = r#"{"id":"x","addr":"0x10","original":"488bf9","replacement":"909090"}"#;
+        let e: JournalEntry = serde_json::from_str(old).unwrap();
+        assert_eq!(e.kind, PatchKind::Code);
+        // `Code` continua sem o campo no arquivo; `Cave` grava `kind`.
+        let text = serde_json::to_string(&e).unwrap();
+        assert!(!text.contains("kind"), "{text}");
+        let cave = JournalEntry {
+            kind: PatchKind::Cave,
+            ..e
+        };
+        let text = serde_json::to_string(&cave).unwrap();
+        assert!(text.contains(r#""kind":"cave""#), "{text}");
+        let back: JournalEntry = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, cave);
     }
 
     #[test]

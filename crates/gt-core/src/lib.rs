@@ -2,6 +2,7 @@
 
 pub mod addr;
 pub mod asm;
+pub mod cave;
 pub mod diff;
 #[cfg(feature = "write")]
 pub mod engine;

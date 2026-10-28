@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use gt_core::engine::{Engine, EngineOptions, PolicyFn};
 use gt_core::journal::{JournalLock, JournalStore};
 use gt_core::mem::{MemReader, Pidfd};
-use gt_core::patch::{PatchSpec, Validated, WritePolicy, validate};
+use gt_core::patch::{PatchKind, PatchSpec, Validated, WritePolicy, validate};
 use gt_core::procinfo::{Identity, check_alive, identity, is_dead, read_stat};
 use gt_core::recovery::recover;
 use gt_core::suspend::{PauseConfig, open_checked};
@@ -191,6 +191,9 @@ fn raw_search(
             avail: avail_of(def, pid)?,
             field: false,
             action: false,
+            label: None,
+            hook: false,
+            pawn: false,
         });
     }
     if let Some(ue) = &ue {
@@ -437,6 +440,7 @@ impl Session<RawPayload> for RawSession {
                 addr: def.addr,
                 expected: def.expected.clone(),
                 replacement: def.bytes_at(*k),
+                kind: PatchKind::Code,
             };
             match validate(spec) {
                 Ok(v) => batch.push(v),

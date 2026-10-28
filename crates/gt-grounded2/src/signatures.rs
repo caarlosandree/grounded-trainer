@@ -17,6 +17,7 @@ use gt_ue::{
     FBoolLayout, FFieldLayout, FPropLayout, FStructLayout, ObjectsLayout, UObjectLayout,
     UStructLayout, UeLayout,
 };
+use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 use serde::Deserialize;
 
 use crate::GAME_EXE;
@@ -128,6 +129,24 @@ pub struct PlayerCfg {
     pub alt_pawn_fields: Vec<String>,
     /// Caminho até o `GameState` (spec 006, 6.3); só existe se o `[ue.player]` traz os cinco campos.
     pub game_state: Option<GameStateCfg>,
+    /// Onde está `PartyComponent.ResearchPoints` (spec 008, 6.10); só existe se o `[ue.player]` traz
+    /// os três campos e o caminho do `GameState`.
+    pub research: Option<ResearchCfg>,
+    /// Campo do pawn que aponta para o `InventoryComponent` do jogador (spec 008, 6.7.4); sem ele
+    /// a coleta não acha o inventário.
+    pub inventory_field: Option<String>,
+}
+
+/// `PartyComponent.ResearchPoints`, a partir do `GameState` (spec 008, 6.10): só leitura, para o
+/// `gt ue player` e para conferir o offset que o Brain Power usa.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResearchCfg {
+    /// Campo do `GameState` que aponta para o `PartyComponent`.
+    pub party_field: String,
+    /// Classe esperada do `PartyComponent`, como `Pacote.Nome`.
+    pub party_class: String,
+    /// Campo `int` do `PartyComponent` com os pontos de pesquisa.
+    pub points_field: String,
 }
 
 /// Caminho controller → `Outer` → `Level.OwningWorld` → `World.GameState` (spec 006, 6.3).
@@ -183,6 +202,8 @@ pub enum FieldKind {
     Int,
     /// `BoolProperty` de byte inteiro (1 byte, `0` ou `1`; spec 007, 6.4).
     Bool,
+    /// `DoubleProperty` (8 bytes). Só no `add` (spec 008, 6.8.2); o `set` não o aceita.
+    Double,
 }
 
 impl FieldKind {
@@ -191,6 +212,7 @@ impl FieldKind {
         match self {
             FieldKind::Bool => 1,
             FieldKind::Int | FieldKind::Float => 4,
+            FieldKind::Double => 8,
         }
     }
 }
@@ -228,8 +250,13 @@ pub enum FieldRule {
         target: Option<f64>,
         bools: Option<Vec<bool>>,
     },
-    /// Soma a quantidade da grade a um campo `int`, sem diário nem desfazer (spec 006, 6.6).
-    Add { field: String, result_max: i64 },
+    /// Soma a quantidade da grade a um campo `int` (ou `double`, se a grade é `f64`), sem diário nem
+    /// desfazer (spec 006, 6.6, e 008, 6.8.2). Com `at_least` a releitura aceita "maior ou igual".
+    Add {
+        field: String,
+        result_max: i64,
+        at_least: bool,
+    },
 }
 
 /// Cheat de valor (`[[field]]`), já validado pela regra de carga.
@@ -249,6 +276,63 @@ pub struct FieldDef {
     pub rule: FieldRule,
     /// Grade do valor ajustável (`[field.value]`), sem `slot`.
     pub value: Option<ValueGrid>,
+    /// Classe dona do primeiro salto da raiz `game_state` (`Pacote.Nome`, subclasse da
+    /// `game_state_class`): o campo do primeiro salto mora nela e o `GameState` vivo tem de ser dela
+    /// (ou de uma filha) (spec 008, 6.8). `None`: a `game_state_class` do `[ue.player]`.
+    pub owner_class: Option<String>,
+    /// Texto da quantidade na linha da TUI, no lugar da formatação da grade (`[field.value] label`).
+    pub label: Option<String>,
+}
+
+/// Corpo da cave de um `[[hook]]` (spec 008, 6.7 e 12). O código de cada corpo mora em Rust; o TOML só nomeia.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaveBody {
+    /// Brain Power rápido (6.6.1).
+    Brain,
+    /// Analisador infinito (6.7.1).
+    Analyzer,
+    /// Coleta multiplicada (6.7.4).
+    Collect,
+}
+
+impl CaveBody {
+    fn parse(text: &str) -> Option<CaveBody> {
+        match text {
+            "brain" => Some(CaveBody::Brain),
+            "analyzer" => Some(CaveBody::Analyzer),
+            "collect" => Some(CaveBody::Collect),
+            _ => None,
+        }
+    }
+}
+
+/// Tamanho mínimo da instrução trocada por um desvio (`jmp rel32`), em bytes.
+const HOOK_MIN_INSN: usize = 5;
+
+/// Definição de um desvio com cave (`[[hook]]`), já validada pela regra de carga (spec 008, 6.2).
+///
+/// Não tem `expected` nem `replacement`: a instrução trocada é decodificada na ocorrência, em
+/// `offset` ([`hook_insn`]), e o motor relê os bytes dela na pausa.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HookDef {
+    pub id: String,
+    /// Nome curto, mostrado na lista.
+    pub name: String,
+    pub category: Category,
+    pub description: String,
+    /// Módulo onde o desvio vale (nesta fase, só o exe do jogo).
+    pub module: String,
+    /// Bytes originais em volta do ponto, com curingas (os curingas são lidos pela cave).
+    pub pattern: Pattern,
+    /// Distância do início da ocorrência até o início da instrução do desvio.
+    pub offset: usize,
+    pub body: CaveBody,
+    /// Grade por lista de pontos do valor ajustável, se o corpo tem valor.
+    pub value: Option<ValueGrid>,
+    /// Classe do objeto que a cave confere (`Pacote.Nome`) e dona do campo que ela escreve: `Item`
+    /// na coleta, `ResourceAnalyzerBuilding` no analisador. O Brain Power não tem
+    /// (usa a `party_class` do `[ue.player]`).
+    pub object_class: Option<String>,
 }
 
 /// Conjunto das assinaturas carregadas: o genérico e uma lista de definições por versão.
@@ -258,6 +342,7 @@ pub struct Signatures {
     versions: BTreeMap<String, VersionSigs>,
     ue: Option<GenericUe>,
     fields: Vec<FieldDef>,
+    hooks: Vec<HookDef>,
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +378,8 @@ struct GenericFile {
     ue: Option<GenericUeBlock>,
     #[serde(default)]
     field: Vec<GenericField>,
+    #[serde(default)]
+    hook: Vec<GenericHook>,
 }
 
 /// Bloco `[ue]` do `generic.toml`.
@@ -330,6 +417,12 @@ struct PlayerBlock {
     world_class: Option<String>,
     game_state_field: Option<String>,
     game_state_class: Option<String>,
+    // Os três do `ResearchPoints` vêm juntos ou nenhum, e só com o `game_state` (`build_player`).
+    party_field: Option<String>,
+    party_class: Option<String>,
+    research_points_field: Option<String>,
+    // Campo do pawn que aponta para o inventário do jogador (spec 008, 6.7.4); opcional.
+    inventory_field: Option<String>,
 }
 
 // Espelhos de `UeLayout` para o serde (o `gt-ue` não depende dele). Sem `Default`: todo campo é
@@ -435,6 +528,28 @@ struct GenericField {
     value: Option<ValueBlock>,
     result_max: Option<toml::Value>,
     bools: Option<Vec<bool>>,
+    /// Classe dona do primeiro salto da raiz `game_state` (spec 008, 6.8).
+    owner_class: Option<String>,
+    /// Releitura "maior ou igual" no `add` (spec 008, 6.8.2).
+    at_least: Option<bool>,
+}
+
+/// Bloco `[[hook]]` (spec 008, 12). Sem `expected`: a instrução é decodificada na ocorrência.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GenericHook {
+    id: String,
+    // Obrigatórios, mas a falta é reportada pela regra de carga (com o campo certo).
+    name: Option<String>,
+    category: Option<String>,
+    description: String,
+    module: Option<String>,
+    pattern: String,
+    offset: usize,
+    body: Option<String>,
+    value: Option<ValueBlock>,
+    /// Classe dona do objeto que a cave confere (`Pacote.Nome`); obrigatória fora do `brain`.
+    object_class: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -468,6 +583,10 @@ struct ValueBlock {
     default: Option<toml::Value>,
     unit: Option<toml::Value>,
     decimals: Option<toml::Value>,
+    /// Lista de pontos no lugar de `min`/`max`/`step` (spec 008, 6.9); nos `[[hook]]` e nos `[[field]]`.
+    points: Option<toml::Value>,
+    /// Texto da quantidade na linha da TUI; só no `[field.value]`.
+    label: Option<toml::Value>,
 }
 
 #[derive(Deserialize)]
@@ -549,7 +668,7 @@ fn parse_hex(file: &str, field: &str, text: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Número do bloco `value`: inteiro TOML sempre vale; decimal só para `f32`.
+/// Número do bloco `value`: inteiro TOML sempre vale; decimal só para `f32` e `f64`.
 fn value_number(file: &str, field: &str, v: Option<&toml::Value>, ty: ValueType) -> Result<f64> {
     let Some(v) = v else {
         return Err(sig_err(file, field, "campo obrigatório ausente"));
@@ -557,7 +676,7 @@ fn value_number(file: &str, field: &str, v: Option<&toml::Value>, ty: ValueType)
     match v {
         // Inteiros fora da faixa exata do `f64` acabam recusados pelas conferências de faixa.
         toml::Value::Integer(i) => Ok(*i as f64),
-        toml::Value::Float(f) if ty == ValueType::F32 => Ok(*f),
+        toml::Value::Float(f) if matches!(ty, ValueType::F32 | ValueType::F64) => Ok(*f),
         toml::Value::Float(f) => Err(sig_err(
             file,
             field,
@@ -581,7 +700,7 @@ fn decimals_for(step: f64) -> u8 {
         .unwrap_or(6)
 }
 
-/// `type` do bloco de valor (`i32`, `u32` ou `f32`).
+/// `type` do bloco de valor (`i32`, `u32`, `f32` ou `f64`; o `f64` só vale no `add` de `double`).
 fn value_type(file: &str, block: &ValueBlock) -> Result<ValueType> {
     match block.ty.as_ref() {
         None => Err(sig_err(file, "value.type", "campo obrigatório ausente")),
@@ -589,10 +708,11 @@ fn value_type(file: &str, block: &ValueBlock) -> Result<ValueType> {
             "i32" => Ok(ValueType::I32),
             "u32" => Ok(ValueType::U32),
             "f32" => Ok(ValueType::F32),
+            "f64" => Ok(ValueType::F64),
             other => Err(sig_err(
                 file,
                 "value.type",
-                format!("`{other}` não é i32, u32 nem f32"),
+                format!("`{other}` não é i32, u32, f32 nem f64"),
             )),
         },
         Some(_) => Err(sig_err(file, "value.type", "esperava um texto")),
@@ -601,6 +721,13 @@ fn value_type(file: &str, block: &ValueBlock) -> Result<ValueType> {
 
 /// Monta a grade do bloco de valor (tudo menos o `slot`) e confere as regras de carga (6.3).
 fn build_grid(file: &str, block: &ValueBlock, ty: ValueType) -> Result<ValueGrid> {
+    if block.points.is_some() {
+        return Err(sig_err(
+            file,
+            "value.points",
+            "a lista de pontos só vale no valor de um [[hook]] ou [[field]]",
+        ));
+    }
     let min = value_number(file, "value.min", block.min.as_ref(), ty)?;
     let max = value_number(file, "value.max", block.max.as_ref(), ty)?;
     let step = value_number(file, "value.step", block.step.as_ref(), ty)?;
@@ -611,18 +738,18 @@ fn build_grid(file: &str, block: &ValueBlock, ty: ValueType) -> Result<ValueGrid
         Some(_) => return Err(sig_err(file, "value.unit", "esperava um texto")),
     };
     let decimals = match (block.decimals.as_ref(), ty) {
-        (None, ValueType::F32) => None,
+        (None, ValueType::F32 | ValueType::F64) => None,
         (None, _) => Some(0),
         (Some(_), ValueType::I32 | ValueType::U32) => {
             return Err(sig_err(file, "value.decimals", "só vale para f32"));
         }
-        (Some(toml::Value::Integer(d)), ValueType::F32) => Some(
+        (Some(toml::Value::Integer(d)), ValueType::F32 | ValueType::F64) => Some(
             u8::try_from(*d)
                 .ok()
                 .filter(|&d| d <= 9)
                 .ok_or_else(|| sig_err(file, "value.decimals", "precisa estar entre 0 e 9"))?,
         ),
-        (Some(_), ValueType::F32) => {
+        (Some(_), ValueType::F32 | ValueType::F64) => {
             return Err(sig_err(file, "value.decimals", "esperava um inteiro"));
         }
     };
@@ -675,13 +802,98 @@ fn build_grid(file: &str, block: &ValueBlock, ty: ValueType) -> Result<ValueGrid
         default_k: k.max(0.0) as u64,
         unit,
         decimals: decimals.unwrap_or_else(|| decimals_for(step)),
+        points: None,
     };
     grid.check().map_err(|e| sig_err(file, "value", e))?;
     Ok(grid)
 }
 
+/// Grade por lista de pontos do `[hook.value]` (spec 008, 6.9): `points` no lugar de `min`/`max`/`step`,
+/// com o `default` dentro da lista. Um ponto só é aceito.
+fn build_points_grid(file: &str, id: &str, block: &ValueBlock) -> Result<ValueGrid> {
+    let err = |field: &str, reason: String| sig_err(file, field, format!("`{id}`: {reason}"));
+    if block.slot.is_some() {
+        return Err(err("value.slot", "o [hook.value] não tem slot".into()));
+    }
+    for (name, present) in [
+        ("min", block.min.is_some()),
+        ("max", block.max.is_some()),
+        ("step", block.step.is_some()),
+    ] {
+        if present {
+            return Err(err(
+                &format!("value.{name}"),
+                "não vale junto de points".into(),
+            ));
+        }
+    }
+    let ty = value_type(file, block)?;
+    let Some(points) = block.points.as_ref() else {
+        return Err(err("value.points", "campo obrigatório ausente".into()));
+    };
+    let toml::Value::Array(items) = points else {
+        return Err(err("value.points", "esperava uma lista de números".into()));
+    };
+    let mut list = Vec::with_capacity(items.len());
+    for item in items {
+        list.push(value_number(file, "value.points", Some(item), ty)?);
+    }
+    if list.is_empty() {
+        return Err(err("value.points", "a lista de pontos está vazia".into()));
+    }
+    let default = value_number(file, "value.default", block.default.as_ref(), ty)?;
+    let Some(default_k) = list.iter().position(|p| (p - default).abs() < 1e-9) else {
+        return Err(err(
+            "value.default",
+            format!("{default} não está na lista de pontos"),
+        ));
+    };
+    let unit = match block.unit.as_ref() {
+        None => None,
+        Some(toml::Value::String(u)) => Some(u.clone()),
+        Some(_) => return Err(err("value.unit", "esperava um texto".into())),
+    };
+    let decimals = match (block.decimals.as_ref(), ty) {
+        (None, ValueType::F32 | ValueType::F64) => list
+            .iter()
+            .map(|p| decimals_for(*p))
+            .max()
+            .unwrap_or_default(),
+        (None, _) => 0,
+        (Some(_), ValueType::I32 | ValueType::U32) => {
+            return Err(err("value.decimals", "só vale para f32".into()));
+        }
+        (Some(toml::Value::Integer(d)), ValueType::F32 | ValueType::F64) => u8::try_from(*d)
+            .ok()
+            .filter(|&d| d <= 9)
+            .ok_or_else(|| err("value.decimals", "precisa estar entre 0 e 9".into()))?,
+        (Some(_), ValueType::F32 | ValueType::F64) => {
+            return Err(err("value.decimals", "esperava um inteiro".into()));
+        }
+    };
+    let grid = ValueGrid {
+        ty,
+        min: list.first().copied().unwrap_or(0.0),
+        max: list.last().copied().unwrap_or(0.0),
+        step: 0.0,
+        default_k: default_k as u64,
+        unit,
+        decimals,
+        points: Some(list),
+    };
+    grid.check().map_err(|e| err("value", e))?;
+    Ok(grid)
+}
+
 /// Converte o bloco `value` no `ValueSpec` e confere as regras de carga do valor (6.3).
 fn build_value(file: &str, block: &ValueBlock, replacement: &[u8]) -> Result<ValueSpec> {
+    if block.label.is_some() {
+        return Err(sig_err(
+            file,
+            "value.label",
+            "o label só vale no [field.value]",
+        ));
+    }
     let ty = value_type(file, block)?;
     let slot = match block.slot.as_ref() {
         None => return Err(sig_err(file, "value.slot", "campo obrigatório ausente")),
@@ -794,6 +1006,246 @@ fn build(file: &str, raw: RawDef) -> Result<PatchDef> {
         replacement,
         rva: raw.rva,
         value,
+    })
+}
+
+/// Instrução do desvio dentro de uma ocorrência: decodifica a instrução em `occurrence[offset..]` e
+/// devolve os bytes dela (o `expected` do desvio, spec 008, 6.2). Erro se a instrução for inválida,
+/// ficar cortada pelo fim da ocorrência ou tiver menos de 5 bytes (o `jmp rel32` não cabe).
+pub fn hook_insn(occurrence: &[u8], offset: usize) -> Result<Vec<u8>> {
+    let bad = |reason: String| Error::BadHookInsn { reason };
+    let Some(tail) = occurrence.get(offset..).filter(|t| !t.is_empty()) else {
+        return Err(bad(format!(
+            "o offset {offset} fica fora da ocorrência de {} bytes",
+            occurrence.len()
+        )));
+    };
+    let insn = Decoder::new(64, tail, DecoderOptions::NONE).decode();
+    if insn.is_invalid() {
+        return Err(bad(format!(
+            "os bytes no offset {offset} não são uma instrução inteira"
+        )));
+    }
+    if insn.len() < HOOK_MIN_INSN {
+        return Err(bad(format!(
+            "a instrução no offset {offset} tem {} bytes (precisa de {HOOK_MIN_INSN} ou mais)",
+            insn.len()
+        )));
+    }
+    Ok(tail[..insn.len()].to_vec())
+}
+
+/// Aplica a regra de carga (spec 008, 12) a um `[[hook]]`.
+fn build_hook(file: &str, raw: GenericHook) -> Result<HookDef> {
+    let id = raw.id.as_str();
+    check_not_blank(file, "id", id)?;
+    let err = |field: &str, reason: &str| sig_err(file, field, format!("`{id}`: {reason}"));
+    let name = check_name(file, raw.name.clone())?;
+    let category = check_category(file, raw.category.as_deref())?;
+    let module = raw.module.clone().unwrap_or_else(|| GAME_EXE.to_string());
+    if module != GAME_EXE {
+        return Err(err(
+            "module",
+            &format!("só `{GAME_EXE}` é aceito nesta fase, veio `{module}`"),
+        ));
+    }
+    let pattern =
+        Pattern::parse(&raw.pattern).map_err(|e| sig_err(file, "pattern", e.to_string()))?;
+    if raw.offset >= pattern.len() {
+        return Err(err(
+            "offset",
+            &format!(
+                "{} fica fora do pattern de {} posições",
+                raw.offset,
+                pattern.len()
+            ),
+        ));
+    }
+    // A instrução tem de caber no padrão e ter 5+ bytes; os curingas valem 0 só para medir o tamanho.
+    let sample: Vec<u8> = (0..pattern.len())
+        .map(|i| pattern.token(i).flatten().unwrap_or(0))
+        .collect();
+    hook_insn(&sample, raw.offset).map_err(|e| err("offset", &e.to_string()))?;
+    let body = match raw.body.as_deref() {
+        None => return Err(err("body", "campo obrigatório ausente")),
+        Some(text) => CaveBody::parse(text).ok_or_else(|| {
+            err(
+                "body",
+                &format!("`{text}` não é brain, analyzer nem collect"),
+            )
+        })?,
+    };
+    let value = match (&raw.value, body) {
+        (Some(_), CaveBody::Analyzer) => {
+            return Err(err("value", "o corpo analyzer não tem valor"));
+        }
+        (None, CaveBody::Analyzer) => None,
+        (None, _) => return Err(err("value", "campo obrigatório ausente")),
+        (Some(block), _) => {
+            reject_label(file, id, block)?;
+            let grid = build_points_grid(file, id, block)?;
+            if grid.ty == ValueType::F64 {
+                return Err(err(
+                    "value.type",
+                    "f64 só vale no add de double de um [[field]]",
+                ));
+            }
+            Some(grid)
+        }
+    };
+    let object_class = match (raw.object_class, body) {
+        (Some(_), CaveBody::Brain) => {
+            return Err(err(
+                "object_class",
+                "o corpo brain usa a party_class do [ue.player]",
+            ));
+        }
+        (None, CaveBody::Brain) => None,
+        (None, _) => return Err(err("object_class", "campo obrigatório ausente")),
+        (Some(class), _) => {
+            check_class_path(file, "object_class", &class)?;
+            Some(class)
+        }
+    };
+    Ok(HookDef {
+        id: raw.id,
+        name,
+        category,
+        description: raw.description,
+        module,
+        pattern,
+        offset: raw.offset,
+        body,
+        value,
+        object_class,
+    })
+}
+
+/// Deslocamentos que a cave do Brain Power lê da ocorrência do padrão (spec 008, 6.6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrainCaptures {
+    /// `R`: deslocamento de `PartyComponent.ResearchPoints` (igual nos três acessos do padrão).
+    pub research: u32,
+    /// `T0`: deslocamento do início da tabela de níveis no objeto da tabela.
+    pub table: u32,
+    /// `T1`: deslocamento da contagem de níveis no objeto da tabela.
+    pub count: u32,
+    /// `L`: deslocamento do limite dentro de cada nível.
+    pub limit: u32,
+}
+
+fn incoherent(reason: impl Into<String>) -> Error {
+    Error::IncoherentPattern {
+        reason: reason.into(),
+    }
+}
+
+/// Deslocamento de memória da instrução, se couber em `u32` (o do jogo é sempre positivo).
+fn disp_u32(insn: &Instruction) -> Option<u32> {
+    u32::try_from(insn.memory_displacement64()).ok()
+}
+
+/// `insn` é `mov/cmp ..., [base + disp]` com o operando de memória no índice `mem_op`.
+fn mem_base(insn: &Instruction, mem_op: u32) -> Option<Register> {
+    (insn.op_count() > mem_op
+        && insn.op_kind(mem_op) == OpKind::Memory
+        && insn.memory_index() == Register::None)
+        .then(|| insn.memory_base())
+}
+
+/// Lê `R`, `T0`, `T1` e `L` dos bytes da ocorrência inteira do padrão do Brain Power e confere a
+/// forma do trecho (spec 008, 6.6.1): `esi` = valor antigo, `rbx` = o objeto, `rax` = a tabela, passo
+/// de `0x30` bytes por nível, e os três acessos a `ResearchPoints` com o mesmo deslocamento.
+///
+/// Erro [`Error::IncoherentPattern`] (`padrão incoerente`) se os bytes não decodificam, se faltar
+/// uma das instruções esperadas ou se os três deslocamentos de `R` diferirem. A comparação com o
+/// deslocamento da reflexão é de quem resolve o desvio.
+pub fn brain_captures_from_hit(occurrence: &[u8]) -> Result<BrainCaptures> {
+    let mut insns = Vec::new();
+    for insn in &mut Decoder::with_ip(64, occurrence, 0, DecoderOptions::NONE) {
+        if insn.is_invalid() {
+            return Err(incoherent("os bytes da ocorrência não decodificam"));
+        }
+        insns.push(insn);
+    }
+    let find = |what: &str, pick: fn(&Instruction) -> Option<u32>| -> Result<u32> {
+        insns
+            .iter()
+            .find_map(pick)
+            .ok_or_else(|| incoherent(format!("não achei {what}")))
+    };
+    // `mov esi,[rcx+R]`: o valor antigo.
+    let first = find("mov esi,[rcx+R]", |i| {
+        (i.mnemonic() == Mnemonic::Mov
+            && i.op0_register() == Register::ESI
+            && mem_base(i, 1) == Some(Register::RCX))
+        .then(|| disp_u32(i))
+        .flatten()
+    })?;
+    // `mov [rcx+R],eax`: grava o novo total.
+    let store = find("mov [rcx+R],eax", |i| {
+        (i.mnemonic() == Mnemonic::Mov
+            && mem_base(i, 0) == Some(Register::RCX)
+            && i.op1_register() == Register::EAX)
+            .then(|| disp_u32(i))
+            .flatten()
+    })?;
+    // `cmp eax,[rbx+R]`: o objeto lido de novo, no laço.
+    let compare = find("cmp eax,[rbx+R]", |i| {
+        (i.mnemonic() == Mnemonic::Cmp
+            && i.op0_register() == Register::EAX
+            && mem_base(i, 1) == Some(Register::RBX))
+        .then(|| disp_u32(i))
+        .flatten()
+    })?;
+    if first != store || store != compare {
+        return Err(incoherent(format!(
+            "os três deslocamentos de ResearchPoints diferem ({first:#x}, {store:#x}, {compare:#x})"
+        )));
+    }
+    let table = find("mov r14,[rax+T0]", |i| {
+        (i.mnemonic() == Mnemonic::Mov
+            && i.op0_register() == Register::R14
+            && mem_base(i, 1) == Some(Register::RAX))
+        .then(|| disp_u32(i))
+        .flatten()
+    })?;
+    let count = find("movsxd rax,[rax+T1]", |i| {
+        (i.mnemonic() == Mnemonic::Movsxd
+            && i.op0_register() == Register::RAX
+            && mem_base(i, 1) == Some(Register::RAX))
+        .then(|| disp_u32(i))
+        .flatten()
+    })?;
+    let limit = find("mov eax,[r14+L]", |i| {
+        (i.mnemonic() == Mnemonic::Mov
+            && i.op0_register() == Register::EAX
+            && mem_base(i, 1) == Some(Register::R14))
+        .then(|| disp_u32(i))
+        .flatten()
+    })?;
+    // Passo de 0x30 bytes por nível: `lea rcx,[rax+rax*2]; shl rcx,4` (3 × 16).
+    let lea = insns.iter().any(|i| {
+        i.mnemonic() == Mnemonic::Lea
+            && i.op0_register() == Register::RCX
+            && i.memory_base() == Register::RAX
+            && i.memory_index() == Register::RAX
+            && i.memory_index_scale() == 2
+    });
+    let shl = insns.iter().any(|i| {
+        i.mnemonic() == Mnemonic::Shl
+            && i.op0_register() == Register::RCX
+            && i.op1_kind() == OpKind::Immediate8
+            && i.immediate8() == 4
+    });
+    if !(lea && shl) {
+        return Err(incoherent("o passo de 0x30 bytes por nível não confere"));
+    }
+    Ok(BrainCaptures {
+        research: first,
+        table,
+        count,
+        limit,
     })
 }
 
@@ -913,12 +1365,56 @@ fn build_player(file: &str, block: PlayerBlock) -> Result<PlayerCfg> {
             ));
         }
     };
+    let research = match (
+        block.party_field,
+        block.party_class,
+        block.research_points_field,
+    ) {
+        (None, None, None) => None,
+        (Some(party_field), Some(party_class), Some(points_field)) => {
+            check_not_blank(file, "ue.player.party_field", &party_field)?;
+            check_class_path(file, "ue.player.party_class", &party_class)?;
+            check_not_blank(file, "ue.player.research_points_field", &points_field)?;
+            if game_state.is_none() {
+                return Err(sig_err(
+                    file,
+                    "ue.player.party_field",
+                    "o ResearchPoints parte do GameState: faltam os cinco campos do game_state",
+                ));
+            }
+            Some(ResearchCfg {
+                party_field,
+                party_class,
+                points_field,
+            })
+        }
+        (party_field, party_class, points_field) => {
+            let missing = [
+                ("party_field", party_field.is_none()),
+                ("party_class", party_class.is_none()),
+                ("research_points_field", points_field.is_none()),
+            ]
+            .into_iter()
+            .find_map(|(name, absent)| absent.then_some(name))
+            .unwrap_or("party_field");
+            return Err(sig_err(
+                file,
+                &format!("ue.player.{missing}"),
+                "os três campos do ResearchPoints vêm juntos: campo obrigatório ausente",
+            ));
+        }
+    };
+    if let Some(field) = &block.inventory_field {
+        check_not_blank(file, "ue.player.inventory_field", field)?;
+    }
     Ok(PlayerCfg {
         controller_class: block.controller_class,
         pawn_field: block.pawn_field,
         pawn_class: block.pawn_class,
         alt_pawn_fields: block.alt_pawn_fields,
         game_state,
+        research,
+        inventory_field: block.inventory_field,
     })
 }
 
@@ -1046,7 +1542,36 @@ fn build_field_grid(
             format!("`{id}`: o tipo do valor precisa casar com o kind do campo"),
         ));
     }
+    if block.points.is_some() {
+        return build_points_grid(file, id, block);
+    }
     build_grid(file, block, ty)
+}
+
+/// `label` do bloco de valor de um `[[field]]`: texto não vazio.
+fn field_label(file: &str, id: &str, block: &ValueBlock) -> Result<Option<String>> {
+    match block.label.as_ref() {
+        None => Ok(None),
+        Some(toml::Value::String(t)) if !t.trim().is_empty() => Ok(Some(t.clone())),
+        Some(toml::Value::String(_)) => Err(sig_err(file, "value.label", format!("`{id}`: vazio"))),
+        Some(_) => Err(sig_err(
+            file,
+            "value.label",
+            format!("`{id}`: esperava um texto"),
+        )),
+    }
+}
+
+/// O `label` só vale no `[field.value]`: o `[hook.value]` o recusa.
+fn reject_label(file: &str, id: &str, block: &ValueBlock) -> Result<()> {
+    if block.label.is_some() {
+        return Err(sig_err(
+            file,
+            "value.label",
+            format!("`{id}`: o label só vale no [field.value]"),
+        ));
+    }
+    Ok(())
 }
 
 /// Número do `[[field]]` para `set` (`target`, `min`, `max`): inteiro de 32 bits para `int`, finito
@@ -1088,6 +1613,8 @@ fn field_number64(
         }
         // O `bool` não tem número: `build_field` recusa `target`, `min` e `max` antes de chegar aqui.
         FieldKind::Bool => return Err(err("kind = \"bool\" não tem número".into())),
+        // O `double` só existe no `add`, que não usa `target`, `min` nem `max`.
+        FieldKind::Double => return Err(err("kind = \"double\" só vale no add".into())),
     }
     Ok(n)
 }
@@ -1254,6 +1781,9 @@ fn build_field(file: &str, raw: GenericField) -> Result<FieldDef> {
                 Some("float") => FieldKind::Float,
                 Some("int") => FieldKind::Int,
                 Some("bool") => FieldKind::Bool,
+                Some("double") => {
+                    return Err(err("kind", "double só vale com rule = \"add\""));
+                }
                 Some(other) => {
                     return Err(err(
                         "kind",
@@ -1304,6 +1834,7 @@ fn build_field(file: &str, raw: GenericField) -> Result<FieldDef> {
                     let expected = match kind {
                         FieldKind::Int => ValueType::I32,
                         FieldKind::Float | FieldKind::Bool => ValueType::F32,
+                        FieldKind::Double => ValueType::F64,
                     };
                     value = Some(build_field_grid(file, id, block, expected)?);
                     None
@@ -1358,17 +1889,22 @@ fn build_field(file: &str, raw: GenericField) -> Result<FieldDef> {
                 Some(f) if f.trim().is_empty() => return Err(err("field", "vazio")),
                 Some(f) => f.to_string(),
             };
-            match raw.kind.as_deref() {
+            // O tipo da grade (`i32` ou `f64`) é o que leva o `kind` adiante.
+            let expected = match raw.kind.as_deref() {
                 None => return Err(err("kind", "campo obrigatório ausente")),
-                Some("int") => {}
+                Some("int") => ValueType::I32,
+                Some("double") => ValueType::F64,
                 Some(other) => {
-                    return Err(err("kind", &format!("`{other}` não é int (ação)")));
+                    return Err(err(
+                        "kind",
+                        &format!("`{other}` não é int nem double (ação)"),
+                    ));
                 }
-            }
+            };
             let Some(block) = raw.value.as_ref() else {
                 return Err(err("value", "campo obrigatório ausente"));
             };
-            let grid = build_field_grid(file, id, block, ValueType::I32)?;
+            let grid = build_field_grid(file, id, block, expected)?;
             if grid.min <= 0.0 {
                 return Err(sig_err(
                     file,
@@ -1391,7 +1927,11 @@ fn build_field(file: &str, raw: GenericField) -> Result<FieldDef> {
                 ));
             }
             value = Some(grid);
-            FieldRule::Add { field, result_max }
+            FieldRule::Add {
+                field,
+                result_max,
+                at_least: raw.at_least.unwrap_or(false),
+            }
         }
         Some(other) => {
             return Err(err(
@@ -1401,6 +1941,19 @@ fn build_field(file: &str, raw: GenericField) -> Result<FieldDef> {
         }
     };
 
+    if raw.at_least.is_some() && !matches!(rule, FieldRule::Add { .. }) {
+        return Err(err("at_least", "só vale com rule = \"add\""));
+    }
+    if let Some(owner) = &raw.owner_class {
+        if root != FieldRoot::GameState {
+            return Err(err("owner_class", "só vale com root = \"game_state\""));
+        }
+        check_class_path(file, "owner_class", owner)?;
+    }
+    let label = match raw.value.as_ref() {
+        Some(block) => field_label(file, id, block)?,
+        None => None,
+    };
     if root == FieldRoot::GameState {
         if !matches!(rule, FieldRule::Add { .. } | FieldRule::Set { .. }) {
             return Err(err(
@@ -1425,6 +1978,8 @@ fn build_field(file: &str, raw: GenericField) -> Result<FieldDef> {
         root,
         rule,
         value,
+        owner_class: raw.owner_class,
+        label,
     })
 }
 
@@ -1516,7 +2071,7 @@ impl Signatures {
             .ue
             .map(|block| build_generic_ue(GENERIC_FILE, block))
             .transpose()?;
-        // O `id` é único entre `[[patch]]` e `[[field]]`: `seen` já tem os dos patches.
+        // O `id` é único entre `[[patch]]`, `[[field]]` e `[[hook]]`: `seen` já tem os dos patches.
         let mut fields = Vec::new();
         for f in parsed.field {
             if !seen.insert(f.id.clone()) {
@@ -1529,6 +2084,17 @@ impl Signatures {
             fields.push(build_field(GENERIC_FILE, f)?);
         }
         check_field_set(GENERIC_FILE, &fields, ue.as_ref())?;
+        let mut hooks = Vec::new();
+        for h in parsed.hook {
+            if !seen.insert(h.id.clone()) {
+                return Err(sig_err(
+                    GENERIC_FILE,
+                    "id",
+                    format!("`{}` repetido entre [[patch]], [[field]] e [[hook]]", h.id),
+                ));
+            }
+            hooks.push(build_hook(GENERIC_FILE, h)?);
+        }
 
         let mut versions = BTreeMap::new();
         for (name, text) in version_files {
@@ -1621,6 +2187,7 @@ impl Signatures {
             versions,
             ue,
             fields,
+            hooks,
         })
     }
 
@@ -1675,6 +2242,11 @@ impl Signatures {
     /// Os cheats de valor (`[[field]]`), na ordem do arquivo. Valem para qualquer versão.
     pub fn fields(&self) -> &[FieldDef] {
         &self.fields
+    }
+
+    /// Os desvios com cave (`[[hook]]`), na ordem do arquivo. Valem para qualquer versão.
+    pub fn hooks(&self) -> &[HookDef] {
+        &self.hooks
     }
 }
 
@@ -1957,8 +2529,9 @@ offset = 3
                 "pet-stamina-infinita",
             ]
         );
-        // Os dois cheats do mundo (spec 007) vêm depois, conferidos em `real_generic_has_world_cheats`.
-        assert_eq!(ids.len(), 19);
+        // Os dois cheats do mundo (spec 007), o `pular-hora` e o `congelar-hora` (spec 008) vêm depois, conferidos em
+        // `real_generic_has_world_cheats`, `real_generic_has_pular_hora` e `real_generic_has_congelar_hora`.
+        assert_eq!(ids.len(), 21);
         let category = |id: &str| {
             if id.starts_with("pet-") {
                 Category::Pet
@@ -2459,6 +3032,7 @@ offset = 3
                 addr: rva,
                 expected: hex(expected),
                 replacement: hex(replacement),
+                kind: gt_core::patch::PatchKind::Code,
             })
             .unwrap_or_else(|e| panic!("{id}: {e}"));
             assert!(v.lost_on_apply().is_empty(), "{id}");
@@ -2578,6 +3152,8 @@ alt_pawn_fields = []
                 pawn_class: "/Script/Maine.SurvivalPlayerCharacter".into(),
                 alt_pawn_fields: vec![],
                 game_state: None,
+                research: None,
+                inventory_field: None,
             }
         );
 
@@ -2785,6 +3361,8 @@ kind = "bool"
                 object: "StaminaComponent".into(),
                 object_class: "/Script/Maine.StaminaComponent".into(),
                 root: FieldRoot::Pawn,
+                owner_class: None,
+                label: None,
                 value: None,
                 rule: FieldRule::Lock {
                     field: "CurrentStamina".into(),
@@ -3491,7 +4069,8 @@ bools = [false, true]
             def.rule,
             FieldRule::Add {
                 field: "ScienceFound".into(),
-                result_max: 100_000
+                result_max: 100_000,
+                at_least: false,
             }
         );
         let grid = def.value.unwrap();
@@ -3577,6 +4156,164 @@ bools = [false, true]
         for (what, text, field) in cases {
             assert_eq!(bad(text), field, "caso: {what}");
         }
+    }
+
+    /// O `pular-hora` da spec 008, 6.8.2, no mesmo formato do `generic.toml`.
+    const ADD_DOUBLE: &str = r#"
+[[field]]
+id = "pular-hora"
+name = "Pular 1 hora"
+category = "progressao"
+description = "Avança o relógio"
+object = "CalendarComponent"
+object_class = "/Script/Maine.CalendarComponent"
+root = "game_state"
+owner_class = "/Script/Maine.SurvivalGameState"
+rule = "add"
+field = "CurrentTime"
+kind = "double"
+at_least = true
+result_max = 1000000000
+
+[field.value]
+type = "f64"
+points = [3600.0]
+default = 3600.0
+label = "+1h"
+"#;
+
+    #[test]
+    fn add_double_loads_with_points_label_and_owner() {
+        let def = only_field_in(&with_ue(ADD_DOUBLE, true));
+        assert_eq!(
+            def.rule,
+            FieldRule::Add {
+                field: "CurrentTime".into(),
+                result_max: 1_000_000_000,
+                at_least: true,
+            }
+        );
+        assert_eq!(
+            def.owner_class.as_deref(),
+            Some("/Script/Maine.SurvivalGameState")
+        );
+        assert_eq!(def.label.as_deref(), Some("+1h"));
+        let grid = def.value.unwrap();
+        assert_eq!(grid.ty, ValueType::F64);
+        assert_eq!(grid.points.as_deref(), Some(&[3600.0][..]));
+        // Um ponto só: sem passos, e o valor é o próprio ponto.
+        assert_eq!((grid.steps(), grid.value(0)), (0, 3600.0));
+        // Sem `at_least`, `owner_class` nem `label`, o resto continua valendo.
+        let plain = ADD_DOUBLE
+            .replace("at_least = true\n", "")
+            .replace("owner_class = \"/Script/Maine.SurvivalGameState\"\n", "")
+            .replace("label = \"+1h\"\n", "");
+        let def = only_field_in(&with_ue(&plain, true));
+        assert_eq!(def.owner_class, None);
+        assert_eq!(def.label, None);
+        assert!(matches!(
+            def.rule,
+            FieldRule::Add {
+                at_least: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn add_double_rules() {
+        let bad = |text: String| field_err(&with_ue(&text, true));
+        let cases: Vec<(&str, String, &str)> = vec![
+            (
+                "value i32 com kind double",
+                ADD_DOUBLE.replace("type = \"f64\"", "type = \"i32\""),
+                "value.type",
+            ),
+            (
+                "value f64 com kind int",
+                ADD_DOUBLE.replace("kind = \"double\"", "kind = \"int\""),
+                "value.type",
+            ),
+            (
+                "kind float continua recusado",
+                ADD_DOUBLE.replace("kind = \"double\"", "kind = \"float\""),
+                "kind",
+            ),
+            (
+                "ponto não positivo",
+                ADD_DOUBLE
+                    .replace("points = [3600.0]", "points = [0.0]")
+                    .replace("default = 3600.0", "default = 0.0"),
+                "value.min",
+            ),
+            (
+                "default fora dos pontos",
+                ADD_DOUBLE.replace("default = 3600.0", "default = 7200.0"),
+                "value.default",
+            ),
+            (
+                "result_max abaixo do ponto",
+                ADD_DOUBLE.replace("result_max = 1000000000", "result_max = 3600"),
+                "result_max",
+            ),
+            (
+                "points junto de min",
+                ADD_DOUBLE.replace("points = [3600.0]", "points = [3600.0]\nmin = 1"),
+                "value.min",
+            ),
+            (
+                "label vazio",
+                ADD_DOUBLE.replace("label = \"+1h\"", "label = \" \""),
+                "value.label",
+            ),
+            (
+                "label não é texto",
+                ADD_DOUBLE.replace("label = \"+1h\"", "label = 1"),
+                "value.label",
+            ),
+            (
+                "owner_class malformada",
+                ADD_DOUBLE.replace("/Script/Maine.SurvivalGameState", "SurvivalGameState"),
+                "owner_class",
+            ),
+            (
+                "owner_class fora do game_state",
+                ADD_DOUBLE.replace("root = \"game_state\"\n", ""),
+                "owner_class",
+            ),
+        ];
+        for (what, text, field) in cases {
+            assert_eq!(bad(text), field, "caso: {what}");
+        }
+        // `at_least` só vale no `add`.
+        let set = SET_VALUE.replace("kind = \"int\"\n", "kind = \"int\"\nat_least = true\n");
+        assert_eq!(field_err(&set), "at_least");
+        // O `set` não aceita `double`.
+        let set_double = SET_VALUE.replace("kind = \"int\"", "kind = \"double\"");
+        assert_eq!(field_err(&set_double), "kind");
+    }
+
+    #[test]
+    fn f64_and_label_only_in_field_values() {
+        // O `f64` e o `label` não valem no `[hook.value]` nem no `slot` de um patch.
+        let hook = |value: &str| {
+            format!(
+                "{GENERIC}{UE_PATTERNS}{UE_LAYOUT}{UE_PLAYER_GAME_STATE}\n[[hook]]\nid = \"h\"\nname = \"H\"\n\
+                 category = \"progressao\"\ndescription = \"d\"\npattern = \"48 8b 05 ?? ?? ?? ??\"\n\
+                 offset = 0\nbody = \"brain\"\n[hook.value]\n{value}"
+            )
+        };
+        let err = |text: String| match parse(&[("generic.toml", &text)]) {
+            Err(e) => e.to_string(),
+            Ok(_) => "carregou".to_string(),
+        };
+        let ok = "type = \"i32\"\npoints = [2, 3]\ndefault = 2\n";
+        let e = err(hook(ok));
+        assert_eq!(e, "carregou");
+        let e = err(hook(&format!("{ok}label = \"x\"\n")));
+        assert!(e.contains("value.label"), "{e}");
+        let e = err(hook("type = \"f64\"\npoints = [2.0, 3.0]\ndefault = 2.0\n"));
+        assert!(e.contains("value.type"), "{e}");
     }
 
     /// Como `only_field`, para um texto que já traz o `[ue]`.
@@ -3706,6 +4443,45 @@ bools = [false, true]
     }
 
     #[test]
+    fn research_points_fields_come_together_and_need_game_state() {
+        const RESEARCH: &str = "party_field = \"PartyComponent\"\n\
+            party_class = \"/Script/Maine.PartyComponent\"\n\
+            research_points_field = \"ResearchPoints\"\n";
+        let build =
+            |player: &str, extra: &str| format!("{GENERIC}{UE_PATTERNS}{UE_LAYOUT}{player}{extra}");
+        // Os três com o `game_state`: carrega.
+        let sigs = parse(&[("generic.toml", &build(UE_PLAYER_GAME_STATE, RESEARCH))]).unwrap();
+        assert_eq!(
+            sigs.ue_for_version("x").unwrap().player.research,
+            Some(ResearchCfg {
+                party_field: "PartyComponent".into(),
+                party_class: "/Script/Maine.PartyComponent".into(),
+                points_field: "ResearchPoints".into(),
+            })
+        );
+        // Nenhum dos três: ausente.
+        let sigs = parse(&[("generic.toml", &build(UE_PLAYER_GAME_STATE, ""))]).unwrap();
+        assert_eq!(sigs.ue_for_version("x").unwrap().player.research, None);
+        // Faltando um: o nome do campo que falta.
+        let partial = RESEARCH.replace("party_class = \"/Script/Maine.PartyComponent\"\n", "");
+        assert_eq!(
+            field_err(&build(UE_PLAYER_GAME_STATE, &partial)),
+            "ue.player.party_class"
+        );
+        // Classe fora do formato Pacote.Nome.
+        let bad = RESEARCH.replace("/Script/Maine.PartyComponent", "PartyComponent");
+        assert_eq!(
+            field_err(&build(UE_PLAYER_GAME_STATE, &bad)),
+            "ue.player.party_class"
+        );
+        // Sem o caminho do `game_state`, não há de onde partir.
+        assert_eq!(
+            field_err(&build(UE_PLAYER, RESEARCH)),
+            "ue.player.party_field"
+        );
+    }
+
+    #[test]
     fn add_with_pawn_root_accepted() {
         let pawn = ADD_FIELD.replace("root = \"game_state\"\n", "");
         let def = only_field(&pawn);
@@ -3774,6 +4550,7 @@ bools = [false, true]
                 FieldRule::Add {
                     field: class("ScienceFound"),
                     result_max: 100_000,
+                    at_least: false,
                 },
             ),
             (
@@ -3851,7 +4628,7 @@ bools = [false, true]
     fn real_generic_has_world_cheats() {
         let sigs = Signatures::embedded().unwrap();
         let fields = sigs.fields();
-        assert_eq!(fields.len(), 19);
+        assert_eq!(fields.len(), 21);
         let object = "SurvivalModeManagerComponent.GameModeSettings";
         let class = "/Script/Maine.SurvivalGameModeSettings";
 
@@ -3900,5 +4677,418 @@ bools = [false, true]
         assert!((grid.value(grid.default_k) - 0.25).abs() < 1e-9);
         assert_eq!(grid.unit.as_deref(), Some("x"));
         assert_eq!(grid.decimals, 2);
+    }
+
+    #[test]
+    fn real_generic_has_pular_hora() {
+        let sigs = Signatures::embedded().unwrap();
+        let def = &sigs.fields()[19];
+        assert_eq!(def.id, "pular-hora");
+        assert_eq!(def.category, Category::Progressao);
+        assert_eq!(def.root, FieldRoot::GameState);
+        assert_eq!(
+            (def.object.as_str(), def.object_class.as_str()),
+            ("CalendarComponent", "/Script/Maine.CalendarComponent")
+        );
+        assert_eq!(
+            def.owner_class.as_deref(),
+            Some("/Script/Maine.SurvivalGameState")
+        );
+        assert_eq!(
+            def.rule,
+            FieldRule::Add {
+                field: "CurrentTime".into(),
+                result_max: 1_000_000_000,
+                at_least: true,
+            }
+        );
+        assert_eq!(def.label.as_deref(), Some("+1h"));
+        let grid = def.value.as_ref().unwrap();
+        assert_eq!(grid.ty, ValueType::F64);
+        assert_eq!(grid.points.as_deref(), Some(&[3600.0][..]));
+        assert_eq!((grid.steps(), grid.value(grid.default_k)), (0, 3600.0));
+    }
+
+    #[test]
+    fn real_generic_has_congelar_hora() {
+        let sigs = Signatures::embedded().unwrap();
+        let def = &sigs.fields()[20];
+        assert_eq!(def.id, "congelar-hora");
+        assert_eq!(def.name, "Congelar hora do dia");
+        assert_eq!(def.category, Category::Progressao);
+        assert_eq!(def.root, FieldRoot::GameState);
+        assert_eq!(
+            (def.object.as_str(), def.object_class.as_str()),
+            ("CalendarComponent", "/Script/Maine.CalendarComponent")
+        );
+        assert_eq!(
+            def.owner_class.as_deref(),
+            Some("/Script/Maine.SurvivalGameState")
+        );
+        // Sem valor ajustável: alvo fixo em 0 (a razão do tempo para), sem grade nem `label`.
+        assert_eq!((def.value.as_ref(), def.label.as_deref()), (None, None));
+        assert_eq!(
+            def.rule,
+            FieldRule::Set {
+                fields: vec!["GameToRealTimeRatio".into()],
+                kind: FieldKind::Float,
+                target: Some(0.0),
+                bools: None,
+            }
+        );
+    }
+
+    // ---- [[hook]] (spec 008, 6.2 e 12) ----
+
+    /// Pedaço de TOML de um `[[hook]]` com `extra` no fim (padrão de 8 bytes, instrução de 5 em 0).
+    fn hook_toml(extra: &str) -> String {
+        format!(
+            "[[hook]]\nid = \"h\"\nname = \"H\"\ncategory = \"itens\"\ndescription = \"d\"\n\
+             pattern = \"48 89 5c 24 08 48 ?? c3\"\noffset = 0\n{extra}"
+        )
+    }
+
+    const ANALYZER_BODY: &str =
+        "body = \"analyzer\"\nobject_class = \"/Script/Maine.ResourceAnalyzerBuilding\"\n";
+    const POINTS: &str = "[hook.value]\ntype = \"i32\"\npoints = [2, 3, 5]\ndefault = 3\n";
+
+    fn hook_err(extra: &str) -> String {
+        parse(&[("generic.toml", &hook_toml(extra))])
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn hooks_load() {
+        let sigs = Signatures::embedded().unwrap();
+        let hooks = sigs.hooks();
+        let ids: Vec<&str> = hooks.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["brain-power", "analisador-infinito", "coleta-multiplicada"]
+        );
+        // Os hooks não entram na lista de patches.
+        assert!(sigs.ids().iter().all(|id| !ids.contains(id)));
+
+        let brain = &hooks[0];
+        assert_eq!(brain.body, CaveBody::Brain);
+        assert_eq!((brain.offset, brain.pattern.len()), (36, 91));
+        let grid = brain.value.as_ref().unwrap();
+        assert_eq!(grid.points.as_deref(), Some(&[2.0, 3.0, 5.0, 10.0][..]));
+        assert_eq!((grid.default_k, grid.steps()), (0, 3));
+        assert_eq!(grid.format(grid.default_k), "2x");
+        assert_eq!(grid.ty, ValueType::I32);
+
+        let analyzer = &hooks[1];
+        assert_eq!(analyzer.body, CaveBody::Analyzer);
+        assert_eq!(analyzer.offset, 0);
+        assert!(analyzer.value.is_none());
+
+        // Coleta: começo da função (offset 0), classe `Item`, grade 2/3/5/10 (padrão 2).
+        let collect = &hooks[2];
+        assert_eq!(collect.body, CaveBody::Collect);
+        assert_eq!((collect.offset, collect.pattern.len()), (0, 118));
+        assert_eq!(collect.object_class.as_deref(), Some("/Script/Maine.Item"));
+        let grid = collect.value.as_ref().unwrap();
+        assert_eq!(grid.points.as_deref(), Some(&[2.0, 3.0, 5.0, 10.0][..]));
+        assert_eq!(grid.format(grid.default_k), "2x");
+
+        // Todos com módulo do jogo e a instrução do desvio com 5+ bytes (conferido na carga).
+        for h in hooks {
+            assert_eq!(h.module, crate::GAME_EXE);
+        }
+    }
+
+    #[test]
+    fn hook_insn_too_short() {
+        // `mov rax,rbx` (3 bytes) no offset 2 da ocorrência.
+        let occurrence = [0x90, 0x90, 0x48, 0x89, 0xD8, 0x90, 0x90, 0x90];
+        let err = hook_insn(&occurrence, 2).unwrap_err();
+        assert!(matches!(err, Error::BadHookInsn { .. }), "{err}");
+        assert!(err.to_string().contains("3 bytes"), "{err}");
+        // A de 5 bytes serve, e o resultado são os bytes dela (não os do que vem depois).
+        let occurrence = [0x48, 0x89, 0x5C, 0x24, 0x08, 0x90, 0x90];
+        assert_eq!(
+            hook_insn(&occurrence, 0).unwrap(),
+            vec![0x48, 0x89, 0x5C, 0x24, 0x08]
+        );
+        // Instrução cortada pelo fim da ocorrência, e offset fora dela.
+        assert!(hook_insn(&[0x48, 0x89, 0x5C, 0x24], 0).is_err());
+        assert!(hook_insn(&occurrence, occurrence.len()).is_err());
+        // Na carga: o padrão com a instrução curta é recusado, no campo `offset`.
+        let text = "[[hook]]\nid = \"h\"\nname = \"H\"\ncategory = \"itens\"\ndescription = \"d\"\n\
+                    pattern = \"90 48 89 d8 90 90 c3\"\noffset = 1\nbody = \"analyzer\"\n";
+        let err = parse(&[("generic.toml", text)]).unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature { field, .. } if field == "offset"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn hook_id_collides_with_patch() {
+        let patch_id = "[[patch]]\nid = \"h\"\nname = \"P\"\ncategory = \"itens\"\ndescription = \"d\"\n\
+                        pattern = \"48 8B F9\"\noffset = 0\nexpected = \"48 8B F9\"\nreplacement = \"48 89 CF\"\n\n";
+        let text = format!("{patch_id}{}", hook_toml(ANALYZER_BODY));
+        let err = parse(&[("generic.toml", &text)]).unwrap_err().to_string();
+        assert!(err.contains("`h` repetido"), "{err}");
+        // Dois hooks com o mesmo id também.
+        let one = hook_toml(ANALYZER_BODY);
+        let err = parse(&[("generic.toml", &format!("{one}\n{one}"))])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`h` repetido"), "{err}");
+    }
+
+    #[test]
+    fn hook_load_rules() {
+        // `offset` dentro do padrão.
+        let text = hook_toml(ANALYZER_BODY).replace("offset = 0", "offset = 8");
+        let err = parse(&[("generic.toml", &text)]).unwrap_err().to_string();
+        assert!(
+            err.contains("offset") && err.contains("fora do pattern"),
+            "{err}"
+        );
+        // `body` obrigatório e conhecido; `value` obrigatório fora do analisador.
+        assert!(hook_err("").contains("body"));
+        assert!(hook_err("body = \"voa\"\n").contains("voa"));
+        assert!(hook_err("body = \"brain\"\n").contains("value"));
+        let err = hook_err(&format!("body = \"analyzer\"\n{POINTS}"));
+        assert!(err.contains("analyzer não tem valor"), "{err}");
+        // `module` só o exe do jogo; campos desconhecidos recusados.
+        assert!(hook_err("body = \"analyzer\"\nmodule = \"x.dll\"\n").contains("x.dll"));
+        assert!(hook_err("body = \"analyzer\"\nexpected = \"48\"\n").contains("expected"));
+    }
+
+    #[test]
+    fn hook_object_class_rules() {
+        // O analisador e a coleta trazem a classe; ela fica em `HookDef`.
+        let ok = parse(&[("generic.toml", &hook_toml(ANALYZER_BODY))]).unwrap();
+        assert_eq!(
+            ok.hooks()[0].object_class.as_deref(),
+            Some("/Script/Maine.ResourceAnalyzerBuilding")
+        );
+        // Sem ela, o campo é obrigatório fora do Brain Power.
+        for body in ["analyzer", "collect"] {
+            let value = if body == "analyzer" { "" } else { POINTS };
+            let err = hook_err(&format!("body = \"{body}\"\n{value}"));
+            assert!(err.contains("object_class"), "{body}: {err}");
+        }
+        // Formato `Pacote.Nome`.
+        let err = hook_err("body = \"analyzer\"\nobject_class = \"Analisador\"\n");
+        assert!(err.contains("Pacote.Nome"), "{err}");
+        // O Brain Power usa a `party_class` do `[ue.player]`: a classe no `[[hook]]` é recusada.
+        let err = hook_err(&format!(
+            "body = \"brain\"\nobject_class = \"/Script/Maine.PartyComponent\"\n{POINTS}"
+        ));
+        assert!(err.contains("party_class"), "{err}");
+        // Os embutidos: o analisador com a classe, Brain Power sem.
+        let sigs = Signatures::embedded().unwrap();
+        let class = |id: &str| {
+            sigs.hooks()
+                .iter()
+                .find(|h| h.id == id)
+                .unwrap()
+                .object_class
+                .clone()
+        };
+        assert_eq!(
+            class("analisador-infinito").as_deref(),
+            Some("/Script/Maine.ResourceAnalyzerBuilding")
+        );
+        assert_eq!(class("brain-power"), None);
+    }
+
+    #[test]
+    fn inventory_field_is_optional_and_not_blank() {
+        let with = |extra: &str| {
+            let text = format!("{GENERIC}{UE_PATTERNS}{UE_LAYOUT}{UE_PLAYER}{extra}");
+            parse(&[("generic.toml", &text)])
+        };
+        let player = |extra: &str| {
+            with(extra)
+                .unwrap()
+                .ue_for_version("0000-0000")
+                .unwrap()
+                .player
+        };
+        assert_eq!(
+            player("inventory_field = \"InventoryComponent\"\n")
+                .inventory_field
+                .as_deref(),
+            Some("InventoryComponent")
+        );
+        assert_eq!(player("").inventory_field, None);
+        let err = with("inventory_field = \" \"\n").unwrap_err().to_string();
+        assert!(err.contains("inventory_field"), "{err}");
+        // Os embutidos trazem o campo do inventário.
+        let ue = Signatures::embedded()
+            .unwrap()
+            .ue_for_version("0000-0000")
+            .unwrap();
+        assert_eq!(
+            ue.player.inventory_field.as_deref(),
+            Some("InventoryComponent")
+        );
+    }
+
+    #[test]
+    fn hook_points_grid_rules() {
+        let load = |value: &str| {
+            parse(&[(
+                "generic.toml",
+                &hook_toml(&format!("body = \"brain\"\n[hook.value]\n{value}")),
+            )])
+        };
+        let grid = |value: &str| load(value).unwrap().hooks()[0].value.clone().unwrap();
+        let g = grid("type = \"i32\"\npoints = [2, 3, 5]\ndefault = 5\nunit = \"x\"\n");
+        assert_eq!(g.default_k, 2);
+        assert_eq!(g.format(2), "5x");
+        // Um ponto só é aceito.
+        assert_eq!(
+            grid("type = \"i32\"\npoints = [7]\ndefault = 7\n").steps(),
+            0
+        );
+        // f32 aceita decimais.
+        let g = grid("type = \"f32\"\npoints = [0.5, 1.5]\ndefault = 1.5\n");
+        assert_eq!(g.format(1), "1.5");
+        let bad = |value: &str, want: &str| {
+            let err = load(value).unwrap_err().to_string();
+            assert!(err.contains(want), "{value}: {err}");
+        };
+        bad(
+            "type = \"i32\"\npoints = [2, 3]\ndefault = 4\n",
+            "não está na lista",
+        );
+        bad(
+            "type = \"i32\"\npoints = [3, 2]\ndefault = 3\n",
+            "crescentes",
+        );
+        bad("type = \"i32\"\npoints = []\ndefault = 3\n", "vazia");
+        bad(
+            "type = \"i32\"\npoints = [2, 2.5]\ndefault = 2\n",
+            "inteiro",
+        );
+        bad(
+            "type = \"i32\"\npoints = [2, 3]\ndefault = 2\nmin = 2\n",
+            "points",
+        );
+        bad(
+            "type = \"i32\"\npoints = [2, 3]\ndefault = 2\nslot = 1\n",
+            "slot",
+        );
+        bad("type = \"i32\"\npoints = 3\ndefault = 3\n", "lista");
+        bad("type = \"i32\"\ndefault = 3\n", "points");
+        bad(
+            "type = \"i32\"\npoints = [2, 3]\ndefault = 2\ndecimals = 1\n",
+            "f32",
+        );
+    }
+
+    #[test]
+    fn points_refused_outside_hook() {
+        let patch = "[[patch]]\nid = \"p\"\nname = \"N\"\ncategory = \"itens\"\ndescription = \"d\"\n\
+                     pattern = \"48 8B F9 11 22 33 44\"\noffset = 3\nexpected = \"11 22 33 44\"\nreplacement = \"01 00 00 00\"\n\
+                     [patch.value]\ntype = \"i32\"\nslot = 0\npoints = [1, 2]\ndefault = 1\n";
+        let err = parse(&[("generic.toml", patch)]).unwrap_err().to_string();
+        assert!(
+            err.contains("value.points") || err.contains("[[hook]]"),
+            "{err}"
+        );
+    }
+
+    /// Ocorrência sintética do padrão do Brain Power: os curingas valem 0, exceto os que o teste fixa.
+    fn brain_occurrence() -> Vec<u8> {
+        let sigs = Signatures::embedded().unwrap();
+        let pattern = &sigs.hooks()[0].pattern;
+        (0..pattern.len())
+            .map(|i| pattern.token(i).flatten().unwrap_or(0))
+            .collect()
+    }
+
+    /// A função de produção (o teste de mesmo nome a esconde).
+    fn captures_of(bytes: &[u8]) -> Result<BrainCaptures> {
+        super::brain_captures_from_hit(bytes)
+    }
+
+    /// Escreve `value` (16 bits baixos) nos dois bytes do curinga em `at`.
+    fn put16(bytes: &mut [u8], at: usize, value: u16) {
+        bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    /// Ocorrência com `R` nos três acessos e `T0`, `T1`, `L` distintos.
+    fn brain_filled(r: u16) -> Vec<u8> {
+        let mut bytes = brain_occurrence();
+        for at in [2, 22, 87] {
+            put16(&mut bytes, at, r);
+        }
+        put16(&mut bytes, 39, 0x118);
+        put16(&mut bytes, 46, 0x120);
+        bytes[80] = 0x10;
+        bytes
+    }
+
+    #[test]
+    fn brain_captures_from_hit() {
+        let caps = captures_of(&brain_filled(0x514)).unwrap();
+        assert_eq!(
+            caps,
+            BrainCaptures {
+                research: 0x514,
+                table: 0x118,
+                count: 0x120,
+                limit: 0x10,
+            }
+        );
+        // Outros valores saem iguais: nada é fixo no código.
+        let mut bytes = brain_filled(0x6A0);
+        put16(&mut bytes, 39, 0x200);
+        put16(&mut bytes, 46, 0x208);
+        bytes[80] = 0x18;
+        let caps = captures_of(&bytes).unwrap();
+        assert_eq!(
+            (caps.research, caps.table, caps.count, caps.limit),
+            (0x6A0, 0x200, 0x208, 0x18)
+        );
+        // A instrução do desvio do `[[hook]]` é a de T0 (7 bytes, `mov r14,[rax+T0]`).
+        let sigs = Signatures::embedded().unwrap();
+        let insn = hook_insn(&brain_filled(0x514), sigs.hooks()[0].offset).unwrap();
+        assert_eq!(insn, vec![0x4C, 0x8B, 0xB0, 0x18, 0x01, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn brain_pattern_incoherent_disp() {
+        for (which, at) in [(0, 2), (1, 22), (2, 87)] {
+            let mut bytes = brain_filled(0x514);
+            put16(&mut bytes, at, 0x518);
+            let err = captures_of(&bytes).unwrap_err();
+            assert!(
+                matches!(err, Error::IncoherentPattern { .. }),
+                "{which}: {err}"
+            );
+            assert!(
+                err.to_string().contains("padrão incoerente"),
+                "{which}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn brain_captures_reject_other_shapes() {
+        // O passo de 0x30 por nível (`shl rcx,4`) trocado por outro não confere.
+        let mut bytes = brain_filled(0x514);
+        bytes[57] = 0x05;
+        let err = captures_of(&bytes).unwrap_err().to_string();
+        assert!(
+            err.contains("padrão incoerente") && err.contains("0x30"),
+            "{err}"
+        );
+        // `esi` trocado por outro registrador no primeiro `mov` (8b b1 -> 8b 99, `ebx`).
+        let mut bytes = brain_filled(0x514);
+        bytes[1] = 0x99;
+        assert!(captures_of(&bytes).is_err());
+        // Bytes que não são código.
+        assert!(captures_of(&[0x06; 4]).is_err());
+        assert!(captures_of(&[]).is_err());
     }
 }

@@ -90,8 +90,10 @@ fn restore_discards_dead_process_journal() {
                 original: vec![0x48, 0x8B, 0xF9],
                 replacement: vec![0x48, 0x89, 0xCF],
                 next: None,
+                kind: gt_core::patch::PatchKind::Code,
             }],
             data: Vec::new(),
+            vars: Vec::new(),
         })
         .unwrap();
     let out = gt_patch(state.path(), &["restore"]);
@@ -151,4 +153,48 @@ fn restore_refused_while_locked() {
         "{}",
         stderr(&out)
     );
+}
+
+#[test]
+fn observe_checks_its_arguments_before_touching_the_game_or_the_journal() {
+    // Registrador, padrão e offset inválidos saem antes de procurar o jogo (e sem diário).
+    for (args, expected) in [
+        (
+            &["observe", "48 89 5c", "0", "eax"][..],
+            "registrador de 64 bits",
+        ),
+        (&["observe", "zz 01", "0", "rcx"][..], "padrão inválido"),
+        (
+            &["observe", "48 89 5c", "talvez", "rcx"][..],
+            "não é um número",
+        ),
+        (
+            &["observe", "48 89 5c", "0", "rcx", "--secs", "0"][..],
+            "--secs",
+        ),
+    ] {
+        let state = tempfile::tempdir().unwrap();
+        let out = gt_patch(state.path(), args);
+        assert!(!out.status.success(), "{args:?}");
+        let err = stderr(&out);
+        assert!(err.contains(expected), "{args:?}: {err}");
+        assert!(!err.contains("jogo não encontrado"), "{args:?}: {err}");
+        assert!(!journal_dir(state.path()).join("journal.json").exists());
+    }
+}
+
+#[test]
+fn observe_without_game_says_so() {
+    if game_is_open() {
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let out = gt_patch(state.path(), &["observe", "48 89 5c 24 08", "0", "rcx"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("jogo não encontrado"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!journal_dir(state.path()).join("journal.json").exists());
 }

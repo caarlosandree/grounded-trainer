@@ -133,14 +133,24 @@ A fase foi dividida em duas specs:
 
 ## Fase 6 — Code caves (lógica nova)
 
+**Status:** ✅ concluída em 2026-10-28 (spec e plano `008-code-caves`). Confirmados no jogo pelo dono pela TUI:
+Brain Power rápido (o ganho veio multiplicado; é o critério de pronto), analisador infinito (as cargas não caíram),
+coleta multiplicada (multiplicou; tirar do baú veio ×1), congelar hora e pular 1 hora; o save carregou normal. O teste
+`#[ignore]` do Brain Power com o jogo aberto passou (liga, desliga, nada nosso depois do `undo_all`). A quantidade ao
+arrastar **saiu da fase** (decisão do dono: sem ponto desviável). Pendências: anotar no jogo o que acontece ao dormir
+com a hora congelada, com o inventário cheio, com uma pilha acima do máximo e com uma ferramenta multiplicada.
+
 **Objetivo:** cheats que mudam *cálculos* do jogo, não só valores.
 
-- Encontrar espaço livre no executável para código novo.
-- Montar o código com `iced-x86` e desviar a execução para ele.
-- Cheats:
-  - Sobrevivência: god mode por desvio (se a versão por valor da Fase 5 não servir).
-  - Progressão: Brain Power rápido, congelar a hora do dia / velocidade do tempo.
-  - Itens: cargas infinitas do analisador, quantidade ao arrastar.
+- Encontrar espaço livre no executável para código novo (sequências de `CC` da `.text` e a folga da `.data`).
+- Montar o código com `iced-x86` e desviar a execução para ele, com as garantias do motor da Fase 2.
+- Cheats da spec 008:
+  - Progressão: **Brain Power rápido** (×2 a ×10, sem pular nível), **congelar a hora do dia** e **pular 1 hora**
+    (os dois de hora são por valor, sem desvio).
+  - Itens: **analisador infinito** (cargas) e **coleta multiplicada** (chão, colheita, loot de criatura e criação,
+    ×2, ×3, ×5 e ×10, sem limite de pilha; baú não; item solto pelo dono multiplica, porque o jogo usa o mesmo caminho).
+- **Fora da fase:** quantidade ao arrastar (2026-10-28, sem ponto desviável), god mode por desvio (o "não morrer" da Fase 5 funciona; volta se o dono pedir), multiplicador de
+  defesa (saiu na spec 007) e velocidade do tempo ajustável (o dono escolheu congelar e pular hora).
 
 **Pronto quando:** o Brain Power rápido funciona no jogo.
 **Você faz:** testar os cheats no jogo.

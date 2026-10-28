@@ -1,8 +1,8 @@
 //! Desmontagem x86-64 e destino de desvios.
 
 use iced_x86::{
-    Decoder, DecoderOptions, FlowControl, Formatter, Instruction, IntelFormatter, MemorySize,
-    Mnemonic, OpKind,
+    Decoder, DecoderOptions, FlowControl, Formatter, Instruction, InstructionInfoFactory,
+    IntelFormatter, MemorySize, Mnemonic, OpAccess, OpKind, Register,
 };
 
 /// Texto de uma instrução que o decodificador não reconheceu.
@@ -295,6 +295,110 @@ pub fn immediate_slot(code: &[u8], ip: u64) -> Vec<ImmSlot> {
     out
 }
 
+/// Por que a desmontagem não prova que o ponto de uma função é um prefixo sem pilha.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PrefixError {
+    /// Bytes que não são instrução: sem desmontar a função inteira não há prova.
+    #[error("não deu para desmontar a função inteira (bytes inválidos em +{0:#x})")]
+    Undecodable(usize),
+    /// O ponto cai no meio de uma instrução.
+    #[error("o ponto (+{0:#x}) não cai numa fronteira de instrução")]
+    NotOnBoundary(usize),
+    /// Uma instrução do prefixo mexe no `rsp`.
+    #[error("a instrução `{text}` em +{at:#x} muda o rsp")]
+    ChangesRsp {
+        /// Deslocamento desde o começo da função.
+        at: usize,
+        /// A instrução, em sintaxe Intel.
+        text: String,
+    },
+    /// Um desvio da função cai entre o segundo byte e o ponto.
+    #[error("o desvio em +{from:#x} tem destino +{to:#x}, entre o começo da função e o ponto")]
+    BranchInto {
+        /// Deslocamento do desvio.
+        from: usize,
+        /// Deslocamento do destino.
+        to: usize,
+    },
+}
+
+/// A instrução escreve no `rsp`/`esp`/`sp`, explícita (`sub rsp,x`, `mov rsp,rbp`) ou
+/// implicitamente (`push`, `pop`, `call`, `ret`, `enter`, `leave`, `pushf`...)?
+fn changes_rsp(insn: &Instruction, info: &mut InstructionInfoFactory) -> bool {
+    let by_mnemonic = matches!(
+        insn.mnemonic(),
+        Mnemonic::Push
+            | Mnemonic::Pop
+            | Mnemonic::Call
+            | Mnemonic::Ret
+            | Mnemonic::Retf
+            | Mnemonic::Enter
+            | Mnemonic::Leave
+            | Mnemonic::Pushf
+            | Mnemonic::Pushfd
+            | Mnemonic::Pushfq
+            | Mnemonic::Popf
+            | Mnemonic::Popfd
+            | Mnemonic::Popfq
+            | Mnemonic::Iret
+            | Mnemonic::Iretd
+            | Mnemonic::Iretq
+    );
+    by_mnemonic
+        || info.info(insn).used_registers().iter().any(|used| {
+            used.register().full_register() == Register::RSP
+                && matches!(
+                    used.access(),
+                    OpAccess::Write
+                        | OpAccess::CondWrite
+                        | OpAccess::ReadWrite
+                        | OpAccess::ReadCondWrite
+                )
+        })
+}
+
+/// Prova que `point` (deslocamento em `code`, a função inteira desde o `start`) é um prefixo sem
+/// pilha (spec 008, 6.7.3, regra 3): a desmontagem linear de `code` chega exatamente em `point`
+/// numa fronteira de instrução, nenhuma instrução antes dele muda o `rsp` e nenhum desvio
+/// relativo (`jmp`/`jcc`) da função inteira tem destino entre `start + 1` e `point`. Desvios
+/// condicionais no prefixo são aceitos desde que não caiam nessa faixa. `ip` é o endereço de
+/// `code[0]` (só para os destinos saírem certos). Qualquer byte que não decodifica recusa.
+pub fn check_stack_free_prefix(code: &[u8], ip: u64, point: usize) -> Result<(), PrefixError> {
+    let mut decoder = Decoder::with_ip(64, code, ip, DecoderOptions::NONE);
+    let mut info = InstructionInfoFactory::new();
+    let mut insn = Instruction::default();
+    let mut on_boundary = point == 0;
+    while decoder.can_decode() {
+        let at = decoder.position();
+        decoder.decode_out(&mut insn);
+        if insn.is_invalid() {
+            return Err(PrefixError::Undecodable(at));
+        }
+        if at == point {
+            on_boundary = true;
+        }
+        if at < point && changes_rsp(&insn, &mut info) {
+            let mut text = String::new();
+            formatter().format(&insn, &mut text);
+            return Err(PrefixError::ChangesRsp { at, text });
+        }
+        if is_near_branch(&insn) && insn.mnemonic() != Mnemonic::Call {
+            let to = insn.near_branch_target().wrapping_sub(ip);
+            if (1..=point as u64).contains(&to) {
+                return Err(PrefixError::BranchInto {
+                    from: at,
+                    to: to as usize,
+                });
+            }
+        }
+    }
+    if on_boundary {
+        Ok(())
+    } else {
+        Err(PrefixError::NotOnBoundary(point))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,5 +549,38 @@ mod tests {
     #[test]
     fn immediate_slot_ignores_instructions_without_immediate() {
         assert!(immediate_slot(&[0x90, 0x48, 0x89, 0xCF, 0xC3], 0).is_empty());
+    }
+
+    #[test]
+    fn stack_free_prefix_proof() {
+        // test rdx,rdx; je +0x30; mov [rsp+0x18],r8b; nop...
+        let mut code = vec![
+            0x48, 0x85, 0xd2, 0x0f, 0x84, 0x30, 0, 0, 0, 0x44, 0x88, 0x44, 0x24, 0x18,
+        ];
+        code.extend_from_slice(&[0x90; 8]);
+        assert_eq!(check_stack_free_prefix(&code, 0x1000, 9), Ok(()));
+        assert_eq!(
+            check_stack_free_prefix(&code, 0x1000, 10),
+            Err(PrefixError::NotOnBoundary(10))
+        );
+        // `push rbx` no começo, `mov rsp,rbp` e `lea rsp,[rsp+8]` mudam o rsp.
+        for (code, at) in [
+            (&[0x53u8, 0x90][..], 1),
+            (&[0x48, 0x89, 0xec, 0x90][..], 3),
+            (&[0x48, 0x8d, 0x64, 0x24, 0x08, 0x90][..], 5),
+        ] {
+            assert!(
+                matches!(
+                    check_stack_free_prefix(code, 0x1000, at),
+                    Err(PrefixError::ChangesRsp { .. })
+                ),
+                "{code:x?}"
+            );
+        }
+        // Bytes inválidos em qualquer lugar da função tiram a prova.
+        assert_eq!(
+            check_stack_free_prefix(&[0x90, 0x90, 0x06], 0x1000, 1),
+            Err(PrefixError::Undecodable(2))
+        );
     }
 }

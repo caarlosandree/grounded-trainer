@@ -463,8 +463,10 @@ mod tests {
                     original: vec![1],
                     replacement: vec![2],
                     next: None,
+                    kind: gt_core::patch::PatchKind::Code,
                 }],
                 data: Vec::new(),
+                vars: Vec::new(),
             })
             .unwrap();
         let end = RunEnd {

@@ -76,6 +76,18 @@ fn inspect_on_elf_says_not_pe() {
 }
 
 #[test]
+fn caves_on_elf_says_not_pe() {
+    let t = TestTarget::spawn();
+    let out = gt(&t, &["caves"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("não é uma imagem PE"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
 fn unknown_module_with_shortcut_errors() {
     let t = TestTarget::spawn();
     let out = gt_with(t.pid, "nada.exe", &["read", "+10"]);
@@ -173,7 +185,12 @@ fn no_game_running_message() {
         eprintln!("aviso: o jogo está aberto; teste ignorado");
         return;
     }
-    for args in [&["read", "0x1000"][..], &["ue", "class", "Actor"]] {
+    for args in [
+        &["read", "0x1000"][..],
+        &["ue", "class", "Actor"],
+        &["caves"],
+        &["diff"],
+    ] {
         let out = Command::new(env!("CARGO_BIN_EXE_gt"))
             .args(args)
             .output()

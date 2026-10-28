@@ -1,4 +1,5 @@
-//! Aplica e desfaz patches de bytes no Grounded 2: `list`, `run`, `toggle`, `restore` e `profile`.
+//! Aplica e desfaz patches de bytes no Grounded 2: `list`, `run`, `toggle`, `observe`, `restore` e
+//! `profile`.
 //!
 //! É o único aplicativo que escreve na memória do jogo (spec 6.10). O trabalho de verdade mora
 //! no `gt-core` e no `gt-grounded2`; aqui só se juntam argumentos, assinaturas embutidas e saída.
@@ -51,6 +52,20 @@ enum Command {
         #[arg(long, value_name = "MS", default_value = TOGGLE_INTERVAL_MS)]
         interval: u64,
     },
+    /// Pesquisa: instala uma cave que conta as passagens pelo começo de uma função e mostra os
+    /// chamadores distintos e a classe do registrador; devolve tudo ao sair.
+    Observe {
+        /// Padrão AOB único (`48 89 5C 24 08 ...`; `??` é curinga) que leva ao ponto.
+        pattern: String,
+        /// Distância, em bytes, do início do padrão até o começo da função (decimal ou `0x...`).
+        #[arg(value_parser = parse_offset)]
+        offset: usize,
+        /// Registrador de 64 bits cujo valor é guardado a cada passagem (`rcx`, `rdx`, `r8`, ...).
+        register: String,
+        /// Para sozinho depois de N segundos; sem isto, roda até Ctrl+C.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+        secs: Option<u64>,
+    },
     /// Só recupera o diário (desfaz o que uma execução interrompida deixou) e sai.
     Restore,
     /// Amostra o contador de programa das threads e mostra as funções mais executadas.
@@ -62,6 +77,15 @@ enum Command {
         #[arg(long, value_name = "MS", default_value = PROFILE_INTERVAL_MS)]
         interval: u64,
     },
+}
+
+/// `offset` do `observe`: decimal ou hexadecimal com `0x`.
+fn parse_offset(text: &str) -> Result<usize, String> {
+    let parsed = match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        Some(hex) => usize::from_str_radix(hex, 16),
+        None => text.parse(),
+    };
+    parsed.map_err(|_| format!("`{text}` não é um número (decimal ou 0x...)"))
 }
 
 /// Erro do núcleo dentro de `err`, direto ou embrulhado em `gt_grounded2::Error`.
@@ -131,6 +155,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             times,
             interval,
         } => cmd::toggle::run(cli.pid, &id, times, interval),
+        Command::Observe {
+            pattern,
+            offset,
+            register,
+            secs,
+        } => cmd::observe::run(cli.pid, &pattern, offset, &register, secs),
         Command::Restore => cmd::restore::run(),
         Command::Profile { samples, interval } => cmd::profile::run(cli.pid, samples, interval),
     }

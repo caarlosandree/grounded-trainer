@@ -12,6 +12,8 @@
 //!     (run --addr A --expected HEX --replacement HEX [--set-value HEX]
 //!      | set-bits --id ID --addr A --mask M --guard A:HEX [--guard A:HEX ...]
 //!      | set-word --id ID --addr A --value HEX [--value HEX] --guard A:HEX [--guard A:HEX ...]
+//!      | cave-run --vars START:LEN [--var A:HEX ...] --cave-addr A --cave HEX
+//!                  --addr A --expected HEX --replacement HEX
 //!      | restore)
 //! ```
 //!
@@ -24,6 +26,13 @@
 //! logo depois; com `--hook kill-after-next` o processo morre por `SIGKILL` depois de gravar o
 //! `next` e antes de escrever o valor novo. `--hook panic-after-set` entra em pânico logo
 //! depois do `set-word`.
+//!
+//! `cave-run` (spec 008, 6.3) reclama a região de variáveis (`--vars`), grava cada `--var`
+//! (`A:HEX`), aplica a **cave** (`--cave-addr`, `--cave`; o esperado é todo `CC`) numa pausa e
+//! o **desvio** (`--addr`, `--expected`, `--replacement`) em outra, e fica no laço do `run`
+//! (imprime `ativo`; na saída por sinal, desfaz e imprime `restaurado`). `--hook-pause 2` põe o
+//! gancho na pausa do desvio, depois de a cave estar escrita. `--hook panic-after-hook` entra
+//! em pânico logo depois de o desvio estar ativo.
 //!
 //! `run` imprime `ativo` depois de aplicar, `valor trocado` depois de `--set-value` (que
 //! troca o `replacement` do patch ativo e segue no laço do `run`) e `restaurado` (ou
@@ -52,12 +61,24 @@ const TICK: Duration = Duration::from_millis(200);
 /// `id` do patch cru.
 const PATCH_ID: &str = "harness";
 
+/// `id` da cave da `cave-run`.
+const CAVE_ID: &str = "harness-cave";
+
 enum Cmd {
     Run {
         addr: u64,
         expected: Vec<u8>,
         replacement: Vec<u8>,
         set_value: Option<Vec<u8>>,
+    },
+    CaveRun {
+        vars: Range<u64>,
+        var_writes: Vec<GuardBytes>,
+        cave_addr: u64,
+        cave: Vec<u8>,
+        addr: u64,
+        expected: Vec<u8>,
+        replacement: Vec<u8>,
     },
     SetBits {
         id: String,
@@ -83,6 +104,9 @@ struct Args {
     panic_after_bits: bool,
     /// `--hook panic-after-set`: pânico do próprio harness logo depois do `set_word`.
     panic_after_set: bool,
+    /// `--hook panic-after-hook`: pânico do próprio harness logo depois de o desvio da
+    /// `cave-run` estar ativo.
+    panic_after_hook: bool,
     hook_pause: Option<u32>,
     fault: Option<Fault>,
     cmd: Cmd,
@@ -192,6 +216,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
     let (mut journal_dir, mut pid, mut allow, mut hook) = (None, None, None, None);
     let (mut hook_pause, mut fault) = (None, None);
     let (mut panic_after_bits, mut panic_after_set) = (false, false);
+    let mut panic_after_hook = false;
     let cmd = loop {
         let Some(arg) = it.next() else {
             bail!("falta o subcomando (run ou restore)");
@@ -209,6 +234,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
                     panic_after_bits = true;
                 } else if v == "panic-after-set" {
                     panic_after_set = true;
+                } else if v == "panic-after-hook" {
+                    panic_after_hook = true;
                 } else {
                     hook = Some(parse_hook(&v)?);
                 }
@@ -270,6 +297,33 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
                     guard,
                 };
             }
+            "cave-run" => {
+                let (mut vars, mut cave_addr, mut cave) = (None, None, None);
+                let (mut addr, mut expected, mut replacement) = (None, None, None);
+                let mut var_writes = Vec::new();
+                while let Some(flag) = it.next() {
+                    let v = value(&mut it, &flag)?;
+                    match flag.as_str() {
+                        "--vars" => vars = Some(parse_allow(&v)?),
+                        "--var" => var_writes.push(parse_guard(&v)?),
+                        "--cave-addr" => cave_addr = Some(parse_num(&v)?),
+                        "--cave" => cave = Some(parse_hex(&v)?),
+                        "--addr" => addr = Some(parse_num(&v)?),
+                        "--expected" => expected = Some(parse_hex(&v)?),
+                        "--replacement" => replacement = Some(parse_hex(&v)?),
+                        other => bail!("opção desconhecida do cave-run: {other}"),
+                    }
+                }
+                break Cmd::CaveRun {
+                    vars: vars.context("cave-run sem --vars")?,
+                    var_writes,
+                    cave_addr: cave_addr.context("cave-run sem --cave-addr")?,
+                    cave: cave.context("cave-run sem --cave")?,
+                    addr: addr.context("cave-run sem --addr")?,
+                    expected: expected.context("cave-run sem --expected")?,
+                    replacement: replacement.context("cave-run sem --replacement")?,
+                };
+            }
             "run" => {
                 let (mut addr, mut expected, mut replacement) = (None, None, None);
                 let mut set_value = None;
@@ -303,6 +357,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
         hook,
         panic_after_bits,
         panic_after_set,
+        panic_after_hook,
         hook_pause,
         fault,
         cmd,
@@ -370,6 +425,7 @@ fn restore(args: Args) -> Result<()> {
     if args.hook.is_some()
         || args.panic_after_bits
         || args.panic_after_set
+        || args.panic_after_hook
         || args.hook_pause.is_some()
         || args.fault.is_some()
     {
@@ -414,6 +470,7 @@ fn run(
         addr,
         expected,
         replacement,
+        kind: gt_core::patch::PatchKind::Code,
     })?;
     let policy: PolicyFn = Box::new(move |_maps| WritePolicy::new(vec![allow.clone()]));
     let opts = EngineOptions {
@@ -436,6 +493,72 @@ fn run(
         engine.set_replacement(PATCH_ID, bytes)?;
         let mut out = std::io::stdout().lock();
         writeln!(out, "valor trocado")?;
+        out.flush()?;
+    }
+    let end = run_until_shutdown(&mut engine, &shutdown, TICK)?;
+    finish_run(&mut engine, end)
+}
+
+/// Tudo do `cave-run`, na ordem da spec 008, 6.3: variáveis, cave (uma pausa), desvio (outra).
+struct CaveJob {
+    vars: Range<u64>,
+    var_writes: Vec<GuardBytes>,
+    cave_addr: u64,
+    cave: Vec<u8>,
+    addr: u64,
+    expected: Vec<u8>,
+    replacement: Vec<u8>,
+}
+
+fn cave_run(args: Args, job: CaveJob) -> Result<()> {
+    let pid = args.pid.context("cave-run exige --pid")?;
+    let allow = args.allow.context("cave-run exige --allow")?;
+    let shutdown = Shutdown::install()?;
+    let store = JournalStore::new(args.journal_dir);
+    let lock = store.lock()?;
+    let report = recover(&store, &lock, &PauseConfig::default())?;
+    if !report.is_empty() {
+        print_recovery(&mut std::io::stdout().lock(), &report)?;
+    }
+    ensure_recovered(&report)?;
+    let target_id = identity(pid)?;
+    let cave = validate(PatchSpec {
+        id: CAVE_ID.into(),
+        addr: job.cave_addr,
+        expected: vec![gt_core::patch::CAVE_FILL; job.cave.len()],
+        replacement: job.cave,
+        kind: gt_core::patch::PatchKind::Cave,
+    })?;
+    let hook = validate(PatchSpec {
+        id: PATCH_ID.into(),
+        addr: job.addr,
+        expected: job.expected,
+        replacement: job.replacement,
+        kind: gt_core::patch::PatchKind::Code,
+    })?;
+    let policy: PolicyFn = Box::new(move |_maps| WritePolicy::new(vec![allow.clone()]));
+    let opts = EngineOptions {
+        version_key: "harness".into(),
+        pause: PauseConfig {
+            hook: args.hook,
+            fault: args.fault,
+            hook_on_pause: args.hook_pause.unwrap_or(1),
+            ..PauseConfig::default()
+        },
+    };
+    let mut engine = Engine::open(pid, Some(&target_id), store.clone(), &lock, policy, opts)?;
+    engine.claim_vars(job.vars)?;
+    for w in &job.var_writes {
+        engine.write_var(w.addr, &w.bytes)?;
+    }
+    engine.apply(vec![cave])?;
+    engine.apply(vec![hook])?;
+    if args.panic_after_hook {
+        panic!("pânico de teste depois de ativar o desvio");
+    }
+    {
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "ativo")?;
         out.flush()?;
     }
     let end = run_until_shutdown(&mut engine, &shutdown, TICK)?;
@@ -565,6 +688,26 @@ fn main() -> Result<()> {
             replacement,
             set_value,
         } => run(args, addr, expected, replacement, set_value),
+        Cmd::CaveRun {
+            vars,
+            var_writes,
+            cave_addr,
+            cave,
+            addr,
+            expected,
+            replacement,
+        } => cave_run(
+            args,
+            CaveJob {
+                vars,
+                var_writes,
+                cave_addr,
+                cave,
+                addr,
+                expected,
+                replacement,
+            },
+        ),
         Cmd::SetBits {
             id,
             addr,
