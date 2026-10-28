@@ -785,6 +785,14 @@ cada observação (`gt caves`: nada nosso).
   `+5615f30` é o ponto comum das três fontes vistas (começa com `mov [rsp+8],rbx`, 5 bytes, começo pela `.pdata`;
   padrão único `48 89 5c 24 08 48 89 6c 24 10 48 89 74 24 18 57 48 83 ec 30 48 8b f2 41 0f b6 f8 48 8b 15 26 8c 14 05 48 8b d9 e8 46 ef e9 fb`).
   Ainda não observados: criar na bancada e tirar do baú.
+- **Bancada e baú** (na base, `+5615f30`, `rcx`): criar vários itens na bancada deu uma passagem por item, pelo
+  `execServerAddItem` (`+5618680`); tirar do baú e pôr no baú **não** passaram pela `+5615f30`. Logo, um desvio na
+  `+5615f30` cobre chão (inclusive item solto), colheita, loot e bancada, e deixa o baú de fora.
+- **Analisador:** observar o getter `+57bd6d0` (aceito pela regra da função folha) com o dono abrindo e olhando o
+  analisador por 240 s deu **0 passagens**: a interface não lê as cargas por ele; a chamada deve vir só ao analisar
+  (sem recurso à mão, não testado). Leitura direta de 21 `BP_ResourceAnalyzer_Augusta_C`: cargas (`float`, `+0x974`)
+  4,0 com `MaxPowerCapacity` 4 (uma em 3,0), `InitialCharges` 4, `HoursPerCharge` 1 — cheio é `float(MaxPowerCapacity)`.
+  Falta confirmar no critério de pronto que gastar uma carga passa pelo getter.
 - **Arrastar:** mover para slot vazio e trocar passam pelo RPC `ServerSwapItemSlots` do controller, cujas implementações
   (controller `+5c37240` → stubs de envio `+5616a00`/`+5616a60`; inventário `+5960fc0`) não têm ponto desviável na
   entrada. Juntar pilhas tem (`+5960590`).
