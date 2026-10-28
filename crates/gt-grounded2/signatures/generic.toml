@@ -547,7 +547,8 @@ object_class = "/Script/Maine.ResourceAnalyzerBuilding"
 # pegar do chão, colher, loot e criar na bancada (não o baú). Pesquisa de 2026-10-28 no RESEARCH.md. O padrão
 # vai até a chamada pela interface do inventário: `48 8d 8b e0 00 00 00` (`lea rcx,[rbx+0xe0]`, a interface
 # do `InventoryComponent`) é byte fixo e separa esta função de uma gêmea de outra classe (interface em 0xc8);
-# os `disp`/`rel32` e os desvios curtos são curinga. Único no exe em disco (build c935e799-0b27c000).
+# os `disp`/`rel32` e os desvios curtos são curinga. Único no exe em disco (build c935e799-0b27c000); a unicidade na
+# memória é conferida no critério de pronto (spec 008, seção 9, item 5).
 [[hook]]
 id = "coleta-multiplicada"
 name = "Coleta multiplicada"

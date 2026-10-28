@@ -135,9 +135,10 @@ A fase foi dividida em duas specs:
 
 **Status:** 🚧 em andamento (spec e plano `008-code-caves`). Já está na branch `spec-008-code-caves`: o motor de
 desvios (cave e variáveis como tipos de escrita do motor), a cave de observação (`gt-patch observe`), `gt caves`,
-os corpos das caves (Brain Power, analisador, arrastar), a grade por lista de pontos, `congelar-hora`, `pular-hora`
-e as linhas de desvio na TUI, tudo testado sem o jogo. **Faltam**: a pesquisa no jogo (o ponto do arrastar, a coleta
-e o analisador), a coleta multiplicada e o critério de pronto no jogo com o dono. A fase **não está fechada**.
+os corpos das caves (Brain Power, analisador e coleta multiplicada), a grade por lista de pontos, `congelar-hora`,
+`pular-hora` e as linhas de desvio na TUI, tudo testado sem o jogo. A pesquisa no jogo da coleta foi feita
+(2026-10-28; o `observe` foi confirmado no jogo real). A quantidade ao arrastar **saiu da fase** em 2026-10-28
+(decisão do dono: sem ponto desviável). **Falta** o critério de pronto no jogo com o dono. A fase **não está fechada**.
 
 **Objetivo:** cheats que mudam *cálculos* do jogo, não só valores.
 
@@ -146,10 +147,9 @@ e o analisador), a coleta multiplicada e o critério de pronto no jogo com o don
 - Cheats da spec 008:
   - Progressão: **Brain Power rápido** (×2 a ×10, sem pular nível), **congelar a hora do dia** e **pular 1 hora**
     (os dois de hora são por valor, sem desvio).
-  - Itens: **analisador infinito** (cargas), **quantidade ao arrastar** (uso único por tecla) e **coleta
-    multiplicada** (mundo, loot de criatura e criação, ×2 a ×10; baú e item solto pelo dono não; é uma tentativa,
-    depende da pesquisa).
-- **Fora da fase:** god mode por desvio (o "não morrer" da Fase 5 funciona; volta se o dono pedir), multiplicador de
+  - Itens: **analisador infinito** (cargas) e **coleta multiplicada** (chão, colheita, loot de criatura e criação,
+    ×2, ×3, ×5 e ×10, sem limite de pilha; baú não; item solto pelo dono multiplica, porque o jogo usa o mesmo caminho).
+- **Fora da fase:** quantidade ao arrastar (2026-10-28, sem ponto desviável), god mode por desvio (o "não morrer" da Fase 5 funciona; volta se o dono pedir), multiplicador de
   defesa (saiu na spec 007) e velocidade do tempo ajustável (o dono escolheu congelar e pular hora).
 
 **Pronto quando:** o Brain Power rápido funciona no jogo.

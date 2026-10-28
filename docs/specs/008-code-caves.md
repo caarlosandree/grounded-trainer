@@ -392,7 +392,9 @@ Com backup do save feito pelo dono e o FLiNG fechado:
 
 5. **Coleta**: com ×3, pegar do chão, colher, pegar loot de uma criatura e criar um item: cada um vem ×3. Tirar do
    baú: vem ×1. Soltar um item e pegar de volta: vem ×3 (decisão do dono). Anotar o que o jogo faz com uma pilha acima do
-   máximo (divide, limita ou aceita) e com uma ferramenta ×3, e se isso vai para o save.
+   máximo (divide, limita ou aceita) e com uma ferramenta ×3, e se isso vai para o save. Com o inventário cheio, anotar
+   o que acontece com o item recusado (o jogo pode deixá-lo no chão já multiplicado, e pegar de novo multiplica de
+   novo). Conferir que a coleta aparece disponível (padrão único na memória).
 6. **Congelar hora**: o relógio para; desligado, volta. Tentar dormir com a hora congelada e anotar.
 7. **Pular hora**: cada toque avança 1 hora, com e sem a hora congelada; segurar avança no máximo uma vez por
    segundo.
