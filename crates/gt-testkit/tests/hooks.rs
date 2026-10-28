@@ -571,6 +571,89 @@ fn cave_kept_while_thread_inside() {
     r.assert_clean(&env.store);
 }
 
+/// Recuperação de um SIGKILL com um desvio (thread presa na cave) e um dado inteiro (como a
+/// entrada `set` do `congelar-hora`): a cave não sai, mas o dado não pode sumir do diário antes
+/// de resolvido. Uma recuperação seguinte, com a thread solta, resolve o resto.
+#[test]
+fn recovery_keeps_data_when_cave_restore_fails() {
+    use gt_core::journal::{DataEntry, DataMode};
+    use gt_core::recovery::recover;
+    let mut r = rig(true);
+    let env = env();
+    let mut engine = r.engine(&env);
+    engine.claim_vars(r.region.clone()).unwrap();
+    engine.write_var(r.var_n, &n_bytes(3)).unwrap();
+    engine.apply(vec![r.cave_patch()]).unwrap();
+    engine.apply(vec![r.hook_patch()]).unwrap();
+    let tail = r.tail_addr.unwrap();
+    r.t.park(tail);
+    wait_pc_in(&r, r.cave_addr..r.cave_addr + r.cave.len() as u64);
+    // SIGKILL do trainer: o motor some sem desfazer nada.
+    std::mem::forget(engine);
+    // Um campo inteiro "congelado" (original 1.0, escrito 0.0), com a entrada no diário.
+    let field = r.flag + 0x10;
+    let original = 1.0f32.to_le_bytes().to_vec();
+    let written = 0.0f32.to_le_bytes().to_vec();
+    r.poke(field, &written);
+    let entry = DataEntry {
+        id: "congelar-hora".into(),
+        addr: field,
+        mode: DataMode::Whole,
+        original: original.clone(),
+        written: written.clone(),
+        mask: 0,
+        next: None,
+        guard: Vec::new(),
+    };
+    let mut journal = match env.store.peek().unwrap() {
+        Loaded::Ok(j) => j,
+        other => panic!("diário inesperado: {other:?}"),
+    };
+    journal.data.push(entry.clone());
+    env.store.save(&journal).unwrap();
+    let journal_data = |env: &Env| match env.store.peek().unwrap() {
+        Loaded::Ok(j) => j.data,
+        other => panic!("diário inesperado: {other:?}"),
+    };
+
+    // O que a recuperação faz, passo a passo: com os dados adotados, o `Err` da cave não os tira
+    // do disco. Um SIGKILL logo depois (o motor some) deixa o diário com o dado.
+    let mut engine = r.engine(&env);
+    engine.adopt_data(&journal.data);
+    let err = engine.restore_entries(journal.entries.clone()).unwrap_err();
+    assert!(matches!(err, Error::ThreadsInPatch { .. }), "{err:?}");
+    assert_eq!(journal_data(&env), vec![entry.clone()]);
+    std::mem::forget(engine);
+    assert_eq!(r.bytes(field, 4), written);
+
+    // A recuperação inteira: a cave não sai (thread dentro), mas o dado não se perde; a saída do
+    // motor da recuperação o restaura (ele é pendente do motor, que tenta de novo no `Drop`).
+    let err = recover(&env.store, &env.lock, &PauseConfig::default()).unwrap_err();
+    assert!(matches!(err, Error::ThreadsInPatch { .. }), "{err:?}");
+    assert_eq!(r.bytes(r.cave_addr, r.cave.len()), r.cave);
+    assert_eq!(r.bytes(field, 4), original, "o dado devia ter voltado");
+    match env.store.peek().unwrap() {
+        Loaded::Ok(j) => {
+            assert!(j.data.is_empty(), "{:?}", j.data);
+            assert!(j.entries.iter().any(|e| e.id == CAVE_ID), "{j:?}");
+        }
+        other => panic!("diário inesperado: {other:?}"),
+    }
+
+    // A thread sai da cave: a recuperação seguinte resolve tudo.
+    r.poke(r.flag, &1u32.to_le_bytes());
+    let report = recover(&env.store, &env.lock, &PauseConfig::default()).unwrap();
+    assert!(report.kept.is_empty(), "{report:?}");
+    assert_eq!(r.bytes(field, 4), original);
+    assert_eq!(
+        r.bytes(r.cave_addr, r.cave.len()),
+        vec![CAVE_FILL; r.cave.len()]
+    );
+    r.poke(r.flag, &0u32.to_le_bytes());
+    r.poke(field, &[0; 4]);
+    r.assert_clean(&env.store);
+}
+
 // ---------------------------------------------------------------------------
 // Harness: SIGKILL, pânico e sinais
 // ---------------------------------------------------------------------------

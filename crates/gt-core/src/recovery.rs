@@ -203,17 +203,21 @@ pub fn recover(
         Err(Error::ProcessGone { .. }) => return finish_gone(store, report),
         Err(e) => return Err(e),
     };
-    // As regiões de variáveis entram no registro do motor antes de tudo: o diário que ele
-    // regrava as mantém mesmo que uma falha abandone a recuperação no meio.
+    // As regiões de variáveis e os dados entram no registro do motor antes de tudo (os dados
+    // como pendentes, sem escrever): o diário que ele regrava os mantém mesmo que uma falha
+    // abandone a recuperação no meio (uma cave com thread dentro, um prazo de pausa), em vez de
+    // tirá-los do disco antes de resolvidos.
+    engine.adopt_data(&journal.data);
     // Região do diário que não passa no filtro do motor (tamanho, alinhamento, sobreposição)
     // não é tocada: sai do diário como entrada de outro.
     let rejected = engine.adopt_vars(&journal.vars);
     if !rejected.is_empty() {
         report.foreign.push(VARS_ID.to_owned());
-        // Regravar agora, com o registro do motor ainda vazio, tiraria do disco as entradas e
-        // os dados que ainda não foram restaurados ("diário primeiro"). Só vale quando não há
-        // nada a restaurar; senão a gravação das próximas etapas já tira as regiões recusadas.
-        if eligible.is_empty() && journal.data.is_empty() {
+        // Regravar agora, com as entradas ainda fora do registro do motor, as tiraria do disco
+        // antes de restauradas ("diário primeiro"). Só vale quando não há entrada a restaurar
+        // (os dados já foram adotados); senão a gravação das próximas etapas já tira as regiões
+        // recusadas.
+        if eligible.is_empty() {
             engine.save_journal_now();
         }
     }

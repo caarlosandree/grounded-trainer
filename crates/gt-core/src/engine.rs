@@ -654,7 +654,19 @@ impl Engine {
     /// restauradas pela regra de [`decide_data`]. Uma escrita que falha mantém a entrada.
     pub fn restore_data(&mut self, entries: Vec<DataEntry>) -> Result<RestoreReport> {
         self.retry_resume()?;
-        for e in &entries {
+        self.adopt_data(&entries);
+        let result =
+            self.restore_data_inner(|e| entries.iter().any(|x| data_key(x) == data_key(e)));
+        self.finish(result)
+    }
+
+    /// Põe entradas de dados vindas do diário entre as pendentes, **sem** ler nem escrever nem
+    /// gravar o diário (como o [`Engine::adopt_vars`]): elas passam a constar de todo diário que o
+    /// motor grava até serem resolvidas. A recuperação as adota antes de restaurar os patches,
+    /// para que uma falha ali não as tire do disco. As já conhecidas (mesmo `id` e endereço) são
+    /// ignoradas.
+    pub fn adopt_data(&mut self, entries: &[DataEntry]) {
+        for e in entries {
             let key = data_key(e);
             let known = self
                 .data
@@ -665,9 +677,6 @@ impl Engine {
                 self.data_pending.push(e.clone());
             }
         }
-        let result =
-            self.restore_data_inner(|e| entries.iter().any(|x| data_key(x) == data_key(e)));
-        self.finish(result)
     }
 
     /// Entradas de dados vivas (bits limpos ou valor inteiro escrito, uma por par `id` e endereço).
@@ -735,9 +744,9 @@ impl Engine {
         rejected
     }
 
-    /// Regrava o diário com o estado em memória. Cuidado: entradas e dados só entram no registro
-    /// do motor quando são restaurados; chamar antes disso tira-os do disco. A recuperação só
-    /// usa quando não há nada a restaurar.
+    /// Regrava o diário com o estado em memória. Cuidado: entradas de patches só entram no
+    /// registro do motor quando são restauradas (os dados, com [`Engine::adopt_data`]); chamar
+    /// antes disso tira-as do disco. A recuperação só usa quando não há entrada a restaurar.
     pub fn save_journal_now(&self) {
         self.save_final();
     }
