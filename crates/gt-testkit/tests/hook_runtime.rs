@@ -546,7 +546,7 @@ fn set_value_only_writes_var() {
     s.set_points(0);
     s.gain(4);
     assert_eq!(s.points(), 40);
-    // Desligado, o valor também pode mudar; religar usa o valor do arme.
+    // Desligado, o valor também pode mudar; religar usa o valor escrito agora.
     s.rt.disable(&mut s.engine, BRAIN).unwrap();
     s.rt.set_value(&mut s.engine, BRAIN, 1).unwrap();
     assert_eq!(s.var_i32(var::BRAIN_N), 3);
@@ -1027,6 +1027,28 @@ fn collect_enable_uses_player_inventory() {
     let region = s.rig.var_region();
     let slack = s.bytes(region.start, (region.end - region.start) as usize);
     assert!(slack.iter().all(|b| *b == 0));
+}
+
+#[test]
+fn collect_reenable_does_not_keep_the_old_inventory() {
+    let mut s = scene();
+    s.resolve();
+    s.rt.enable(&mut s.engine, COLLECT, Some(1)).unwrap();
+    s.tick(Some(s.refl.pawn_a));
+    assert_eq!(s.var_u64(var::COLLECT_INVENTORY), INV_A);
+    // Desligada, a coleta deixa o ciclo parado na TUI (nenhum desvio ligado): o ponteiro velho
+    // fica na variável até religar.
+    s.rt.disable(&mut s.engine, COLLECT).unwrap();
+    assert_eq!(s.var_u64(var::COLLECT_INVENTORY), INV_A);
+    // Religar zera o inventário já no `enable` (nada multiplica até o ciclo achar o personagem)…
+    s.rt.enable(&mut s.engine, COLLECT, Some(1)).unwrap();
+    assert_eq!(s.var_u64(var::COLLECT_INVENTORY), 0);
+    // …e o ciclo seguinte grava o do personagem atual, mesmo que seja o mesmo de antes.
+    s.tick(Some(s.refl.pawn_a));
+    assert_eq!(s.var_u64(var::COLLECT_INVENTORY), INV_A);
+    s.tick(Some(s.refl.pawn_b));
+    assert_eq!(s.var_u64(var::COLLECT_INVENTORY), INV_B);
+    s.engine.undo_all().unwrap();
 }
 
 #[test]

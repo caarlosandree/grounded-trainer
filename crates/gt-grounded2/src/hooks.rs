@@ -656,6 +656,14 @@ impl HookRuntime {
                 .write_var(base + var::ANALYZER_ON, &1u64.to_le_bytes())
                 .map_err(core)?;
         }
+        if def.body == CaveBody::Collect {
+            // O inventário da variável pode ser de antes (o ciclo não roda com todos os desvios
+            // desligados): 0 até o próximo ciclo gravar o do personagem atual (spec 6.7.4).
+            engine
+                .write_var(base + var::COLLECT_INVENTORY, &0u64.to_le_bytes())
+                .map_err(core)?;
+            self.inventory_written = Some(0);
+        }
         let mut batch = Vec::new();
         if !cave_written {
             batch.push(

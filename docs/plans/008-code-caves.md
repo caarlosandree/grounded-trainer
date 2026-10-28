@@ -1,4 +1,4 @@
-# Plano 008 — Code caves: Brain Power, hora do dia, analisador, arrastar e coleta
+# Plano 008 — Code caves: Brain Power, hora do dia, analisador e coleta
 
 > **Para agentes executores:** SUB-SKILL OBRIGATÓRIA: use superpowers:subagent-driven-development (recomendado) ou superpowers:executing-plans para executar este plano tarefa a tarefa. Os passos usam checkbox (`- [ ]`).
 

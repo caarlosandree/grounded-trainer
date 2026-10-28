@@ -85,7 +85,7 @@ Valem os das specs anteriores. Além deles:
 | Grade por lista, `f64` na grade | `crates/gt-core/src/value.rs` |
 | Pontos dos desvios (`[[hook]]` ou equivalente) e corpos das caves (Rust) | `crates/gt-grounded2/signatures/generic.toml` e `crates/gt-grounded2/src/` |
 | Calendário, `add` de `double` com `at_least`, salto com classe dona própria | `crates/gt-grounded2/src/` (`player.rs`, `fields.rs`, `signatures.rs`) e, no motor, uma escrita de dados com releitura **"maior ou igual"** (`crates/gt-core/src/engine.rs`; hoje a releitura exige igualdade exata). Os tipos da ação (`plan_add`, `ActionOutcome`, `Backend::field_action`, backend falso, formatação no `controller.rs`) passam de `i32` para um valor numérico de 4 ou 8 bytes, de ponta a ponta |
-| Linhas na TUI (desvio com valor, ação de armar, `[ação]` de pular hora, registro do Brain Power) | `apps/gt-tui/src/` |
+| Linhas na TUI (desvio com valor, `[ação]` de pular hora, registro do Brain Power) | `apps/gt-tui/src/` |
 | `gt caves`, `gt diff`, `gt ue player` (só leitura; `gt diff` e `gt caves` passam a ler o diário sem a trava, conferindo a identidade boot/PID/início antes de usar) | `apps/gt-cli/` e `crates/gt-grounded2/src/player.rs` |
 | `gt-patch observe` (escreve; usa trava do diário e recuperação) | `apps/gt-patch/` |
 | **Módulo sintético** no alvo de teste: imagem com a mesma forma do jogo (cabeça mapeada de arquivo e cauda da `.data` em VMA **anônima** `rw-p`), cabeçalho PE mínimo, `.text` com funções e `CC`, `.data` com `VirtualSize` menor que a página, achada pela descoberta de módulos e pela política de confiança como o jogo, e o arquivo servindo de "disco" para o `gt diff`. É infraestrutura grande (hoje o alvo é só páginas anônimas) e vira tarefa própria do plano | `crates/gt-testkit/` (`gt-testtarget`) |
@@ -146,9 +146,9 @@ excluem as imagens de módulo e exigem guarda de objeto). Entram dois tipos novo
 **exceção explícita** à regra da spec 005 de que a `.data` dos módulos nunca é escrita; ela vai para o `AGENTS.md` 3.
 
 - **Cave**: bytes na `.text` do executável, dentro de uma sequência de `CC`, de qualquer tamanho até o da sequência.
-  Antes de escrever: todos os bytes do trecho são `CC`, e o trecho fica dentro da sequência com pelo menos 16 bytes
-  `CC` intactos no começo dela (o fim de função antes). O diário guarda endereço e bytes escritos **antes** da
-  escrita. Escrita por `/proc/<pid>/mem` (página de código).
+  O alocador (pelo disco) só oferece trechos dentro da sequência com pelo menos 16 bytes `CC` intactos no começo
+  dela (o fim de função antes); na hora da escrita, todos os bytes do trecho da cave são conferidos como `CC`. O
+  diário guarda endereço e bytes escritos **antes** da escrita. Escrita por `/proc/<pid>/mem` (página de código).
 - **Alocador**: várias caves podem dividir a mesma sequência; duas caves nunca se sobrepõem. Uma sequência serve se
   `tamanho ≥ cave + 16`. Tamanhos estimados: Brain Power ~150 bytes, analisador ~50, coleta ~150 (o
   plano mede). A sequência de 1871 bytes cabe tudo.
@@ -163,10 +163,10 @@ excluem as imagens de módulo e exigem guarda de objeto). Entram dois tipos novo
   | Variáveis | Bytes |
   |---|---|
   | Brain Power: N, último ganho original, aplicado, `L1`, `L2`, contador de sequência | 24 |
-  | Arrastar: N armado, contador de aplicadas | 16 |
+  | Reservado (`24..40`; era o arrastar, que saiu, 6.7.2) | 16 |
   | Analisador: ligado (0/1), ponteiro da classe `ResourceAnalyzerBuilding` | 16 |
   | Coleta: N, ponteiro do inventário do jogador, até 8 endereços de retorno permitidos | 80 |
-  | Arrastar e coleta: ponteiro da classe `Item` (6.7.2) | 8 |
+  | Coleta: ponteiro da classe `Item` (6.7.4) | 8 |
   | Cave de observação: contador e anel de 8 entradas (retorno + 1 registrador), **uma de cada vez** | 136 |
   | Total | 280 |
 
@@ -332,7 +332,7 @@ Patches com `slot` e grades existentes não mudam. O `unit` continua sufixo (`5x
 - `congelar-hora` é um `set` como os da 007.
 - Os desvios ligados seguem as regras dos patches: religar depois de reconectar (mesma chave de versão), suspensão
   com motor `stuck`, saída pelo motor.
-- Os quatro desvios usam a reflexão (offsets ou conferência), então ficam
+- Os três desvios usam a reflexão (offsets ou conferência), então ficam
   `verificando…` até o índice da reflexão, como os cheats de valor, e `indisponível (campo X não encontrado)` se o
   campo faltar. Religar depois de reconectar espera a reflexão.
 
@@ -352,7 +352,7 @@ Patches com `slot` e grades existentes não mudam. O `unit` continua sufixo (`5x
 | Achar folgas (função pura): sequências de `CC`, margem de 16, `tamanho ≥ cave + 16`, várias caves na mesma sequência sem sobreposição; folga da `.data` pelo `VirtualSize` e pelo `maps` | Não |
 | Montagem do desvio (função pura): `jmp rel32` + `NOP`; instrução original relocada (com e sem RIP relativo); recusa instrução < 5 bytes e distância > ±2 GB | Não |
 | Grade por lista: carga (crescente, `default`, inteiros, um ponto só), `←→`, `f64`; grades antigas iguais | Não |
-| Assinaturas: os quatro desvios e os dois cheats de hora carregam; erros de carga do formato novo; `add` com `double`, `at_least` e um ponto | Não |
+| Assinaturas: os três desvios e os dois cheats de hora carregam; erros de carga do formato novo; `add` com `double`, `at_least` e um ponto | Não |
 | Módulo sintético: ligar um desvio numa função "soma" multiplica; trocar valor muda o resultado sem pausa; desligar devolve; sair limpa cave e variáveis (`.text` igual à cópia "em disco") | Não |
 | Módulo sintético com uma thread chamando a função em laço: 1000 ligar/desligar e a saída sem crash, resultado sempre o original ou o multiplicado | Não |
 | Limpeza com thread parada dentro da cave (thread de teste segura num laço dentro dela): a cave não é apagada; com a thread fora, é | Não |
@@ -370,7 +370,7 @@ Patches com `slot` e grades existentes não mudam. O `unit` continua sufixo (`5x
 | Padrão do Brain Power com `disp` diferentes entre si ou da reflexão: `indisponível (padrão incoerente)` | Não |
 | Cave de observação: conta, guarda retornos no anel, não muda registradores nem o resultado | Não |
 | Calendário sintético: salto com classe dona (`GameState` de outra classe recusado); `set` de `float`; `add` de `double` com releitura "maior ou igual" (igual, acima, muito acima com a nota, abaixo = não pegou) | Não |
-| TUI com o backend falso: desvio com valor; ação de armar (`aplicada`, desarmar, `expirou`, recusa com motor `stuck`, não religa ao reconectar); `verificando…` dos desvios até a reflexão; registro do Brain Power; `pular-hora` com `não pegou`; desvio ligado religado ao reconectar | Não |
+| TUI com o backend falso: desvio com valor; `verificando…` dos desvios até a reflexão; registro do Brain Power; `pular-hora` com `não pegou`; desvio ligado religado ao reconectar | Não |
 | `gt caves`, `gt diff` (desvio marcado como nosso) e `gt ue player` (`ResearchPoints`) contra o módulo sintético | Não |
 | Com o jogo aberto: os desvios disponíveis; `brain-power` liga e desliga parado (sem ganho durante o teste, nada vai ao save; o analisador fica de fora, porque enche as cargas); depois da saída do motor (`undo_all`), `gt diff` sem diferença e `gt caves` sem nada nosso | Sim (`#[ignore]`) |
 
@@ -381,7 +381,8 @@ testados à mão (seção 9).
 
 Com backup do save feito pelo dono e o FLiNG fechado:
 
-1. A TUI mostra os seis (ou cinco, se a coleta sair pela 6.7.4) como disponíveis nas categorias certas.
+1. A TUI mostra os cinco (`brain-power`, analisador, coleta, `congelar-hora` e `pular-hora`) como disponíveis nas
+   categorias certas.
 2. **Brain Power** (critério da fase): com ×5, os ganhos no jogo aparecem no registro como `+X → +5X` (ou com
    `ganhos não mostrados`, se vierem juntos) e o
    `ResearchPoints` (`gt ue player`) sobe nessa medida. Quando `ResearchPoints` passa do "próximo nível em" (`L1`)
