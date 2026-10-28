@@ -3,7 +3,7 @@
 > **Para agentes executores:** SUB-SKILL OBRIGATÓRIA: use superpowers:subagent-driven-development (recomendado) ou superpowers:executing-plans para executar este plano tarefa a tarefa. Os passos usam checkbox (`- [ ]`).
 
 **Objetivo:** motor de desvios com code cave e variáveis na folga da `.data`, a cave de observação para pesquisa, e
-seis cheats: `brain-power`, `analisador-infinito`, `quantidade-arrastar`, `coleta-multiplicada` (tentativa),
+cinco cheats (o `quantidade-arrastar` saiu da fase em 2026-10-28): `brain-power`, `analisador-infinito`, `coleta-multiplicada`,
 `pular-hora` e `congelar-hora`, fechando a Fase 6.
 
 **Arquitetura:** o desvio e a cave são **patches** do motor da Fase 2, de dois tipos: `Code` (o de hoje, a instrução

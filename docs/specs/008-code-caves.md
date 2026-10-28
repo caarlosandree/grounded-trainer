@@ -3,7 +3,7 @@
 | Campo | Valor |
 |---|---|
 | Fase | 6 (ver `docs/ROADMAP.md`) |
-| Estado | Aprovada pelo dono em 2026-10-27 (Fase 6 em andamento) |
+| Estado | Implementada e confirmada no jogo pelo dono em 2026-10-28 (Fase 6 fechada) |
 | Data | 2026-10-27 |
 | Depende de | Spec 007 na `main` (raiz `game_state` com `set`), só para `congelar-hora` (6.8.1) |
 
@@ -416,7 +416,7 @@ Com o item 2, a **Fase 6 fecha**.
 - `AGENTS.md` 3: ressalva dos desvios (7).
 - `docs/specs/005-sobrevivencia-por-reflexao.md` e `006-progressao-e-movimento.md`: notas da exceção da `.data` e do
   `add` generalizado.
-- `docs/ROADMAP.md`: Fase 6 com os seis cheats; god mode por desvio fora; status ao terminar.
+- `docs/ROADMAP.md`: Fase 6 com os cinco cheats (o arrastar saiu); god mode por desvio fora; status ao terminar.
 
 ## 11. Decisões tomadas
 

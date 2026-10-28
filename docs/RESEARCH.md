@@ -802,6 +802,19 @@ cada observação (`gt caves`: nada nosso).
   (controller `+5c37240` → stubs de envio `+5616a00`/`+5616a60`; inventário `+5960fc0`) não têm ponto desviável na
   entrada. Juntar pilhas tem (`+5960590`).
 
+## Sessão de 2026-10-28 (Fase 6): critério de pronto da spec 008 no jogo
+
+Build `c935e799-0b27c000`, backup do save feito pelo dono, FLiNG fechado, trainer do branch `spec-008-code-caves`
+(`9855077`).
+
+| O quê | Resultado |
+|---|---|
+| Teste `#[ignore]` `brain_power_toggles_and_undo_all_leaves_nothing` (release) | Passou em 5 s: cave e desvio do Brain Power instalados, desligado, `undo_all` sem nada nosso (`gt diff` e `gt caves`). O `cargo test --workspace -- --ignored` completo em debug passou de 15 min e foi interrompido pelo `timeout`; o jogo foi conferido limpo depois |
+| Analisador: getter `+57bd6d0` ao analisar (`gt-patch observe`, `rcx`) | 5 passagens, um chamador (`+5582973`), `rcx` sempre `BP_ResourceAnalyzer_Augusta_C`: a cave só vê analisadores |
+| Pela TUI, com o dono | Brain Power multiplicado (critério de pronto), analisador sem gastar cargas, coleta multiplicada (baú ×1), congelar hora, pular 1 hora (`2540107 → 2543707`); o save carregou normal |
+| Travamento | Com a TUI aberta e vários cheats ligados, a `GameThread` ficou a 99,5% de CPU com o `pc` dentro de `libnvidia-glcore.so` (driver de vídeo), `rcx` avançando; nenhuma thread nas nossas caves e nenhum retorno para o exe na pilha. A TUI saiu e desfez tudo (`gt diff` sem alteração); a trava continuou sem nada nosso instalado e o jogo voltou sozinho minutos depois. Conclusão: trava do jogo ou do driver, não das caves |
+| Não testado | Dormir com a hora congelada; inventário cheio, pilha acima do máximo e ferramenta com a coleta |
+
 ## Hipóteses descartadas
 
 - (2026-10-25) "Os patches em `+57BD6D0`/`+5BBFE8C` indicam que as opções de cargas e arrastar item estavam

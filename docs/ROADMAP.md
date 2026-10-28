@@ -133,12 +133,12 @@ A fase foi dividida em duas specs:
 
 ## Fase 6 — Code caves (lógica nova)
 
-**Status:** 🚧 em andamento (spec e plano `008-code-caves`). Já está na branch `spec-008-code-caves`: o motor de
-desvios (cave e variáveis como tipos de escrita do motor), a cave de observação (`gt-patch observe`), `gt caves`,
-os corpos das caves (Brain Power, analisador e coleta multiplicada), a grade por lista de pontos, `congelar-hora`,
-`pular-hora` e as linhas de desvio na TUI, tudo testado sem o jogo. A pesquisa no jogo da coleta foi feita
-(2026-10-28; o `observe` foi confirmado no jogo real). A quantidade ao arrastar **saiu da fase** em 2026-10-28
-(decisão do dono: sem ponto desviável). **Falta** o critério de pronto no jogo com o dono. A fase **não está fechada**.
+**Status:** ✅ concluída em 2026-10-28 (spec e plano `008-code-caves`). Confirmados no jogo pelo dono pela TUI:
+Brain Power rápido (o ganho veio multiplicado; é o critério de pronto), analisador infinito (as cargas não caíram),
+coleta multiplicada (multiplicou; tirar do baú veio ×1), congelar hora e pular 1 hora; o save carregou normal. O teste
+`#[ignore]` do Brain Power com o jogo aberto passou (liga, desliga, nada nosso depois do `undo_all`). A quantidade ao
+arrastar **saiu da fase** (decisão do dono: sem ponto desviável). Pendências: anotar no jogo o que acontece ao dormir
+com a hora congelada, com o inventário cheio, com uma pilha acima do máximo e com uma ferramenta multiplicada.
 
 **Objetivo:** cheats que mudam *cálculos* do jogo, não só valores.
 
